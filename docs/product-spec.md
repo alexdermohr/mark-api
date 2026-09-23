@@ -1,0 +1,108 @@
+# Produktspezifikation
+
+Stand: 23.09.2026
+
+Status: **funktionaler Scope konkretisiert; Integrationsweg und Detail-Akzeptanz noch offen**
+
+Quelle: docs/requirements-source-2026-09-23.md
+
+## 1. Ziel
+
+Für Marks Kleinanzeigen-Account soll eine Lösung entstehen, die Anzeigen verwaltet, KI-generierte Texte und Bilder für Anzeigen erzeugt und Leistungsdaten in einem Dashboard auswertet. Aus den gesammelten Daten sollen Vergleiche, Ranglisten und Optimierungsvorschläge entstehen.
+
+## 2. Belegter Funktionsumfang
+
+### 2.1 Anzeigen
+- Anzeigen erstellen.
+- Anzeigen löschen.
+- Anzeigen verwalten.
+
+„Verwalten“ ist als gewünschter Oberbegriff belegt; die darunter fallenden Einzeloperationen müssen noch präzisiert werden.
+
+### 2.2 Textgenerierung
+- Titel aus Prompts generieren.
+- Beschreibungstexte aus Prompts generieren.
+- Generierte Inhalte für Anzeigen verwenden.
+
+### 2.3 Bildgenerierung
+- Bilder aus Prompts generieren.
+- Generierte Bilder automatisch für Anzeigen verwenden.
+
+### 2.4 Dashboard
+Ein Dashboard soll die relevanten Anzeigen- und Leistungsdaten sichtbar machen.
+
+### 2.5 Datensammlung und Auswertung
+Gewünscht sind mindestens:
+- Aufrufe,
+- wie viele Personen geschrieben haben,
+- daraus berechnete Kennzahlen,
+- Grafiken,
+- Top-Listen.
+
+### 2.6 Vergleichsdimensionen
+Top-Listen bzw. Vergleiche sollen insbesondere nach folgenden Merkmalen möglich sein:
+- Bild-Typ,
+- Stadt,
+- Text-Typ,
+- Titel-Typ.
+
+### 2.7 Empfehlungen
+Aus den Daten sollen Vorschläge für die besten bzw. erfolgversprechendsten Lösungen abgeleitet werden.
+
+## 3. Funktionale Anforderungen
+
+- **FR-01:** Anzeigen erstellen.
+- **FR-02:** Anzeigen löschen.
+- **FR-03:** Anzeigen verwalten.
+- **FR-04:** Titel anhand eines Prompts generieren.
+- **FR-05:** Beschreibungstexte anhand eines Prompts generieren.
+- **FR-06:** Bilder anhand eines Prompts generieren.
+- **FR-07:** Generierte Bilder einer Anzeige automatisch zur Verwendung zuführen.
+- **FR-08:** Aufrufzahlen erfassen, soweit der Integrationsweg diese Daten bereitstellt.
+- **FR-09:** Anzahl der schreibenden Interessenten erfassen, sobald die genaue Metrik definiert und technisch verfügbar ist.
+- **FR-10:** Kennzahlen und Verläufe im Dashboard visualisieren.
+- **FR-11:** Top-Listen nach Bild-Typ, Stadt, Text-Typ und Titel-Typ erzeugen.
+- **FR-12:** Aus beobachteten Ergebnissen Optimierungsvorschläge ableiten.
+
+## 4. Noch nicht belegte Detailanforderungen
+
+Folgende Punkte dürfen nicht als bereits entschieden behandelt werden:
+
+1. Welche Einzelaktionen umfasst „Anzeigen verwalten“ genau?
+2. Welche Pflichtfelder muss eine Anzeige enthalten?
+3. Welche Aktionen laufen automatisch und welche benötigen Freigabe?
+4. Was bedeutet „wie viele geschrieben haben“ exakt: Chats, eindeutige Interessenten oder Nachrichten?
+5. Wie werden Bild-, Text- und Titel-Typen klassifiziert?
+6. Welche Zeiträume und Vergleichsgruppen gelten im Dashboard?
+7. Wo soll die Anwendung laufen?
+8. Welche Kosten- und Betriebsgrenzen gelten?
+9. Welche Daten dürfen wie lange gespeichert werden?
+10. Welche Mindestqualität bzw. Zielwerte definieren „beste Lösung“?
+
+## 5. Technische Gates
+
+Vor einer dauerhaften Architekturentscheidung muss belegt werden:
+
+1. Welcher zulässige Integrationsweg für Kleinanzeigen die benötigten Lese- und Schreibaktionen ermöglicht.
+2. Ob Aufrufe und Nachrichten-/Interessentenmetriken technisch abrufbar sind.
+3. Welche Authentifizierung, Limits und Nutzungsbedingungen gelten.
+4. Welche Aktionen tatsächlich automatisierbar sind und wo menschliche Freigaben erforderlich sind.
+
+## 6. Vorgeschlagener MVP
+
+Der MVP ist ein **Planungsvorschlag**, keine bereits bestätigte Detailanforderung.
+
+Ziel ist genau ein realer End-to-End-Pfad:
+1. Anzeige vorbereiten.
+2. Titel per Prompt erzeugen.
+3. Beschreibung per Prompt erzeugen.
+4. Bild per Prompt erzeugen.
+5. Inhalte der Anzeige zuordnen.
+6. Anzeige über den belegten Integrationsweg erstellen.
+7. Verfügbare Basiskennzahlen zurücklesen und im einfachen Dashboard darstellen.
+
+Erst danach sollen Variantenvergleiche, Top-Listen und automatische Optimierung erweitert werden.
+
+## 7. Erfolgskriterium für die nächste Phase
+
+Die Discovery-Phase ist technisch abgeschlossen, wenn für jede benötigte Lese- und Schreibaktion ein zulässiger, reproduzierbarer Integrationsweg belegt oder eine konkrete Nicht-Verfügbarkeit dokumentiert ist.

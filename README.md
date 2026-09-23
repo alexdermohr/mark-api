@@ -1,42 +1,53 @@
 # mark-api
 
-Öffentliche Projektdokumentation für die mit Mark besprochene Agent-/API-Integration.
+Öffentliche Projektdokumentation für die mit Mark besprochene Kleinanzeigen-Agent-/API-Integration.
 
 ## Status
 
-**Discovery / Anforderungen ausstehend** — Stand: 23.09.2026.
+**Funktionaler Scope konkretisiert / technische Discovery offen** — Stand: 23.09.2026.
 
-Im Telefonat wurde nur der Rahmen geklärt. Die konkrete Funktion des Agenten ist noch nicht beschrieben. Mark will die genaue Wunschvorstellung schriftlich per WhatsApp nachreichen.
+Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Gewünscht sind Anzeigenverwaltung, KI-generierte Titel/Beschreibungen/Bilder, ein Dashboard sowie datenbasierte Auswertungen und Optimierungsvorschläge.
 
 ## Aktuell belegt
 
-- Ziel ist eine Agent-/API-Integration für Marks **Kleinanzeigen-Account** zur privaten Nutzung.
-- Die Wahl zwischen lokalen, kostenlosen oder anderen Modellen ist für Mark derzeit kein Kriterium.
-- Seine explizite Priorität: **„Ich brauche nur, dass das alles funktioniert.“**
-- Welche Aktionen der Agent konkret ausführen soll, ist noch offen.
-- Der nächste harte Input ist Marks detaillierte schriftliche Anforderung.
+- Anzeigen **erstellen, löschen und verwalten**.
+- Titel und Beschreibungstexte **aus Prompts generieren**.
+- Bilder **aus Prompts generieren und automatisch für Anzeigen verwenden**.
+- Dashboard für Anzeigen- und Leistungsdaten.
+- Datensammlung zu **Aufrufen** und dazu, **wie viele geschrieben haben**.
+- Grafiken und Top-Listen nach **Bild-Typen, Städten, Text-Typen und Titel-Typen**.
+- Daraus Vorschläge für die besten bzw. erfolgversprechendsten Lösungen ableiten.
+- Modellwahl ist derzeit kein Kriterium; entscheidend ist, dass die Lösung zuverlässig funktioniert.
+
+## Wichtigstes Gate
+
+Der funktionale Zielumfang ist jetzt ausreichend konkret für die technische Discovery. Noch offen ist, **welcher zulässige Kleinanzeigen-Integrationsweg** die benötigten Lese- und Schreibaktionen tatsächlich ermöglicht und welche Kennzahlen verfügbar sind.
+
+Bis das belegt ist, wird keine API-, Browser-, Hosting- oder Modellarchitektur dauerhaft festgelegt.
 
 ## Projektregistratur
 
-Dieses Repository ist die **kanonische Registratur für `mark-api`**.
+Dieses Repository ist die **kanonische Registratur für mark-api**.
 
 - Aufgaben und offene Punkte: **GitHub Issues dieses Repositories**
-- Entscheidungen, Gesprächsstände und Evidenz: **`docs/`**
+- Entscheidungen, Gesprächsstände und Evidenz: **docs/**
 - Implementierung: dieses Repository
 - **Für dieses Projekt keine Registrierung im Bureau.**
 
+## Dokumentation
+
+- Schriftliche Wunschvorstellung: [docs/requirements-source-2026-09-23.md](docs/requirements-source-2026-09-23.md)
+- Produktspezifikation: [docs/product-spec.md](docs/product-spec.md)
+- Anforderungen und offene Punkte: [docs/requirements.md](docs/requirements.md)
+- Telefonat, Rohtranskription: [docs/call-2026-09-23-raw.md](docs/call-2026-09-23-raw.md)
+- Telefonat, bereinigter Stand: [docs/call-2026-09-23.md](docs/call-2026-09-23.md)
+- Ausgangskontext: [docs/context.md](docs/context.md)
+- Entscheidungen: [docs/DECISIONS.md](docs/DECISIONS.md)
+
 ## Datenschutz / Öffentlichkeit
 
-Das Repository ist öffentlich. Deshalb werden hier keine Zugangsdaten, Tokens, Telefonnummern oder sonstige nicht erforderliche personenbezogene Daten abgelegt. Die private Audiodatei bleibt außerhalb des Repositories; dokumentiert wird nur die Transkription und daraus abgeleitete Projektinformation.
-
-## Quellen
-
-- Private Gesprächsaufnahme `mark.m4a`, 23.09.2026, Google Drive (nicht im Repository)
-- Automatische Rohtranskription: [docs/call-2026-09-23-raw.md](docs/call-2026-09-23-raw.md)
-- Bereinigter Gesprächsstand: [docs/call-2026-09-23.md](docs/call-2026-09-23.md)
-- Anforderungen und Lücken: [docs/requirements.md](docs/requirements.md)
-- Entscheidungen: [docs/DECISIONS.md](docs/DECISIONS.md)
+Das Repository ist öffentlich. Zugangsdaten, Tokens, Telefonnummern und sonstige nicht erforderliche personenbezogene Daten werden nicht committed. Private Rohquellen bleiben außerhalb des Repositorys.
 
 ## Arbeitsregel
 
-Keine Architektur festlegen, bevor die konkreten gewünschten Agentenaktionen und der tatsächlich verfügbare Kleinanzeigen-Integrationsweg geklärt sind. Danach wird der kleinste ausreichende End-to-End-Pfad umgesetzt.
+Zuerst den real verfügbaren Integrationsweg und die verfügbaren Daten belegen. Danach genau einen kleinen End-to-End-Fall umsetzen. Analyse-, Ranking- und Optimierungsfunktionen werden auf real verfügbaren und sauber definierten Metriken aufgebaut.
