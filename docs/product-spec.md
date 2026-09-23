@@ -34,7 +34,7 @@ Ein Dashboard soll die relevanten Anzeigen- und Leistungsdaten sichtbar machen.
 ### 2.5 Datensammlung und Auswertung
 Gewünscht sind mindestens:
 - Aufrufe,
-- wie viele Personen geschrieben haben,
+- die Kennzahl „wie viele geschrieben haben“; ob damit Chats, eindeutige Personen oder Nachrichten gemeint sind, ist noch offen,
 - daraus berechnete Kennzahlen,
 - Grafiken,
 - Top-Listen.
@@ -59,7 +59,7 @@ Aus den Daten sollen Vorschläge für die besten bzw. erfolgversprechendsten Lö
 - **FR-06:** Bilder anhand eines Prompts generieren.
 - **FR-07:** Generierte Bilder einer Anzeige automatisch zur Verwendung zuführen.
 - **FR-08:** Aufrufzahlen erfassen, soweit der Integrationsweg diese Daten bereitstellt.
-- **FR-09:** Anzahl der schreibenden Interessenten erfassen, sobald die genaue Metrik definiert und technisch verfügbar ist.
+- **FR-09:** Die vom Auftraggeber gewünschte Kennzahl „wie viele geschrieben haben“ erfassen, sobald ihre Einheit (z. B. Chats, eindeutige Personen oder Nachrichten) definiert und technisch verfügbar ist.
 - **FR-10:** Kennzahlen und Verläufe im Dashboard visualisieren.
 - **FR-11:** Top-Listen nach Bild-Typ, Stadt, Text-Typ und Titel-Typ erzeugen.
 - **FR-12:** Aus beobachteten Ergebnissen Optimierungsvorschläge ableiten.

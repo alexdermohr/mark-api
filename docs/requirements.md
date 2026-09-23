@@ -15,7 +15,7 @@ Stand: 23.09.2026
 | Text | Titel und Beschreibungen aus Prompts generieren |
 | Bilder | aus Prompts generieren und automatisch für Anzeigen verwenden |
 | Dashboard | gewünscht |
-| Daten | Aufrufe und Anzahl der Personen, die geschrieben haben |
+| Daten | Aufrufe und die Kennzahl „wie viele geschrieben haben“; Einheit noch offen (z. B. Chats, Personen oder Nachrichten) |
 | Auswertung | Kennzahlen, Grafiken und Top-Listen |
 | Vergleichsdimensionen | Bild-Typen, Städte, Text-Typen, Titel-Typen |
 | Ergebnis | Vorschläge für die besten bzw. erfolgversprechendsten Lösungen |
