@@ -1,0 +1,145 @@
+---
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "22"
+
+      - name: Show runtimes
+        run: |
+          python --version
+          node --version
+
+      - name: Compile Python
+        run: python -m compileall -q src tests
+
+      - name: Run unit tests
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
+
+      - name: Check embedded dashboard JavaScript
+        env:
+          PYTHONPATH: src
+        run: >-
+          python -c
+          'from mark_api.dashboard import _DASHBOARD_JS; print(_DASHBOARD_JS)'
+          | node --check -
+
+      - name: Determine diff base
+        id: diff-base
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE_SHA"
+          elif [[ ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]] \
+            && git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE_SHA"
+          else
+            base="$(git rev-parse HEAD^)"
+          fi
+          git cat-file -e "$base^{commit}"
+          printf 'sha=%s\n' "$base" >> "$GITHUB_OUTPUT"
+
+      - name: Check diff hygiene
+        env:
+          BASE_SHA: ${{ steps.diff-base.outputs.sha }}
+        run: git diff --check "$BASE_SHA...HEAD"
+
+      - name: Scan changed files for secret patterns
+        env:
+          BASE_SHA: ${{ steps.diff-base.outputs.sha }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          patterns = {
+              "password_assignment": re.compile(rb"(?i)password\s*[:=]"),
+              "passwd_assignment": re.compile(rb"(?i)passwd\s*[:=]"),
+              "secret_assignment": re.compile(rb"(?i)secret\s*[:=]"),
+              "token_assignment": re.compile(rb"(?i)token\s*[:=]"),
+              "cookie_assignment": re.compile(rb"(?i)cookie\s*[:=]"),
+              "authorization_assignment": re.compile(
+                  rb"(?i)authorization\s*[:=]"
+              ),
+              "bearer_token": re.compile(
+                  rb"(?i)bearer\s+[A-Za-z0-9._~-]{16,}"
+              ),
+              "openai_key": re.compile(rb"sk-[A-Za-z0-9_-]{16,}"),
+              "github_token": re.compile(rb"gh[pousr]_[A-Za-z0-9]{20,}"),
+              "aws_access_key": re.compile(rb"AKIA[0-9A-Z]{16}"),
+          }
+
+          base = os.environ["BASE_SHA"]
+          raw_paths = subprocess.check_output(
+              ["git", "diff", "--name-only", "-z", f"{base}...HEAD"]
+          )
+          paths = [
+              Path(item.decode("utf-8", "surrogateescape"))
+              for item in raw_paths.split(b"\0")
+              if item
+          ]
+
+          findings = []
+          scanned = 0
+          for path in paths:
+              try:
+                  data = path.read_bytes()
+              except (FileNotFoundError, IsADirectoryError):
+                  continue
+              if b"\0" in data:
+                  continue
+              scanned += 1
+              for line_number, line in enumerate(data.splitlines(), start=1):
+                  for rule_name, pattern in patterns.items():
+                      if pattern.search(line):
+                          findings.append((path, line_number, rule_name))
+
+          for path, line_number, rule_name in findings:
+              print(
+                  f"::error file={path},line={line_number}::"
+                  f"possible secret pattern: {rule_name}"
+              )
+
+          if findings:
+              raise SystemExit(1)
+          print(f"Secret scan passed for {scanned} changed text files.")
+          PY
