@@ -41,7 +41,7 @@ jobs:
           node --version
 
       - name: Compile Python
-        run: python -m compileall -q src tests
+        run: python -m compileall -q src tests tools
 
       - name: Run unit tests
         env:
@@ -81,65 +81,12 @@ jobs:
           BASE_SHA: ${{ steps.diff-base.outputs.sha }}
         run: git diff --check "$BASE_SHA...HEAD"
 
-      - name: Scan changed files for secret patterns
+      - name: Scan commit-added lines for secret patterns
         env:
           BASE_SHA: ${{ steps.diff-base.outputs.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_SHA: ${{ github.sha }}
         run: |
-          python - <<'PY'
-          import os
-          import re
-          import subprocess
-          from pathlib import Path
-
-          patterns = {
-              "password_assignment": re.compile(rb"(?i)password\s*[:=]"),
-              "passwd_assignment": re.compile(rb"(?i)passwd\s*[:=]"),
-              "secret_assignment": re.compile(rb"(?i)secret\s*[:=]"),
-              "token_assignment": re.compile(rb"(?i)token\s*[:=]"),
-              "cookie_assignment": re.compile(rb"(?i)cookie\s*[:=]"),
-              "authorization_assignment": re.compile(
-                  rb"(?i)authorization\s*[:=]"
-              ),
-              "bearer_token": re.compile(
-                  rb"(?i)bearer\s+[A-Za-z0-9._~-]{16,}"
-              ),
-              "openai_key": re.compile(rb"sk-[A-Za-z0-9_-]{16,}"),
-              "github_token": re.compile(rb"gh[pousr]_[A-Za-z0-9]{20,}"),
-              "aws_access_key": re.compile(rb"AKIA[0-9A-Z]{16}"),
-          }
-
-          base = os.environ["BASE_SHA"]
-          raw_paths = subprocess.check_output(
-              ["git", "diff", "--name-only", "-z", f"{base}...HEAD"]
-          )
-          paths = [
-              Path(item.decode("utf-8", "surrogateescape"))
-              for item in raw_paths.split(b"\0")
-              if item
-          ]
-
-          findings = []
-          scanned = 0
-          for path in paths:
-              try:
-                  data = path.read_bytes()
-              except (FileNotFoundError, IsADirectoryError):
-                  continue
-              if b"\0" in data:
-                  continue
-              scanned += 1
-              for line_number, line in enumerate(data.splitlines(), start=1):
-                  for rule_name, pattern in patterns.items():
-                      if pattern.search(line):
-                          findings.append((path, line_number, rule_name))
-
-          for path, line_number, rule_name in findings:
-              print(
-                  f"::error file={path},line={line_number}::"
-                  f"possible secret pattern: {rule_name}"
-              )
-
-          if findings:
-              raise SystemExit(1)
-          print(f"Secret scan passed for {scanned} changed text files.")
-          PY
+          set -euo pipefail
+          head="${PR_HEAD_SHA:-$EVENT_SHA}"
+          python tools/ci_secret_scan.py "$BASE_SHA" "$head"
