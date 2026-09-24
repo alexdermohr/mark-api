@@ -45,3 +45,38 @@
 - Die technische Discovery priorisiert vorhandene Lösungen für CRUD, Messaging und Statistik.
 - Noch keine endgültige Architekturwahl: `kleinanzeigen-bot-ui`/`kleinanzeigen-bot` und `monkrel/kleinanzeigen-api` werden als PoC-Kandidaten geprüft.
 - Account-/ToS- und Wartungsrisiken inoffizieller Schnittstellen bleiben ein Gate.
+
+## D-006 — Dünne eigene Schicht mit Capability-Adaptern
+
+**Entscheidung:** Für den privaten technischen MVP wird kein geprüfter Fremdkandidat als vollständiger Anwendungskern übernommen. `mark-api` wird als dünne eigene Python-Schicht mit capability-spezifischen Adaptern aufgebaut.
+
+**Primäre Zuordnung:**
+- private/mobile API über einen austauschbaren `MobileApiAdapter` für eigene Anzeigen, Pause/Aktivierung, Delete und Inbox/Messaging,
+- eigener read-only `ManagementReadAdapter` für Verkäuferstatus, Views, Merker und Replies,
+- `Second-Hand-Friends/kleinanzeigen-bot` nur als isolierter externer Prozess für in-place Inhaltsupdate und erst nach separatem Real-Smoke-Test ggf. Create/Publish,
+- eigenes normalisiertes SQLite-Datenmodell und eigenes kleines Dashboard statt Übernahme von `kleinanzeigen-bot-ui`.
+
+**Begründung:** Der Realtest auf Anzeigen-ID `3521676801` zeigte:
+- monkrel war für ID-gebundene Pause/Aktivierung/Delete und Inbox kompakt und reproduzierbar,
+- der Browser-Bot konnte als einziger Kandidat das bestehende Inserat mit stabiler ID in-place ändern,
+- Browserpfade zeigten reale XPath/CDP-/Parser-Robustheitsprobleme,
+- monkrel allein hat kein belegtes in-place Update und modelliert Status/Verkäufermetriken unvollständig,
+- die vollständige UI bringt unnötige AGPL-/Browserkomplexität und hat real die Last-Ad-Stats-Lücke bestätigt.
+
+**Grenzen:**
+- keine AGPL-Codeübernahme in den mark-api-Kern ohne separate Lizenzentscheidung,
+- Schreiboperationen standardmäßig deaktiviert und immer an eine einzelne bekannte Anzeigen-ID gebunden,
+- Create/Publish bleibt bis zu einem eigenen Remote-Smoke-Test deaktiviert,
+- diese technische Entscheidung ist keine Feststellung einer vertraglichen Freigabe der inoffiziellen Schnittstellen.
+
+Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`.
+
+## D-007 — Python-Core und SQLite für den ersten Slice
+
+**Entscheidung:** Der erste Implementierungs-Slice wird als Python-3.12+-Package mit frameworkfreien Domain-/Adapter-Contracts und SQLite-Persistenz umgesetzt.
+
+**Begründung:** Beide operativ relevanten Adapterpfade sind Python-basiert. Python vermeidet für den ersten Slice eine zusätzliche Sprachbrücke; SQLite deckt den privaten Single-Account-MVP und append-only Metrik-Snapshots ohne Infrastrukturvorgriff ab.
+
+**Nicht entschieden:** Webframework, Dashboard-Frontend, Queue/Job-System und späteres Deploymentmodell.
+
+**Folge:** Der erste Code-Slice implementiert Domänenmodelle, diskriminierte Read-Ergebnisse, Adapterports und Snapshot-Persistenz. Plattformwrites bleiben standardmäßig deaktiviert.

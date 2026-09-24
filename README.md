@@ -4,7 +4,7 @@
 
 ## Status
 
-**Funktionaler Scope konkretisiert / technische Discovery offen** — Stand: 23.09.2026.
+**Ein-Anzeigen-Realtest abgeschlossen / technische MVP-Architektur festgelegt / Core-Implementierung startet** — Stand: 24.09.2026.
 
 Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Gewünscht sind Anzeigenverwaltung, ein Dashboard sowie datenbasierte Auswertungen und Optimierungsvorschläge. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
 
@@ -21,9 +21,9 @@ Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkreti
 
 ## Wichtigstes Gate
 
-Der funktionale Zielumfang ist jetzt ausreichend konkret für die technische Discovery. Noch offen ist, **welcher zulässige Kleinanzeigen-Integrationsweg** die benötigten Lese- und Schreibaktionen tatsächlich ermöglicht und welche Kennzahlen verfügbar sind.
+Der technische Ein-Anzeigen-PoC ist abgeschlossen. Belegt sind Sync, in-place Update, Pause/Aktivierung, Verkäufermetriken, positiver Inbox/adId-Fall und Delete mit unabhängigen Besitzerlisten-Readbacks.
 
-Bis das belegt ist, wird keine API-, Browser-, Hosting- oder Modellarchitektur dauerhaft festgelegt.
+Für den MVP gilt D-006/D-007: dünne eigene Python-Schicht mit Capability-Adaptern; SQLite für den ersten Core-Slice. Produktions-/ToS-Freigabe und ein separater Create/Publish-Realtest bleiben vor schreibendem Dauerbetrieb offen.
 
 ## Projektregistratur
 
@@ -43,6 +43,8 @@ Dieses Repository ist die **kanonische Registratur für mark-api**.
 - Telefonat, bereinigter Stand: [docs/call-2026-09-23.md](docs/call-2026-09-23.md)
 - Ausgangskontext: [docs/context.md](docs/context.md)
 - Entscheidungen: [docs/DECISIONS.md](docs/DECISIONS.md)
+- Architekturentscheidung: [docs/architecture-decision-2026-09-24.md](docs/architecture-decision-2026-09-24.md)
+- Realtest/PoC: [docs/poc-2026-09-24.md](docs/poc-2026-09-24.md)
 - Integrationsoptionen: [docs/integration-options.md](docs/integration-options.md)
 
 ## Datenschutz / Öffentlichkeit
@@ -51,4 +53,4 @@ Das Repository ist öffentlich. Zugangsdaten, Tokens, Telefonnummern und sonstig
 
 ## Arbeitsregel
 
-Zuerst die real verfügbaren Integrationswege mit einem kleinen PoC gegeneinander prüfen. MVP-Priorität haben Anzeigen-CRUD, Synchronisation, Besucher/Watchlist, Inbox und darauf aufbauende Messbarkeit. Analyse-, Ranking- und Optimierungsfunktionen werden auf real verfügbaren und sauber definierten Metriken aufgebaut.
+Ab jetzt entlang der belegten Adaptergrenzen implementieren: frameworkfreier Python-Core, diskriminierte Read-Ergebnisse, SQLite-Snapshots, danach Management- und Mobile-API-Adapter. Browserautomation bleibt auf Fähigkeiten beschränkt, für die kein engerer belegter API-Pfad existiert. Plattformwrites sind standardmäßig deaktiviert und benötigen Pre-/Post-Readbacks auf eine explizite Anzeigen-ID.

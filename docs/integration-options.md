@@ -2,7 +2,7 @@
 
 Stand: 24.09.2026
 
-Status: **Ein-Anzeigen-Realtest weitgehend belegt; Inbox/adId und Delete noch offen; Architekturentscheidung weiter gesperrt**
+Status: **Ein-Anzeigen-Realtest abgeschlossen; Architekturentscheidung getroffen**
 
 Ausführliche Prüfprotokolle, Testresultate und Codepfade: `docs/poc-2026-09-24.md`.
 
@@ -29,7 +29,7 @@ Wir unterscheiden:
 - **lokal gestartet:** Anwendung/Route praktisch gestartet,
 - **remote belegt:** echte Plattformwirkung plus Readback.
 
-Remote-Evidenz ist inzwischen für Sync, Inhaltsupdate, Pause/Aktivieren und Verkäufermetriken erreicht. Positiver Inbox/adId-Fall und Delete fehlen noch.
+Remote-Evidenz ist für Sync, Inhaltsupdate, Pause/Aktivieren, Verkäufermetriken, positiven Inbox/adId-Fall und Delete erreicht. Die verbleibenden Punkte sind Härtung, nicht mehr Architektur-Sondierung.
 
 ## Frisch bestätigte Kandidaten
 
@@ -179,13 +179,13 @@ Legende: **S** statisch, **T** offline getestet, **L** lokal gestartet, **R** ec
 | neue Anzeige erstellen | S | S/T | S/T Payload | Kandidaten-Publish nicht separat getestet |
 | pausieren | UI-Menü nur lokal | **R** | **R** | Bot einmaliger XPath-Fehler, später unverändert erfolgreich; beide mit Status-Readback |
 | aktivieren | UI-Menü nur lokal | **R** | **R** | Bot-Erfolg ohne Overlay-Patch; beide mit Status-Readback |
-| Views lesen | S | Roh-Manage-Ads **R** | — im Modell | real, zuletzt 13 |
+| Views lesen | S | Roh-Manage-Ads **R** | — im Modell | real, vor Delete zuletzt 15 |
 | Merkerzahl lesen | S | Roh-Manage-Ads **R** | — im Modell | real, zuletzt 0 |
-| Replies lesen | S | Roh-Manage-Ads **R** | — im Modell | real, zuletzt 0 |
-| Inbox lesen | S | — | **R** | für Testanzeige aktuell 0 Conversations |
-| Conversation → Anzeige | S über `adId` | — | S/T über `ad_id` | positiver Realfall offen |
+| Replies lesen | S | Roh-Manage-Ads **R** | — im Modell | real, vor Delete zuletzt 1 |
+| Inbox lesen | **R** | — | **R** | bot-ui und monkrel lesen denselben Conversation-Fall real |
+| Conversation → Anzeige | **R** über `adId` | — | **R** über `ad_id` | beide ordnen real ID 3521676801 zu |
 | Nachricht senden | S | — | S | nicht automatisch getestet |
-| Delete | S über Bot | S/T | S | offen; absichtlich letzter Schritt |
+| Delete | S über Bot | Readback **R** | **R** | Erst-DELETE über monkrel; beide Besitzerlisten danach ohne ID |
 | Extend | S über Bot | S/T | S | nicht Teil des minimalen Kernnachweises |
 | Dashboard | L | — | — | lokal |
 | Statistik-Historie | S | — | — | lokal |
@@ -229,39 +229,41 @@ Die offizielle API bleibt technisch relevant, ist für den dokumentierten privat
 
 ## Was jetzt nicht mehr sinnvoll ist
 
-Keine weitere breite Tool-/Marktrecherche. Der Realtest hat die entscheidenden Unterschiede bereits sichtbar gemacht.
+Keine weitere breite Tool-/Marktrecherche. Der Realtest hat die entscheidenden Unterschiede sichtbar gemacht und die Architektur-Sondierung beendet.
 
-Offen sind nur noch die letzten experimentellen Gates:
+Abschlussbefunde:
 
-1. genau eine kontrollierte Testnachricht → Conversation → korrekte `adId`,
-2. daraus `conversation_count`, `unique_buyer_count` und `inbound_message_count` getrennt lesen,
-3. Delete als letzter Schritt mit vorab gewähltem Erst-DELETE-Kandidaten,
-4. beide Kandidaten lesen anschließend die Abwesenheit,
-5. UI-Stats nach Delete auf Phantomdaten/verwaiste Historie prüfen,
-6. danach Wartbarkeit gegen die real beobachteten Browser-/API-Brüche abwägen.
+1. kontrollierte Testnachricht → Conversation mit korrekter `ad_id=3521676801`,
+2. `conversation_count=1`, `unique_buyer_count=1`, `inbound_message_count=1`,
+3. Erst-DELETE vorab auf Kandidat B festgelegt und genau einmal ausgeführt,
+4. `my_ads()` und Management-Besitzerbestand danach ohne Test-ID,
+5. `get_my_ad(id)` und öffentliche Detailseite liefern mindestens drei Minuten weiter alte Detaildaten,
+6. unveränderter bot-ui-`fetchAdStats()` lässt nach erfolgreichem leeren Last-Ad-Readback den alten Stats-Eintrag stehen,
+7. Kandidat A zeigte beim Pre-Delete-Neusync zusätzlich einen `GIVE_AWAY`-Preisparser-`IndexError`.
 
-## Aktueller Gate-Stand
+## Gate-Stand
 
-Bereits remote belegt:
+Der definierte E2E-Ablauf ist abgeschlossen:
 
-`Sync → Update → Pause → Aktivieren → Views/Watchlist/Replies`
+`Sync → Update → Pause/Reserve → Aktivieren → Views/Watchlist/Replies → Inbox/adId → Delete → Besitzerlisten-Abwesenheit → UI-Stats-Nachprüfung`
 
-Noch offen:
+Die Detail-/Public-URL-Staleness nach Delete ist als eigene Semantik dokumentiert und blockiert die Architekturentscheidung nicht; für Delete gilt der Besitzerbestand als authoritative Readback.
 
-`Inbox-Zuordnung → Löschen`
+## Architekturentscheidung
 
-Die Testanzeige `3521676801` bleibt bis zum kontrollierten Nachrichtentest aktiv. Ein legitimer Gegenkontakt einer anderen berechtigten Person muss genau eine Nachricht an diese Anzeige senden.
+Gewählt ist ein **dünnes eigenes Orchestrierungsbackend mit getrennten Adaptern**:
 
-Keine Architekturentscheidung vorher.
+1. monkrel als primärer MIT-Adapter für Auth, eigene Anzeigen, Pause/Aktivieren, Delete und Messaging,
+2. eigener Management-Read-Adapter für Besitzerbestand, Status, Views, Merker und Replies mit diskriminierten Fehlerzuständen,
+3. `Second-Hand-Friends/kleinanzeigen-bot` als isolierter externer Browser-Adapter nur für Sync/in-place Inhaltsupdate, solange kein stabiler API-Updatepfad belegt ist,
+4. kein vollständiges `kleinanzeigen-bot-ui`; Dashboard/API werden gegen das eigene Domänenmodell gebaut.
 
-## Mögliche Ergebnisse nach dem E2E-Test
+Nicht gewählt:
 
-Noch gleichberechtigt offen:
+- bot-ui + Bot als Gesamtsystem: reale Remote-/Stats-Semantikfehler und unnötige Kopplung,
+- monkrel-only: kein belegtes in-place Inhaltsupdate und keine Verkäufermetriken im Modell,
+- Browser-Bot-only: reale DOM/CDP- und Preisparser-Robustheitsprobleme.
 
-1. UI weitgehend übernehmen/forken.
-2. Nur UI-/Stats-/Messaging-Komponenten nutzen.
-3. monkrel als schlanken API-Unterbau verwenden und gezielt ergänzen.
-4. Browser-Bot und API-Client kombinieren.
-5. Eigenes dünnes Backend nur dann, wenn Adapter um vorhandene Komponenten nachweislich nicht ausreichen.
+Authoritative Delete-Semantik: Abwesenheit aus den Besitzerlisten. `get_my_ad(id)` und öffentliche Detail-HTTP-200 sind nach dem realen Delete nachweislich stale.
 
-Die Auswahl erfolgt erst anhand der realen Readbacks aus dem Ein-Anzeigen-Test.
+Details und Adapter-Contracts: `docs/architecture-decision-2026-09-24.md`.

@@ -2,7 +2,7 @@
 
 Stand: 23.09.2026
 
-Status: **funktionaler Scope konkretisiert; Integrationsweg und Detail-Akzeptanz noch offen**
+Status: **funktionaler Scope konkretisiert; technischer MVP-Integrationsweg nach Realtest gewählt; Detail-Akzeptanz und Produktionsfreigabe noch offen**
 
 Quelle: docs/requirements-source-2026-09-23.md
 
@@ -87,12 +87,20 @@ Folgende Punkte dürfen nicht als bereits entschieden behandelt werden:
 
 ## 5. Technische Gates
 
-Vor einer dauerhaften Architekturentscheidung muss belegt werden:
+Der Ein-Anzeigen-Realtest vom 24.09.2026 hat technisch belegt:
 
-1. Welcher zulässige Integrationsweg für Kleinanzeigen die benötigten Lese- und Schreibaktionen ermöglicht.
-2. Ob Aufrufe und Nachrichten-/Interessentenmetriken technisch abrufbar sind.
-3. Welche Authentifizierung, Limits und Nutzungsbedingungen gelten.
-4. Welche Aktionen tatsächlich automatisierbar sind und wo menschliche Freigaben erforderlich sind.
+1. Sync, in-place Update, Pause/Aktivierung, Delete und Inbox/adId sind über die dokumentierten Capability-Pfade ausführbar.
+2. Aufrufe, Merker, Replies und getrennte Nachrichten-/Interessentenmetriken sind technisch abrufbar.
+3. Login/MFA bleibt manuell; Tokens/Sessions bleiben lokale Adapterdetails.
+4. Für den technischen MVP ist D-006/D-007 gewählt: eigene dünne Adapter-Schicht statt Übernahme eines Gesamtsystems.
+
+Weiter offen bleiben als **Produktionsgates**:
+
+- vertragliche Freigabe bzw. bewusste Account-/ToS-Risikoentscheidung für die inoffiziellen Schnittstellen,
+- Betriebs-/Polling-Grenzen,
+- separater Remote-Smoke-Test für Create/Publish,
+- fachliche Auswahl der Kennzahl „wie viele geschrieben haben“,
+- Freigaberegeln für produktive Schreibaktionen.
 
 ## 6. Vorgeschlagener MVP
 
@@ -114,4 +122,4 @@ Technische Kandidaten und PoC-Plan: `docs/integration-options.md`.
 
 ## 7. Erfolgskriterium für die nächste Phase
 
-Die Discovery-Phase ist technisch abgeschlossen, wenn für jede benötigte Lese- und Schreibaktion ein zulässiger, reproduzierbarer Integrationsweg belegt oder eine konkrete Nicht-Verfügbarkeit dokumentiert ist.
+Die technische Architektur-Sondierung ist für den getesteten Kernablauf abgeschlossen. Der Create/Publish-Pfad und die vertragliche Produktionsfreigabe bleiben ausdrücklich außerhalb dieses Abschlusses und müssen vor entsprechender Write-Freigabe separat belegt werden.

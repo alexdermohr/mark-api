@@ -2,7 +2,7 @@
 
 Stand: 24.09.2026
 
-Status: **laufend; Baseline/Sync/Update/Pause/Aktivieren/Metriken belegt; Inbox/adId und Delete offen**
+Status: **abgeschlossen; kompletter Ein-Anzeigen-E2E am 24.09.2026 durchlaufen**
 
 Dieses Runbook operationalisiert den Plattformtest. Laufende Ergebnisse stehen in `docs/poc-2026-09-24.md`; das Runbook selbst bleibt der Ablaufvertrag und ersetzt keine Architekturentscheidung.
 
@@ -236,6 +236,19 @@ Nach dem DELETE prüfen:
 - zeigt Dashboard Phantomdaten?,
 - wurde ein Fehler als leere Liste maskiert?
 
+### Ausgeführter Delete-Nachlauf
+
+Beobachtet:
+
+- `my_ads()`: Test-ID absent,
+- Management-Besitzerbestand: `count=0`, Test-ID absent,
+- `get_my_ad(id)`: alte Detaildaten mindestens drei Minuten weiter verfügbar,
+- öffentliche Detailseite: HTTP 200 mit altem Inhalt mindestens drei Minuten weiter verfügbar,
+- Conversation zur gelöschten Anzeige bleibt erhalten,
+- unveränderter bot-ui-`fetchAdStats()`: erfolgreicher leerer Fetch, aber alter `.ad-stats.json`-Eintrag bleibt stehen und `last_updated` wird nicht fortgeschrieben.
+
+Für den Betriebsvertrag gilt daher Besitzerlisten-Abwesenheit als Delete-Readback; Detail-GET/Public-URL sind nicht authoritative.
+
 ## Stop-Bedingungen
 
 Sofort stoppen, wenn:
@@ -257,13 +270,13 @@ Nach Abschluss muss eine Tabelle dieser Form ausgefüllt sein:
 
 | Schritt | Kandidat A | Kandidat B | unabhängiger Readback | Ergebnis |
 |---|---|---|---|---|
-| Baseline/Sync | | | | |
-| Update | | nicht vorhanden, falls unverändert | | |
-| Pause | | | | |
-| Aktivieren | | | | |
-| Views/Merker/Replies | | | Verkäuferansicht | |
-| Inbox/adId | | | Gegenkontakt + zweiter Abruf | |
-| Delete | Erst-DELETE oder nur Readback | Erst-DELETE oder nur Readback | Verkäuferansicht | |
+| Baseline/Sync | Kandidat A: 1/1 Download, stabile ID; später Pre-Delete-Detail-Sync mit GIVE_AWAY-Parserfehler | Kandidat B: `my_ads/get_my_ad` real | Management + API | belegt |
+| Update | Kandidat A: in-place Update, stabile ID | kein in-place Update im geprüften Stand | Kandidat B + öffentliche Detailseite | belegt |
+| Pause | Reserve real; ein früher XPath-Lauf intermittierend fehlgeschlagen | `pause_ad` real | Management/API | belegt |
+| Aktivieren | real | `activate_ad` real | Management/API | belegt |
+| Views/Merker/Replies | Management-Rohdaten | nicht im Listing-Modell | Management: vor Delete 15 / 0 / 1 | belegt |
+| Inbox/adId | bot-ui `listConversations()`: 1 Treffer mit `adId=3521676801`, Rolle `Seller` | 1 Conversation, `ad_id=3521676801`, Direction `received` | kontrollierter Gegenkontakt + zweiter Abruf | bei beiden belegt |
+| Delete | nur Besitzerlisten-Readback | **Erst-DELETE genau einmal** | Management + `my_ads` ohne ID | belegt |
 
 Zusätzlich festhalten:
 
@@ -277,7 +290,7 @@ Zusätzlich festhalten:
 
 ## Architektur-Gate danach
 
-Erst nach dem vollständigen Readback-Ablauf Gegner erneut auf folgende Annahmen ansetzen:
+Der vollständige Readback-Ablauf wurde abgeschlossen. Die Gegenprobe auf die Architekturannahmen wurde durchgeführt. Zu prüfen waren:
 
 1. Ein erfolgreicher Einzeltest bedeutet ausreichende Stabilität.
 2. Das UI spart langfristig mehr Aufwand als seine Komplexität kostet.
@@ -285,14 +298,16 @@ Erst nach dem vollständigen Readback-Ablauf Gegner erneut auf folgende Annahmen
 4. Fehlende Felder sind Plattformlücken statt Parser-/Endpoint-Lücken.
 5. Eine Anzeige ist für die Kernabläufe repräsentativ genug.
 
-Danach erst zwischen folgenden Pfaden entscheiden:
+Entscheidung nach dem Realtest:
 
-- UI weitgehend übernehmen,
-- nur UI-/Stats-/Messaging-Komponenten übernehmen,
-- monkrel als Backend-Unterbau ergänzen,
-- Komponenten kombinieren,
-- eigenes dünnes Backend über vorhandenen Komponenten.
+- dünnes eigenes Orchestrierungsbackend,
+- monkrel als primärer Account/API-Adapter,
+- eigener Management-Read-Adapter für Verkäuferstatus/-metriken,
+- Browser-Bot nur als isolierter Sync/Update-Adapter,
+- kein vollständiges bot-ui.
+
+Siehe `docs/architecture-decision-2026-09-24.md`.
 
 ## Nächste Aktion
 
-Verkäuferlogin und Testanzeige sind vorhanden; die Schritte Baseline/Sync/Update/Pause/Aktivieren/Metriken sind durchgeführt. Nächste Aktion ist genau eine kontrollierte Nachricht eines legitimen Gegenkontakts an Anzeige `3521676801`; danach Inbox/adId prüfen und erst anschließend den Delete-Schritt ausführen.
+Der E2E-Test ist abgeschlossen. Nächste Aktion ist die Umsetzung des frameworkfreien Python-Core-Slices entlang `docs/architecture-decision-2026-09-24.md`; Produktionshärtungen bleiben in Issue #5. Create/Publish bleibt bis zum separaten Remote-Smoke-Test deaktiviert.
