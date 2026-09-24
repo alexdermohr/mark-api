@@ -60,7 +60,7 @@ Aus den Daten sollen Vorschläge für die besten bzw. erfolgversprechendsten Lö
 - **FR-07:** Generierte Bilder einer Anzeige automatisch zur Verwendung zuführen.
 - **FR-08:** Aufrufzahlen erfassen, soweit der Integrationsweg diese Daten bereitstellt.
 - **FR-09:** Die vom Auftraggeber gewünschte Kennzahl „wie viele geschrieben haben“ erfassen, sobald ihre Einheit (z. B. Chats, eindeutige Personen oder Nachrichten) definiert und technisch verfügbar ist.
-- **FR-10:** Kennzahlen und Verläufe im Dashboard visualisieren.
+- **FR-10:** Kennzahlen und Grafiken im Dashboard visualisieren.
 - **FR-11:** Top-Listen nach Bild-Typ, Stadt, Text-Typ und Titel-Typ erzeugen.
 - **FR-12:** Aus beobachteten Ergebnissen Optimierungsvorschläge ableiten.
 
