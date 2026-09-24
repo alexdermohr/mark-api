@@ -8,7 +8,9 @@ Quelle: docs/requirements-source-2026-09-23.md
 
 ## 1. Ziel
 
-Für Marks Kleinanzeigen-Account soll eine Lösung entstehen, die Anzeigen verwaltet, KI-generierte Texte und Bilder für Anzeigen erzeugt und Leistungsdaten in einem Dashboard auswertet. Aus den gesammelten Daten sollen Vergleiche, Ranglisten und Optimierungsvorschläge entstehen.
+Für Marks Kleinanzeigen-Account soll eine Lösung entstehen, die Anzeigen verwaltet und Leistungsdaten in einem Dashboard auswertet. Aus den gesammelten Daten sollen Vergleiche, Ranglisten und Optimierungsvorschläge entstehen.
+
+Die ursprünglich genannten Wünsche nach externer Titel-/Beschreibungsgenerierung und Bildgenerierung bleiben dokumentiert, sind nach Projektentscheidung vom 24.09.2026 jedoch **nicht MVP-priorisiert**. Der MVP konzentriert sich auf Anzeigen-CRUD, Synchronisation, Messaging und messbare Leistungsdaten.
 
 ## 2. Belegter Funktionsumfang
 
@@ -19,14 +21,18 @@ Für Marks Kleinanzeigen-Account soll eine Lösung entstehen, die Anzeigen verwa
 
 „Verwalten“ ist als gewünschter Oberbegriff belegt; die darunter fallenden Einzeloperationen müssen noch präzisiert werden.
 
-### 2.2 Textgenerierung
+### 2.2 Textgenerierung — bestätigt, aber depriorisiert
 - Titel aus Prompts generieren.
 - Beschreibungstexte aus Prompts generieren.
 - Generierte Inhalte für Anzeigen verwenden.
 
-### 2.3 Bildgenerierung
+Diese ursprünglich bestätigte Anforderung ist **kein MVP-Schwerpunkt**.
+
+### 2.3 Bildgenerierung — bestätigt, aber depriorisiert
 - Bilder aus Prompts generieren.
 - Generierte Bilder automatisch für Anzeigen verwenden.
+
+Diese ursprünglich bestätigte Anforderung ist **kein MVP-Schwerpunkt**.
 
 ### 2.4 Dashboard
 Ein Dashboard soll die relevanten Anzeigen- und Leistungsdaten sichtbar machen.
@@ -54,10 +60,10 @@ Aus den Daten sollen Vorschläge für die besten bzw. erfolgversprechendsten Lö
 - **FR-01:** Anzeigen erstellen.
 - **FR-02:** Anzeigen löschen.
 - **FR-03:** Anzeigen verwalten.
-- **FR-04:** Titel anhand eines Prompts generieren.
-- **FR-05:** Beschreibungstexte anhand eines Prompts generieren.
-- **FR-06:** Bilder anhand eines Prompts generieren.
-- **FR-07:** Generierte Bilder einer Anzeige automatisch zur Verwendung zuführen.
+- **FR-04 (depriorisiert):** Titel anhand eines Prompts generieren.
+- **FR-05 (depriorisiert):** Beschreibungstexte anhand eines Prompts generieren.
+- **FR-06 (depriorisiert):** Bilder anhand eines Prompts generieren.
+- **FR-07 (depriorisiert):** Generierte Bilder einer Anzeige automatisch zur Verwendung zuführen.
 - **FR-08:** Aufrufzahlen erfassen, soweit der Integrationsweg diese Daten bereitstellt.
 - **FR-09:** Die vom Auftraggeber gewünschte Kennzahl „wie viele geschrieben haben“ erfassen, sobald ihre Einheit (z. B. Chats, eindeutige Personen oder Nachrichten) definiert und technisch verfügbar ist.
 - **FR-10:** Kennzahlen und Grafiken im Dashboard visualisieren.
@@ -92,16 +98,19 @@ Vor einer dauerhaften Architekturentscheidung muss belegt werden:
 
 Der MVP ist ein **Planungsvorschlag**, keine bereits bestätigte Detailanforderung.
 
-Ziel ist genau ein realer End-to-End-Pfad:
-1. Anzeige vorbereiten.
-2. Titel per Prompt erzeugen.
-3. Beschreibung per Prompt erzeugen.
-4. Bild per Prompt erzeugen.
-5. Inhalte der Anzeige zuordnen.
-6. Anzeige über den belegten Integrationsweg erstellen.
-7. Verfügbare Basiskennzahlen zurücklesen und im einfachen Dashboard darstellen.
+Ziel ist ein realer, begrenzter End-to-End-Pfad rund um **Verwaltung und Messbarkeit**:
 
-Erst danach sollen Variantenvergleiche, Top-Listen und automatische Optimierung erweitert werden.
+1. eine vorhandene eigene Anzeige einlesen/synchronisieren,
+2. eine Testanzeige erstellen,
+3. diese ändern sowie pausieren/aktivieren,
+4. Besucher- und Watchlist-Zahlen erfassen,
+5. zugehörige Konversationen lesen und als definierte Reaktionsmetrik speichern,
+6. die Testanzeige wieder löschen,
+7. die Messwerte in einem einfachen Dashboard anzeigen.
+
+Text- und Bildgenerierung werden erst wieder aufgenommen, wenn dafür ein konkreter Zusatznutzen gegenüber Kleinanzeigen selbst belegt ist.
+
+Technische Kandidaten und PoC-Plan: `docs/integration-options.md`.
 
 ## 7. Erfolgskriterium für die nächste Phase
 

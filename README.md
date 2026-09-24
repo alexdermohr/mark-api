@@ -6,7 +6,7 @@
 
 **Funktionaler Scope konkretisiert / technische Discovery offen** — Stand: 23.09.2026.
 
-Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Gewünscht sind Anzeigenverwaltung, KI-generierte Titel/Beschreibungen/Bilder, ein Dashboard sowie datenbasierte Auswertungen und Optimierungsvorschläge.
+Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Gewünscht sind Anzeigenverwaltung, ein Dashboard sowie datenbasierte Auswertungen und Optimierungsvorschläge. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
 
 ## Aktuell belegt
 
@@ -43,6 +43,7 @@ Dieses Repository ist die **kanonische Registratur für mark-api**.
 - Telefonat, bereinigter Stand: [docs/call-2026-09-23.md](docs/call-2026-09-23.md)
 - Ausgangskontext: [docs/context.md](docs/context.md)
 - Entscheidungen: [docs/DECISIONS.md](docs/DECISIONS.md)
+- Integrationsoptionen: [docs/integration-options.md](docs/integration-options.md)
 
 ## Datenschutz / Öffentlichkeit
 
@@ -50,4 +51,4 @@ Das Repository ist öffentlich. Zugangsdaten, Tokens, Telefonnummern und sonstig
 
 ## Arbeitsregel
 
-Zuerst den real verfügbaren Integrationsweg und die verfügbaren Daten belegen. Danach genau einen kleinen End-to-End-Fall umsetzen. Analyse-, Ranking- und Optimierungsfunktionen werden auf real verfügbaren und sauber definierten Metriken aufgebaut.
+Zuerst die real verfügbaren Integrationswege mit einem kleinen PoC gegeneinander prüfen. MVP-Priorität haben Anzeigen-CRUD, Synchronisation, Besucher/Watchlist, Inbox und darauf aufbauende Messbarkeit. Analyse-, Ranking- und Optimierungsfunktionen werden auf real verfügbaren und sauber definierten Metriken aufgebaut.
