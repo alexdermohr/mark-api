@@ -2,7 +2,7 @@
 
 Stand: 24.09.2026
 
-Status: **vorbereitet; wartet auf freigegebene Testsitzung und genau eine Testanzeige**
+Status: **lokale Browserrollen vorbereitet; wartet auf legitime Authentifizierung und genau ein reales Testangebot**
 
 Dieses Runbook operationalisiert den einzigen noch offenen Plattformtest. Es ersetzt keine Architekturentscheidung.
 
@@ -13,11 +13,13 @@ Vor dem Start müssen ausdrücklich vorhanden sein:
 - eine eigene/dedizierte oder ausdrücklich freigegebene Kleinanzeigen-Testsitzung,
 - genau eine als Test bestimmte Anzeige,
 - bekannte Anzeigen-ID,
-- ein kontrollierter Gegenkontakt für genau eine Testnachricht,
+- ein kontrollierter Gegenkontakt über ein eigenständiges legitimes Nutzerkonto einer anderen berechtigten Person für genau eine Testnachricht,
 - ein separates Browserprofil/Sessionverzeichnis,
 - keine produktiven Mark-Anzeigen im Testscope.
 
 Secrets bleiben ausschließlich lokal außerhalb von Git, Issues und Testprotokollen.
+
+Für Registrierung und Gegenkontakt gelten zusätzlich die aktuellen Kleinanzeigen-Regeln: Registrierungsdaten müssen wahrheitsgemäß sein, die Telefonnummer muss verifizierbar sein, und dieselbe Person darf nicht zwei private Konten als Verkäufer- und Gegenkontaktrolle betreiben. Ein Nutzer darf höchstens ein privates und zusätzlich ein gewerbliches/freiberufliches Konto führen; das gewerbliche Konto darf nicht als privates Testkonto zweckentfremdet werden. Referenz: https://themen.kleinanzeigen.de/nutzungsbedingungen/ (§ 2) und https://hilfe.kleinanzeigen.de/hc/de/articles/17113969003932-SMS-Verifizierung-bei-Kleinanzeigen.
 
 ## Kandidaten
 
@@ -241,6 +243,8 @@ Sofort stoppen, wenn:
 - Anzeigen-ID unerwartet wechselt,
 - mehr als die Testanzeige betroffen wäre,
 - Captcha/MFA eine Umgehung statt manueller Aktion verlangen würde,
+- für den Gegenkontakt ein zweites privates Konto derselben Person erzeugt werden müsste,
+- kein realer Gegenstand bzw. kein legitimes Angebot für die Testanzeige vorhanden ist,
 - Kandidat einen unklaren Batch-Scope ausführen will,
 - ein Fehlerzustand nicht sicher von „0“ oder „leer“ unterscheidbar ist,
 - der tatsächliche Remote-Zustand nicht unabhängig gelesen werden kann.
@@ -291,4 +295,4 @@ Danach erst zwischen folgenden Pfaden entscheiden:
 
 ## Nächste Aktion
 
-Testsitzung + genau eine Testanzeige bereitstellen. Danach dieses Runbook ohne Scope-Erweiterung abarbeiten.
+Die getrennten lokalen Browserprofile `kleinanzeigen-test-seller` und `kleinanzeigen-test-countercontact` sind vorbereitet. Sobald ein legitimer Verkäufer-Account, ein reales Testangebot und ein legitimer Gegenkontakt verfügbar sind, dieses Runbook ohne Scope-Erweiterung abarbeiten.
