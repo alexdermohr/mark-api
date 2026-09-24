@@ -81,23 +81,31 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            base="$PR_BASE_SHA"
-          elif [[ ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]] \
-            && git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
-            base="$PUSH_BEFORE_SHA"
-          else
-            base="$(git rev-parse HEAD^)"
-          fi
+          base="$(
+            python tools/ci_secret_scan.py \
+              --resolve-base \
+              --event-name "$EVENT_NAME" \
+              --pr-base-sha "$PR_BASE_SHA" \
+              --push-before-sha "$PUSH_BEFORE_SHA" \
+              --default-branch "$DEFAULT_BRANCH" \
+              --event-head "$EVENT_SHA"
+          )"
           git cat-file -e "$base^{commit}"
           printf 'sha=%s\n' "$base" >> "$GITHUB_OUTPUT"
 
       - name: Check diff hygiene
         env:
           BASE_SHA: ${{ steps.diff-base.outputs.sha }}
-        run: git diff --check "$BASE_SHA...HEAD"
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          head="${PR_HEAD_SHA:-$EVENT_SHA}"
+          git diff --check "$BASE_SHA...$head"
 
       - name: Scan commit-added lines for secret patterns
         env:
