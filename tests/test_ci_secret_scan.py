@@ -93,6 +93,50 @@ class CiSecretScanTests(unittest.TestCase):
         self.assertIn("token_assignment", output.getvalue())
         self.assertNotIn("temporary-value", output.getvalue())
 
+    def test_variable_declarations_and_placeholders_are_not_credentials(self) -> None:
+        repo = self.make_repo()
+        self.commit_file(repo, "sample.txt", "safe\n", "base")
+        base = self.git(repo, "rev-parse", "HEAD")
+        declarations = "\n".join(
+            (
+                'token = os.environ["TOKEN"]',
+                "password = None",
+                "secret = config.secret",
+                'cookie = request.headers["Cookie"]',
+                'authorization = "${AUTHORIZATION}"',
+                'token = "placeholder-token"',
+            )
+        )
+        head = self.commit_file(
+            repo,
+            "sample.txt",
+            declarations + "\n",
+            "add credential plumbing",
+        )
+
+        findings, commit_count = ci_secret_scan.scan_range(repo, base, head)
+
+        self.assertEqual(commit_count, 1)
+        self.assertEqual(findings, ())
+
+    def test_specific_token_pattern_still_blocks(self) -> None:
+        repo = self.make_repo()
+        self.commit_file(repo, "sample.txt", "safe\n", "base")
+        base = self.git(repo, "rev-parse", "HEAD")
+        token = "ghp_" + ("A" * 24)
+        head = self.commit_file(
+            repo,
+            "sample.txt",
+            f"value = {token}\n",
+            "add token",
+        )
+
+        findings, _ = ci_secret_scan.scan_range(repo, base, head)
+
+        self.assertTrue(
+            any(item.rule_name == "github_token" for item in findings)
+        )
+
     def test_preexisting_fixture_does_not_block_unrelated_file_change(self) -> None:
         repo = self.make_repo()
         fixture = "token" + " = " + '"fixture-value"\n'
@@ -115,6 +159,81 @@ class CiSecretScanTests(unittest.TestCase):
 
         self.assertEqual(commit_count, 1)
         self.assertEqual(findings, ())
+
+    def test_merge_commit_uses_parent_on_base_ancestry(self) -> None:
+        repo = self.make_repo()
+        self.commit_file(repo, "base.txt", "base\n", "base")
+        self.git(repo, "checkout", "-q", "-b", "feature")
+        self.commit_file(repo, "feature.txt", "feature\n", "feature work")
+
+        self.git(repo, "checkout", "-q", "main")
+        base_only_secret = "token" + " = " + '"base-only-secret-value"\n'
+        base = self.commit_file(
+            repo,
+            "base-only.txt",
+            base_only_secret,
+            "advance base",
+        )
+
+        self.git(repo, "checkout", "-q", "feature")
+        self.git(repo, "merge", "-q", "--no-ff", "main", "-m", "merge main")
+        head = self.git(repo, "rev-parse", "HEAD")
+
+        findings, commit_count = ci_secret_scan.scan_range(repo, base, head)
+
+        self.assertEqual(commit_count, 2)
+        self.assertEqual(findings, ())
+
+    def test_new_branch_push_resolves_default_branch_merge_base(self) -> None:
+        repo = self.make_repo()
+        base = self.commit_file(repo, "base.txt", "base\n", "base")
+        self.git(repo, "update-ref", "refs/remotes/origin/main", base)
+        self.git(repo, "checkout", "-q", "-b", "feature")
+        self.commit_file(repo, "one.txt", "one\n", "one")
+        head = self.commit_file(repo, "two.txt", "two\n", "two")
+
+        resolved = ci_secret_scan.resolve_event_base(
+            repo,
+            event_name="push",
+            pr_base_sha="",
+            push_before_sha="0" * 40,
+            default_branch="main",
+            head=head,
+        )
+
+        self.assertEqual(resolved, base)
+
+    def test_existing_push_uses_before_sha(self) -> None:
+        repo = self.make_repo()
+        before = self.commit_file(repo, "base.txt", "base\n", "base")
+        head = self.commit_file(repo, "next.txt", "next\n", "next")
+
+        resolved = ci_secret_scan.resolve_event_base(
+            repo,
+            event_name="push",
+            pr_base_sha="",
+            push_before_sha=before,
+            default_branch="main",
+            head=head,
+        )
+
+        self.assertEqual(resolved, before)
+
+    def test_pull_request_uses_declared_base_sha(self) -> None:
+        repo = self.make_repo()
+        base = self.commit_file(repo, "base.txt", "base\n", "base")
+        head = self.commit_file(repo, "next.txt", "next\n", "next")
+
+        resolved = ci_secret_scan.resolve_event_base(
+            repo,
+            event_name="pull_request",
+            pr_base_sha=base,
+            push_before_sha="",
+            default_branch="main",
+            head=head,
+        )
+
+        self.assertEqual(resolved, base)
 
     def test_clean_added_lines_pass_without_value_output(self) -> None:
         repo = self.make_repo()
