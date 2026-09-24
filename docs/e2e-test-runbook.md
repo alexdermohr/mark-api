@@ -2,9 +2,9 @@
 
 Stand: 24.09.2026
 
-Status: **lokale Browserrollen vorbereitet; wartet auf legitime Authentifizierung und genau ein reales Testangebot**
+Status: **laufend; Baseline/Sync/Update/Pause/Aktivieren/Metriken belegt; Inbox/adId und Delete offen**
 
-Dieses Runbook operationalisiert den einzigen noch offenen Plattformtest. Es ersetzt keine Architekturentscheidung.
+Dieses Runbook operationalisiert den Plattformtest. Laufende Ergebnisse stehen in `docs/poc-2026-09-24.md`; das Runbook selbst bleibt der Ablaufvertrag und ersetzt keine Architekturentscheidung.
 
 ## Voraussetzungen
 
@@ -295,4 +295,4 @@ Danach erst zwischen folgenden Pfaden entscheiden:
 
 ## Nächste Aktion
 
-Die getrennten lokalen Browserprofile `kleinanzeigen-test-seller` und `kleinanzeigen-test-countercontact` sind vorbereitet. Sobald ein legitimer Verkäufer-Account, ein reales Testangebot und ein legitimer Gegenkontakt verfügbar sind, dieses Runbook ohne Scope-Erweiterung abarbeiten.
+Verkäuferlogin und Testanzeige sind vorhanden; die Schritte Baseline/Sync/Update/Pause/Aktivieren/Metriken sind durchgeführt. Nächste Aktion ist genau eine kontrollierte Nachricht eines legitimen Gegenkontakts an Anzeige `3521676801`; danach Inbox/adId prüfen und erst anschließend den Delete-Schritt ausführen.

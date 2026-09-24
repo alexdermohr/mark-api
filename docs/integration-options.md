@@ -2,7 +2,7 @@
 
 Stand: 24.09.2026
 
-Status: **credential-frei praktisch verifiziert; Architekturentscheidung noch gesperrt**
+Status: **Ein-Anzeigen-Realtest weitgehend belegt; Inbox/adId und Delete noch offen; Architekturentscheidung weiter gesperrt**
 
 Ausführliche Prüfprotokolle, Testresultate und Codepfade: `docs/poc-2026-09-24.md`.
 
@@ -29,7 +29,7 @@ Wir unterscheiden:
 - **lokal gestartet:** Anwendung/Route praktisch gestartet,
 - **remote belegt:** echte Plattformwirkung plus Readback.
 
-Der letzte Punkt ist noch offen.
+Remote-Evidenz ist inzwischen für Sync, Inhaltsupdate, Pause/Aktivieren und Verkäufermetriken erreicht. Positiver Inbox/adId-Fall und Delete fehlen noch.
 
 ## Frisch bestätigte Kandidaten
 
@@ -121,18 +121,23 @@ Neben publish/update/delete/download/extend existieren inzwischen explizite Befe
 
 `reserve_flow.py` klickt im Manage-Ads-Bereich „Reservieren“ bzw. „Aktivieren“ und liest anschließend die Management-API erneut. Erfolg wird nur gemeldet, wenn der Plattformstatus `paused` bzw. `active` zurückkommt.
 
-Das ist der derzeit konkretste Codepfad für echten Pause/Aktivieren-Readback. Er muss mit der Testanzeige noch praktisch gegen Kleinanzeigen ausgeführt werden.
+Der Pfad wurde real gegen Anzeigen-ID `3521676801` geprüft. Ein erster unveränderter Upstream-Lauf scheiterte im XPath-Lookup, obwohl `li[data-adid]` und der sichtbare `Reservieren`-Button im Produktions-DOM vorhanden waren. Ein isolierter CSS-basierter Runtime-Overlay-Patch wurde daraufhin als fail-closed Kompatibilitätsversuch vorbereitet. Der später erfolgreiche `reserve → paused → activate → active`-Lauf verwendete diesen Patch jedoch nachweislich nicht: der Python-Importpfad zeigte weiterhin die unveränderte Upstream-Datei. Der Befund ist deshalb als intermittierende XPath/CDP-/Timing-Robustheitslücke zu werten. Der Overlay-Patch ist nicht in `mark-api` übernommen.
 
 ## Kandidat B — monkrel/kleinanzeigen-api
 
-### Praktisch belegt
+### Praktisch und remote belegt
 
 Separate Python-3.13.9-Venv:
 
 - Installation erfolgreich,
 - vollständige Suite: **71/71 Tests bestanden**,
 - CLI startbar,
-- PKCE/Login-URL und Nicht-eingeloggt-Verhalten offline getestet.
+- PKCE/Login-URL und Nicht-eingeloggt-Verhalten offline getestet,
+- PKCE-Login im echten Testaccount erfolgreich; Token nur lokal mit Modus 0600,
+- `my_ads()` und `get_my_ad()` lesen Testanzeige `3521676801` real,
+- `pause_ad()` und `activate_ad()` wurden mit unabhängigem Web-Management-Readback real bestätigt.
+
+Auf diesem Host zeigte `curl_cffi` einen reproduzierbaren DNS-Resolve-Timeout, während normales `curl` denselben Host erreichte. Der bereits von `curl_cffi` unterstützte Session-Parameter `doh_url` stellte den Transport ohne Quellcodeänderung her.
 
 ### Statisch vorhandene Account-Funktionen
 
@@ -159,7 +164,7 @@ Conversations enthalten `ad_id`.
 
 **Verkäuferstatistiken fehlen im aktuellen Modell.**
 
-Der Request fordert zwar `ad-status` an, das `Listing`-Dataclass übernimmt ihn aber nicht. Views, Verkäufer-Merkerzahl und Replies werden ebenfalls nicht modelliert.
+Der Request fordert `ad-status` an. Im echten Rohpayload wurden `PENDING`, `ACTIVE` und `PAUSED` tatsächlich beobachtet; das `Listing`-Dataclass übernimmt diesen Status aber nicht. Views, Verkäufer-Merkerzahl und Replies werden ebenfalls nicht modelliert.
 
 `watchlist()` bezeichnet die vom eingeloggten Nutzer gespeicherten Anzeigen und ist nicht die Merkerzahl der eigenen Anzeige.
 
@@ -167,37 +172,38 @@ Der Request fordert zwar `ad-status` an, das `Listing`-Dataclass übernimmt ihn 
 
 Legende: **S** statisch, **T** offline getestet, **L** lokal gestartet, **R** echter Remote-Readback, **—** nicht gefunden.
 
-| Fähigkeit | bot-ui | underlying bot | monkrel API | Remote belegt? |
+| Fähigkeit | bot-ui | underlying bot | monkrel API | Remote-Stand |
 |---|---|---|---|---|
-| eigene Anzeigen synchronisieren | S | S/T | S | nein |
-| bestehende Anzeige inhaltlich ändern | S über Bot | S/T | — | nein |
-| neue Anzeige erstellen | S | S/T | S/T Payload | nein |
-| pausieren | UI-Menü nur lokal | S/T | S | nein |
-| aktivieren | UI-Menü nur lokal | S/T | S | nein |
-| Views lesen | S | Roh-Manage-Ads | — | nein |
-| Merkerzahl lesen | S | Roh-Manage-Ads | — | nein |
-| Replies lesen | S | Roh-Manage-Ads | — | nein |
-| Inbox lesen | S | — | S/T Parser | nein |
-| Conversation → Anzeige | S über `adId` | — | S/T über `ad_id` | nein |
-| Nachricht senden | S | — | S | nein |
-| Delete | S über Bot | S/T | S | nein |
-| Extend | S über Bot | S/T | S | nein |
+| eigene Anzeigen synchronisieren | S | **R** | **R** | beide real auf ID 3521676801 |
+| bestehende Anzeige inhaltlich ändern | S über Bot | **R** | — | Bot mit stabiler ID real |
+| neue Anzeige erstellen | S | S/T | S/T Payload | Kandidaten-Publish nicht separat getestet |
+| pausieren | UI-Menü nur lokal | **R** | **R** | Bot einmaliger XPath-Fehler, später unverändert erfolgreich; beide mit Status-Readback |
+| aktivieren | UI-Menü nur lokal | **R** | **R** | Bot-Erfolg ohne Overlay-Patch; beide mit Status-Readback |
+| Views lesen | S | Roh-Manage-Ads **R** | — im Modell | real, zuletzt 13 |
+| Merkerzahl lesen | S | Roh-Manage-Ads **R** | — im Modell | real, zuletzt 0 |
+| Replies lesen | S | Roh-Manage-Ads **R** | — im Modell | real, zuletzt 0 |
+| Inbox lesen | S | — | **R** | für Testanzeige aktuell 0 Conversations |
+| Conversation → Anzeige | S über `adId` | — | S/T über `ad_id` | positiver Realfall offen |
+| Nachricht senden | S | — | S | nicht automatisch getestet |
+| Delete | S über Bot | S/T | S | offen; absichtlich letzter Schritt |
+| Extend | S über Bot | S/T | S | nicht Teil des minimalen Kernnachweises |
 | Dashboard | L | — | — | lokal |
 | Statistik-Historie | S | — | — | lokal |
-| manueller Login/MFA | S | S/T | PKCE S/T | nein |
+| manueller Login/MFA | S | **R Session-Reuse** | **R PKCE** | keine Credentials im Repo |
+| Statusmodell | S | **R** | Rohpayload **R**, Parser-Lücke | monkrel verwirft vorhandenen Status |
 
 ## Vergleich nach Betriebsmerkmalen
 
 ### Technische Abdeckung
 
-- **bot-ui + Bot:** breiteste Gesamtabdeckung, insbesondere Analytics + UI + bestehendes Inhaltsupdate.
-- **monkrel:** schlank für API-Aktionen und Messaging, aber ohne Inhaltsupdate und Verkäuferstatistiken nicht allein MVP-komplett.
+- **bot-ui + Bot:** breiteste Gesamtabdeckung; Sync und stabiles Inhaltsupdate sind real belegt. Beim Reserve-Lookup trat ein realer intermittierender XPath/CDP-Fehler auf; ein späterer unveränderter Wiederholungslauf funktionierte, sodass ein vorbereiteter CSS-Overlay-Patch für den Erfolg nicht benötigt wurde.
+- **monkrel:** Pause/Aktivieren und eigene Anzeigen sind real schlank per API belegt. Ohne Inhaltsupdate und Verkäuferstatistik-Modell ist es allein weiterhin nicht MVP-komplett.
 
 ### Fehlertransparenz
 
-- UI-Stats aktuell problematisch, weil Fehler und echte Leere zusammenfallen können.
-- Underlying Bot kann bei ownership-kritischen Manage-Ads-Abrufen mit `strict=True` fail-closed arbeiten.
-- monkrel nutzt überwiegend explizite Exceptions, reale Netzfehler müssen aber noch am Testaccount bewertet werden.
+- UI-Stats bleiben problematisch, weil Fehler und echte Leere zusammenfallen können.
+- Underlying Bot arbeitet bei ownership-kritischen Manage-Ads-Abrufen mit `strict=True` fail-closed; der reale DOM-Lookup zeigte aber Wartungsbedarf.
+- monkrel nutzt überwiegend explizite Exceptions. Im Realtest trat ein host-lokaler `curl_cffi`-DNS-Fehler auf, der über einen unterstützten DoH-Sessionparameter isoliert umgangen werden konnte.
 
 ### Browserabhängigkeit
 
@@ -223,29 +229,28 @@ Die offizielle API bleibt technisch relevant, ist für den dokumentierten privat
 
 ## Was jetzt nicht mehr sinnvoll ist
 
-Keine weitere breite Tool-/Marktrecherche vor dem echten Test.
+Keine weitere breite Tool-/Marktrecherche. Der Realtest hat die entscheidenden Unterschiede bereits sichtbar gemacht.
 
-Die offenen Fragen sind jetzt konkret und experimentell:
+Offen sind nur noch die letzten experimentellen Gates:
 
-1. Kann dieselbe Testanzeige mit stabiler ID synchronisiert und geändert werden?
-2. Funktioniert Reserve/Pause und Aktivierung tatsächlich aktuell auf Kleinanzeigen?
-3. Stimmen `viewCount`, `watchCount`, `replies` mit der sichtbaren Verkäuferansicht überein?
-4. Kommt eine kontrollierte Testnachricht mit korrekter `adId` bei beiden Clients an?
-5. Welche Fehlerbilder entstehen bei Sessionablauf und Plattformänderungen?
-6. Welche Lösung ist nach diesem realen Ablauf wartbarer?
+1. genau eine kontrollierte Testnachricht → Conversation → korrekte `adId`,
+2. daraus `conversation_count`, `unique_buyer_count` und `inbound_message_count` getrennt lesen,
+3. Delete als letzter Schritt mit vorab gewähltem Erst-DELETE-Kandidaten,
+4. beide Kandidaten lesen anschließend die Abwesenheit,
+5. UI-Stats nach Delete auf Phantomdaten/verwaiste Historie prüfen,
+6. danach Wartbarkeit gegen die real beobachteten Browser-/API-Brüche abwägen.
 
-## Nächstes Gate
+## Aktueller Gate-Stand
 
-Benötigt werden:
+Bereits remote belegt:
 
-- eine explizit freigegebene Kleinanzeigen-Testsitzung,
-- genau eine Testanzeige,
-- eine bekannte Anzeigen-ID,
-- für die Inbox-Prüfung ein kontrollierter Gegenkontakt.
+`Sync → Update → Pause → Aktivieren → Views/Watchlist/Replies`
 
-Dann exakt:
+Noch offen:
 
-`Sync → Update → Pause → Aktivieren → Views/Watchlist → Inbox-Zuordnung → Löschen`
+`Inbox-Zuordnung → Löschen`
+
+Die Testanzeige `3521676801` bleibt bis zum kontrollierten Nachrichtentest aktiv. Ein legitimer Gegenkontakt einer anderen berechtigten Person muss genau eine Nachricht an diese Anzeige senden.
 
 Keine Architekturentscheidung vorher.
 
