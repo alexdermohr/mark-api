@@ -4,8 +4,15 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
+from .analytics import (
+    ANALYTICS_DIMENSIONS,
+    ANALYTICS_METRICS,
+    AnalyticsService,
+    ad_metric_ranking_to_dict,
+    group_metric_ranking_to_dict,
+)
 from .query import (
     MarkQueryService,
     ad_snapshot_to_dict,
@@ -43,6 +50,55 @@ _DASHBOARD_HTML = """<!doctype html>
       <article><span>Views (bekannt)</span><strong id="views">—</strong></article>
       <article><span>Merker (bekannt)</span><strong id="watches">—</strong></article>
       <article><span>Replies (bekannt)</span><strong id="replies">—</strong></article>
+    </section>
+
+    <section class="panel">
+      <h2>Analytics-Rankings</h2>
+      <p class="muted">Rohmetriken nach explizit gespeicherten Labels. Keine Qualitäts- oder Kausalaussage.</p>
+      <div class="controls">
+        <label>
+          Metrik
+          <select id="metric-select"></select>
+        </label>
+        <label>
+          Dimension
+          <select id="dimension-select"></select>
+        </label>
+      </div>
+
+      <h3>Gruppen</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Label</th>
+              <th>Stichprobe</th>
+              <th>Summe</th>
+              <th>Mittelwert</th>
+            </tr>
+          </thead>
+          <tbody id="groups-body"></tbody>
+        </table>
+      </div>
+      <p id="groups-empty" class="empty" hidden>Keine ausreichenden klassifizierten Daten für diese Auswahl.</p>
+      <p class="note">Stichprobengröße 1 ist nur ein Datenwert, keine Qualitätsaussage.</p>
+
+      <h3>Anzeigenranking</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Titel</th>
+              <th>Wert</th>
+              <th>Vorhanden</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="ranking-body"></tbody>
+        </table>
+      </div>
+      <p id="ranking-empty" class="empty" hidden>Keine Anzeigen mit bekanntem Wert für diese Metrik.</p>
     </section>
 
     <section class="panel">
@@ -94,16 +150,17 @@ header {
   gap: 20px;
   margin-bottom: 22px;
 }
-h1, h2, p { margin-top: 0; }
-header p { color: #aeb5c0; margin-bottom: 0; }
-button {
+h1, h2, h3, p { margin-top: 0; }
+header p, .muted, .note { color: #aeb5c0; }
+header p { margin-bottom: 0; }
+button, select {
   border: 1px solid #424a57;
   background: #20252d;
   color: inherit;
   border-radius: 8px;
   padding: 9px 14px;
-  cursor: pointer;
 }
+button { cursor: pointer; }
 button:hover { background: #2a313b; }
 .status {
   min-height: 1.4em;
@@ -132,7 +189,22 @@ button:hover { background: #2a313b; }
   margin-top: 5px;
   font-size: 1.7rem;
 }
-.panel { padding: 18px; }
+.panel {
+  padding: 18px;
+  margin-bottom: 22px;
+}
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 14px 0 20px;
+}
+.controls label {
+  display: grid;
+  gap: 6px;
+  color: #b7bec8;
+  font-size: 0.9rem;
+}
 .table-wrap { overflow-x: auto; }
 table {
   width: 100%;
@@ -159,6 +231,7 @@ td.title {
 .state.paused, .state.pending { color: #f2c36b; }
 .state.absent { color: #aeb5c0; }
 .empty { color: #9da6b2; margin-bottom: 0; }
+.note { margin: 10px 0 22px; font-size: 0.88rem; }
 @media (max-width: 640px) {
   header { align-items: flex-start; flex-direction: column; }
 }
@@ -209,13 +282,71 @@ function renderAds(ads) {
   }
 }
 
+function setOptions(select, values) {
+  select.replaceChildren();
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    select.append(option);
+  }
+}
+
+function renderGroups(groups) {
+  const body = byId("groups-body");
+  body.replaceChildren();
+  byId("groups-empty").hidden = groups.length !== 0;
+  for (const group of groups) {
+    const row = document.createElement("tr");
+    row.append(td(group.label));
+    row.append(td(group.sample_size));
+    row.append(td(group.metric_sum));
+    row.append(td(Number(group.metric_mean).toFixed(2)));
+    body.append(row);
+  }
+}
+
+function renderRanking(items) {
+  const body = byId("ranking-body");
+  body.replaceChildren();
+  byId("ranking-empty").hidden = items.length !== 0;
+  for (const item of items) {
+    const row = document.createElement("tr");
+    row.append(td(item.ad_id));
+    row.append(td(item.title, "title"));
+    row.append(td(item.value));
+    row.append(td(item.present ? "ja" : "nein"));
+    row.append(td(item.lifecycle_state));
+    body.append(row);
+  }
+}
+
+async function loadAnalytics() {
+  const metric = byId("metric-select").value;
+  const dimension = byId("dimension-select").value;
+  if (!metric || !dimension) {
+    renderGroups([]);
+    renderRanking([]);
+    return;
+  }
+
+  const [groups, ranking] = await Promise.all([
+    getJson(`/api/analytics/groups?dimension=${encodeURIComponent(dimension)}&metric=${encodeURIComponent(metric)}`),
+    getJson(`/api/analytics/ads?metric=${encodeURIComponent(metric)}`),
+  ]);
+  renderGroups(groups);
+  renderRanking(ranking);
+}
+
 async function load() {
   const status = byId("status");
   status.textContent = "Lade lokale Daten …";
   try {
-    const [summary, ads] = await Promise.all([
+    const [summary, ads, metricsPayload, dimensionsPayload] = await Promise.all([
       getJson("/api/summary"),
       getJson("/api/ads"),
+      getJson("/api/analytics/metrics"),
+      getJson("/api/analytics/dimensions"),
     ]);
     byId("tracked").textContent = summary.tracked_ads;
     byId("current").textContent = summary.current_ads;
@@ -227,6 +358,17 @@ async function load() {
     byId("replies").textContent =
       `${summary.replies_total_known} / ${summary.replies_observed_ads} Ads`;
     renderAds(ads);
+
+    const metricSelect = byId("metric-select");
+    const dimensionSelect = byId("dimension-select");
+    const previousMetric = metricSelect.value;
+    const previousDimension = dimensionSelect.value;
+    setOptions(metricSelect, metricsPayload.metrics);
+    setOptions(dimensionSelect, dimensionsPayload.dimensions);
+    if (metricsPayload.metrics.includes(previousMetric)) metricSelect.value = previousMetric;
+    if (dimensionsPayload.dimensions.includes(previousDimension)) dimensionSelect.value = previousDimension;
+
+    await loadAnalytics();
     status.textContent = "";
   } catch (error) {
     status.textContent = `Fehler beim Laden: ${error.message}`;
@@ -234,6 +376,8 @@ async function load() {
 }
 
 byId("reload").addEventListener("click", load);
+byId("metric-select").addEventListener("change", loadAnalytics);
+byId("dimension-select").addEventListener("change", loadAnalytics);
 load();
 """
 
@@ -256,7 +400,14 @@ def _json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def _handler_factory(query: MarkQueryService):
+def _single_query_value(query_string: str, name: str) -> str | None:
+    values = parse_qs(query_string, keep_blank_values=True).get(name)
+    if values is None or len(values) != 1 or not values[0]:
+        return None
+    return values[0]
+
+
+def _handler_factory(query: MarkQueryService, analytics: AnalyticsService):
     class DashboardHandler(BaseHTTPRequestHandler):
         server_version = "mark-api-readonly/0.1"
         sys_version = ""
@@ -305,8 +456,27 @@ def _handler_factory(query: MarkQueryService):
                 allow="GET",
             )
 
+        def _invalid_metric(self) -> None:
+            self._send_json(
+                400,
+                {
+                    "error": "invalid_metric",
+                    "allowed_metrics": list(ANALYTICS_METRICS),
+                },
+            )
+
+        def _invalid_dimension(self) -> None:
+            self._send_json(
+                400,
+                {
+                    "error": "invalid_dimension",
+                    "allowed_dimensions": list(ANALYTICS_DIMENSIONS),
+                },
+            )
+
         def do_GET(self) -> None:
-            path = urlsplit(self.path).path
+            target = urlsplit(self.path)
+            path = target.path
 
             if path == "/":
                 self._send(
@@ -339,6 +509,45 @@ def _handler_factory(query: MarkQueryService):
                 self._send_json(
                     200,
                     [ad_view_to_dict(item) for item in query.latest_ads()],
+                )
+                return
+            if path == "/api/analytics/metrics":
+                self._send_json(200, {"metrics": list(ANALYTICS_METRICS)})
+                return
+            if path == "/api/analytics/dimensions":
+                self._send_json(
+                    200,
+                    {"dimensions": list(ANALYTICS_DIMENSIONS)},
+                )
+                return
+            if path == "/api/analytics/ads":
+                metric = _single_query_value(target.query, "metric")
+                if metric not in ANALYTICS_METRICS:
+                    self._invalid_metric()
+                    return
+                self._send_json(
+                    200,
+                    [
+                        ad_metric_ranking_to_dict(item)
+                        for item in analytics.rank_ads(metric)
+                    ],
+                )
+                return
+            if path == "/api/analytics/groups":
+                dimension = _single_query_value(target.query, "dimension")
+                if dimension not in ANALYTICS_DIMENSIONS:
+                    self._invalid_dimension()
+                    return
+                metric = _single_query_value(target.query, "metric")
+                if metric not in ANALYTICS_METRICS:
+                    self._invalid_metric()
+                    return
+                self._send_json(
+                    200,
+                    [
+                        group_metric_ranking_to_dict(item)
+                        for item in analytics.group_rankings(dimension, metric)
+                    ],
                 )
                 return
 
@@ -419,9 +628,10 @@ def create_server(
         raise ValueError("port must be an integer between 0 and 65535")
 
     query = MarkQueryService(store)
+    analytics = AnalyticsService(store)
     return LoopbackDashboardServer(
         (host, port),
-        _handler_factory(query),
+        _handler_factory(query, analytics),
     )
 
 
