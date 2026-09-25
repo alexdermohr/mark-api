@@ -39,6 +39,15 @@ class ResultAndDomainTests(unittest.TestCase):
                 views=-1,
             )
 
+    def test_fractional_metric_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            AdSnapshot(
+                ad_id="1",
+                observed_at=NOW,
+                source="test",
+                views=1.5,  # type: ignore[arg-type]
+            )
+
     def test_naive_timestamp_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             AdSnapshot(

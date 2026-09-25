@@ -310,14 +310,22 @@ class SnapshotStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT ad_id, observed_at, source, image_type, city,
+                SELECT id, ad_id, observed_at, source, image_type, city,
                        text_type, title_type
                 FROM ad_classifications
                 WHERE ad_id = ?
-                ORDER BY observed_at ASC, id ASC
+                ORDER BY id ASC
                 """,
                 (ad_id,),
             ).fetchall()
+
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: (
+                datetime.fromisoformat(row["observed_at"]),
+                int(row["id"]),
+            ),
+        )
         return tuple(
             AdClassification(
                 ad_id=row["ad_id"],
@@ -328,30 +336,9 @@ class SnapshotStore:
                 text_type=row["text_type"],
                 title_type=row["title_type"],
             )
-            for row in rows
+            for row in ordered_rows
         )
 
     def latest_classification(self, ad_id: str) -> AdClassification | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT ad_id, observed_at, source, image_type, city,
-                       text_type, title_type
-                FROM ad_classifications
-                WHERE ad_id = ?
-                ORDER BY observed_at DESC, id DESC
-                LIMIT 1
-                """,
-                (ad_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return AdClassification(
-            ad_id=row["ad_id"],
-            observed_at=datetime.fromisoformat(row["observed_at"]),
-            source=row["source"],
-            image_type=row["image_type"],
-            city=row["city"],
-            text_type=row["text_type"],
-            title_type=row["title_type"],
-        )
+        history = self.classification_history(ad_id)
+        return history[-1] if history else None

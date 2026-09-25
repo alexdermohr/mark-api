@@ -296,6 +296,35 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         dimension_payload = json.loads(bad_dimension.exception.read())
         self.assertEqual(dimension_payload["error"], "invalid_dimension")
         self.assertIn("city", dimension_payload["allowed_dimensions"])
+    def test_reaction_only_history_is_available_without_ad_history(self) -> None:
+        self.store.append_reaction_snapshot(
+            ReactionSnapshot(
+                ad_id="3",
+                observed_at=T1,
+                source="mobile",
+                conversation_count=2,
+                unique_buyer_count=2,
+                inbound_message_count=3,
+            )
+        )
+
+        status, _, body = self.get("/api/ads/3/reactions")
+
+        self.assertEqual(status, 200)
+        reactions = json.loads(body)
+        self.assertEqual(len(reactions), 1)
+        self.assertEqual(reactions[0]["ad_id"], "3")
+        self.assertEqual(reactions[0]["conversation_count"], 2)
+        self.assertEqual(reactions[0]["unique_buyer_count"], 2)
+        self.assertEqual(reactions[0]["inbound_message_count"], 3)
+
+        with self.assertRaises(HTTPError) as missing:
+            urlopen(self.base + "/api/ads/999/reactions", timeout=2)
+        self.assertEqual(missing.exception.code, 404)
+        self.assertEqual(
+            json.loads(missing.exception.read()),
+            {"error": "ad_not_found"},
+        )
 
     def test_unknown_and_invalid_ad_ids_are_explicit(self) -> None:
         with self.assertRaises(HTTPError) as missing:
@@ -328,6 +357,17 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         javascript = js_body.decode("utf-8")
         self.assertIn("summary.views_total_known", javascript)
         self.assertIn("/api/analytics/groups", javascript)
+        self.assertIn("let analyticsRequestGeneration = 0;", javascript)
+        self.assertIn(
+            "const generation = ++analyticsRequestGeneration;",
+            javascript,
+        )
+        guard = "if (generation !== analyticsRequestGeneration) return;"
+        self.assertIn(guard, javascript)
+        self.assertLess(
+            javascript.index(guard),
+            javascript.index("renderGroups(groups);"),
+        )
         self.assertNotIn(chr(92) + chr(96), javascript)
 
         _, _, css_body = self.get("/dashboard.css")
