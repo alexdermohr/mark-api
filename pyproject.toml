@@ -9,5 +9,8 @@ description = "Thin Kleinanzeigen orchestration core for Mark"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.scripts]
+mark-api-dashboard = "mark_api.dashboard:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]

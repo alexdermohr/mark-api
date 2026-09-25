@@ -9,13 +9,17 @@ from .domain import (
     OperationReceipt,
     ReactionSnapshot,
 )
+from .query import AdView, DashboardSummary, MarkQueryService
 from .results import ReadResult, ReadStatus
 
 __all__ = [
     "AdSnapshot",
+    "AdView",
+    "DashboardSummary",
     "DeleteApproval",
     "EnrichedOwnerReader",
     "LifecycleState",
+    "MarkQueryService",
     "MarkService",
     "OperationOutcome",
     "OperationReceipt",
