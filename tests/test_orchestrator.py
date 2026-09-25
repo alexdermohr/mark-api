@@ -10,7 +10,7 @@ from mark_api.domain import (
     OperationOutcome,
 )
 from mark_api.orchestrator import SafeWriteOrchestrator
-from mark_api.results import ReadResult
+from mark_api.results import ReadResult, ReadStatus
 
 
 NOW = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
@@ -132,11 +132,12 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
         self.assertEqual(reader.calls, 0)
         self.assertEqual(writer.calls, 0)
 
-    def test_delete_runs_once_and_confirms_from_owner_inventory_absence(self) -> None:
+    def test_delete_confirms_only_when_both_owner_inventories_are_absent(self) -> None:
         reader = SequenceReader(
             ReadResult.success_nonempty((snapshot(LifecycleState.ACTIVE),)),
             ReadResult.success_empty(()),
         )
+        confirmation_reader = SequenceReader(ReadResult.success_empty(()))
         writer = DeleteWriter()
 
         receipt = self.service().delete(
@@ -148,6 +149,7 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
             ),
             reader=reader,
             writer=writer,
+            confirmation_reader=confirmation_reader,
         )
 
         self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
@@ -156,7 +158,77 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
         self.assertEqual(receipt.authorization_reference, "issue-3-predelete")
         self.assertEqual(writer.calls, 1)
         self.assertEqual(reader.calls, 2)
+        self.assertEqual(confirmation_reader.calls, 1)
         self.assertIsNone(receipt.post_snapshot)
+
+    def test_delete_without_second_inventory_is_ambiguous(self) -> None:
+        reader = SequenceReader(
+            ReadResult.success_nonempty((snapshot(LifecycleState.ACTIVE),)),
+            ReadResult.success_empty(()),
+        )
+        writer = DeleteWriter()
+
+        receipt = self.service().delete(
+            ad_id="3521676801",
+            approval=DeleteApproval(
+                ad_id="3521676801",
+                approved_by="test-owner",
+            ),
+            reader=reader,
+            writer=writer,
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(reader.calls, 2)
+
+    def test_delete_is_ambiguous_when_second_inventory_still_contains_target(self) -> None:
+        reader = SequenceReader(
+            ReadResult.success_nonempty((snapshot(LifecycleState.ACTIVE),)),
+            ReadResult.success_empty(()),
+        )
+        confirmation_reader = SequenceReader(
+            ReadResult.success_nonempty((snapshot(LifecycleState.ACTIVE),))
+        )
+        writer = DeleteWriter()
+
+        receipt = self.service().delete(
+            ad_id="3521676801",
+            approval=DeleteApproval(
+                ad_id="3521676801",
+                approved_by="test-owner",
+            ),
+            reader=reader,
+            writer=writer,
+            confirmation_reader=confirmation_reader,
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertEqual(confirmation_reader.calls, 1)
+
+    def test_delete_is_ambiguous_when_second_inventory_fails(self) -> None:
+        reader = SequenceReader(
+            ReadResult.success_nonempty((snapshot(LifecycleState.ACTIVE),)),
+            ReadResult.success_empty(()),
+        )
+        confirmation_reader = SequenceReader(
+            ReadResult.failure(ReadStatus.HTTP_ERROR, http_status=500)
+        )
+        writer = DeleteWriter()
+
+        receipt = self.service().delete(
+            ad_id="3521676801",
+            approval=DeleteApproval(
+                ad_id="3521676801",
+                approved_by="test-owner",
+            ),
+            reader=reader,
+            writer=writer,
+            confirmation_reader=confirmation_reader,
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertEqual(confirmation_reader.calls, 1)
 
     def test_writer_exception_is_not_retried_and_unconfirmed_is_ambiguous(self) -> None:
         active = snapshot(LifecycleState.ACTIVE)
@@ -182,11 +254,12 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
         self.assertEqual(receipt.writer_error, "RuntimeError")
         self.assertNotIn("secret", receipt.writer_error)
 
-    def test_writer_exception_can_be_confirmed_by_post_readback(self) -> None:
+    def test_writer_exception_can_be_confirmed_by_both_post_readbacks(self) -> None:
         reader = SequenceReader(
             ReadResult.success_nonempty((snapshot(LifecycleState.ACTIVE),)),
             ReadResult.success_empty(()),
         )
+        confirmation_reader = SequenceReader(ReadResult.success_empty(()))
         writer = DeleteWriter(error=TimeoutError("unknown delivery"))
 
         receipt = self.service().delete(
@@ -197,11 +270,13 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
             ),
             reader=reader,
             writer=writer,
+            confirmation_reader=confirmation_reader,
         )
 
         self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
         self.assertEqual(receipt.writer_error, "TimeoutError")
         self.assertEqual(writer.calls, 1)
+        self.assertEqual(confirmation_reader.calls, 1)
 
     def test_state_change_uses_expected_pre_and_post_state(self) -> None:
         reader = SequenceReader(
