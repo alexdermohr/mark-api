@@ -69,9 +69,26 @@ def _pseudonym(value: str) -> bytes:
 
 def _is_unauthenticated_exception(exc: Exception) -> bool:
     exc_type = type(exc)
-    return (
+    if (
         exc_type.__name__ == "NotLoggedIn"
         and exc_type.__module__ == "kleinanzeigen_api.auth"
+    ):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+
+    # The upstream currently collapses some HTTP/Auth0 failures into RuntimeError.
+    # Inspect only its fixed status markers; never persist or return the message.
+    message = str(exc)
+    return (
+        message.startswith("This call needs a logged-in user.")
+        or message.startswith("401 from API")
+        or message.startswith("403 from API")
+        or message.startswith("Auth0 token endpoint returned 400:")
+        or message.startswith("Auth0 token endpoint returned 401:")
+        or message.startswith("Auth0 token endpoint returned 403:")
+        or " -> 401:" in message
+        or " -> 403:" in message
     )
 
 

@@ -170,6 +170,29 @@ class MonkrelMobileApiAdapterTests(unittest.TestCase):
         self.assertEqual(result.error, "NotLoggedIn")
         self.assertNotIn("token", result.error)
 
+    def test_http_auth_runtime_error_is_unauthenticated_without_leaking_body(self) -> None:
+        client = FakeClient()
+        client.my_ads_error = RuntimeError(
+            "GET https://provider.invalid -> 401: token=must-not-leak"
+        )
+
+        result = self.adapter(client).read_ads()
+
+        self.assertEqual(result.status, ReadStatus.UNAUTHENTICATED)
+        self.assertEqual(result.error, "RuntimeError")
+        self.assertNotIn("token", result.error)
+
+    def test_auth0_refresh_rejection_is_unauthenticated(self) -> None:
+        client = FakeClient()
+        client.my_ads_error = RuntimeError(
+            'Auth0 token endpoint returned 400: {"error":"invalid_grant"}'
+        )
+
+        result = self.adapter(client).read_ads()
+
+        self.assertEqual(result.status, ReadStatus.UNAUTHENTICATED)
+        self.assertEqual(result.error, "RuntimeError")
+
     def test_state_writer_dispatches_only_active_and_paused(self) -> None:
         client = FakeClient()
         adapter = self.adapter(client)
