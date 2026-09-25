@@ -354,23 +354,26 @@ def _handler_factory(query: MarkQueryService):
                     self._send_json(400, {"error": "invalid_ad_id"})
                     return
 
-                history = query.ad_history(ad_id)
-                if not history:
-                    self._send_json(404, {"error": "ad_not_found"})
-                    return
-
                 if parts[3] == "history":
+                    history = query.ad_history(ad_id)
+                    if not history:
+                        self._send_json(404, {"error": "ad_not_found"})
+                        return
                     self._send_json(
                         200,
                         [ad_snapshot_to_dict(item) for item in history],
                     )
                     return
 
+                reactions = query.reaction_history(ad_id)
+                if not reactions:
+                    self._send_json(404, {"error": "ad_not_found"})
+                    return
                 self._send_json(
                     200,
                     [
                         reaction_snapshot_to_dict(item)
-                        for item in query.reaction_history(ad_id)
+                        for item in reactions
                     ],
                 )
                 return

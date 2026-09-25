@@ -181,6 +181,36 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertEqual(reactions[0]["conversation_count"], 1)
         self.assertNotIn("text", reactions[0])
 
+    def test_reaction_only_history_is_available_without_ad_history(self) -> None:
+        self.store.append_reaction_snapshot(
+            ReactionSnapshot(
+                ad_id="3",
+                observed_at=T1,
+                source="mobile",
+                conversation_count=2,
+                unique_buyer_count=2,
+                inbound_message_count=3,
+            )
+        )
+
+        status, _, body = self.get("/api/ads/3/reactions")
+
+        self.assertEqual(status, 200)
+        reactions = json.loads(body)
+        self.assertEqual(len(reactions), 1)
+        self.assertEqual(reactions[0]["ad_id"], "3")
+        self.assertEqual(reactions[0]["conversation_count"], 2)
+        self.assertEqual(reactions[0]["unique_buyer_count"], 2)
+        self.assertEqual(reactions[0]["inbound_message_count"], 3)
+
+        with self.assertRaises(HTTPError) as missing:
+            urlopen(self.base + "/api/ads/999/reactions", timeout=2)
+        self.assertEqual(missing.exception.code, 404)
+        self.assertEqual(
+            json.loads(missing.exception.read()),
+            {"error": "ad_not_found"},
+        )
+
     def test_unknown_and_invalid_ad_ids_are_explicit(self) -> None:
         with self.assertRaises(HTTPError) as missing:
             urlopen(self.base + "/api/ads/999/history", timeout=2)
