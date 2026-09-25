@@ -4,26 +4,41 @@
 
 ## Status
 
-**Ein-Anzeigen-Realtest abgeschlossen / technische MVP-Architektur festgelegt / Core-Implementierung startet** — Stand: 24.09.2026.
+**Core, Adapter, Dashboard und Analytics implementiert / technischer Read-only-Livepfad belegt / Plattformwrites bis zur Integrationsfreigabe gesperrt** — Stand: 25.09.2026.
 
-Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Gewünscht sind Anzeigenverwaltung, ein Dashboard sowie datenbasierte Auswertungen und Optimierungsvorschläge. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
+Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Der MVP-Fokus liegt auf Anzeigenverwaltung, Synchronisation, Verkäufermetriken, Inbox/Interessenten, Dashboard und datenbasierter Auswertung. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
 
-## Aktuell belegt
+## Technisch belegt
 
-- Anzeigen **erstellen, löschen und verwalten**.
-- Titel und Beschreibungstexte **aus Prompts generieren**.
-- Bilder **aus Prompts generieren und automatisch für Anzeigen verwenden**.
-- Dashboard für Anzeigen- und Leistungsdaten.
-- Datensammlung zu **Aufrufen** und dazu, **wie viele geschrieben haben**.
-- Grafiken und Top-Listen nach **Bild-Typen, Städten, Text-Typen und Titel-Typen**.
-- Daraus Vorschläge für die besten bzw. erfolgversprechendsten Lösungen ableiten.
-- Modellwahl ist derzeit kein Kriterium; entscheidend ist, dass die Lösung zuverlässig funktioniert.
+- Python-3.12+-Core mit diskriminierten Read-Ergebnissen, Safe-Write-Orchestrierung und SQLite-Snapshot-Persistenz.
+- `ManagementReadAdapter` für den autoritativen Besitzerbestand sowie Verkäuferstatus, Views, Merker und Replies.
+- `MonkrelMobileApiAdapter` für eigene Anzeigen, ID-gebundene Pause/Aktivierung, Delete und Inbox/Conversation-Zuordnung.
+- `BrowserBotAdapter` als isolierter externer Prozess für Sync und in-place Inhaltsupdate; Browserautomation ist nicht der bevorzugte Zustandsadapter.
+- `MarkService` als Application-Layer über den Capability-Adaptern.
+- Read-only Dashboard/API auf Loopback sowie Analytics-Rankings auf explizit gespeicherten Klassifikationslabels.
+- Der Ein-Anzeigen-Realtest vom 24.09.2026 belegt Sync, stabiles in-place Update, Pause/Aktivierung, Verkäufermetriken, positiven Inbox/adId-Fall und Delete mit unabhängigen Besitzerlisten-Readbacks.
+- Am 25.09.2026 wurde der aktuell eingeloggte eigene Account read-only durch `ManagementReadAdapter -> EnrichedOwnerReader -> MarkService -> SnapshotStore` geführt: erfolgreicher leerer Besitzerbestand (`success_empty`), keine Plattformmutation.
+- Plattformwrites sind im Core standardmäßig deaktiviert. Create/Publish ist weiterhin nicht für den Dauerbetrieb freigegeben.
+
+## Offene fachliche Punkte
+
+Die Reaktionsdaten werden absichtlich getrennt als `conversation_count`, `unique_buyer_count` und `inbound_message_count` gespeichert. Welche dieser Größen fachlich „wie viele geschrieben haben“ meint, ist noch nicht festgelegt.
+
+Ebenso ist noch keine fachlich bestätigte Zielfunktion für „beste Lösung“ definiert. Die Analytics-Schicht zeigt deshalb Rohmetriken und Rankings, ohne daraus Kausalität oder Qualität abzuleiten.
 
 ## Wichtigstes Gate
 
-Der technische Ein-Anzeigen-PoC ist abgeschlossen. Belegt sind Sync, in-place Update, Pause/Aktivierung, Verkäufermetriken, positiver Inbox/adId-Fall und Delete mit unabhängigen Besitzerlisten-Readbacks.
+Der technische PoC ist abgeschlossen; die technische Machbarkeit ist **nicht** mit einer Freigabe für automatisierten Dauerbetrieb gleichzusetzen.
 
-Für den MVP gilt D-006/D-007: dünne eigene Python-Schicht mit Capability-Adaptern; SQLite für den ersten Core-Slice. Produktions-/ToS-Freigabe und ein separater Create/Publish-Realtest bleiben vor schreibendem Dauerbetrieb offen.
+Die aktuell veröffentlichten Kleinanzeigen-Nutzungsbedingungen untersagen ohne ausdrückliche schriftliche Zustimmung den Einsatz von Crawlern, Scrapern oder anderen automatisierten Mechanismen, um auf die Kleinanzeigen-Dienste zuzugreifen und Inhalte zu sammeln. Die offizielle Professional-Sellers-API ist laut Entwicklerdokumentation nur für professionelle Nutzer mit Power- oder Premium-Angebot verfügbar und nicht mit manuell im Web erstellten Anzeigen synchron.
+
+Daher gilt bis zur Klärung von [Issue #2](https://github.com/alexdermohr/mark-api/issues/2):
+
+- keine synthetischen oder testartig erkennbaren Anzeigen/Nachrichten auf dem aktuellen Account,
+- keine Publish/Delete/Pause/Aktivieren-Zyklen nur zu Testzwecken,
+- keine Ableitung einer produktiven Freigabe aus dem erfolgreichen technischen PoC,
+- schreibender Dauerbetrieb bleibt gesperrt,
+- ein dauerhafter Integrationsweg benötigt entweder einen belegten offiziellen API-Pfad für den konkreten Account oder eine ausdrückliche Freigabe/Partnerlösung von Kleinanzeigen.
 
 ## Projektregistratur
 
@@ -53,4 +68,4 @@ Das Repository ist öffentlich. Zugangsdaten, Tokens, Telefonnummern und sonstig
 
 ## Arbeitsregel
 
-Ab jetzt entlang der belegten Adaptergrenzen implementieren: frameworkfreier Python-Core, diskriminierte Read-Ergebnisse, SQLite-Snapshots, danach Management- und Mobile-API-Adapter. Browserautomation bleibt auf Fähigkeiten beschränkt, für die kein engerer belegter API-Pfad existiert. Plattformwrites sind standardmäßig deaktiviert und benötigen Pre-/Post-Readbacks auf eine explizite Anzeigen-ID.
+Der Core wird entlang der bereits belegten Adaptergrenzen weiter gehärtet. Plattformwrites bleiben fail-closed: standardmäßig deaktiviert, an genau eine bekannte Anzeigen-ID gebunden, mit frischem Precondition-Read, genau einer Mutation, ohne Blind-Retry und mit unabhängigem Post-Readback. Delete verlangt zusätzlich eine explizite Freigabe für die konkrete Anzeigen-ID. Create/Publish bleibt bis zu einem separaten technischen und zulässigen Betriebs-Gate deaktiviert.
