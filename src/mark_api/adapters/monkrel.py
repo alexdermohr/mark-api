@@ -10,6 +10,8 @@ from ..results import ReadResult, ReadStatus
 
 
 DEFAULT_SOURCE = "monkrel-mobile-api"
+AD_PAGE_SIZE = 100
+MAX_AD_PAGES = 100
 CONVERSATION_PAGE_SIZE = 100
 MAX_CONVERSATION_PAGES = 100
 
@@ -65,6 +67,42 @@ def _pseudonym(value: str) -> bytes:
     return hashlib.sha256(value.encode("utf-8")).digest()
 
 
+def _is_unauthenticated_exception(exc: Exception) -> bool:
+    exc_type = type(exc)
+    if (
+        exc_type.__name__ == "NotLoggedIn"
+        and exc_type.__module__ == "kleinanzeigen_api.auth"
+    ):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+
+    # The upstream currently collapses some HTTP/Auth0 failures into RuntimeError.
+    # Inspect only its fixed status markers; never persist or return the message.
+    message = str(exc)
+    return (
+        message.startswith("This call needs a logged-in user.")
+        or message.startswith("401 from API")
+        or message.startswith("403 from API")
+        or message.startswith("Auth0 token endpoint returned 400:")
+        or message.startswith("Auth0 token endpoint returned 401:")
+        or message.startswith("Auth0 token endpoint returned 403:")
+        or " -> 401:" in message
+        or " -> 403:" in message
+    )
+
+
+def _stable_buyer_id(conversation: Any) -> str:
+    role = _safe_attr(conversation, "role")
+    if not isinstance(role, str) or role.strip().upper() != "SELLER":
+        raise ValueError("conversation.role must be SELLER")
+
+    raw = _safe_attr(conversation, "raw")
+    if not isinstance(raw, Mapping):
+        raise ValueError("conversation.raw must be a mapping")
+    return _required_id(raw.get("userIdBuyer"), "conversation.raw.userIdBuyer")
+
+
 class MonkrelMobileApiAdapter:
     """Normalize the real-tested monkrel client behind mark-api contracts.
 
@@ -92,8 +130,13 @@ class MonkrelMobileApiAdapter:
     @staticmethod
     def _client_failure(exc: Exception) -> ReadResult[Any]:
         # Exception text can contain provider URLs, response bodies or secrets.
+        status = (
+            ReadStatus.UNAUTHENTICATED
+            if _is_unauthenticated_exception(exc)
+            else ReadStatus.TRANSPORT_ERROR
+        )
         return ReadResult.failure(
-            ReadStatus.TRANSPORT_ERROR,
+            status,
             error=type(exc).__name__,
         )
 
@@ -122,32 +165,47 @@ class MonkrelMobileApiAdapter:
         )
 
     def read_ads(self) -> ReadResult[tuple[AdSnapshot, ...]]:
-        try:
-            listings = self._client.my_ads(page=0, size=100)
-        except Exception as exc:  # noqa: BLE001 - client boundary.
-            return self._client_failure(exc)
-
-        if not isinstance(listings, list):
-            return ReadResult.failure(
-                ReadStatus.PARSE_ERROR,
-                error="my_ads_not_list",
-            )
-
         observed_at = self._clock()
-        try:
-            snapshots = tuple(
-                self._listing_snapshot(item, observed_at=observed_at)
-                for item in listings
-            )
-        except ValueError:
-            return ReadResult.failure(
-                ReadStatus.PARSE_ERROR,
-                error="invalid_listing_shape",
-            )
+        snapshots: list[AdSnapshot] = []
+        seen_ids: set[str] = set()
 
-        if not snapshots:
-            return ReadResult.success_empty(())
-        return ReadResult.success_nonempty(snapshots)
+        for page in range(MAX_AD_PAGES):
+            try:
+                listings = self._client.my_ads(page=page, size=AD_PAGE_SIZE)
+            except Exception as exc:  # noqa: BLE001 - client boundary.
+                return self._client_failure(exc)
+
+            if not isinstance(listings, list):
+                return ReadResult.failure(
+                    ReadStatus.PARSE_ERROR,
+                    error="my_ads_not_list",
+                )
+
+            try:
+                for listing in listings:
+                    snapshot = self._listing_snapshot(
+                        listing,
+                        observed_at=observed_at,
+                    )
+                    if snapshot.ad_id in seen_ids:
+                        continue
+                    seen_ids.add(snapshot.ad_id)
+                    snapshots.append(snapshot)
+            except ValueError:
+                return ReadResult.failure(
+                    ReadStatus.PARSE_ERROR,
+                    error="invalid_listing_shape",
+                )
+
+            if len(listings) < AD_PAGE_SIZE:
+                if not snapshots:
+                    return ReadResult.success_empty(())
+                return ReadResult.success_nonempty(tuple(snapshots))
+
+        return ReadResult.failure(
+            ReadStatus.PARSE_ERROR,
+            error="my_ads_pagination_limit",
+        )
 
     def read_ad(self, ad_id: str) -> ReadResult[AdSnapshot]:
         """Read presence from current inventory rather than stale detail GET."""
@@ -228,7 +286,7 @@ class MonkrelMobileApiAdapter:
             )
 
         matching: list[Any] = []
-        counterparties: set[bytes] = set()
+        buyer_ids: set[bytes] = set()
 
         for conversation in all_conversations.value or ():
             try:
@@ -244,19 +302,16 @@ class MonkrelMobileApiAdapter:
             if conversation_ad_id != ad_id:
                 continue
 
-            matching.append(conversation)
-            raw_counterparty = _safe_attr(conversation, "counterparty")
-            if isinstance(raw_counterparty, str) and raw_counterparty.strip():
-                identity = raw_counterparty.strip()
-            else:
-                identity = (
-                    "conversation:"
-                    + _required_id(
-                        _safe_attr(conversation, "id"),
-                        "conversation.id",
-                    )
+            try:
+                stable_buyer_id = _stable_buyer_id(conversation)
+            except ValueError:
+                return ReadResult.failure(
+                    ReadStatus.PARSE_ERROR,
+                    error="stable_buyer_id_unavailable",
                 )
-            counterparties.add(_pseudonym(identity))
+
+            matching.append(conversation)
+            buyer_ids.add(_pseudonym(stable_buyer_id))
 
         inbound_messages = 0
         for conversation in matching:
@@ -301,7 +356,7 @@ class MonkrelMobileApiAdapter:
         snapshot = ReactionSnapshot(
             ad_id=ad_id,
             conversation_count=len(matching),
-            unique_buyer_count=len(counterparties),
+            unique_buyer_count=len(buyer_ids),
             inbound_message_count=inbound_messages,
             observed_at=self._clock(),
             source=self._source,
