@@ -103,6 +103,30 @@ class ClassificationCliTests(unittest.TestCase):
         self.assertIsNone(item.text_type)
         self.assertEqual(item.title_type, "question")
 
+    def test_non_newer_timestamp_is_rejected_without_append(self) -> None:
+        _, store = self.make_store()
+        self.track(store)
+        store.append_classification(
+            AdClassification(
+                ad_id="1",
+                observed_at=T1,
+                source="manual",
+                city="Berlin",
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "later than the latest"):
+            update_classification(
+                store,
+                ad_id="1",
+                labels={"city": "Leipzig"},
+                observed_at=T0,
+            )
+
+        history = store.classification_history("1")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].city, "Berlin")
+
     def test_set_and_clear_same_dimension_is_rejected(self) -> None:
         _, store = self.make_store()
         self.track(store)

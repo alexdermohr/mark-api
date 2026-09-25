@@ -52,6 +52,20 @@ def update_classification(
         raise ValueError(f"unknown tracked ad_id: {ad_id}")
 
     previous = store.latest_classification(ad_id)
+    effective_observed_at = observed_at or datetime.now(timezone.utc)
+    if (
+        effective_observed_at.tzinfo is None
+        or effective_observed_at.utcoffset() is None
+    ):
+        raise ValueError("observed_at must be timezone-aware")
+    if (
+        previous is not None
+        and effective_observed_at <= previous.observed_at
+    ):
+        raise ValueError(
+            "observed_at must be later than the latest classification"
+        )
+
     merged = {
         dimension: getattr(previous, dimension) if previous is not None else None
         for dimension in ANALYTICS_DIMENSIONS
@@ -73,7 +87,7 @@ def update_classification(
 
     classification = AdClassification(
         ad_id=ad_id,
-        observed_at=observed_at or datetime.now(timezone.utc),
+        observed_at=effective_observed_at,
         source=_SOURCE,
         **merged,
     )
