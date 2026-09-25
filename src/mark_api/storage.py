@@ -235,6 +235,18 @@ class SnapshotStore:
         history = self.ad_history(ad_id)
         return history[-1] if history else None
 
+    def tracked_ad_ids(self) -> tuple[str, ...]:
+        """Return every ad ID ever observed by this store."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT ad_id
+                FROM ad_snapshots
+                ORDER BY ad_id ASC
+                """
+            ).fetchall()
+        return tuple(str(row["ad_id"]) for row in rows)
+
     def reaction_history(self, ad_id: str) -> tuple[ReactionSnapshot, ...]:
         with self._connect() as connection:
             rows = connection.execute(
