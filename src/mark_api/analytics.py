@@ -78,7 +78,11 @@ class AnalyticsService:
             history = self._store.reaction_history(ad.ad_id)
             if not history:
                 return None
-            value = getattr(history[-1], metric)
+            _, latest = max(
+                enumerate(history),
+                key=lambda pair: (pair[1].observed_at, pair[0]),
+            )
+            value = getattr(latest, metric)
             return value if isinstance(value, int) else None
 
         raise ValueError(f"unknown analytics metric: {metric}")

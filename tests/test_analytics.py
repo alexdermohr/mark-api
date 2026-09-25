@@ -78,6 +78,37 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(store.classification_history("1"), (older, newer))
         self.assertEqual(store.latest_classification("1"), newer)
 
+    def test_classification_order_uses_instants_across_utc_offsets(self) -> None:
+        store = self.make_store()
+        older_instant = AdClassification(
+            ad_id="1",
+            observed_at=datetime(
+                2026,
+                9,
+                24,
+                12,
+                0,
+                tzinfo=timezone(timedelta(hours=2)),
+            ),
+            source="manual",
+            city="Older",
+        )
+        newer_instant = AdClassification(
+            ad_id="1",
+            observed_at=datetime(2026, 9, 24, 11, 0, tzinfo=timezone.utc),
+            source="manual",
+            city="Newer",
+        )
+
+        store.append_classification(newer_instant)
+        store.append_classification(older_instant)
+
+        self.assertEqual(
+            store.classification_history("1"),
+            (older_instant, newer_instant),
+        )
+        self.assertEqual(store.latest_classification("1"), newer_instant)
+
     def test_unknown_metric_and_dimension_fail_closed(self) -> None:
         analytics = AnalyticsService(self.make_store())
 
@@ -129,7 +160,7 @@ class AnalyticsTests(unittest.TestCase):
             [("2", 0)],
         )
 
-    def test_latest_reaction_snapshot_is_used_and_missing_history_is_not_zero(self) -> None:
+    def test_reaction_metric_uses_latest_observed_at_not_append_order(self) -> None:
         store = self.make_store()
         for ad_id in ("1", "2"):
             store.append_ad_snapshot(
@@ -144,21 +175,21 @@ class AnalyticsTests(unittest.TestCase):
         store.append_reaction_snapshot(
             ReactionSnapshot(
                 ad_id="1",
-                observed_at=T0,
-                source="mobile",
-                conversation_count=1,
-                unique_buyer_count=1,
-                inbound_message_count=1,
-            )
-        )
-        store.append_reaction_snapshot(
-            ReactionSnapshot(
-                ad_id="1",
                 observed_at=T1,
                 source="mobile",
                 conversation_count=2,
                 unique_buyer_count=2,
                 inbound_message_count=3,
+            )
+        )
+        store.append_reaction_snapshot(
+            ReactionSnapshot(
+                ad_id="1",
+                observed_at=T0,
+                source="mobile-backfill",
+                conversation_count=1,
+                unique_buyer_count=1,
+                inbound_message_count=1,
             )
         )
 

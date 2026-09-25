@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from mark_api.adapters.monkrel import MonkrelMobileApiAdapter
@@ -24,11 +24,14 @@ class FakeConversation:
     id: str
     ad_id: str
     counterparty: str
+    role: str = "SELLER"
+    raw: dict = field(default_factory=dict)
 
 
 class FakeClient:
     def __init__(self) -> None:
         self.ads = []
+        self.ad_pages = None
         self.conversation_pages = {0: []}
         self.messages_by_id = {}
         self.calls = []
@@ -40,6 +43,8 @@ class FakeClient:
         self.calls.append(("my_ads", page, size))
         if self.my_ads_error is not None:
             raise self.my_ads_error
+        if self.ad_pages is not None:
+            return self.ad_pages.get(page, [])
         return self.ads
 
     def pause_ad(self, ad_id):
@@ -95,6 +100,44 @@ class MonkrelMobileApiAdapterTests(unittest.TestCase):
         self.assertIsNone(item.watch_count)
         self.assertIsNone(item.reply_count)
 
+    def test_my_ads_pages_until_short_page_and_deduplicates_ids(self) -> None:
+        client = FakeClient()
+        first_page = [
+            FakeListing(str(index), f"title-{index}", "description")
+            for index in range(100)
+        ]
+        client.ad_pages = {
+            0: first_page,
+            1: [
+                FakeListing("99", "duplicate", "description"),
+                FakeListing("100", "last", "description"),
+            ],
+        }
+
+        result = self.adapter(client).read_ads()
+
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        self.assertEqual(len(result.value), 101)
+        self.assertEqual(result.value[-1].ad_id, "100")
+        self.assertEqual(
+            client.calls,
+            [("my_ads", 0, 100), ("my_ads", 1, 100)],
+        )
+
+    def test_my_ads_fails_closed_at_pagination_limit(self) -> None:
+        client = FakeClient()
+        full_page = [
+            FakeListing(str(index), f"title-{index}", "description")
+            for index in range(100)
+        ]
+        client.ad_pages = {page: full_page for page in range(100)}
+
+        result = self.adapter(client).read_ads()
+
+        self.assertEqual(result.status, ReadStatus.PARSE_ERROR)
+        self.assertEqual(result.error, "my_ads_pagination_limit")
+        self.assertEqual(client.calls[-1], ("my_ads", 99, 100))
+
     def test_read_ad_uses_my_ads_not_stale_detail_endpoint(self) -> None:
         client = FakeClient()
 
@@ -112,6 +155,43 @@ class MonkrelMobileApiAdapterTests(unittest.TestCase):
         self.assertEqual(result.status, ReadStatus.TRANSPORT_ERROR)
         self.assertEqual(result.error, "RuntimeError")
         self.assertNotIn("secret", result.error)
+
+    def test_not_logged_in_is_unauthenticated_without_error_text(self) -> None:
+        class NotLoggedIn(RuntimeError):
+            pass
+
+        NotLoggedIn.__module__ = "kleinanzeigen_api.auth"
+        client = FakeClient()
+        client.my_ads_error = NotLoggedIn("token=must-not-leak")
+
+        result = self.adapter(client).read_ads()
+
+        self.assertEqual(result.status, ReadStatus.UNAUTHENTICATED)
+        self.assertEqual(result.error, "NotLoggedIn")
+        self.assertNotIn("token", result.error)
+
+    def test_http_auth_runtime_error_is_unauthenticated_without_leaking_body(self) -> None:
+        client = FakeClient()
+        client.my_ads_error = RuntimeError(
+            "GET https://provider.invalid -> 401: token=must-not-leak"
+        )
+
+        result = self.adapter(client).read_ads()
+
+        self.assertEqual(result.status, ReadStatus.UNAUTHENTICATED)
+        self.assertEqual(result.error, "RuntimeError")
+        self.assertNotIn("token", result.error)
+
+    def test_auth0_refresh_rejection_is_unauthenticated(self) -> None:
+        client = FakeClient()
+        client.my_ads_error = RuntimeError(
+            'Auth0 token endpoint returned 400: {"error":"invalid_grant"}'
+        )
+
+        result = self.adapter(client).read_ads()
+
+        self.assertEqual(result.status, ReadStatus.UNAUTHENTICATED)
+        self.assertEqual(result.error, "RuntimeError")
 
     def test_state_writer_dispatches_only_active_and_paused(self) -> None:
         client = FakeClient()
@@ -135,8 +215,18 @@ class MonkrelMobileApiAdapterTests(unittest.TestCase):
         client = FakeClient()
         client.conversation_pages = {
             0: [
-                FakeConversation("c1", "3521676801", "Buyer A"),
-                FakeConversation("c2", "3521676801", "Buyer A"),
+                FakeConversation(
+                    "c1",
+                    "3521676801",
+                    "Buyer A",
+                    raw={"userIdBuyer": 501},
+                ),
+                FakeConversation(
+                    "c2",
+                    "3521676801",
+                    "Renamed Buyer",
+                    raw={"userIdBuyer": 501},
+                ),
                 FakeConversation("c3", "other-ad", "Buyer B"),
             ]
         }
@@ -160,6 +250,41 @@ class MonkrelMobileApiAdapterTests(unittest.TestCase):
         self.assertIn(("messages", "c2"), client.calls)
         self.assertNotIn(("messages", "c3"), client.calls)
 
+    def test_unique_buyer_count_uses_stable_buyer_id_not_display_name(self) -> None:
+        client = FakeClient()
+        client.conversation_pages = {
+            0: [
+                FakeConversation(
+                    "c1",
+                    "3521676801",
+                    "Same Name",
+                    raw={"userIdBuyer": 501},
+                ),
+                FakeConversation(
+                    "c2",
+                    "3521676801",
+                    "Same Name",
+                    raw={"userIdBuyer": 502},
+                ),
+            ]
+        }
+
+        result = self.adapter(client).read_reactions("3521676801")
+
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        self.assertEqual(result.value.unique_buyer_count, 2)
+
+    def test_missing_stable_buyer_id_is_parse_error(self) -> None:
+        client = FakeClient()
+        client.conversation_pages = {
+            0: [FakeConversation("c1", "3521676801", "Buyer")]
+        }
+
+        result = self.adapter(client).read_reactions("3521676801")
+
+        self.assertEqual(result.status, ReadStatus.PARSE_ERROR)
+        self.assertEqual(result.error, "stable_buyer_id_unavailable")
+
     def test_zero_reactions_is_still_a_successful_metric_snapshot(self) -> None:
         client = FakeClient()
 
@@ -173,7 +298,14 @@ class MonkrelMobileApiAdapterTests(unittest.TestCase):
     def test_unknown_message_direction_is_parse_error(self) -> None:
         client = FakeClient()
         client.conversation_pages = {
-            0: [FakeConversation("c1", "3521676801", "Buyer")]
+            0: [
+                FakeConversation(
+                    "c1",
+                    "3521676801",
+                    "Buyer",
+                    raw={"userIdBuyer": 501},
+                )
+            ]
         }
         client.messages_by_id = {"c1": [{"direction": "sideways"}]}
 
@@ -185,7 +317,14 @@ class MonkrelMobileApiAdapterTests(unittest.TestCase):
     def test_message_exception_is_sanitized(self) -> None:
         client = FakeClient()
         client.conversation_pages = {
-            0: [FakeConversation("c1", "3521676801", "Buyer")]
+            0: [
+                FakeConversation(
+                    "c1",
+                    "3521676801",
+                    "Buyer",
+                    raw={"userIdBuyer": 501},
+                )
+            ]
         }
         client.messages_error = TimeoutError("secret provider response")
 

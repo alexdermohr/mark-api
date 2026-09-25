@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,7 +86,25 @@ class CommandRunner(Protocol):
 
 
 class SubprocessRunner:
-    """Run argv-only child processes while discarding their provider output."""
+    """Run one isolated argv-only process group without retaining provider output."""
+
+    _TERMINATION_GRACE_SECONDS = 5.0
+
+    @classmethod
+    def _terminate_process_group(cls, process: subprocess.Popen[str]) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+        try:
+            process.wait(timeout=cls._TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            process.wait()
 
     def run(
         self,
@@ -95,21 +114,29 @@ class SubprocessRunner:
         input_text: str | None,
         timeout_seconds: float,
     ) -> ProcessResult:
+        process = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            stdin=(
+                subprocess.PIPE
+                if input_text is not None
+                else subprocess.DEVNULL
+            ),
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            start_new_session=True,
+        )
         try:
-            completed = subprocess.run(
-                list(argv),
-                cwd=cwd,
+            process.communicate(
                 input=input_text,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
                 timeout=timeout_seconds,
-                check=False,
             )
         except subprocess.TimeoutExpired:
+            self._terminate_process_group(process)
             return ProcessResult(returncode=124, timed_out=True)
-        return ProcessResult(returncode=completed.returncode)
+        return ProcessResult(returncode=process.returncode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,14 +297,12 @@ class BrowserBotAdapter:
             raise BrowserBotWorkspaceError("synced YAML escapes the download workspace")
         return path
 
-    def _stage_content(
-        self,
+    @staticmethod
+    def _validated_content_updates(
         *,
-        ad_id: str,
         title: str | None,
         description: str | None,
-    ) -> Path:
-        target_id = _validated_ad_id(ad_id)
+    ) -> dict[str, str]:
         updates: dict[str, str] = {}
         if title is not None:
             if not isinstance(title, str):
@@ -289,7 +314,15 @@ class BrowserBotAdapter:
             updates["description"] = description
         if not updates:
             raise ValueError("at least one content field must be provided")
+        return updates
 
+    def _stage_content(
+        self,
+        *,
+        ad_id: str,
+        updates: dict[str, str],
+    ) -> Path:
+        target_id = _validated_ad_id(ad_id)
         ad_yaml = self._find_ad_yaml(target_id)
         payload = json.dumps(
             updates,
@@ -318,10 +351,19 @@ class BrowserBotAdapter:
         description: str | None = None,
     ) -> None:
         target_id = _validated_ad_id(ad_id)
-        self._stage_content(
-            ad_id=target_id,
+        updates = self._validated_content_updates(
             title=title,
             description=description,
+        )
+
+        # The external update command submits the full downloaded YAML. Refresh
+        # the exact ad immediately before staging so unrelated remote fields are
+        # not overwritten from a stale local baseline. A title change can leave
+        # multiple matching folders; _find_ad_yaml then fails closed.
+        self.sync(target_id)
+        self._stage_content(
+            ad_id=target_id,
+            updates=updates,
         )
         self._run(
             phase="update",
