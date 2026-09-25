@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .domain import (
+    AdClassification,
     AdSnapshot,
     LifecycleState,
     OperationReceipt,
@@ -61,6 +62,20 @@ class SnapshotStore:
 
                 CREATE INDEX IF NOT EXISTS idx_reaction_snapshots_ad_id_observed
                     ON reaction_snapshots(ad_id, observed_at, id);
+
+                CREATE TABLE IF NOT EXISTS ad_classifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ad_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    image_type TEXT,
+                    city TEXT,
+                    text_type TEXT,
+                    title_type TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ad_classifications_ad_id_observed
+                    ON ad_classifications(ad_id, observed_at, id);
 
                 CREATE TABLE IF NOT EXISTS operation_receipts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +141,26 @@ class SnapshotStore:
                     snapshot.conversation_count,
                     snapshot.unique_buyer_count,
                     snapshot.inbound_message_count,
+                ),
+            )
+
+    def append_classification(self, classification: AdClassification) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ad_classifications (
+                    ad_id, observed_at, source, image_type, city,
+                    text_type, title_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    classification.ad_id,
+                    classification.observed_at.isoformat(),
+                    classification.source,
+                    classification.image_type,
+                    classification.city,
+                    classification.text_type,
+                    classification.title_type,
                 ),
             )
 
@@ -270,3 +305,40 @@ class SnapshotStore:
             )
             for row in rows
         )
+
+    def classification_history(self, ad_id: str) -> tuple[AdClassification, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, ad_id, observed_at, source, image_type, city,
+                       text_type, title_type
+                FROM ad_classifications
+                WHERE ad_id = ?
+                ORDER BY id ASC
+                """,
+                (ad_id,),
+            ).fetchall()
+
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: (
+                datetime.fromisoformat(row["observed_at"]),
+                int(row["id"]),
+            ),
+        )
+        return tuple(
+            AdClassification(
+                ad_id=row["ad_id"],
+                observed_at=datetime.fromisoformat(row["observed_at"]),
+                source=row["source"],
+                image_type=row["image_type"],
+                city=row["city"],
+                text_type=row["text_type"],
+                title_type=row["title_type"],
+            )
+            for row in ordered_rows
+        )
+
+    def latest_classification(self, ad_id: str) -> AdClassification | None:
+        history = self.classification_history(ad_id)
+        return history[-1] if history else None

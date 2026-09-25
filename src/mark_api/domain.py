@@ -38,6 +38,17 @@ def _require_counter(value: int | None, field_name: str) -> None:
         raise ValueError(f"{field_name} must be an integer >= 0 or None")
 
 
+def _normalize_optional_label(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string or None")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} must not be blank")
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class AdSnapshot:
     ad_id: str
@@ -75,6 +86,28 @@ class ReactionSnapshot:
         _require_counter(self.conversation_count, "conversation_count")
         _require_counter(self.unique_buyer_count, "unique_buyer_count")
         _require_counter(self.inbound_message_count, "inbound_message_count")
+
+
+@dataclass(frozen=True, slots=True)
+class AdClassification:
+    ad_id: str
+    observed_at: datetime
+    source: str
+    image_type: str | None = None
+    city: str | None = None
+    text_type: str | None = None
+    title_type: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_nonempty(self.ad_id, "ad_id")
+        _require_nonempty(self.source, "source")
+        _require_aware(self.observed_at, "observed_at")
+        for field_name in ("image_type", "city", "text_type", "title_type"):
+            object.__setattr__(
+                self,
+                field_name,
+                _normalize_optional_label(getattr(self, field_name), field_name),
+            )
 
 
 @dataclass(frozen=True, slots=True)

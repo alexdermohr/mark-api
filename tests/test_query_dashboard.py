@@ -10,7 +10,12 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from mark_api.dashboard import create_server
-from mark_api.domain import AdSnapshot, LifecycleState, ReactionSnapshot
+from mark_api.domain import (
+    AdClassification,
+    AdSnapshot,
+    LifecycleState,
+    ReactionSnapshot,
+)
 from mark_api.query import (
     MarkQueryService,
     ad_view_to_dict,
@@ -70,6 +75,28 @@ class SeededStoreMixin:
                 conversation_count=1,
                 unique_buyer_count=1,
                 inbound_message_count=1,
+            )
+        )
+        store.append_classification(
+            AdClassification(
+                ad_id="1",
+                observed_at=T0,
+                source="manual",
+                image_type="detail",
+                city="Berlin",
+                text_type="short",
+                title_type="object",
+            )
+        )
+        store.append_classification(
+            AdClassification(
+                ad_id="2",
+                observed_at=T1,
+                source="manual",
+                image_type="overview",
+                city="Berlin",
+                text_type="short",
+                title_type="object",
             )
         )
         return store
@@ -181,6 +208,94 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertEqual(reactions[0]["conversation_count"], 1)
         self.assertNotIn("text", reactions[0])
 
+    def test_analytics_contract_and_rankings_endpoints(self) -> None:
+        _, _, metrics_body = self.get("/api/analytics/metrics")
+        _, _, dimensions_body = self.get("/api/analytics/dimensions")
+        metrics = json.loads(metrics_body)["metrics"]
+        dimensions = json.loads(dimensions_body)["dimensions"]
+
+        self.assertEqual(
+            metrics,
+            [
+                "views",
+                "watch_count",
+                "reply_count",
+                "conversation_count",
+                "unique_buyer_count",
+                "inbound_message_count",
+            ],
+        )
+        self.assertEqual(
+            dimensions,
+            ["image_type", "city", "text_type", "title_type"],
+        )
+
+        _, _, ads_body = self.get("/api/analytics/ads?metric=views")
+        ranking = json.loads(ads_body)
+        self.assertEqual([item["ad_id"] for item in ranking], ["1", "2"])
+        self.assertEqual(ranking[0]["value"], 15)
+        self.assertFalse(ranking[0]["present"])
+        self.assertEqual(ranking[0]["lifecycle_state"], "absent")
+
+        _, _, groups_body = self.get(
+            "/api/analytics/groups?dimension=city&metric=views"
+        )
+        groups = json.loads(groups_body)
+        self.assertEqual(
+            groups,
+            [
+                {
+                    "label": "Berlin",
+                    "sample_size": 2,
+                    "metric_sum": 19,
+                    "metric_mean": 9.5,
+                }
+            ],
+        )
+        encoded = json.dumps(groups).lower()
+        self.assertNotIn("winner", encoded)
+        self.assertNotIn("recommend", encoded)
+
+    def test_reaction_ranking_excludes_ads_without_reaction_history(self) -> None:
+        _, _, body = self.get(
+            "/api/analytics/ads?metric=inbound_message_count"
+        )
+        ranking = json.loads(body)
+
+        self.assertEqual(
+            [(item["ad_id"], item["value"]) for item in ranking],
+            [("1", 1)],
+        )
+
+    def test_invalid_analytics_metric_and_dimension_are_400(self) -> None:
+        with self.assertRaises(HTTPError) as bad_metric:
+            urlopen(
+                self.base + "/api/analytics/ads?metric=engagement",
+                timeout=2,
+            )
+        self.assertEqual(bad_metric.exception.code, 400)
+        metric_payload = json.loads(bad_metric.exception.read())
+        self.assertEqual(metric_payload["error"], "invalid_metric")
+        self.assertIn("views", metric_payload["allowed_metrics"])
+
+        with self.assertRaises(HTTPError) as missing_metric:
+            urlopen(self.base + "/api/analytics/ads", timeout=2)
+        self.assertEqual(missing_metric.exception.code, 400)
+        self.assertEqual(
+            json.loads(missing_metric.exception.read())["error"],
+            "invalid_metric",
+        )
+
+        with self.assertRaises(HTTPError) as bad_dimension:
+            urlopen(
+                self.base
+                + "/api/analytics/groups?dimension=category&metric=views",
+                timeout=2,
+            )
+        self.assertEqual(bad_dimension.exception.code, 400)
+        dimension_payload = json.loads(bad_dimension.exception.read())
+        self.assertEqual(dimension_payload["error"], "invalid_dimension")
+        self.assertIn("city", dimension_payload["allowed_dimensions"])
     def test_reaction_only_history_is_available_without_ad_history(self) -> None:
         self.store.append_reaction_snapshot(
             ReactionSnapshot(
@@ -233,31 +348,49 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         html = html_body.decode("utf-8")
         self.assertIn("Mark Dashboard", html)
         self.assertIn('src="/dashboard.js"', html)
+        self.assertIn('id="metric-select"', html)
+        self.assertIn('id="groups-body"', html)
         self.assertNotIn("https://", html)
         self.assertNotIn("http://", html)
 
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
         self.assertIn("summary.views_total_known", javascript)
+        self.assertIn("/api/analytics/groups", javascript)
+        self.assertIn("let analyticsRequestGeneration = 0;", javascript)
+        self.assertIn(
+            "const generation = ++analyticsRequestGeneration;",
+            javascript,
+        )
+        guard = "if (generation !== analyticsRequestGeneration) return;"
+        self.assertIn(guard, javascript)
+        self.assertLess(
+            javascript.index(guard),
+            javascript.index("renderGroups(groups);"),
+        )
         self.assertNotIn(chr(92) + chr(96), javascript)
 
         _, _, css_body = self.get("/dashboard.css")
         self.assertIn(".cards", css_body.decode("utf-8"))
 
     def test_non_get_methods_are_405_and_no_write_route_exists(self) -> None:
-        request = Request(
-            self.base + "/api/ads/1",
-            data=b"{}",
-            method="POST",
-        )
-        with self.assertRaises(HTTPError) as error:
-            urlopen(request, timeout=2)
-        self.assertEqual(error.exception.code, 405)
-        self.assertEqual(error.exception.headers["Allow"], "GET")
-        self.assertEqual(
-            json.loads(error.exception.read()),
-            {"error": "method_not_allowed"},
-        )
+        for path in (
+            "/api/ads/1",
+            "/api/analytics/ads?metric=views",
+        ):
+            request = Request(
+                self.base + path,
+                data=b"{}",
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as error:
+                urlopen(request, timeout=2)
+            self.assertEqual(error.exception.code, 405)
+            self.assertEqual(error.exception.headers["Allow"], "GET")
+            self.assertEqual(
+                json.loads(error.exception.read()),
+                {"error": "method_not_allowed"},
+            )
 
     def test_unknown_route_is_404(self) -> None:
         with self.assertRaises(HTTPError) as error:
