@@ -160,6 +160,7 @@ class MarkService:
         *,
         owner_reader: AdsReader,
         management_reader: AdsReader,
+        delete_confirmation_reader: AdsReader,
         reaction_reader: InboxReader,
         state_writer: AdStateWriter,
         delete_writer: AdDeleteWriter,
@@ -170,6 +171,7 @@ class MarkService:
     ) -> None:
         self._owner_reader = owner_reader
         self._management_reader = management_reader
+        self._delete_confirmation_reader = delete_confirmation_reader
         self._reaction_reader = reaction_reader
         self._state_writer = state_writer
         self._delete_writer = delete_writer
@@ -229,6 +231,7 @@ class MarkService:
             approval=approval,
             reader=self._management_reader,
             writer=self._delete_writer,
+            confirmation_reader=self._delete_confirmation_reader,
         )
 
     def update_content(

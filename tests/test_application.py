@@ -289,6 +289,7 @@ class MarkServiceTests(unittest.TestCase):
         *,
         owner_reader,
         management_reader,
+        delete_confirmation_reader=None,
         reaction_reader=None,
         state_writer=None,
         delete_writer=None,
@@ -296,6 +297,8 @@ class MarkServiceTests(unittest.TestCase):
         writes_enabled=False,
         store=None,
     ):
+        if delete_confirmation_reader is None:
+            delete_confirmation_reader = SequenceAdsReader()
         if reaction_reader is None:
             reaction_reader = ReactionReader(ReadResult.success_empty())
         if state_writer is None:
@@ -309,6 +312,7 @@ class MarkServiceTests(unittest.TestCase):
         service = MarkService(
             owner_reader=owner_reader,
             management_reader=management_reader,
+            delete_confirmation_reader=delete_confirmation_reader,
             reaction_reader=reaction_reader,
             state_writer=state_writer,
             delete_writer=delete_writer,
@@ -505,7 +509,7 @@ class MarkServiceTests(unittest.TestCase):
         self.assertEqual(owner.calls, 0)
         self.assertEqual(management.calls, 2)
 
-    def test_delete_uses_management_and_exact_approval(self) -> None:
+    def test_delete_requires_management_and_mobile_absence(self) -> None:
         management = SequenceAdsReader(
             ReadResult.success_nonempty(
                 (
@@ -518,10 +522,12 @@ class MarkServiceTests(unittest.TestCase):
             ),
             ReadResult.success_empty(()),
         )
+        mobile = SequenceAdsReader(ReadResult.success_empty(()))
         writer = StateDeleteWriter()
         service, _, _, _ = self.service(
             owner_reader=SequenceAdsReader(),
             management_reader=management,
+            delete_confirmation_reader=mobile,
             state_writer=writer,
             delete_writer=writer,
             writes_enabled=True,
@@ -539,6 +545,86 @@ class MarkServiceTests(unittest.TestCase):
         self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
         self.assertEqual(writer.delete_calls, ["3521676801"])
         self.assertEqual(receipt.authorization_reference, "approval-1")
+        self.assertEqual(management.calls, 2)
+        self.assertEqual(mobile.calls, 1)
+
+    def test_delete_is_ambiguous_when_mobile_still_contains_target(self) -> None:
+        active = ad(
+            "3521676801",
+            state=LifecycleState.ACTIVE,
+            source="management",
+        )
+        management = SequenceAdsReader(
+            ReadResult.success_nonempty((active,)),
+            ReadResult.success_empty(()),
+        )
+        mobile = SequenceAdsReader(
+            ReadResult.success_nonempty(
+                (
+                    ad(
+                        "3521676801",
+                        source="mobile",
+                    ),
+                )
+            )
+        )
+        writer = StateDeleteWriter()
+        service, _, _, _ = self.service(
+            owner_reader=SequenceAdsReader(),
+            management_reader=management,
+            delete_confirmation_reader=mobile,
+            delete_writer=writer,
+            writes_enabled=True,
+        )
+
+        receipt = service.delete(
+            "3521676801",
+            approval=DeleteApproval(
+                ad_id="3521676801",
+                approved_by="owner",
+            ),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertEqual(writer.delete_calls, ["3521676801"])
+        self.assertEqual(mobile.calls, 1)
+
+    def test_delete_is_ambiguous_when_mobile_confirmation_fails(self) -> None:
+        active = ad(
+            "3521676801",
+            state=LifecycleState.ACTIVE,
+            source="management",
+        )
+        management = SequenceAdsReader(
+            ReadResult.success_nonempty((active,)),
+            ReadResult.success_empty(()),
+        )
+        mobile = SequenceAdsReader(
+            ReadResult.failure(
+                ReadStatus.TRANSPORT_ERROR,
+                error="TimeoutError",
+            )
+        )
+        writer = StateDeleteWriter()
+        service, _, _, _ = self.service(
+            owner_reader=SequenceAdsReader(),
+            management_reader=management,
+            delete_confirmation_reader=mobile,
+            delete_writer=writer,
+            writes_enabled=True,
+        )
+
+        receipt = service.delete(
+            "3521676801",
+            approval=DeleteApproval(
+                ad_id="3521676801",
+                approved_by="owner",
+            ),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertEqual(writer.delete_calls, ["3521676801"])
+        self.assertEqual(mobile.calls, 1)
 
     def test_content_update_uses_enriched_owner_reader(self) -> None:
         owner = SequenceAdsReader(

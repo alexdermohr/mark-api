@@ -30,7 +30,11 @@ def _require_aware(value: datetime, field_name: str) -> None:
 
 
 def _require_counter(value: int | None, field_name: str) -> None:
-    if value is not None and (isinstance(value, bool) or value < 0):
+    if value is not None and (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+    ):
         raise ValueError(f"{field_name} must be an integer >= 0 or None")
 
 

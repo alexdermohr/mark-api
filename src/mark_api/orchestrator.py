@@ -254,6 +254,7 @@ class SafeWriteOrchestrator:
         approval: DeleteApproval,
         reader: AdsReader,
         writer: AdDeleteWriter,
+        confirmation_reader: AdsReader | None = None,
     ) -> OperationReceipt:
         started_at = self._clock()
         if approval.ad_id != ad_id:
@@ -266,12 +267,70 @@ class SafeWriteOrchestrator:
                 authorization_reference=approval.reference,
             )
 
-        return self._execute(
-            operation="delete",
-            ad_id=ad_id,
-            reader=reader,
-            writer_call=lambda: writer.delete_ad(ad_id),
-            postcondition=lambda _result, snapshot: snapshot is None,
-            authorization_by=approval.approved_by,
-            authorization_reference=approval.reference,
+        if not self._writes_enabled:
+            return self._precondition_failed(
+                operation="delete",
+                ad_id=ad_id,
+                started_at=started_at,
+                pre_read_status="writes_disabled",
+                authorization_by=approval.approved_by,
+                authorization_reference=approval.reference,
+            )
+
+        pre = reader.read_ads()
+        pre_snapshot = self._find_target(pre, ad_id)
+        if not pre.is_success or pre_snapshot is None:
+            return self._precondition_failed(
+                operation="delete",
+                ad_id=ad_id,
+                started_at=started_at,
+                pre_read_status=pre.status.value,
+                pre_snapshot=pre_snapshot,
+                authorization_by=approval.approved_by,
+                authorization_reference=approval.reference,
+            )
+
+        writer_error: str | None = None
+        try:
+            writer.delete_ad(ad_id)
+        except Exception as exc:  # noqa: BLE001 - reconciled by both owner inventories.
+            writer_error = type(exc).__name__
+
+        post = reader.read_ads()
+        post_snapshot = self._find_target(post, ad_id)
+
+        confirmation = None
+        confirmation_snapshot = None
+        if confirmation_reader is not None and confirmation_reader is not reader:
+            confirmation = confirmation_reader.read_ads()
+            confirmation_snapshot = self._find_target(confirmation, ad_id)
+
+        confirmed = (
+            post.is_success
+            and post_snapshot is None
+            and confirmation is not None
+            and confirmation.is_success
+            and confirmation_snapshot is None
+        )
+
+        return self._persist(
+            OperationReceipt(
+                operation="delete",
+                ad_id=ad_id,
+                started_at=started_at,
+                completed_at=self._clock(),
+                outcome=(
+                    OperationOutcome.CONFIRMED
+                    if confirmed
+                    else OperationOutcome.AMBIGUOUS
+                ),
+                pre_read_status=pre.status.value,
+                post_read_status=post.status.value,
+                writer_invoked=True,
+                authorization_by=approval.approved_by,
+                authorization_reference=approval.reference,
+                writer_error=writer_error,
+                pre_snapshot=pre_snapshot,
+                post_snapshot=post_snapshot,
+            )
         )
