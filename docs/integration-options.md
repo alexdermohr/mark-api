@@ -267,3 +267,18 @@ Nicht gewählt:
 Authoritative Delete-Semantik: Abwesenheit aus den Besitzerlisten. `get_my_ad(id)` und öffentliche Detail-HTTP-200 sind nach dem realen Delete nachweislich stale.
 
 Details und Adapter-Contracts: `docs/architecture-decision-2026-09-24.md`.
+
+## Update 26.09.2026 — Write-Machbarkeit ist Umsetzungsziel
+
+Die frühere Aussage „kein in-place Inhaltsupdate im aktuellen monkrel-Modell gefunden“ beschreibt nur den damals geprüften Upstream-Client, nicht die technische Plattformfähigkeit.
+
+Aktuelle technische Evidenz zeigt:
+
+- die offizielle ProSellers API besitzt vollständige Listing-/Publication-/Media-Writes,
+- aktuelle Mobile-CAPI-Kartierung nennt owner-scoped create/edit/extend/delete,
+- die historische API-Spezifikation dokumentiert `PUT /users/{idName}/ads/{adId}`,
+- unser eigener PoC hat Pause/Aktivieren/Delete und Browser-in-place-Update bereits remote belegt.
+
+Daraus folgt die neue aktive Richtung: **HTTP-first Write-Adapter für eigene Anzeigen; Browser nur Fallback, bis der jeweilige HTTP-Pfad remote bestätigt ist.**
+
+Vollständige Evidenzmatrix, Grenzen und Implementierungsreihenfolge: `docs/technical-write-capabilities-2026-09-26.md`.
