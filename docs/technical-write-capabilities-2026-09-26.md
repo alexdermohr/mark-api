@@ -27,7 +27,7 @@ SafeWriteOrchestrator
       |
       +-- ProSellersAdapter        # offizielle Power/Premium-API
       +-- MobileApiAdapter         # eigener Account, HTTP-first
-      +-- BrowserBotAdapter        # nur Fallback, solange HTTP-Lücke besteht
+      +-- BrowserBotAdapter        # aktuell primär für Content-Update; später Fallback
       |
       +-- unabhängige Readback-Adapter
 ```
@@ -152,8 +152,8 @@ Diese Befunde bleiben gültige Regressionsevidenz. Der neue HTTP-first-Plan erse
 
 ## Aktive Architekturentscheidung ab 26.09.2026
 
-1. **HTTP-first für Writes.** Für private/eigene Accounts wird die Mobile-CAPI als primärer technischer Write-Kandidat weiter ausgebaut.
-2. **Browser nur Fallback.** Der vorhandene BrowserBotAdapter bleibt solange verfügbar, bis der entsprechende HTTP-Write remote bestätigt ist; er ist nicht mehr das Zielbild.
+1. **HTTP-first als Zielarchitektur.** Für private/eigene Accounts wird die Mobile-CAPI als primärer technischer Write-Kandidat weiter ausgebaut.
+2. **Browser bis zum Remote-Beleg primär.** Für bestehende Inhaltsupdates bleibt der BrowserBotAdapter der operative primäre Writer, weil dieser Pfad remote belegt ist. Erst nach erfolgreichem Slice-B-HTTP-Readback wird er zum Fallback; das Zielbild bleibt HTTP-first.
 3. **Offizielle API parallel anschließbar.** Ein ProSellersAdapter soll denselben Mark-Domainvertrag bedienen.
 4. **Keine Providersemantik im Mark-API-Vertrag.** Mark exponiert eigene Operationen; UUID/adId/Publication-Details bleiben im Adapter.
 5. **Fail closed.** Nicht belegte Fähigkeiten bleiben deaktiviert; kein Blind-Retry bei unklarem Write-Ergebnis.

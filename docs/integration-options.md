@@ -279,6 +279,6 @@ Aktuelle technische Evidenz zeigt:
 - die historische API-Spezifikation dokumentiert `PUT /users/{idName}/ads/{adId}`,
 - unser eigener PoC hat Pause/Aktivieren/Delete und Browser-in-place-Update bereits remote belegt.
 
-Daraus folgt die neue aktive Richtung: **HTTP-first Write-Adapter für eigene Anzeigen; Browser nur Fallback, bis der jeweilige HTTP-Pfad remote bestätigt ist.**
+Daraus folgt die neue aktive Richtung: **HTTP-first als Zielarchitektur für eigene Anzeigen. Für bestehende Inhaltsupdates bleibt der remote belegte Browserpfad operativ primär, bis der jeweilige HTTP-Pfad remote bestätigt ist; erst danach wird er zum Fallback.**
 
 Vollständige Evidenzmatrix, Grenzen und Implementierungsreihenfolge: `docs/technical-write-capabilities-2026-09-26.md`.

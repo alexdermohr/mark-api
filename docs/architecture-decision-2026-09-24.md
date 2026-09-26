@@ -255,7 +255,7 @@ Die Entscheidung wird für den nächsten Slice präzisiert:
 
 - Ziel bleibt eine **eigene schreibfähige Mark-API**.
 - Für private/eigene Anzeigen wird die Mobile-CAPI als primärer technischer Write-Kandidat ausgebaut.
-- Der vorhandene Browser-Update-Adapter ist ab jetzt **Fallback**, nicht Zielarchitektur.
+- Für bestehende Inhaltsupdates bleibt der remote belegte Browser-Update-Adapter **operativ primär**, solange der private HTTP-in-place-Updatepfad nicht remote bestätigt ist. Nach erfolgreichem HTTP-Beleg wird er zum Fallback; das Zielbild bleibt HTTP-first.
 - `MonkrelMobileApiAdapter` erhält den `AdContentUpdater`-Vertrag und delegiert Partial-Updates an einen HTTP-fähigen Client.
 - Der konkrete 2026er private in-place-Request bleibt bis zum separaten Remote-Smoke fail-closed; dieser Commit führt keinen Plattform-Write aus.
 - Für Power/Premium bleibt ein offizieller ProSellersAdapter parallel möglich und soll denselben Domainvertrag erfüllen.
