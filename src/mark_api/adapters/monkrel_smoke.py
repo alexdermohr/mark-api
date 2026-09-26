@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from ..domain import AdSnapshot
 from ..results import ReadResult
+
+
+ContentField = Literal["title", "description"]
 
 
 class SmokeAdReader(Protocol):
@@ -62,10 +65,17 @@ class _ObservedContent:
     source: str
 
 
-def _observed_content(
+@dataclass(frozen=True, slots=True)
+class _ObservedField:
+    field: ContentField
+    value: str
+    source: str
+
+
+def _snapshot(
     reader: SmokeAdReader,
     ad_id: str,
-) -> _ObservedContent:
+) -> AdSnapshot:
     result = reader.read_ad(ad_id)
     if not result.is_success:
         raise RuntimeError(f"read failed with status {result.status.value}")
@@ -74,19 +84,43 @@ def _observed_content(
         raise ValueError("read did not return the requested ad")
     if snapshot.ad_id != ad_id:
         raise ValueError("read returned a different ad id")
-    if not isinstance(snapshot.title, str) or not snapshot.title.strip():
-        raise ValueError("read returned a blank or missing title")
-    if (
-        not isinstance(snapshot.description, str)
-        or not snapshot.description.strip()
-    ):
-        raise ValueError("read returned a blank or missing description")
+    return snapshot
+
+
+def _content_field(
+    snapshot: AdSnapshot,
+    field: ContentField,
+) -> str:
+    value = getattr(snapshot, field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"read returned a blank or missing {field}")
+    return value
+
+
+def _owner_content(
+    reader: SmokeAdReader,
+    ad_id: str,
+) -> _ObservedContent:
+    snapshot = _snapshot(reader, ad_id)
     return _ObservedContent(
         content=SmokeContent(
             ad_id=snapshot.ad_id,
-            title=snapshot.title,
-            description=snapshot.description,
+            title=_content_field(snapshot, "title"),
+            description=_content_field(snapshot, "description"),
         ),
+        source=snapshot.source,
+    )
+
+
+def _observed_field(
+    reader: SmokeAdReader,
+    ad_id: str,
+    field: ContentField,
+) -> _ObservedField:
+    snapshot = _snapshot(reader, ad_id)
+    return _ObservedField(
+        field=field,
+        value=_content_field(snapshot, field),
         source=snapshot.source,
     )
 
@@ -94,9 +128,10 @@ def _observed_content(
 def _readback(
     reader: SmokeAdReader,
     ad_id: str,
-) -> tuple[_ObservedContent | None, str | None]:
+    field: ContentField,
+) -> tuple[_ObservedField | None, str | None]:
     try:
-        return _observed_content(reader, ad_id), None
+        return _observed_field(reader, ad_id, field), None
     except Exception as exc:  # noqa: BLE001 - external read boundary.
         return None, type(exc).__name__
 
@@ -104,10 +139,10 @@ def _readback(
 def _changed_field(
     baseline: SmokeContent,
     target: SmokeContent,
-) -> str:
+) -> ContentField:
     if baseline.ad_id != target.ad_id:
         raise ValueError("baseline and target must bind the same ad id")
-    changed: list[str] = []
+    changed: list[ContentField] = []
     if baseline.title != target.title:
         changed.append("title")
     if baseline.description != target.description:
@@ -120,14 +155,15 @@ def _changed_field(
 class MonkrelPrivateHttpContentSmoke:
     """Run one reversible, independently verified content-write smoke.
 
-    The harness deliberately performs no retries. It requires two read channels
-    with distinct source labels to agree on the exact baseline before the first
-    write. A rollback is attempted only after the independent reader confirms
-    the target content on the same ad id.
+    The harness deliberately performs no retries. The owner reader must expose
+    the complete exact baseline before the first write. The independent reader
+    must expose only the field being changed, which keeps title-only management
+    readback independent even when that surface does not include description.
 
-    A transport exception from either write never authorizes a replay. The
-    independent readback may establish that the effect happened despite that
-    exception; otherwise the run stops fail-closed.
+    A rollback is attempted only after the independent reader confirms the
+    target field on the same ad id. A transport exception from either write
+    never authorizes a replay. Independent readback may establish that the
+    effect happened despite the exception; otherwise the run stops fail-closed.
     """
 
     def __init__(
@@ -149,17 +185,20 @@ class MonkrelPrivateHttpContentSmoke:
     ) -> SmokeResult:
         changed_field = _changed_field(baseline, target)
 
-        owner_before = _observed_content(self._owner_reader, baseline.ad_id)
-        independent_before = _observed_content(
+        owner_before = _owner_content(self._owner_reader, baseline.ad_id)
+        independent_before = _observed_field(
             self._independent_reader,
             baseline.ad_id,
+            changed_field,
         )
         if owner_before.source == independent_before.source:
             raise ValueError("independent reader must use a distinct source")
         if owner_before.content != baseline:
             raise ValueError("owner read does not match the bound baseline")
-        if independent_before.content != baseline:
-            raise ValueError("independent read does not match the bound baseline")
+        if independent_before.value != getattr(baseline, changed_field):
+            raise ValueError(
+                f"independent read does not match the bound baseline {changed_field}"
+            )
 
         target_kwargs = {
             "title": target.title if changed_field == "title" else None,
@@ -179,11 +218,12 @@ class MonkrelPrivateHttpContentSmoke:
         target_after, target_read_error = _readback(
             self._independent_reader,
             baseline.ad_id,
+            changed_field,
         )
         target_confirmed = bool(
             target_after is not None
             and target_after.source == independent_before.source
-            and target_after.content == target
+            and target_after.value == getattr(target, changed_field)
         )
         if not target_confirmed:
             return SmokeResult(
@@ -213,11 +253,12 @@ class MonkrelPrivateHttpContentSmoke:
         final_after, final_read_error = _readback(
             self._independent_reader,
             baseline.ad_id,
+            changed_field,
         )
         rollback_confirmed = bool(
             final_after is not None
             and final_after.source == independent_before.source
-            and final_after.content == baseline
+            and final_after.value == getattr(baseline, changed_field)
         )
         if not rollback_confirmed:
             return SmokeResult(
