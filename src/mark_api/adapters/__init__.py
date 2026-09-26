@@ -9,6 +9,7 @@ from .browser_bot import (
 )
 from .management import ManagementReadAdapter
 from .monkrel import MonkrelMobileApiAdapter
+from .monkrel_http import MonkrelPrivateHttpContentClient
 
 __all__ = [
     "BrowserBotAdapter",
@@ -18,4 +19,5 @@ __all__ = [
     "BrowserBotWorkspaceError",
     "ManagementReadAdapter",
     "MonkrelMobileApiAdapter",
+    "MonkrelPrivateHttpContentClient",
 ]
