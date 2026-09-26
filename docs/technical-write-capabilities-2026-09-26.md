@@ -48,7 +48,7 @@ Der Mark-Core bleibt provider-neutral. Jeder Plattform-Write bleibt standardmä�
 |---|---|---|---|---|
 | eigene Anzeigen lesen | O | R | R | vorhanden |
 | Anzeige erstellen | O | S | S | technisch vorhanden; privater Remote-Smoke offen |
-| Titel/Beschreibung in-place ändern | O | S/H | R | HTTP-Pfad ist nächster Beweis-Slice |
+| Titel/Beschreibung in-place ändern | O | S/H + lokale Implementierung | R | konservativer HTTP-Client lokal vorhanden; Remote-Smoke offen |
 | Preis/Attribute ändern | O | S/H | R/S | nach HTTP-Update-Grundpfad |
 | Bilder hochladen | O | S/H | S | offiziell vollständig; mobile Detailfluss noch zu härten |
 | Bilder löschen/sortieren | O | S/H | S | offiziell vollständig |
@@ -134,7 +134,22 @@ mit demselben Write-Payloadmodell wie Create.
 Referenz:
 https://github.com/tejado/ebk-client/blob/8468b6b6cf3997b3fadeb672d64497c5b63ef728/docs/pages/users.html
 
-Zusammen mit der aktuellen Endpoint-Kartierung ist damit die technische Hypothese stark genug, den HTTP-in-place-Updatepfad als nächsten Implementierungsslice festzulegen. **Noch nicht behauptet wird**, dass der konkrete 2026er Request bereits remote mit unserem Account bestätigt ist.
+Zusammen mit der aktuellen Endpoint-Kartierung ist damit die technische Hypothese stark genug, den HTTP-in-place-Updatepfad zu implementieren. **Noch nicht behauptet wird**, dass der konkrete 2026er Request bereits remote mit unserem Account bestätigt ist.
+
+### Lokales HTTP-Update-Primitive
+
+`MonkrelPrivateHttpContentClient` implementiert jetzt lokal den fehlenden `update_ad()`-Vertrag:
+
+- frischer owner-scoped GET der konkreten Anzeige,
+- exakte ID-Bindung,
+- Rekonstruktion des bestehenden Write-Payloads über den aktuell von monkrel verwendeten Create-XML-Builder,
+- genau ein owner-scoped `PUT /api/users/{uid}/ads/{adId}`,
+- `max_retries=1` als harte Voraussetzung für den dedizierten Write-Client,
+- No-op-Rejection,
+- fail-closed bei nicht verlustfrei rekonstruierbaren Mehrfachattributen, Bildern ohne eindeutigen XXL-Link oder noch nicht modellierten Commerce-/Media-Sonderzuständen,
+- kein Token-, Cookie- oder Response-Body-Logging im Mark-Core.
+
+Damit ist die lokale Transportlücke geschlossen. Der Browser bleibt für echte Inhaltsupdates weiterhin operativ primär, bis der Remote-Smoke den HTTP-Pfad auf einer eigenen Anzeige bestätigt.
 
 ## Im Projekt bereits remote belegt
 
@@ -192,7 +207,9 @@ Die konkrete Webframework-Wahl bleibt nachrangig gegenüber stabilen Domain-/Ada
 - lokale Tests für Partial-Update, ID-Bindung und Fail-closed Eingabe.
 - diese technische Machbarkeit und den Plan im Repo festhalten.
 
-### Slice B — nächster Remote-Beweis
+### Slice B — HTTP-Primitive lokal vorhanden; nächster Schritt Remote-Beweis
+
+Der konservative `MonkrelPrivateHttpContentClient` ist lokal implementiert und getestet. Er führt in diesem Slice keinen Plattform-Write aus.
 
 Auf genau einer eigenen, ausdrücklich geeigneten Anzeige:
 
