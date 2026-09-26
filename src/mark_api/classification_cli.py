@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
-from collections.abc import Iterable, Mapping
+import os
+import threading
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +17,26 @@ from .storage import SnapshotStore
 
 _SOURCE = "manual-cli"
 _CLEAR_CHOICES = tuple(item.replace("_", "-") for item in ANALYTICS_DIMENSIONS)
+_LOCAL_CLASSIFICATION_LOCK = threading.Lock()
+
+
+@contextmanager
+def _classification_update_lock(store: SnapshotStore) -> Iterator[None]:
+    lock_path = store.path.with_name(store.path.name + ".classification.lock")
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with _LOCAL_CLASSIFICATION_LOCK:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def update_classification(
@@ -48,51 +72,54 @@ def update_classification(
             "cannot set and clear the same dimensions: " + ", ".join(conflicts)
         )
 
-    if ad_id not in store.tracked_ad_ids():
-        raise ValueError(f"unknown tracked ad_id: {ad_id}")
+    with _classification_update_lock(store):
+        if ad_id not in store.tracked_ad_ids():
+            raise ValueError(f"unknown tracked ad_id: {ad_id}")
 
-    previous = store.latest_classification(ad_id)
-    effective_observed_at = observed_at or datetime.now(timezone.utc)
-    if (
-        effective_observed_at.tzinfo is None
-        or effective_observed_at.utcoffset() is None
-    ):
-        raise ValueError("observed_at must be timezone-aware")
-    if (
-        previous is not None
-        and effective_observed_at <= previous.observed_at
-    ):
-        raise ValueError(
-            "observed_at must be later than the latest classification"
-        )
+        previous = store.latest_classification(ad_id)
+        effective_observed_at = observed_at or datetime.now(timezone.utc)
+        if (
+            effective_observed_at.tzinfo is None
+            or effective_observed_at.utcoffset() is None
+        ):
+            raise ValueError("observed_at must be timezone-aware")
+        if (
+            previous is not None
+            and effective_observed_at <= previous.observed_at
+        ):
+            raise ValueError(
+                "observed_at must be later than the latest classification"
+            )
 
-    merged = {
-        dimension: getattr(previous, dimension) if previous is not None else None
-        for dimension in ANALYTICS_DIMENSIONS
-    }
-    merged.update(normalized_labels)
-    for dimension in normalized_clears:
-        merged[dimension] = None
-
-    previous_values = (
-        {
-            dimension: getattr(previous, dimension)
+        merged = {
+            dimension: (
+                getattr(previous, dimension) if previous is not None else None
+            )
             for dimension in ANALYTICS_DIMENSIONS
         }
-        if previous is not None
-        else {dimension: None for dimension in ANALYTICS_DIMENSIONS}
-    )
-    if merged == previous_values:
-        raise ValueError("classification update would not change any label")
+        merged.update(normalized_labels)
+        for dimension in normalized_clears:
+            merged[dimension] = None
 
-    classification = AdClassification(
-        ad_id=ad_id,
-        observed_at=effective_observed_at,
-        source=_SOURCE,
-        **merged,
-    )
-    store.append_classification(classification)
-    return classification
+        previous_values = (
+            {
+                dimension: getattr(previous, dimension)
+                for dimension in ANALYTICS_DIMENSIONS
+            }
+            if previous is not None
+            else {dimension: None for dimension in ANALYTICS_DIMENSIONS}
+        )
+        if merged == previous_values:
+            raise ValueError("classification update would not change any label")
+
+        classification = AdClassification(
+            ad_id=ad_id,
+            observed_at=effective_observed_at,
+            source=_SOURCE,
+            **merged,
+        )
+        store.append_classification(classification)
+        return classification
 
 
 def _classification_to_dict(item: AdClassification) -> dict[str, object]:
