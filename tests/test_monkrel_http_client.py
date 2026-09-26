@@ -153,6 +153,32 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
         self.assertEqual(client.build_calls[0]["title"], "Alter Titel")
         self.assertEqual(client.build_calls[0]["description"], "Neu")
 
+    def test_partial_update_preserves_whitespace_in_untouched_content(self):
+        payload = owner_payload()
+        payload[AD_NS]["value"]["description"] = {
+            "value": "  Alte Beschreibung  "
+        }
+        client = FakeRawClient(payload)
+        writer = MonkrelPrivateHttpContentClient(client)
+
+        writer.update_ad("3521676801", title="Neu")
+
+        self.assertEqual(
+            client.build_calls[0]["description"],
+            "  Alte Beschreibung  ",
+        )
+
+    def test_removing_existing_content_whitespace_is_not_a_noop(self):
+        payload = owner_payload()
+        payload[AD_NS]["value"]["title"] = {"value": "  Alter Titel  "}
+        client = FakeRawClient(payload)
+        writer = MonkrelPrivateHttpContentClient(client)
+
+        writer.update_ad("3521676801", title="Alter Titel")
+
+        self.assertEqual(client.build_calls[0]["title"], "Alter Titel")
+        self.assertEqual(client.calls[-1][0], "PUT")
+
     def test_requires_dedicated_single_attempt_monkrel_client(self):
         client = FakeRawClient(owner_payload(), max_retries=3)
         writer = MonkrelPrivateHttpContentClient(client)
