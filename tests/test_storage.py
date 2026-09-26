@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -161,6 +163,58 @@ class SnapshotStoreTests(unittest.TestCase):
         store.append_reaction_snapshot(second)
 
         self.assertEqual(store.reaction_history("3521676801"), (first, second))
+
+
+    def test_merge_classification_serializes_symlink_aliases(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "mark.sqlite"
+        direct_store = SnapshotStore(db_path)
+        direct_store.append_ad_snapshot(
+            AdSnapshot(
+                ad_id="42",
+                observed_at=NOW,
+                source="management",
+                lifecycle_state=LifecycleState.ACTIVE,
+            )
+        )
+
+        alias_path = Path(tmp.name) / "mark-alias.sqlite"
+        alias_path.symlink_to(db_path)
+        alias_store = SnapshotStore(alias_path)
+        barrier = Barrier(2)
+
+        def merge(
+            store: SnapshotStore,
+            changes: dict[str, str | None],
+        ) -> None:
+            barrier.wait(timeout=5)
+            store.merge_classification(
+                ad_id="42",
+                source="test",
+                changes=changes,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            city_update = pool.submit(
+                merge,
+                direct_store,
+                {"city": "Dresden"},
+            )
+            title_update = pool.submit(
+                merge,
+                alias_store,
+                {"title_type": "question"},
+            )
+            city_update.result(timeout=5)
+            title_update.result(timeout=5)
+
+        latest = direct_store.latest_classification("42")
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertEqual(latest.city, "Dresden")
+        self.assertEqual(latest.title_type, "question")
+        self.assertEqual(len(direct_store.classification_history("42")), 2)
 
 
 if __name__ == "__main__":

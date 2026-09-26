@@ -20,6 +20,29 @@ Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkreti
 - Am 25.09.2026 wurde der aktuell eingeloggte eigene Account read-only durch `ManagementReadAdapter -> EnrichedOwnerReader -> MarkService -> SnapshotStore` geführt: erfolgreicher leerer Besitzerbestand (`success_empty`), keine Plattformmutation.
 - Plattformwrites sind im Core standardmäßig deaktiviert. Create/Publish ist weiterhin nicht für den Dauerbetrieb freigegeben.
 
+## Lokale Klassifikationspflege
+
+Die Analytics-Gruppierung verwendet explizite Labels für `image_type`, `city`, `text_type` und `title_type`. Das HTTP-Dashboard bleibt absichtlich vollständig read-only. Labels werden lokal und append-only über den separaten CLI-Entrypoint gepflegt:
+
+```bash
+mark-api-classify \
+  --db /pfad/zu/mark.sqlite \
+  --ad-id 1234567890 \
+  --city Dresden \
+  --image-type overview
+```
+
+Nicht angegebene Dimensionen werden aus der letzten Klassifikation übernommen. Ein Label wird nur durch eine explizite Clear-Aktion entfernt, zum Beispiel:
+
+```bash
+mark-api-classify \
+  --db /pfad/zu/mark.sqlite \
+  --ad-id 1234567890 \
+  --clear text-type
+```
+
+Der CLI akzeptiert nur bereits im lokalen Store bekannte Anzeigen-IDs. Er greift weder auf Kleinanzeigen noch auf andere Netzwerkdienste zu und verändert keine Plattformdaten.
+
 ## Offene fachliche Punkte
 
 Die Reaktionsdaten werden absichtlich getrennt als `conversation_count`, `unique_buyer_count` und `inbound_message_count` gespeichert. Welche dieser Größen fachlich „wie viele geschrieben haben“ meint, ist noch nicht festgelegt.
