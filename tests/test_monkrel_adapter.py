@@ -56,6 +56,9 @@ class FakeClient:
     def delete_ad(self, ad_id):
         self.calls.append(("delete_ad", ad_id))
 
+    def update_ad(self, ad_id, *, title=None, description=None):
+        self.calls.append(("update_ad", ad_id, title, description))
+
     def conversations(self, page=0, size=100):
         self.calls.append(("conversations", page, size))
         if self.conversations_error is not None:
@@ -210,6 +213,46 @@ class MonkrelMobileApiAdapterTests(unittest.TestCase):
         self.adapter(client).delete_ad("3521676801")
 
         self.assertEqual(client.calls, [("delete_ad", "3521676801")])
+
+    def test_content_writer_dispatches_exact_partial_update(self) -> None:
+        client = FakeClient()
+        adapter = self.adapter(client)
+
+        adapter.update_content(" 3521676801 ", title="Neuer Titel")
+        adapter.update_content("3521676801", description="Neue Beschreibung")
+
+        self.assertEqual(
+            client.calls,
+            [
+                ("update_ad", "3521676801", "Neuer Titel", None),
+                ("update_ad", "3521676801", None, "Neue Beschreibung"),
+            ],
+        )
+
+    def test_content_writer_fails_closed_without_update_capability(self) -> None:
+        class ClientWithoutUpdate:
+            pass
+
+        adapter = MonkrelMobileApiAdapter(ClientWithoutUpdate(), clock=lambda: NOW)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "content update capability unavailable",
+        ):
+            adapter.update_content("3521676801", title="Neuer Titel")
+
+    def test_content_writer_requires_at_least_one_valid_field(self) -> None:
+        client = FakeClient()
+        adapter = self.adapter(client)
+
+        with self.assertRaises(ValueError):
+            adapter.update_content("3521676801")
+        with self.assertRaises(TypeError):
+            adapter.update_content("3521676801", title=123)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            adapter.update_content("   ", title="Neuer Titel")
+
+        self.assertEqual(client.calls, [])
 
     def test_reactions_count_conversations_unique_buyers_and_inbound_messages(self) -> None:
         client = FakeClient()

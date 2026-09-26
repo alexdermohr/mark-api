@@ -248,3 +248,17 @@ Diese Punkte werden erst gewählt, wenn der frameworkfreie Core-Slice und die er
 ## Konsequenz
 
 Der Realtest beendet die Architektur-Sondierung. Weitere breite Toolrecherche ist nicht Teil des nächsten Schritts; ab jetzt wird entlang dieser Adaptergrenzen implementiert und gegen die dokumentierten Realtest-Regressionsfälle geprüft.
+
+## Fortschreibung 26.09.2026 — HTTP-first Write-Pfad
+
+Die Entscheidung wird für den nächsten Slice präzisiert:
+
+- Ziel bleibt eine **eigene schreibfähige Mark-API**.
+- Für private/eigene Anzeigen wird die Mobile-CAPI als primärer technischer Write-Kandidat ausgebaut.
+- Für bestehende Inhaltsupdates bleibt der remote belegte Browser-Update-Adapter **operativ primär**, solange der private HTTP-in-place-Updatepfad nicht remote bestätigt ist. Nach erfolgreichem HTTP-Beleg wird er zum Fallback; das Zielbild bleibt HTTP-first.
+- `MonkrelMobileApiAdapter` erhält den `AdContentUpdater`-Vertrag und delegiert Partial-Updates an einen HTTP-fähigen Client.
+- Der konkrete 2026er private in-place-Request bleibt bis zum separaten Remote-Smoke fail-closed; dieser Commit führt keinen Plattform-Write aus.
+- Für Power/Premium bleibt ein offizieller ProSellersAdapter parallel möglich und soll denselben Domainvertrag erfüllen.
+- Danach wird die externe Mark-HTTP-Schicht mit Write-Endpunkten gegen den bestehenden `SafeWriteOrchestrator` gebaut.
+
+Die technische Begründung und Capability-Matrix stehen in `docs/technical-write-capabilities-2026-09-26.md`.

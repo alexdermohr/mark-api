@@ -35,6 +35,15 @@ class MonkrelClient(Protocol):
     def delete_ad(self, ad_id: str) -> None:
         ...
 
+    def update_ad(
+        self,
+        ad_id: str,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        ...
+
     def conversations(self, page: int = 0, size: int = 100) -> list:
         ...
 
@@ -65,6 +74,25 @@ def _optional_string(value: Any, field_name: str) -> str | None:
 
 def _pseudonym(value: str) -> bytes:
     return hashlib.sha256(value.encode("utf-8")).digest()
+
+
+def _validated_content_updates(
+    *,
+    title: str | None,
+    description: str | None,
+) -> dict[str, str]:
+    updates: dict[str, str] = {}
+    if title is not None:
+        if not isinstance(title, str):
+            raise TypeError("title must be a string or None")
+        updates["title"] = title
+    if description is not None:
+        if not isinstance(description, str):
+            raise TypeError("description must be a string or None")
+        updates["description"] = description
+    if not updates:
+        raise ValueError("at least one content field must be provided")
+    return updates
 
 
 def _is_unauthenticated_exception(exc: Exception) -> bool:
@@ -232,6 +260,23 @@ class MonkrelMobileApiAdapter:
 
     def delete_ad(self, ad_id: str) -> None:
         self._client.delete_ad(ad_id)
+
+    def update_content(
+        self,
+        ad_id: str,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        target_id = _required_id(ad_id, "ad_id")
+        updates = _validated_content_updates(
+            title=title,
+            description=description,
+        )
+        update_ad = getattr(self._client, "update_ad", None)
+        if not callable(update_ad):
+            raise RuntimeError("monkrel content update capability unavailable")
+        update_ad(target_id, **updates)
 
     def _all_conversations(self) -> ReadResult[tuple[Any, ...]]:
         conversations: list[Any] = []
