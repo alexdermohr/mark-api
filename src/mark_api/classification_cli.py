@@ -49,12 +49,21 @@ def update_classification(
 ) -> AdClassification:
     """Append one merged classification snapshot for an already tracked ad."""
 
-    normalized_labels = dict(labels or {})
-    unknown_labels = sorted(set(normalized_labels) - set(ANALYTICS_DIMENSIONS))
+    raw_labels = dict(labels or {})
+    unknown_labels = sorted(set(raw_labels) - set(ANALYTICS_DIMENSIONS))
     if unknown_labels:
         raise ValueError(
             "unknown classification dimensions: " + ", ".join(unknown_labels)
         )
+
+    normalized_labels: dict[str, str] = {}
+    for dimension, value in raw_labels.items():
+        if not isinstance(value, str):
+            raise ValueError(f"{dimension} must be a string")
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError(f"{dimension} must not be blank")
+        normalized_labels[dimension] = normalized_value
 
     normalized_clears = tuple(clears)
     unknown_clears = sorted(set(normalized_clears) - set(ANALYTICS_DIMENSIONS))

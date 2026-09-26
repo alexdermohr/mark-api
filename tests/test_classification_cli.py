@@ -176,6 +176,13 @@ class ClassificationCliTests(unittest.TestCase):
             update_classification(
                 store,
                 ad_id="1",
+                labels={"city": "  Berlin  "},
+                observed_at=T1,
+            )
+        with self.assertRaisesRegex(ValueError, "would not change"):
+            update_classification(
+                store,
+                ad_id="1",
                 clears=("image_type",),
                 observed_at=T1,
             )
