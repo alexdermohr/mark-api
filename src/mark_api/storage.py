@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from .domain import (
     AdClassification,
@@ -15,6 +15,14 @@ from .domain import (
     ReactionSnapshot,
 )
 from .results import ReadResult, ReadStatus
+
+
+_CLASSIFICATION_FIELDS = (
+    "image_type",
+    "city",
+    "text_type",
+    "title_type",
+)
 
 
 class SnapshotStore:
@@ -144,25 +152,152 @@ class SnapshotStore:
                 ),
             )
 
+    @staticmethod
+    def _insert_classification(
+        connection: sqlite3.Connection,
+        classification: AdClassification,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO ad_classifications (
+                ad_id, observed_at, source, image_type, city,
+                text_type, title_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                classification.ad_id,
+                classification.observed_at.isoformat(),
+                classification.source,
+                classification.image_type,
+                classification.city,
+                classification.text_type,
+                classification.title_type,
+            ),
+        )
+
     def append_classification(self, classification: AdClassification) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO ad_classifications (
-                    ad_id, observed_at, source, image_type, city,
-                    text_type, title_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    classification.ad_id,
-                    classification.observed_at.isoformat(),
-                    classification.source,
-                    classification.image_type,
-                    classification.city,
-                    classification.text_type,
-                    classification.title_type,
-                ),
+            self._insert_classification(connection, classification)
+
+    def merge_classification(
+        self,
+        *,
+        ad_id: str,
+        source: str,
+        changes: Mapping[str, str | None],
+        observed_at: datetime | None = None,
+    ) -> AdClassification:
+        """Atomically merge one classification update for an already tracked ad."""
+
+        requested_changes = dict(changes)
+        unknown_fields = sorted(
+            set(requested_changes) - set(_CLASSIFICATION_FIELDS)
+        )
+        if unknown_fields:
+            raise ValueError(
+                "unknown classification dimensions: "
+                + ", ".join(unknown_fields)
             )
+        if not requested_changes:
+            raise ValueError("at least one classification change is required")
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            tracked = connection.execute(
+                """
+                SELECT 1
+                FROM ad_snapshots
+                WHERE ad_id = ?
+                LIMIT 1
+                """,
+                (ad_id,),
+            ).fetchone()
+            if tracked is None:
+                raise ValueError(f"unknown tracked ad_id: {ad_id}")
+
+            rows = connection.execute(
+                """
+                SELECT id, ad_id, observed_at, source, image_type, city,
+                       text_type, title_type
+                FROM ad_classifications
+                WHERE ad_id = ?
+                """,
+                (ad_id,),
+            ).fetchall()
+            previous_row = (
+                max(
+                    rows,
+                    key=lambda row: (
+                        datetime.fromisoformat(row["observed_at"]),
+                        int(row["id"]),
+                    ),
+                )
+                if rows
+                else None
+            )
+            previous = (
+                AdClassification(
+                    ad_id=previous_row["ad_id"],
+                    observed_at=datetime.fromisoformat(
+                        previous_row["observed_at"]
+                    ),
+                    source=previous_row["source"],
+                    image_type=previous_row["image_type"],
+                    city=previous_row["city"],
+                    text_type=previous_row["text_type"],
+                    title_type=previous_row["title_type"],
+                )
+                if previous_row is not None
+                else None
+            )
+
+            merged = {
+                field_name: (
+                    getattr(previous, field_name)
+                    if previous is not None
+                    else None
+                )
+                for field_name in _CLASSIFICATION_FIELDS
+            }
+            merged.update(requested_changes)
+
+            classification = AdClassification(
+                ad_id=ad_id,
+                observed_at=observed_at or datetime.now(timezone.utc),
+                source=source,
+                **merged,
+            )
+            if (
+                previous is not None
+                and classification.observed_at <= previous.observed_at
+            ):
+                raise ValueError(
+                    "observed_at must be later than the latest classification"
+                )
+
+            previous_values = (
+                {
+                    field_name: getattr(previous, field_name)
+                    for field_name in _CLASSIFICATION_FIELDS
+                }
+                if previous is not None
+                else {
+                    field_name: None
+                    for field_name in _CLASSIFICATION_FIELDS
+                }
+            )
+            classification_values = {
+                field_name: getattr(classification, field_name)
+                for field_name in _CLASSIFICATION_FIELDS
+            }
+            if classification_values == previous_values:
+                raise ValueError(
+                    "classification update would not change any label"
+                )
+
+            self._insert_classification(connection, classification)
+            return classification
 
     @staticmethod
     def _snapshot_json(snapshot: AdSnapshot | None) -> str | None:

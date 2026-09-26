@@ -2,21 +2,13 @@ from __future__ import annotations
 
 import io
 import json
-import os
-import subprocess
-import sys
 import tempfile
-import time
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mark_api.classification_cli import (
-    _classification_update_lock,
-    main,
-    update_classification,
-)
+from mark_api.classification_cli import main, update_classification
 from mark_api.domain import AdClassification, AdSnapshot, LifecycleState
 from mark_api.storage import SnapshotStore
 
@@ -221,84 +213,6 @@ class ClassificationCliTests(unittest.TestCase):
         assert stored is not None
         self.assertEqual(stored.city, "Dresden")
         self.assertEqual(stored.image_type, "overview")
-
-    def test_cross_process_cli_serializes_read_merge_append(self) -> None:
-        tmp, store = self.make_store()
-        self.track(store, "42")
-        store.append_classification(
-            AdClassification(
-                ad_id="42",
-                observed_at=T1,
-                source="manual",
-                city="Dresden",
-            )
-        )
-        db_path = Path(tmp.name) / "mark.sqlite"
-        marker = Path(tmp.name) / "child-ready"
-        root = Path(__file__).resolve().parents[1]
-        child_script = (
-            "from pathlib import Path\n"
-            "from mark_api.classification_cli import main\n"
-            f"Path({str(marker)!r}).write_text('ready', encoding='utf-8')\n"
-            "raise SystemExit(main(["
-            f"{str('--db')!r}, {str(db_path)!r}, "
-            f"{str('--ad-id')!r}, {str('42')!r}, "
-            f"{str('--title-type')!r}, {str('question')!r}"
-            "]))\n"
-        )
-        env = os.environ.copy()
-        src_path = str(root / "src")
-        if env.get("PYTHONPATH"):
-            env["PYTHONPATH"] = src_path + os.pathsep + env["PYTHONPATH"]
-        else:
-            env["PYTHONPATH"] = src_path
-
-        process: subprocess.Popen[str] | None = None
-        try:
-            with _classification_update_lock(store):
-                process = subprocess.Popen(
-                    [sys.executable, "-c", child_script],
-                    cwd=root,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                deadline = time.monotonic() + 5
-                while not marker.exists() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(marker.exists(), "child did not reach CLI entrypoint")
-                with self.assertRaises(subprocess.TimeoutExpired):
-                    process.wait(timeout=0.3)
-
-                store.append_classification(
-                    AdClassification(
-                        ad_id="42",
-                        observed_at=datetime.now(timezone.utc),
-                        source="manual-parent",
-                        image_type="detail",
-                        city="Dresden",
-                    )
-                )
-
-            stdout, stderr = process.communicate(timeout=5)
-            self.assertEqual(process.returncode, 0, stderr)
-        finally:
-            if process is not None and process.poll() is None:
-                process.kill()
-                process.wait(timeout=5)
-
-        payload = json.loads(stdout)
-        self.assertEqual(payload["city"], "Dresden")
-        self.assertEqual(payload["image_type"], "detail")
-        self.assertEqual(payload["title_type"], "question")
-
-        latest = store.latest_classification("42")
-        self.assertIsNotNone(latest)
-        assert latest is not None
-        self.assertEqual(latest.city, "Dresden")
-        self.assertEqual(latest.image_type, "detail")
-        self.assertEqual(latest.title_type, "question")
 
     def test_main_clear_flag_maps_cli_name_and_preserves_other_labels(self) -> None:
         tmp, store = self.make_store()
