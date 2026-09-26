@@ -68,6 +68,15 @@ def _required_text(value: Any, field: str) -> str:
     return text
 
 
+def _required_content_text(value: Any, field: str) -> str:
+    value = _unwrap_value(value)
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    if not value.strip():
+        raise ValueError(f"{field} is blank")
+    return value
+
+
 def _optional_text(value: Any, field: str) -> str | None:
     if value is None:
         return None
@@ -288,8 +297,11 @@ class MonkrelPrivateHttpContentClient:
 
         _ensure_supported_optional_features(ad)
 
-        current_title = _required_text(ad.get("title"), "title")
-        current_description = _required_text(ad.get("description"), "description")
+        current_title = _required_content_text(ad.get("title"), "title")
+        current_description = _required_content_text(
+            ad.get("description"),
+            "description",
+        )
         new_title = current_title if title is None else title
         new_description = current_description if description is None else description
         if new_title == current_title and new_description == current_description:

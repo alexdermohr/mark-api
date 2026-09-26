@@ -151,6 +151,18 @@ Zusammen mit der aktuellen Endpoint-Kartierung ist damit die technische Hypothes
 
 Damit ist die lokale Transportlücke geschlossen. Der Browser bleibt für echte Inhaltsupdates weiterhin operativ primär, bis der Remote-Smoke den HTTP-Pfad auf einer eigenen Anzeige bestätigt.
 
+### Runtime-Komposition
+
+`MonkrelPrivateHttpRuntimeClient` schließt jetzt auch die Laufzeitlücke zwischen dem bestehenden `MonkrelMobileApiAdapter` und dem neuen HTTP-Content-Writer:
+
+- `my_ads`, Pause, Aktivieren, Delete, Conversations und Messages werden explizit an den normalen upstream Client delegiert,
+- `update_ad` wird ausschließlich an den separaten `MonkrelPrivateHttpContentClient` delegiert,
+- der Content-Write-Client kann dadurch unabhängig mit `max_retries=1` betrieben werden,
+- unbekannte upstream-Methoden werden **nicht** über ein generisches Proxy/`__getattr__` exponiert,
+- `build_monkrel_private_http_adapter(...)` liefert direkt einen für Mark nutzbaren `MonkrelMobileApiAdapter` mit dieser Trennung.
+
+Die Runtime-Komposition ist lokal regressionsgetestet. Sie ändert nichts am Remote-Smoke-Gate.
+
 ## Im Projekt bereits remote belegt
 
 Der bestehende PoC hat gegen eigene Testdaten bereits praktisch bestätigt:
@@ -210,6 +222,15 @@ Die konkrete Webframework-Wahl bleibt nachrangig gegenüber stabilen Domain-/Ada
 ### Slice B — HTTP-Primitive lokal vorhanden; nächster Schritt Remote-Beweis
 
 Der konservative `MonkrelPrivateHttpContentClient` ist lokal implementiert und getestet. Er führt in diesem Slice keinen Plattform-Write aus.
+
+Die Runtime-Facade ist ebenfalls implementiert. Der anschließende Remote-Preflight am 26.09.2026 blieb fail-closed:
+
+- kein dedizierter Mobile-Refresh-Token liegt an einem bekannten sicheren Laufzeitpfad vor,
+- das persistente Verkäufer-Browserprofil ist vorhanden, die Kleinanzeigen-Websession aber abgelaufen,
+- die sichere Grabowski-Browser-Surface erlaubt Navigation, aber keinen generischen Credential-Submit auf öffentlichen Origins,
+- es wurde weder ein Auth-Bypass noch ein Kleinanzeigen-Plattformwrite ausgeführt.
+
+Für den ersten echten HTTP-Write ist deshalb weiterhin zuerst eine reguläre Reauthentifizierung erforderlich.
 
 Auf genau einer eigenen, ausdrücklich geeigneten Anzeige:
 
