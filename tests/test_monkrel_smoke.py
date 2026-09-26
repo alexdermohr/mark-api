@@ -90,9 +90,7 @@ def owner_success(content: SmokeContent = BASELINE) -> ReadResult[AdSnapshot]:
     return success(content, source="monkrel-mobile-api")
 
 
-def management_success(
-    content: SmokeContent,
-) -> ReadResult[AdSnapshot]:
+def management_success(content: SmokeContent) -> ReadResult[AdSnapshot]:
     return success(
         content,
         source="kleinanzeigen-management",
@@ -101,8 +99,14 @@ def management_success(
 
 
 class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
-    def test_title_smoke_uses_management_without_description(self):
-        owner = FakeReader([owner_success()])
+    def test_title_smoke_requires_independent_field_and_full_owner_content(self):
+        owner = FakeReader(
+            [
+                owner_success(BASELINE),
+                owner_success(TITLE_TARGET),
+                owner_success(BASELINE),
+            ]
+        )
         independent = FakeReader(
             [
                 management_success(BASELINE),
@@ -128,12 +132,18 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
             writer.calls,
             [
                 (AD_ID, TITLE_TARGET.title, None),
-                (AD_ID, BASELINE.title, None),
+                (AD_ID, BASELINE.title, BASELINE.description),
             ],
         )
 
     def test_write_exception_never_retries_but_readback_can_confirm_effect(self):
-        owner = FakeReader([owner_success()])
+        owner = FakeReader(
+            [
+                owner_success(BASELINE),
+                owner_success(TITLE_TARGET),
+                owner_success(BASELINE),
+            ]
+        )
         independent = FakeReader(
             [
                 management_success(BASELINE),
@@ -153,10 +163,13 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
         self.assertEqual(result.outcome, SmokeOutcome.VERIFIED_AND_ROLLED_BACK)
         self.assertEqual(result.write_error, "TimeoutError")
         self.assertEqual(len(writer.calls), 2)
-        self.assertEqual(writer.calls[1], (AD_ID, BASELINE.title, None))
+        self.assertEqual(
+            writer.calls[1],
+            (AD_ID, BASELINE.title, BASELINE.description),
+        )
 
-    def test_unconfirmed_write_stops_without_rollback_or_retry(self):
-        owner = FakeReader([owner_success()])
+    def test_unconfirmed_changed_field_stops_without_rollback_or_retry(self):
+        owner = FakeReader([owner_success(BASELINE)])
         independent = FakeReader(
             [
                 management_success(BASELINE),
@@ -176,13 +189,11 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
         self.assertFalse(result.target_confirmed)
         self.assertFalse(result.rollback_confirmed)
         self.assertEqual(result.write_error, "TimeoutError")
-        self.assertEqual(
-            writer.calls,
-            [(AD_ID, TITLE_TARGET.title, None)],
-        )
+        self.assertEqual(writer.calls, [(AD_ID, TITLE_TARGET.title, None)])
+        self.assertEqual(len(owner.calls), 1)
 
-    def test_failed_independent_readback_stops_without_rollback(self):
-        owner = FakeReader([owner_success()])
+    def test_failed_independent_target_readback_stops_without_rollback(self):
+        owner = FakeReader([owner_success(BASELINE)])
         independent = FakeReader(
             [
                 management_success(BASELINE),
@@ -204,6 +215,81 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
         self.assertEqual(result.outcome, SmokeOutcome.WRITE_UNCONFIRMED)
         self.assertEqual(result.readback_error, "RuntimeError")
         self.assertEqual(len(writer.calls), 1)
+        self.assertEqual(len(owner.calls), 1)
+
+    def test_full_target_mismatch_is_recovered_but_never_counted_as_proof(self):
+        corrupted_target = SmokeContent(
+            ad_id=AD_ID,
+            title=TITLE_TARGET.title,
+            description="unexpected description mutation",
+        )
+        owner = FakeReader(
+            [
+                owner_success(BASELINE),
+                owner_success(corrupted_target),
+                owner_success(BASELINE),
+            ]
+        )
+        independent = FakeReader(
+            [
+                management_success(BASELINE),
+                management_success(TITLE_TARGET),
+                management_success(BASELINE),
+            ]
+        )
+        writer = FakeWriter()
+        smoke = MonkrelPrivateHttpContentSmoke(
+            owner_reader=owner,
+            independent_reader=independent,
+            writer=writer,
+        )
+
+        result = smoke.run(baseline=BASELINE, target=TITLE_TARGET)
+
+        self.assertEqual(result.outcome, SmokeOutcome.TARGET_CONTENT_UNCONFIRMED)
+        self.assertFalse(result.target_confirmed)
+        self.assertTrue(result.rollback_confirmed)
+        self.assertEqual(result.readback_error, "owner_target_mismatch")
+        self.assertEqual(
+            writer.calls,
+            [
+                (AD_ID, TITLE_TARGET.title, None),
+                (AD_ID, BASELINE.title, BASELINE.description),
+            ],
+        )
+
+    def test_failed_full_target_read_is_recovered_but_not_counted_as_proof(self):
+        owner = FakeReader(
+            [
+                owner_success(BASELINE),
+                ReadResult.failure(
+                    ReadStatus.TRANSPORT_ERROR,
+                    error="redacted",
+                ),
+                owner_success(BASELINE),
+            ]
+        )
+        independent = FakeReader(
+            [
+                management_success(BASELINE),
+                management_success(TITLE_TARGET),
+                management_success(BASELINE),
+            ]
+        )
+        writer = FakeWriter()
+        smoke = MonkrelPrivateHttpContentSmoke(
+            owner_reader=owner,
+            independent_reader=independent,
+            writer=writer,
+        )
+
+        result = smoke.run(baseline=BASELINE, target=TITLE_TARGET)
+
+        self.assertEqual(result.outcome, SmokeOutcome.TARGET_CONTENT_UNCONFIRMED)
+        self.assertFalse(result.target_confirmed)
+        self.assertTrue(result.rollback_confirmed)
+        self.assertEqual(result.readback_error, "RuntimeError")
+        self.assertEqual(len(writer.calls), 2)
 
     def test_rollback_exception_never_retries_when_final_readback_is_wrong(self):
         wrong_final = SmokeContent(
@@ -211,7 +297,13 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
             title="unexpected final title",
             description=BASELINE.description,
         )
-        owner = FakeReader([owner_success()])
+        owner = FakeReader(
+            [
+                owner_success(BASELINE),
+                owner_success(TITLE_TARGET),
+                owner_success(wrong_final),
+            ]
+        )
         independent = FakeReader(
             [
                 management_success(BASELINE),
@@ -234,8 +326,14 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
         self.assertEqual(result.rollback_error, "TimeoutError")
         self.assertEqual(len(writer.calls), 2)
 
-    def test_rollback_exception_can_be_resolved_only_by_independent_readback(self):
-        owner = FakeReader([owner_success()])
+    def test_rollback_exception_can_be_resolved_only_by_both_readbacks(self):
+        owner = FakeReader(
+            [
+                owner_success(BASELINE),
+                owner_success(TITLE_TARGET),
+                owner_success(BASELINE),
+            ]
+        )
         independent = FakeReader(
             [
                 management_success(BASELINE),
@@ -256,13 +354,46 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
         self.assertEqual(result.rollback_error, "TimeoutError")
         self.assertEqual(len(writer.calls), 2)
 
+    def test_owner_final_mismatch_blocks_success_even_if_management_is_restored(self):
+        owner_wrong = SmokeContent(
+            ad_id=AD_ID,
+            title=BASELINE.title,
+            description="description was not restored",
+        )
+        owner = FakeReader(
+            [
+                owner_success(BASELINE),
+                owner_success(TITLE_TARGET),
+                owner_success(owner_wrong),
+            ]
+        )
+        independent = FakeReader(
+            [
+                management_success(BASELINE),
+                management_success(TITLE_TARGET),
+                management_success(BASELINE),
+            ]
+        )
+        writer = FakeWriter()
+        smoke = MonkrelPrivateHttpContentSmoke(
+            owner_reader=owner,
+            independent_reader=independent,
+            writer=writer,
+        )
+
+        result = smoke.run(baseline=BASELINE, target=TITLE_TARGET)
+
+        self.assertEqual(result.outcome, SmokeOutcome.ROLLBACK_UNCONFIRMED)
+        self.assertFalse(result.rollback_confirmed)
+        self.assertEqual(result.readback_error, "rollback_readback_mismatch")
+
     def test_precondition_requires_exact_changed_field_on_independent_reader(self):
         other = SmokeContent(
             ad_id=AD_ID,
             title="changed elsewhere",
             description=BASELINE.description,
         )
-        owner = FakeReader([owner_success()])
+        owner = FakeReader([owner_success(BASELINE)])
         independent = FakeReader([management_success(other)])
         writer = FakeWriter()
         smoke = MonkrelPrivateHttpContentSmoke(
@@ -279,8 +410,28 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
 
         self.assertEqual(writer.calls, [])
 
+    def test_precondition_requires_exact_full_owner_baseline(self):
+        owner_other = SmokeContent(
+            ad_id=AD_ID,
+            title=BASELINE.title,
+            description="changed elsewhere",
+        )
+        owner = FakeReader([owner_success(owner_other)])
+        independent = FakeReader([management_success(BASELINE)])
+        writer = FakeWriter()
+        smoke = MonkrelPrivateHttpContentSmoke(
+            owner_reader=owner,
+            independent_reader=independent,
+            writer=writer,
+        )
+
+        with self.assertRaisesRegex(ValueError, "owner read does not match"):
+            smoke.run(baseline=BASELINE, target=TITLE_TARGET)
+
+        self.assertEqual(writer.calls, [])
+
     def test_precondition_requires_distinct_read_sources(self):
-        owner = FakeReader([owner_success()])
+        owner = FakeReader([owner_success(BASELINE)])
         independent = FakeReader(
             [success(BASELINE, source="monkrel-mobile-api")]
         )
@@ -319,7 +470,7 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
         self.assertEqual(writer.calls, [])
 
     def test_description_smoke_fails_closed_when_independent_reader_lacks_description(self):
-        owner = FakeReader([owner_success()])
+        owner = FakeReader([owner_success(BASELINE)])
         independent = FakeReader([management_success(BASELINE)])
         writer = FakeWriter()
         smoke = MonkrelPrivateHttpContentSmoke(
@@ -334,7 +485,13 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
         self.assertEqual(writer.calls, [])
 
     def test_description_smoke_works_with_independent_description_surface(self):
-        owner = FakeReader([owner_success()])
+        owner = FakeReader(
+            [
+                owner_success(BASELINE),
+                owner_success(DESCRIPTION_TARGET),
+                owner_success(BASELINE),
+            ]
+        )
         independent = FakeReader(
             [
                 success(BASELINE, source="independent-content-reader"),
@@ -356,7 +513,7 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
             writer.calls,
             [
                 (AD_ID, None, DESCRIPTION_TARGET.description),
-                (AD_ID, None, BASELINE.description),
+                (AD_ID, BASELINE.title, BASELINE.description),
             ],
         )
 

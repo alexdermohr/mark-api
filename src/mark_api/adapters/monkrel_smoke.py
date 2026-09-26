@@ -45,6 +45,7 @@ class SmokeContent:
 class SmokeOutcome(StrEnum):
     VERIFIED_AND_ROLLED_BACK = "verified_and_rolled_back"
     WRITE_UNCONFIRMED = "write_unconfirmed"
+    TARGET_CONTENT_UNCONFIRMED = "target_content_unconfirmed"
     ROLLBACK_UNCONFIRMED = "rollback_unconfirmed"
 
 
@@ -125,7 +126,17 @@ def _observed_field(
     )
 
 
-def _readback(
+def _owner_readback(
+    reader: SmokeAdReader,
+    ad_id: str,
+) -> tuple[_ObservedContent | None, str | None]:
+    try:
+        return _owner_content(reader, ad_id), None
+    except Exception as exc:  # noqa: BLE001 - external read boundary.
+        return None, type(exc).__name__
+
+
+def _field_readback(
     reader: SmokeAdReader,
     ad_id: str,
     field: ContentField,
@@ -155,15 +166,20 @@ def _changed_field(
 class MonkrelPrivateHttpContentSmoke:
     """Run one reversible, independently verified content-write smoke.
 
-    The harness deliberately performs no retries. The owner reader must expose
-    the complete exact baseline before the first write. The independent reader
-    must expose only the field being changed, which keeps title-only management
-    readback independent even when that surface does not include description.
+    The harness deliberately performs no retries. Before the first write, the
+    owner reader must expose the complete exact baseline while the independent
+    reader must expose the field being changed. This supports title-only
+    management readback even when that surface does not include description.
 
-    A rollback is attempted only after the independent reader confirms the
-    target field on the same ad id. A transport exception from either write
-    never authorizes a replay. Independent readback may establish that the
-    effect happened despite the exception; otherwise the run stops fail-closed.
+    After the first write, independent readback must prove that the changed
+    field reached the target before any recovery write is allowed. The owner
+    reader must then prove the complete target content so an untouched-field
+    regression cannot be reported as a successful smoke.
+
+    Recovery explicitly restores both bound baseline content fields exactly
+    once. Completion requires both independent changed-field readback and full
+    owner-content readback to confirm the baseline. A transport exception from
+    either write never authorizes a replay.
     """
 
     def __init__(
@@ -215,60 +231,92 @@ class MonkrelPrivateHttpContentSmoke:
         except Exception as exc:  # noqa: BLE001 - write outcome can be ambiguous.
             write_error = type(exc).__name__
 
-        target_after, target_read_error = _readback(
+        target_field, target_field_error = _field_readback(
             self._independent_reader,
             baseline.ad_id,
             changed_field,
         )
-        target_confirmed = bool(
-            target_after is not None
-            and target_after.source == independent_before.source
-            and target_after.value == getattr(target, changed_field)
+        target_field_confirmed = bool(
+            target_field is not None
+            and target_field.source == independent_before.source
+            and target_field.value == getattr(target, changed_field)
         )
-        if not target_confirmed:
+        if not target_field_confirmed:
             return SmokeResult(
                 outcome=SmokeOutcome.WRITE_UNCONFIRMED,
                 ad_id=baseline.ad_id,
                 target_confirmed=False,
                 rollback_confirmed=False,
                 write_error=write_error,
-                readback_error=target_read_error,
+                readback_error=target_field_error,
             )
 
-        rollback_kwargs = {
-            "title": baseline.title if changed_field == "title" else None,
-            "description": (
-                baseline.description if changed_field == "description" else None
-            ),
-        }
+        owner_target, owner_target_error = _owner_readback(
+            self._owner_reader,
+            baseline.ad_id,
+        )
+        target_content_confirmed = bool(
+            owner_target is not None
+            and owner_target.source == owner_before.source
+            and owner_target.content == target
+        )
+        target_content_error = owner_target_error
+        if owner_target is not None and not target_content_confirmed:
+            target_content_error = "owner_target_mismatch"
+
         rollback_error: str | None = None
         try:
             self._writer.update_content(
                 baseline.ad_id,
-                **rollback_kwargs,
+                title=baseline.title,
+                description=baseline.description,
             )
         except Exception as exc:  # noqa: BLE001 - rollback outcome can be ambiguous.
             rollback_error = type(exc).__name__
 
-        final_after, final_read_error = _readback(
+        final_field, final_field_error = _field_readback(
             self._independent_reader,
             baseline.ad_id,
             changed_field,
         )
-        rollback_confirmed = bool(
-            final_after is not None
-            and final_after.source == independent_before.source
-            and final_after.value == getattr(baseline, changed_field)
+        owner_final, owner_final_error = _owner_readback(
+            self._owner_reader,
+            baseline.ad_id,
         )
+        final_field_confirmed = bool(
+            final_field is not None
+            and final_field.source == independent_before.source
+            and final_field.value == getattr(baseline, changed_field)
+        )
+        final_content_confirmed = bool(
+            owner_final is not None
+            and owner_final.source == owner_before.source
+            and owner_final.content == baseline
+        )
+        rollback_confirmed = final_field_confirmed and final_content_confirmed
         if not rollback_confirmed:
+            final_error = final_field_error or owner_final_error
+            if final_error is None:
+                final_error = "rollback_readback_mismatch"
             return SmokeResult(
                 outcome=SmokeOutcome.ROLLBACK_UNCONFIRMED,
                 ad_id=baseline.ad_id,
-                target_confirmed=True,
+                target_confirmed=target_content_confirmed,
                 rollback_confirmed=False,
                 write_error=write_error,
                 rollback_error=rollback_error,
-                readback_error=final_read_error,
+                readback_error=final_error,
+            )
+
+        if not target_content_confirmed:
+            return SmokeResult(
+                outcome=SmokeOutcome.TARGET_CONTENT_UNCONFIRMED,
+                ad_id=baseline.ad_id,
+                target_confirmed=False,
+                rollback_confirmed=True,
+                write_error=write_error,
+                rollback_error=rollback_error,
+                readback_error=target_content_error,
             )
 
         return SmokeResult(
