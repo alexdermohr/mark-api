@@ -43,6 +43,32 @@ def _mapping(value: Any, label: str) -> dict[str, Any]:
     return current
 
 
+def _is_structurally_empty(value: Any) -> bool:
+    current = _unwrap_value(value)
+    if current is None or current is False or current == "":
+        return True
+    if isinstance(current, dict):
+        return all(
+            _is_structurally_empty(item)
+            for item in current.values()
+        )
+    if isinstance(current, (list, tuple)):
+        return all(_is_structurally_empty(item) for item in current)
+    return False
+
+
+def _optional_collection(
+    value: Any,
+    label: str,
+) -> dict[str, Any] | None:
+    current = _unwrap_value(value)
+    if isinstance(current, dict):
+        return current
+    if _is_structurally_empty(current):
+        return None
+    raise ValueError(f"owner ad has malformed {label}")
+
+
 def _as_sequence(value: Any) -> list[Any]:
     current = _unwrap_value(value)
     if current is None:
@@ -179,7 +205,9 @@ def _attributes(ad: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], ...]:
     raw_container = _direct(ad, "attributes", label="attributes")
     if raw_container is None:
         return ()
-    container = _mapping(raw_container, "attributes")
+    container = _optional_collection(raw_container, "attributes")
+    if container is None:
+        return ()
     items = _collection_items(container, "attribute", label="attributes")
     parsed: list[tuple[str, tuple[str, ...]]] = []
     for index, item in enumerate(items):
@@ -213,7 +241,9 @@ def _pictures(ad: dict[str, Any]) -> tuple[tuple[tuple[str, str], ...], ...]:
     raw_container = _direct(ad, "pictures", label="pictures")
     if raw_container is None:
         return ()
-    container = _mapping(raw_container, "pictures")
+    container = _optional_collection(raw_container, "pictures")
+    if container is None:
+        return ()
     raw_pictures = _collection_items(container, "picture", label="pictures")
     pictures: list[tuple[tuple[str, str], ...]] = []
     for picture_index, item in enumerate(raw_pictures):
@@ -249,13 +279,39 @@ def _shipping_option_ids(ad: dict[str, Any]) -> tuple[str, ...]:
     raw_container = _direct(ad, "shipping-options", label="shipping-options")
     if raw_container is None:
         return ()
-    container = _mapping(raw_container, "shipping-options")
+    container = _optional_collection(raw_container, "shipping-options")
+    if container is None:
+        return ()
     options = _collection_items(
         container,
         "shipping-option",
         label="shipping-options",
     )
-    ids = tuple(_id(option, "shipping-option") for option in options)
+    parsed_ids: list[str] = []
+    for index, option in enumerate(options):
+        block = _mapping(option, f"shipping-option[{index}]")
+        non_id_fields = {
+            key: item
+            for key, item in block.items()
+            if _local_name(key) != "id"
+        }
+        if not _is_structurally_empty(non_id_fields):
+            raise ValueError(
+                f"owner ad shipping-option[{index}] has nonempty metadata"
+            )
+        parsed_ids.append(
+            str(
+                _text(
+                    _direct(
+                        block,
+                        "id",
+                        label=f"shipping-option[{index}] id",
+                    ),
+                    f"shipping-option[{index}] id",
+                )
+            )
+        )
+    ids = tuple(parsed_ids)
     if len(ids) != len(set(ids)):
         raise ValueError("owner ad has duplicate shipping-option ids")
     return ids

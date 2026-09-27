@@ -330,6 +330,79 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
                 self.assertEqual([call[0] for call in client.calls], ["GET"])
                 self.assertEqual(client.build_calls, [])
 
+    def test_structurally_empty_optional_collection_wrappers_remain_empty(self):
+        empty_values = (
+            {"value": None},
+            {"value": False},
+            {"value": ""},
+            [],
+            [None],
+            {"unexpected": None},
+        )
+        cases = (
+            ("attributes", "attributes"),
+            ("pictures", "pictures"),
+            ("shipping-options", "shipping_option_ids"),
+        )
+        for field, invariant_field in cases:
+            for empty_value in empty_values:
+                with self.subTest(field=field, empty_value=empty_value):
+                    payload = owner_payload(shipping_options=("HERMES_001",))
+                    payload[AD_NS]["value"][field] = empty_value
+                    client = FakeRawClient(payload)
+                    writer = MonkrelPrivateHttpContentClient(client)
+
+                    state = writer.read_invariant("3521676801")
+
+                    self.assertEqual(getattr(state, invariant_field), ())
+                    self.assertEqual([call[0] for call in client.calls], ["GET"])
+                    self.assertEqual(client.build_calls, [])
+
+    def test_zero_optional_collection_wrapper_is_not_structurally_empty(self):
+        for field in ("attributes", "pictures", "shipping-options"):
+            with self.subTest(field=field):
+                payload = owner_payload(shipping_options=("HERMES_001",))
+                payload[AD_NS]["value"][field] = 0
+                client = FakeRawClient(payload)
+                writer = MonkrelPrivateHttpContentClient(client)
+
+                with self.assertRaisesRegex(ValueError, rf"malformed {field}"):
+                    writer.update_ad("3521676801", title="Neu")
+
+                self.assertEqual([call[0] for call in client.calls], ["GET"])
+                self.assertEqual(client.build_calls, [])
+
+    def test_shipping_option_nonempty_entry_metadata_fails_closed(self):
+        for metadata in ("5.49", 0, 1):
+            with self.subTest(metadata=metadata):
+                payload = owner_payload(shipping_options=("DHL_001",))
+                option = payload[AD_NS]["value"]["shipping-options"]["shipping-option"][0]
+                option["price"] = metadata
+                client = FakeRawClient(payload)
+                writer = MonkrelPrivateHttpContentClient(client)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"shipping-option\[0\].*nonempty metadata",
+                ):
+                    writer.update_ad("3521676801", title="Neu")
+
+                self.assertEqual([call[0] for call in client.calls], ["GET"])
+                self.assertEqual(client.build_calls, [])
+
+    def test_shipping_option_structurally_empty_entry_metadata_is_allowed(self):
+        payload = owner_payload(shipping_options=("DHL_001",))
+        option = payload[AD_NS]["value"]["shipping-options"]["shipping-option"][0]
+        option["price"] = {"value": None}
+        client = FakeRawClient(payload)
+        writer = MonkrelPrivateHttpContentClient(client)
+
+        state = writer.read_invariant("3521676801")
+
+        self.assertEqual(state.shipping_option_ids, ("DHL_001",))
+        self.assertEqual([call[0] for call in client.calls], ["GET"])
+        self.assertEqual(client.build_calls, [])
+
     def test_blank_attribute_member_fails_closed_before_builder_and_put(self):
         payload = owner_payload()
         payload[AD_NS]["value"]["attributes"]["attribute"][0]["value"] = [
