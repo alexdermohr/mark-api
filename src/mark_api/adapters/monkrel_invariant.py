@@ -58,7 +58,9 @@ def _text(value: Any, label: str, *, required: bool = True) -> str | None:
         if required:
             raise ValueError(f"owner ad is missing {label}")
         return None
-    if isinstance(current, (dict, list)):
+    if isinstance(current, bool):
+        raise ValueError(f"owner ad has boolean {label}")
+    if isinstance(current, (dict, list, tuple)):
         raise ValueError(f"owner ad has non-scalar {label}")
     text = str(current)
     if required and not text.strip():
@@ -103,12 +105,28 @@ def _has_nonempty_value(value: Any) -> bool:
     return bool(current)
 
 
+def _collection_items(
+    container: dict[str, Any],
+    child_local_name: str,
+    *,
+    label: str,
+) -> list[Any]:
+    raw_items = _direct(container, child_local_name, label=child_local_name)
+    if raw_items is None:
+        if _has_nonempty_value(container):
+            raise ValueError(
+                f"owner ad {label} is nonempty but missing {child_local_name}"
+            )
+        return []
+    return _as_sequence(raw_items)
+
+
 def _attributes(ad: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], ...]:
     raw_container = _direct(ad, "attributes", label="attributes")
     if raw_container is None:
         return ()
     container = _mapping(raw_container, "attributes")
-    items = _as_sequence(_direct(container, "attribute", label="attribute"))
+    items = _collection_items(container, "attribute", label="attributes")
     parsed: list[tuple[str, tuple[str, ...]]] = []
     for index, item in enumerate(items):
         attr = _mapping(item, f"attribute[{index}]")
@@ -143,7 +161,7 @@ def _pictures(ad: dict[str, Any]) -> tuple[tuple[tuple[str, str], ...], ...]:
     if raw_container is None:
         return ()
     container = _mapping(raw_container, "pictures")
-    raw_pictures = _as_sequence(_direct(container, "picture", label="picture"))
+    raw_pictures = _collection_items(container, "picture", label="pictures")
     pictures: list[tuple[tuple[str, str], ...]] = []
     for picture_index, item in enumerate(raw_pictures):
         picture = _mapping(item, f"picture[{picture_index}]")
@@ -179,8 +197,10 @@ def _shipping_option_ids(ad: dict[str, Any]) -> tuple[str, ...]:
     if raw_container is None:
         return ()
     container = _mapping(raw_container, "shipping-options")
-    options = _as_sequence(
-        _direct(container, "shipping-option", label="shipping-option")
+    options = _collection_items(
+        container,
+        "shipping-option",
+        label="shipping-options",
     )
     ids = tuple(_id(option, "shipping-option") for option in options)
     if len(ids) != len(set(ids)):

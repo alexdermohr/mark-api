@@ -193,6 +193,74 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
             (("second", ("B",)), ("first", ("A",))),
         )
 
+    def test_nonempty_collection_without_expected_child_fails_closed(self):
+        cases = (
+            (
+                "attributes",
+                {
+                    "unexpected": [
+                        {"name": "condition", "value": [{"value": "USED"}]}
+                    ]
+                },
+                "attribute",
+            ),
+            ("pictures", {"count": 1}, "picture"),
+            ("shipping-options", {"count": 1}, "shipping-option"),
+        )
+        for field, malformed, child in cases:
+            with self.subTest(field=field):
+                payload = owner_payload()
+                payload[AD_NS]["value"][field] = malformed
+                client = FakeRawClient(payload)
+                writer = MonkrelPrivateHttpContentClient(client)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"{field}.*missing {child}",
+                ):
+                    writer.update_ad("3521676801", title="Neu")
+
+                self.assertEqual([call[0] for call in client.calls], ["GET"])
+                self.assertEqual(client.build_calls, [])
+
+    def test_boolean_reconstructed_scalars_fail_closed(self):
+        cases = (
+            (
+                "attribute",
+                lambda ad: ad["attributes"]["attribute"][0]["value"][0].__setitem__(
+                    "value", True
+                ),
+            ),
+            (
+                "location-id",
+                lambda ad: ad["locations"]["location"][0].__setitem__("id", True),
+            ),
+            (
+                "shipping-option-id",
+                lambda ad: ad["shipping-options"]["shipping-option"][0].__setitem__(
+                    "id", True
+                ),
+            ),
+            (
+                "picture-href",
+                lambda ad: ad["pictures"]["picture"][0]["link"][1].__setitem__(
+                    "href", True
+                ),
+            ),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                payload = owner_payload(shipping_options=("HERMES_001",))
+                mutate(payload[AD_NS]["value"])
+                client = FakeRawClient(payload)
+                writer = MonkrelPrivateHttpContentClient(client)
+
+                with self.assertRaisesRegex(ValueError, "boolean"):
+                    writer.update_ad("3521676801", title="Neu")
+
+                self.assertEqual([call[0] for call in client.calls], ["GET"])
+                self.assertEqual(client.build_calls, [])
+
     def test_read_invariant_rejects_nested_decoy_for_missing_required_field(self):
         payload = owner_payload()
         ad = payload[AD_NS]["value"]
