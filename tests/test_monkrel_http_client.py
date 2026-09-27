@@ -582,6 +582,24 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
         self.assertEqual(client.build_calls[0]["price_type"], "FREE")
         self.assertEqual([call[0] for call in client.calls], ["GET", "PUT"])
 
+    def test_structurally_empty_buy_now_wrappers_remain_update_safe(self):
+        cases = (
+            ("false", False),
+            ("blank", ""),
+            ("null-wrapper", {"value": None}),
+        )
+        for label, value in cases:
+            with self.subTest(label=label):
+                payload = owner_payload()
+                payload[AD_NS]["value"]["buy-now"] = value
+                client = FakeRawClient(payload)
+                writer = MonkrelPrivateHttpContentClient(client)
+
+                writer.update_ad("3521676801", title="Neu")
+
+                self.assertEqual([call[0] for call in client.calls], ["GET", "PUT"])
+                self.assertEqual(len(client.build_calls), 1)
+
     def test_boolean_reconstructed_scalars_fail_closed(self):
         cases = (
             (

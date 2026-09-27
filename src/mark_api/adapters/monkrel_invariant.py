@@ -442,7 +442,7 @@ def owner_ad_invariant(
 
     buy_now_raw = _direct(ad, "buy-now", label="buy-now")
     buy_now_selected = False
-    if buy_now_raw is not None:
+    if buy_now_raw is not None and not _is_structurally_empty(buy_now_raw):
         buy_now = _mapping(buy_now_raw, "buy-now")
         buy_now_selected = _bool(
             _direct(buy_now, "selected", label="buy-now selected"),
