@@ -6,6 +6,7 @@ from typing import Literal, Protocol
 
 from ..domain import AdSnapshot
 from ..results import ReadResult
+from .monkrel_invariant import OwnerAdInvariant
 
 
 ContentField = Literal["title", "description"]
@@ -13,6 +14,11 @@ ContentField = Literal["title", "description"]
 
 class SmokeAdReader(Protocol):
     def read_ad(self, ad_id: str) -> ReadResult[AdSnapshot]:
+        ...
+
+
+class SmokeOwnerReader(Protocol):
+    def read_invariant(self, ad_id: str) -> OwnerAdInvariant:
         ...
 
 
@@ -61,12 +67,6 @@ class SmokeResult:
 
 
 @dataclass(frozen=True, slots=True)
-class _ObservedContent:
-    content: SmokeContent
-    source: str
-
-
-@dataclass(frozen=True, slots=True)
 class _ObservedField:
     field: ContentField
     value: str
@@ -98,21 +98,6 @@ def _content_field(
     return value
 
 
-def _owner_content(
-    reader: SmokeAdReader,
-    ad_id: str,
-) -> _ObservedContent:
-    snapshot = _snapshot(reader, ad_id)
-    return _ObservedContent(
-        content=SmokeContent(
-            ad_id=snapshot.ad_id,
-            title=_content_field(snapshot, "title"),
-            description=_content_field(snapshot, "description"),
-        ),
-        source=snapshot.source,
-    )
-
-
 def _observed_field(
     reader: SmokeAdReader,
     ad_id: str,
@@ -127,13 +112,16 @@ def _observed_field(
 
 
 def _owner_readback(
-    reader: SmokeAdReader,
+    reader: SmokeOwnerReader,
     ad_id: str,
-) -> tuple[_ObservedContent | None, str | None]:
+) -> tuple[OwnerAdInvariant | None, str | None]:
     try:
-        return _owner_content(reader, ad_id), None
+        observed = reader.read_invariant(ad_id)
     except Exception as exc:  # noqa: BLE001 - external read boundary.
         return None, type(exc).__name__
+    if observed.ad_id != ad_id:
+        return None, "owner_ad_id_mismatch"
+    return observed, None
 
 
 def _field_readback(
@@ -163,29 +151,40 @@ def _changed_field(
     return changed[0]
 
 
+def _bind_full_baseline(
+    baseline: SmokeContent,
+    baseline_invariant: OwnerAdInvariant,
+) -> None:
+    if baseline_invariant.ad_id != baseline.ad_id:
+        raise ValueError("full baseline binds a different ad id")
+    if baseline_invariant.title != baseline.title:
+        raise ValueError("full baseline title does not match bound content")
+    if baseline_invariant.description != baseline.description:
+        raise ValueError("full baseline description does not match bound content")
+
+
 class MonkrelPrivateHttpContentSmoke:
-    """Run one reversible, independently verified content-write smoke.
+    """Run one reversible content smoke with full owner-state invariants.
 
-    The harness deliberately performs no retries. Before the first write, the
-    owner reader must expose the complete exact baseline while the independent
-    reader must expose the field being changed. This supports title-only
-    management readback even when that surface does not include description.
+    The caller supplies a previously observed full owner baseline. The harness
+    immediately re-reads that state and requires exact equality before any
+    write. This turns price, category, pictures, attributes, shipping options,
+    buy-now state and the other reconstructed fields into explicit preconditions
+    rather than merely post-hoc diagnostics.
 
-    After the first write, independent readback must prove that the changed
-    field reached the target before any recovery write is allowed. The owner
-    reader must then prove the complete target content so an untouched-field
-    regression cannot be reported as a successful smoke.
+    The changed field must then be observed through a distinct independent
+    source before one recovery write is authorized. Full owner readback must
+    match the target invariant before success is possible. Recovery restores
+    both bound content fields exactly once, and completion requires both the
+    independent field read and the complete owner invariant to match baseline.
 
-    Recovery explicitly restores both bound baseline content fields exactly
-    once. Completion requires both independent changed-field readback and full
-    owner-content readback to confirm the baseline. A transport exception from
-    either write never authorizes a replay.
+    Neither the initial write nor recovery is retried after an exception.
     """
 
     def __init__(
         self,
         *,
-        owner_reader: SmokeAdReader,
+        owner_reader: SmokeOwnerReader,
         independent_reader: SmokeAdReader,
         writer: SmokeContentWriter,
     ) -> None:
@@ -198,10 +197,15 @@ class MonkrelPrivateHttpContentSmoke:
         *,
         baseline: SmokeContent,
         target: SmokeContent,
+        baseline_invariant: OwnerAdInvariant,
     ) -> SmokeResult:
         changed_field = _changed_field(baseline, target)
+        _bind_full_baseline(baseline, baseline_invariant)
 
-        owner_before = _owner_content(self._owner_reader, baseline.ad_id)
+        owner_before = self._owner_reader.read_invariant(baseline.ad_id)
+        if owner_before != baseline_invariant:
+            raise ValueError("owner read does not match the bound full baseline")
+
         independent_before = _observed_field(
             self._independent_reader,
             baseline.ad_id,
@@ -209,19 +213,26 @@ class MonkrelPrivateHttpContentSmoke:
         )
         if owner_before.source == independent_before.source:
             raise ValueError("independent reader must use a distinct source")
-        if owner_before.content != baseline:
-            raise ValueError("owner read does not match the bound baseline")
         if independent_before.value != getattr(baseline, changed_field):
             raise ValueError(
                 f"independent read does not match the bound baseline {changed_field}"
             )
 
+        # This is a pre-write gate. In particular, buy-now=true remains blocked
+        # until a direct wire-format contract is proven.
+        owner_before.require_content_update_safe()
+
+        target_invariant = baseline_invariant.with_content(
+            title=target.title,
+            description=target.description,
+        )
         target_kwargs = {
             "title": target.title if changed_field == "title" else None,
             "description": (
                 target.description if changed_field == "description" else None
             ),
         }
+
         write_error: str | None = None
         try:
             self._writer.update_content(
@@ -255,14 +266,10 @@ class MonkrelPrivateHttpContentSmoke:
             self._owner_reader,
             baseline.ad_id,
         )
-        target_content_confirmed = bool(
-            owner_target is not None
-            and owner_target.source == owner_before.source
-            and owner_target.content == target
-        )
+        target_content_confirmed = owner_target == target_invariant
         target_content_error = owner_target_error
         if owner_target is not None and not target_content_confirmed:
-            target_content_error = "owner_target_mismatch"
+            target_content_error = "owner_target_invariant_mismatch"
 
         rollback_error: str | None = None
         try:
@@ -288,16 +295,13 @@ class MonkrelPrivateHttpContentSmoke:
             and final_field.source == independent_before.source
             and final_field.value == getattr(baseline, changed_field)
         )
-        final_content_confirmed = bool(
-            owner_final is not None
-            and owner_final.source == owner_before.source
-            and owner_final.content == baseline
-        )
-        rollback_confirmed = final_field_confirmed and final_content_confirmed
+        final_invariant_confirmed = owner_final == baseline_invariant
+        rollback_confirmed = final_field_confirmed and final_invariant_confirmed
+
         if not rollback_confirmed:
             final_error = final_field_error or owner_final_error
             if final_error is None:
-                final_error = "rollback_readback_mismatch"
+                final_error = "rollback_invariant_mismatch"
             return SmokeResult(
                 outcome=SmokeOutcome.ROLLBACK_UNCONFIRMED,
                 ad_id=baseline.ad_id,
