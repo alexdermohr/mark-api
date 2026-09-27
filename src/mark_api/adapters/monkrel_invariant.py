@@ -137,16 +137,7 @@ def _bool(value: Any, label: str, *, default: bool = False) -> bool:
 
 
 def _has_nonempty_value(value: Any) -> bool:
-    current = _unwrap_value(value)
-    if current is None:
-        return False
-    if isinstance(current, dict):
-        return any(_has_nonempty_value(item) for item in current.values())
-    if isinstance(current, list):
-        return any(_has_nonempty_value(item) for item in current)
-    if isinstance(current, str):
-        return bool(current.strip())
-    return bool(current)
+    return not _is_structurally_empty(value)
 
 
 def _collection_items(

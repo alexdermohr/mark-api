@@ -345,6 +345,51 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
                 self.assertEqual([call[0] for call in client.calls], ["GET"])
                 self.assertEqual(client.build_calls, [])
 
+    def test_numeric_zero_collection_without_expected_child_fails_closed(self):
+        cases = (
+            ("attributes", "attribute"),
+            ("pictures", "picture"),
+            ("shipping-options", "shipping-option"),
+        )
+        for field, child in cases:
+            with self.subTest(field=field):
+                payload = owner_payload()
+                payload[AD_NS]["value"][field] = {"unexpected": 0}
+                client = FakeRawClient(payload)
+                writer = MonkrelPrivateHttpContentClient(client)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"{field}.*missing {child}",
+                ):
+                    writer.update_ad("3521676801", title="Neu")
+
+                self.assertEqual([call[0] for call in client.calls], ["GET"])
+                self.assertEqual(client.build_calls, [])
+
+    def test_numeric_zero_unknown_collection_metadata_fails_closed(self):
+        cases = (
+            ("attributes", "attribute"),
+            ("pictures", "picture"),
+            ("shipping-options", "shipping-option"),
+            ("locations", "location"),
+        )
+        for field, child in cases:
+            with self.subTest(field=field):
+                payload = owner_payload(shipping_options=("HERMES_001",))
+                payload[AD_NS]["value"][field]["unexpected"] = 0
+                client = FakeRawClient(payload)
+                writer = MonkrelPrivateHttpContentClient(client)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"{field}.*populated {child}.*nonempty metadata",
+                ):
+                    writer.update_ad("3521676801", title="Neu")
+
+                self.assertEqual([call[0] for call in client.calls], ["GET"])
+                self.assertEqual(client.build_calls, [])
+
     def test_structurally_empty_optional_collection_wrappers_remain_empty(self):
         empty_values = (
             {"value": None},
@@ -688,6 +733,46 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
 
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.build_calls, [])
+
+    def test_numeric_zero_optional_feature_metadata_fails_closed(self):
+        cases = (
+            ("shipping", "shipping metadata"),
+            ("medias", "medias"),
+            ("productsafety", "product-safety"),
+            ("product-safety", "product-safety"),
+        )
+        for field, error in cases:
+            with self.subTest(field=field):
+                payload = owner_payload()
+                payload[AD_NS]["value"][field] = {"unexpected": 0}
+                client = FakeRawClient(payload)
+                writer = MonkrelPrivateHttpContentClient(client)
+
+                with self.assertRaisesRegex(ValueError, error):
+                    writer.update_ad("3521676801", title="Neu")
+
+                self.assertEqual([call[0] for call in client.calls], ["GET"])
+                self.assertEqual(client.build_calls, [])
+
+    def test_false_optional_feature_metadata_remains_empty(self):
+        cases = (
+            ("shipping", "shipping_metadata_empty"),
+            ("medias", "medias_empty"),
+            ("productsafety", "product_safety_empty"),
+            ("product-safety", "product_safety_empty"),
+        )
+        for field, invariant_field in cases:
+            with self.subTest(field=field):
+                payload = owner_payload()
+                payload[AD_NS]["value"][field] = {"unexpected": False}
+                client = FakeRawClient(payload)
+                writer = MonkrelPrivateHttpContentClient(client)
+
+                state = writer.read_invariant("3521676801")
+
+                self.assertTrue(getattr(state, invariant_field))
+                self.assertEqual([call[0] for call in client.calls], ["GET"])
+                self.assertEqual(client.build_calls, [])
 
     def test_full_address_true_is_rejected(self):
         payload = owner_payload()
