@@ -29,10 +29,10 @@ def _unwrap_value(value: Any) -> Any:
     for _ in range(5):
         if not isinstance(current, dict) or len(current) != 1:
             break
-        next_value = _direct(current, "value", label="value wrapper")
-        if next_value is None:
+        key = next(iter(current))
+        if _local_name(key) != "value":
             break
-        current = next_value
+        current = current[key]
     return current
 
 

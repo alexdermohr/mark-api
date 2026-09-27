@@ -264,6 +264,30 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
                 self.assertEqual([call[0] for call in client.calls], ["GET"])
                 self.assertEqual(client.build_calls, [])
 
+    def test_explicit_null_optional_wrappers_remain_update_safe(self):
+        payload = owner_payload()
+        ad = payload[AD_NS]["value"]
+        ad["contact-name"] = {"value": None}
+        ad["phone"] = {"value": None}
+        ad["imprint"] = {"value": None}
+        ad["ad-address"]["latitude"] = {"value": None}
+        ad["ad-address"]["longitude"] = {"value": None}
+        ad["price"]["amount"] = {"value": None}
+        ad["price"]["price-type"] = {"value": "FREE"}
+
+        client = FakeRawClient(payload)
+        writer = MonkrelPrivateHttpContentClient(client)
+
+        writer.update_ad("3521676801", title="Neu")
+
+        self.assertEqual(client.build_calls[0]["contact_name"], "")
+        self.assertIsNone(client.build_calls[0]["phone"])
+        self.assertIsNone(client.build_calls[0]["latitude"])
+        self.assertIsNone(client.build_calls[0]["longitude"])
+        self.assertIsNone(client.build_calls[0]["price"])
+        self.assertEqual(client.build_calls[0]["price_type"], "FREE")
+        self.assertEqual([call[0] for call in client.calls], ["GET", "PUT"])
+
     def test_boolean_reconstructed_scalars_fail_closed(self):
         cases = (
             (

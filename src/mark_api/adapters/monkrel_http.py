@@ -96,6 +96,8 @@ def _optional_scalar(value: Any, field: str) -> Any:
     if value is None:
         return None
     value = _unwrap_value(value)
+    if value is None:
+        return None
     if isinstance(value, (str, int, float)) and not isinstance(value, bool):
         return value
     raise ValueError(f"{field} must be a scalar or null")
