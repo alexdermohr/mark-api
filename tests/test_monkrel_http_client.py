@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from mark_api.adapters.monkrel_http import MonkrelPrivateHttpContentClient
+from mark_api.domain import LifecycleState
 
 
 AD_NS = "{http://www.ebayclassifiedsgroup.com/schema/ad/v1}ad"
@@ -43,6 +44,7 @@ class FakeRawClient:
 def owner_payload(*, shipping_options=(), buy_now=False):
     ad = {
         "id": 3521676801,
+        "ad-status": {"value": "ACTIVE"},
         "title": {"value": "Alter Titel"},
         "description": {"value": "Alte Beschreibung"},
         "contact-name": {"value": "Mark"},
@@ -147,6 +149,7 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
         state = writer.read_invariant("3521676801")
 
         self.assertEqual(state.ad_id, "3521676801")
+        self.assertEqual(state.lifecycle_state, LifecycleState.ACTIVE)
         self.assertEqual(state.title, "Alter Titel")
         self.assertEqual(state.description, "Alte Beschreibung")
         self.assertEqual(state.category_id, "192")
@@ -175,6 +178,18 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
         self.assertIsNone(state.imprint)
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0][0], "GET")
+        self.assertEqual(client.build_calls, [])
+
+    def test_read_invariant_rejects_unknown_lifecycle_state(self):
+        payload = owner_payload()
+        payload[AD_NS]["value"]["ad-status"] = {"value": "ARCHIVED"}
+        client = FakeRawClient(payload)
+        writer = MonkrelPrivateHttpContentClient(client)
+
+        with self.assertRaisesRegex(ValueError, "unsupported ad status"):
+            writer.update_ad("3521676801", title="Neu")
+
+        self.assertEqual([call[0] for call in client.calls], ["GET"])
         self.assertEqual(client.build_calls, [])
 
     def test_read_invariant_preserves_attribute_order(self):
@@ -428,6 +443,8 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
         ad["ad-address"]["longitude"] = {"value": None}
         ad["price"]["amount"] = {"value": None}
         ad["price"]["price-type"] = {"value": "FREE"}
+        ad["buy-now"]["selected"] = {"value": None}
+        ad["ad-address"]["show-full-address"] = {"value": None}
 
         client = FakeRawClient(payload)
         writer = MonkrelPrivateHttpContentClient(client)

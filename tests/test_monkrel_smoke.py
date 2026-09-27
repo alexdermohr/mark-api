@@ -10,7 +10,7 @@ from mark_api.adapters.monkrel_smoke import (
     SmokeContent,
     SmokeOutcome,
 )
-from mark_api.domain import AdSnapshot
+from mark_api.domain import AdSnapshot, LifecycleState
 from mark_api.results import ReadResult, ReadStatus
 
 
@@ -34,6 +34,7 @@ DESCRIPTION_TARGET = SmokeContent(
 BASELINE_INVARIANT = OwnerAdInvariant(
     source="monkrel-private-owner-http",
     ad_id=AD_ID,
+    lifecycle_state=LifecycleState.ACTIVE,
     title=BASELINE.title,
     description=BASELINE.description,
     category_id="246",
@@ -77,11 +78,13 @@ def snapshot(
     *,
     source: str,
     include_description: bool = True,
+    lifecycle_state: LifecycleState = LifecycleState.ACTIVE,
 ) -> AdSnapshot:
     return AdSnapshot(
         ad_id=content.ad_id,
         observed_at=NOW,
         source=source,
+        lifecycle_state=lifecycle_state,
         title=content.title,
         description=content.description if include_description else None,
     )
@@ -135,21 +138,28 @@ def success(
     *,
     source: str,
     include_description: bool = True,
+    lifecycle_state: LifecycleState = LifecycleState.ACTIVE,
 ) -> ReadResult[AdSnapshot]:
     return ReadResult.success_nonempty(
         snapshot(
             content,
             source=source,
             include_description=include_description,
+            lifecycle_state=lifecycle_state,
         )
     )
 
 
-def management_success(content: SmokeContent) -> ReadResult[AdSnapshot]:
+def management_success(
+    content: SmokeContent,
+    *,
+    lifecycle_state: LifecycleState = LifecycleState.ACTIVE,
+) -> ReadResult[AdSnapshot]:
     return success(
         content,
         source="kleinanzeigen-management",
         include_description=False,
+        lifecycle_state=lifecycle_state,
     )
 
 
@@ -158,6 +168,95 @@ def independent_content_success(content: SmokeContent) -> ReadResult[AdSnapshot]
 
 
 class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
+    def test_prewrite_rejects_independent_lifecycle_mismatch(self):
+        owner = FakeOwnerReader([BASELINE_INVARIANT])
+        independent = FakeIndependentReader(
+            [management_success(BASELINE, lifecycle_state=LifecycleState.PAUSED)]
+        )
+        writer = FakeWriter()
+        smoke = MonkrelPrivateHttpContentSmoke(
+            owner_reader=owner,
+            independent_reader=independent,
+            writer=writer,
+        )
+
+        with self.assertRaisesRegex(ValueError, "independent lifecycle"):
+            smoke.run(
+                baseline=BASELINE,
+                target=TITLE_TARGET,
+                baseline_invariant=BASELINE_INVARIANT,
+            )
+
+        self.assertEqual(writer.calls, [])
+
+    def test_target_lifecycle_drift_is_not_success_and_still_rolls_back(self):
+        owner = FakeOwnerReader(
+            [BASELINE_INVARIANT, TITLE_TARGET_INVARIANT, BASELINE_INVARIANT]
+        )
+        independent = FakeIndependentReader(
+            [
+                management_success(BASELINE),
+                management_success(
+                    TITLE_TARGET,
+                    lifecycle_state=LifecycleState.PAUSED,
+                ),
+                management_success(BASELINE),
+            ]
+        )
+        writer = FakeWriter()
+        smoke = MonkrelPrivateHttpContentSmoke(
+            owner_reader=owner,
+            independent_reader=independent,
+            writer=writer,
+        )
+
+        result = smoke.run(
+            baseline=BASELINE,
+            target=TITLE_TARGET,
+            baseline_invariant=BASELINE_INVARIANT,
+        )
+
+        self.assertEqual(result.outcome, SmokeOutcome.TARGET_CONTENT_UNCONFIRMED)
+        self.assertFalse(result.target_confirmed)
+        self.assertTrue(result.rollback_confirmed)
+        self.assertEqual(
+            result.readback_error,
+            "independent_target_lifecycle_mismatch",
+        )
+        self.assertEqual(len(writer.calls), 2)
+
+    def test_final_lifecycle_drift_blocks_rollback_confirmation(self):
+        owner = FakeOwnerReader(
+            [BASELINE_INVARIANT, TITLE_TARGET_INVARIANT, BASELINE_INVARIANT]
+        )
+        independent = FakeIndependentReader(
+            [
+                management_success(BASELINE),
+                management_success(TITLE_TARGET),
+                management_success(
+                    BASELINE,
+                    lifecycle_state=LifecycleState.PAUSED,
+                ),
+            ]
+        )
+        writer = FakeWriter()
+        smoke = MonkrelPrivateHttpContentSmoke(
+            owner_reader=owner,
+            independent_reader=independent,
+            writer=writer,
+        )
+
+        result = smoke.run(
+            baseline=BASELINE,
+            target=TITLE_TARGET,
+            baseline_invariant=BASELINE_INVARIANT,
+        )
+
+        self.assertEqual(result.outcome, SmokeOutcome.ROLLBACK_UNCONFIRMED)
+        self.assertTrue(result.target_confirmed)
+        self.assertFalse(result.rollback_confirmed)
+        self.assertEqual(len(writer.calls), 2)
+
     def test_title_smoke_requires_full_owner_invariant_and_independent_field(self):
         owner = FakeOwnerReader(
             [BASELINE_INVARIANT, TITLE_TARGET_INVARIANT, BASELINE_INVARIANT]

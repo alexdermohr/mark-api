@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal, Protocol
 
-from ..domain import AdSnapshot
+from ..domain import AdSnapshot, LifecycleState
 from ..results import ReadResult
 from .monkrel_invariant import OwnerAdInvariant
 
@@ -71,6 +71,7 @@ class _ObservedField:
     field: ContentField
     value: str
     source: str
+    lifecycle_state: LifecycleState
 
 
 def _snapshot(
@@ -108,6 +109,7 @@ def _observed_field(
         field=field,
         value=_content_field(snapshot, field),
         source=snapshot.source,
+        lifecycle_state=snapshot.lifecycle_state,
     )
 
 
@@ -213,6 +215,10 @@ class MonkrelPrivateHttpContentSmoke:
         )
         if owner_before.source == independent_before.source:
             raise ValueError("independent reader must use a distinct source")
+        if independent_before.lifecycle_state != baseline_invariant.lifecycle_state:
+            raise ValueError(
+                "independent lifecycle does not match the bound full baseline"
+            )
         if independent_before.value != getattr(baseline, changed_field):
             raise ValueError(
                 f"independent read does not match the bound baseline {changed_field}"
@@ -252,6 +258,10 @@ class MonkrelPrivateHttpContentSmoke:
             and target_field.source == independent_before.source
             and target_field.value == getattr(target, changed_field)
         )
+        target_lifecycle_confirmed = bool(
+            target_field is not None
+            and target_field.lifecycle_state == baseline_invariant.lifecycle_state
+        )
         if not target_field_confirmed:
             return SmokeResult(
                 outcome=SmokeOutcome.WRITE_UNCONFIRMED,
@@ -266,10 +276,15 @@ class MonkrelPrivateHttpContentSmoke:
             self._owner_reader,
             baseline.ad_id,
         )
-        target_content_confirmed = owner_target == target_invariant
+        owner_target_confirmed = owner_target == target_invariant
+        target_content_confirmed = (
+            owner_target_confirmed and target_lifecycle_confirmed
+        )
         target_content_error = owner_target_error
-        if owner_target is not None and not target_content_confirmed:
+        if owner_target is not None and not owner_target_confirmed:
             target_content_error = "owner_target_invariant_mismatch"
+        elif owner_target is not None and not target_lifecycle_confirmed:
+            target_content_error = "independent_target_lifecycle_mismatch"
 
         rollback_error: str | None = None
         try:
@@ -294,6 +309,7 @@ class MonkrelPrivateHttpContentSmoke:
             final_field is not None
             and final_field.source == independent_before.source
             and final_field.value == getattr(baseline, changed_field)
+            and final_field.lifecycle_state == baseline_invariant.lifecycle_state
         )
         final_invariant_confirmed = owner_final == baseline_invariant
         rollback_confirmed = final_field_confirmed and final_invariant_confirmed

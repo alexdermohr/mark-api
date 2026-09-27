@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
+from ..domain import LifecycleState
+
 
 def _local_name(key: Any) -> str:
     text = str(key)
@@ -101,10 +103,26 @@ def _id(value: Any, label: str) -> str:
     return str(_text(_direct(block, "id", label=f"{label} id"), f"{label} id"))
 
 
+def _lifecycle_state(value: Any) -> LifecycleState:
+    raw = str(_text(value, "ad status"))
+    normalized = raw.strip().lower()
+    try:
+        state = LifecycleState(normalized)
+    except ValueError as exc:
+        raise ValueError("owner ad has unsupported ad status") from exc
+    if state not in {
+        LifecycleState.PENDING,
+        LifecycleState.ACTIVE,
+        LifecycleState.PAUSED,
+    }:
+        raise ValueError("owner ad has unsupported ad status")
+    return state
+
+
 def _bool(value: Any, label: str, *, default: bool = False) -> bool:
-    if value is None:
-        return default
     current = _unwrap_value(value)
+    if current is None:
+        return default
     if isinstance(current, bool):
         return current
     if isinstance(current, int) and current in (0, 1):
@@ -323,6 +341,7 @@ class OwnerAdInvariant:
 
     source: str
     ad_id: str
+    lifecycle_state: LifecycleState
     title: str
     description: str
     category_id: str
@@ -449,6 +468,9 @@ def owner_ad_invariant(
     return OwnerAdInvariant(
         source=source,
         ad_id=str(_text(_direct(ad, "id", label="ad id"), "ad id")),
+        lifecycle_state=_lifecycle_state(
+            _direct(ad, "ad-status", label="ad status")
+        ),
         title=str(_text(_direct(ad, "title", label="title"), "title")),
         description=str(
             _text(_direct(ad, "description", label="description"), "description")
