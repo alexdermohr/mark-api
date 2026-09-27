@@ -228,6 +228,7 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
             ("attributes", "attribute"),
             ("pictures", "picture"),
             ("shipping-options", "shipping-option"),
+            ("locations", "location"),
         )
         for field, child in cases:
             with self.subTest(field=field):
@@ -269,6 +270,7 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
             ("attributes", "attribute"),
             ("pictures", "picture"),
             ("shipping-options", "shipping-option"),
+            ("locations", "location"),
         )
         for field, child in cases:
             with self.subTest(field=field):
@@ -292,6 +294,7 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
         ad["attributes"]["count"] = 1
         ad["pictures"]["count"] = 1
         ad["shipping-options"]["count"] = 1
+        ad["locations"]["count"] = 1
         client = FakeRawClient(payload)
         writer = MonkrelPrivateHttpContentClient(client)
 
@@ -300,6 +303,7 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
         self.assertEqual(state.attributes, (("condition", ("USED",)),))
         self.assertEqual(len(state.pictures), 1)
         self.assertEqual(state.shipping_option_ids, ("HERMES_001",))
+        self.assertEqual(state.location_id, "3455")
         self.assertEqual([call[0] for call in client.calls], ["GET"])
         self.assertEqual(client.build_calls, [])
 
@@ -308,6 +312,7 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
             ("attributes", "attribute"),
             ("pictures", "picture"),
             ("shipping-options", "shipping-option"),
+            ("locations", "location"),
         )
         for field, child in cases:
             with self.subTest(field=field):

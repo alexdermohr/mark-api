@@ -356,10 +356,13 @@ def owner_ad_invariant(
     raw_locations = _direct(ad, "locations", label="locations")
     if raw_locations is not None:
         locations = _mapping(raw_locations, "locations")
-        raw_location_items = _direct(locations, "location", label="location")
+        location_items = _collection_items(
+            locations,
+            "location",
+            label="locations",
+        )
     else:
-        raw_location_items = _direct(ad, "location", label="location")
-    location_items = _as_sequence(raw_location_items)
+        location_items = _as_sequence(_direct(ad, "location", label="location"))
     if len(location_items) != 1:
         raise ValueError("owner ad must expose exactly one location")
 
