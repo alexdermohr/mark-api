@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 
+from mark_api.adapters.management import HttpResponse, ManagementReadAdapter
 from mark_api.adapters.monkrel_invariant import OwnerAdInvariant
 from mark_api.adapters.monkrel_smoke import (
     MonkrelPrivateHttpContentSmoke,
@@ -133,6 +135,40 @@ class FakeWriter:
             raise exc
 
 
+class FakeManagementTransport:
+    def __init__(self, *responses: HttpResponse):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get(self, url, *, headers):
+        self.calls.append(url)
+        if not self.responses:
+            raise AssertionError("unexpected management read")
+        return self.responses.pop(0)
+
+
+def management_response(
+    content: SmokeContent,
+    *,
+    state: str = "active",
+) -> HttpResponse:
+    return HttpResponse(
+        status_code=200,
+        body=json.dumps(
+            {
+                "ads": [
+                    {
+                        "id": content.ad_id,
+                        "title": content.title,
+                        "state": state,
+                    }
+                ],
+                "paging": {"last": 1},
+            }
+        ).encode("utf-8"),
+    )
+
+
 def success(
     content: SmokeContent,
     *,
@@ -168,6 +204,33 @@ def independent_content_success(content: SmokeContent) -> ReadResult[AdSnapshot]
 
 
 class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
+    def test_prewrite_rejects_reader_without_concrete_lifecycle(self):
+        owner = FakeOwnerReader([BASELINE_INVARIANT])
+        independent = FakeIndependentReader(
+            [
+                success(
+                    BASELINE,
+                    source="monkrel-mobile",
+                    lifecycle_state=LifecycleState.UNKNOWN,
+                )
+            ]
+        )
+        writer = FakeWriter()
+        smoke = MonkrelPrivateHttpContentSmoke(
+            owner_reader=owner,
+            independent_reader=independent,
+            writer=writer,
+        )
+
+        with self.assertRaisesRegex(ValueError, "concrete lifecycle state"):
+            smoke.run(
+                baseline=BASELINE,
+                target=TITLE_TARGET,
+                baseline_invariant=BASELINE_INVARIANT,
+            )
+
+        self.assertEqual(writer.calls, [])
+
     def test_prewrite_rejects_independent_lifecycle_mismatch(self):
         owner = FakeOwnerReader([BASELINE_INVARIANT])
         independent = FakeIndependentReader(
@@ -256,6 +319,44 @@ class MonkrelPrivateHttpContentSmokeTests(unittest.TestCase):
         self.assertTrue(result.target_confirmed)
         self.assertFalse(result.rollback_confirmed)
         self.assertEqual(len(writer.calls), 2)
+
+    def test_management_reader_supplies_lifecycle_for_title_smoke(self):
+        transport = FakeManagementTransport(
+            management_response(BASELINE),
+            management_response(TITLE_TARGET),
+            management_response(BASELINE),
+        )
+        independent = ManagementReadAdapter(
+            cookie_provider=lambda: "session=opaque",
+            transport=transport,
+            endpoint="https://example.invalid/manage",
+            clock=lambda: NOW,
+        )
+        owner = FakeOwnerReader(
+            [BASELINE_INVARIANT, TITLE_TARGET_INVARIANT, BASELINE_INVARIANT]
+        )
+        writer = FakeWriter()
+        smoke = MonkrelPrivateHttpContentSmoke(
+            owner_reader=owner,
+            independent_reader=independent,
+            writer=writer,
+        )
+
+        result = smoke.run(
+            baseline=BASELINE,
+            target=TITLE_TARGET,
+            baseline_invariant=BASELINE_INVARIANT,
+        )
+
+        self.assertEqual(result.outcome, SmokeOutcome.VERIFIED_AND_ROLLED_BACK)
+        self.assertEqual(len(transport.calls), 3)
+        self.assertEqual(
+            writer.calls,
+            [
+                (AD_ID, TITLE_TARGET.title, None),
+                (AD_ID, BASELINE.title, BASELINE.description),
+            ],
+        )
 
     def test_title_smoke_requires_full_owner_invariant_and_independent_field(self):
         owner = FakeOwnerReader(

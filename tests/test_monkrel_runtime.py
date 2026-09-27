@@ -3,9 +3,11 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
+from mark_api.adapters.management import ManagementReadAdapter
 from mark_api.adapters.monkrel_runtime import (
     MonkrelPrivateHttpRuntimeClient,
     build_monkrel_private_http_adapter,
+    build_monkrel_private_http_smoke,
 )
 
 
@@ -54,6 +56,11 @@ class FakeContentUpdater:
                 description,
             )
         )
+
+
+class NeverManagementTransport:
+    def get(self, url, *, headers):
+        raise AssertionError("management transport should not be reached")
 
 
 class FakeWriteClient:
@@ -162,6 +169,27 @@ class MonkrelPrivateHttpRuntimeClientTests(unittest.TestCase):
             [("my_ads", 0, 100, None, None)],
         )
         self.assertEqual(write_client.calls, [])
+
+    def test_smoke_factory_wires_management_as_independent_lifecycle_reader(self):
+        upstream = FakeUpstream()
+        write_client = FakeWriteClient(max_retries=1)
+        management = ManagementReadAdapter(
+            cookie_provider=lambda: "session=opaque",
+            transport=NeverManagementTransport(),
+            endpoint="https://example.invalid/manage",
+            clock=lambda: NOW,
+        )
+
+        smoke = build_monkrel_private_http_smoke(
+            upstream,
+            write_client=write_client,
+            management_reader=management,
+            clock=lambda: NOW,
+        )
+
+        self.assertIs(smoke._independent_reader, management)
+        self.assertIs(smoke._writer._client._content_updater, smoke._owner_reader)
+        self.assertIs(smoke._owner_reader._client, write_client)
 
     def test_factory_content_write_enforces_single_attempt_write_client(self):
         upstream = FakeUpstream()

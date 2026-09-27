@@ -4,8 +4,10 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Protocol
 
+from .management import ManagementReadAdapter
 from .monkrel import DEFAULT_SOURCE, MonkrelMobileApiAdapter
 from .monkrel_http import API_HOST, MonkrelPrivateHttpContentClient, RawMonkrelClient
+from .monkrel_smoke import MonkrelPrivateHttpContentSmoke
 
 
 class MonkrelRuntimeUpstream(Protocol):
@@ -152,4 +154,44 @@ def build_monkrel_private_http_adapter(
         runtime_client,
         source=source,
         clock=clock,
+    )
+
+def build_monkrel_private_http_smoke(
+    upstream: MonkrelRuntimeUpstream,
+    *,
+    write_client: RawMonkrelClient,
+    management_reader: ManagementReadAdapter,
+    api_host: str = API_HOST,
+    contact_email_provider: Callable[[], str | None] | None = None,
+    source: str = DEFAULT_SOURCE,
+    clock: Callable[[], datetime] | None = None,
+) -> MonkrelPrivateHttpContentSmoke:
+    """Compose the reversible HTTP smoke with a lifecycle-aware reader.
+
+    The upstream mobile Listing parser currently drops the requested ad-status
+    field, so MonkrelMobileApiAdapter cannot serve as the independent lifecycle
+    reader. ManagementReadAdapter is deliberately wired here instead.
+    """
+
+    content_client = MonkrelPrivateHttpContentClient(
+        write_client,
+        api_host=api_host,
+        contact_email_provider=contact_email_provider,
+    )
+    runtime_client = MonkrelPrivateHttpRuntimeClient(
+        upstream,
+        content_updater=content_client,
+    )
+    if clock is None:
+        writer = MonkrelMobileApiAdapter(runtime_client, source=source)
+    else:
+        writer = MonkrelMobileApiAdapter(
+            runtime_client,
+            source=source,
+            clock=clock,
+        )
+    return MonkrelPrivateHttpContentSmoke(
+        owner_reader=content_client,
+        independent_reader=management_reader,
+        writer=writer,
     )

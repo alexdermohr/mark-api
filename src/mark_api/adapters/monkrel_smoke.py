@@ -175,7 +175,11 @@ class MonkrelPrivateHttpContentSmoke:
     rather than merely post-hoc diagnostics.
 
     The changed field must then be observed through a distinct independent
-    source before one recovery write is authorized. Full owner readback must
+    source before one recovery write is authorized. That independent source
+    must expose a concrete lifecycle state; the current Monkrel public Listing
+    parser drops ad-status, so MonkrelMobileApiAdapter is not suitable for this
+    role. ManagementReadAdapter is the supported current-owner lifecycle reader.
+    Full owner readback must
     match the target invariant before success is possible. Recovery restores
     both bound content fields exactly once, and completion requires both the
     independent field read and the complete owner invariant to match baseline.
@@ -215,6 +219,10 @@ class MonkrelPrivateHttpContentSmoke:
         )
         if owner_before.source == independent_before.source:
             raise ValueError("independent reader must use a distinct source")
+        if independent_before.lifecycle_state is LifecycleState.UNKNOWN:
+            raise ValueError(
+                "independent reader must provide a concrete lifecycle state"
+            )
         if independent_before.lifecycle_state != baseline_invariant.lifecycle_state:
             raise ValueError(
                 "independent lifecycle does not match the bound full baseline"
