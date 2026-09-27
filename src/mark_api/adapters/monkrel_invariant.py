@@ -120,16 +120,58 @@ def _collection_items(
         return []
 
     items = _as_sequence(raw_items)
+    sibling_values = {
+        key: item
+        for key, item in container.items()
+        if _local_name(key) != child_local_name
+    }
+    count_values = [
+        item
+        for key, item in sibling_values.items()
+        if _local_name(key) == "count"
+    ]
+    if len(count_values) > 1:
+        raise ValueError(f"owner ad {label} has ambiguous count metadata")
+
+    count: int | None = None
+    if count_values:
+        raw_count = _unwrap_value(count_values[0])
+        if isinstance(raw_count, bool):
+            raise ValueError(f"owner ad {label} has invalid count metadata")
+        if isinstance(raw_count, int):
+            count = raw_count
+        elif isinstance(raw_count, str):
+            normalized = raw_count.strip()
+            if not normalized or any(char not in "0123456789" for char in normalized):
+                raise ValueError(f"owner ad {label} has invalid count metadata")
+            count = int(normalized)
+        else:
+            raise ValueError(f"owner ad {label} has invalid count metadata")
+        if count < 0:
+            raise ValueError(f"owner ad {label} has invalid count metadata")
+
+    non_count_metadata = {
+        key: item
+        for key, item in sibling_values.items()
+        if _local_name(key) != "count"
+    }
     if not items:
-        sibling_values = {
-            key: item
-            for key, item in container.items()
-            if _local_name(key) != child_local_name
-        }
-        if _has_nonempty_value(sibling_values):
+        if (count is not None and count != 0) or _has_nonempty_value(
+            non_count_metadata
+        ):
             raise ValueError(
                 f"owner ad {label} has empty {child_local_name} with nonempty metadata"
             )
+        return items
+
+    if count is not None and count != len(items):
+        raise ValueError(
+            f"owner ad {label} count metadata does not match {child_local_name} items"
+        )
+    if _has_nonempty_value(non_count_metadata):
+        raise ValueError(
+            f"owner ad {label} has populated {child_local_name} with nonempty metadata"
+        )
     return items
 
 
@@ -148,23 +190,22 @@ def _attributes(ad: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], ...]:
                 f"attribute[{index}] name",
             )
         )
-        values = tuple(
-            value
-            for raw in _as_sequence(
-                _direct(attr, "value", label=f"attribute {name} value")
-            )
-            if (
-                value := _text(
-                    raw,
-                    f"attribute {name} value",
-                    required=False,
-                )
-            )
-            is not None
+        raw_values = _as_sequence(
+            _direct(attr, "value", label=f"attribute {name} value")
         )
-        if not values:
+        if not raw_values:
             raise ValueError(f"owner ad attribute {name} has no value")
-        parsed.append((name, values))
+        values: list[str] = []
+        for raw in raw_values:
+            value = _text(
+                raw,
+                f"attribute {name} value",
+                required=False,
+            )
+            if value is None:
+                raise ValueError(f"owner ad attribute {name} has blank value")
+            values.append(value)
+        parsed.append((name, tuple(values)))
     return tuple(parsed)
 
 
