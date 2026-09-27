@@ -118,7 +118,19 @@ def _collection_items(
                 f"owner ad {label} is nonempty but missing {child_local_name}"
             )
         return []
-    return _as_sequence(raw_items)
+
+    items = _as_sequence(raw_items)
+    if not items:
+        sibling_values = {
+            key: item
+            for key, item in container.items()
+            if _local_name(key) != child_local_name
+        }
+        if _has_nonempty_value(sibling_values):
+            raise ValueError(
+                f"owner ad {label} has empty {child_local_name} with nonempty metadata"
+            )
+    return items
 
 
 def _attributes(ad: dict[str, Any]) -> tuple[tuple[str, tuple[str, ...]], ...]:
