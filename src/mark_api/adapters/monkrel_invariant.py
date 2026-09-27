@@ -146,8 +146,12 @@ def _collection_items(
     *,
     label: str,
 ) -> list[Any]:
+    child_present = any(
+        _local_name(key) == child_local_name
+        for key in container
+    )
     raw_items = _direct(container, child_local_name, label=child_local_name)
-    if raw_items is None:
+    if not child_present:
         if _has_nonempty_value(container):
             raise ValueError(
                 f"owner ad {label} is nonempty but missing {child_local_name}"

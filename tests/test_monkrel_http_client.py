@@ -246,20 +246,24 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
             ("locations", "location"),
         )
         for field, child in cases:
-            with self.subTest(field=field):
-                payload = owner_payload(shipping_options=("HERMES_001",))
-                payload[AD_NS]["value"][field] = {child: [], "count": 1}
-                client = FakeRawClient(payload)
-                writer = MonkrelPrivateHttpContentClient(client)
+            for child_value in ([], None):
+                with self.subTest(field=field, child_value=child_value):
+                    payload = owner_payload(shipping_options=("HERMES_001",))
+                    payload[AD_NS]["value"][field] = {
+                        child: child_value,
+                        "count": 1,
+                    }
+                    client = FakeRawClient(payload)
+                    writer = MonkrelPrivateHttpContentClient(client)
 
-                with self.assertRaisesRegex(
-                    ValueError,
-                    rf"{field}.*empty {child}.*nonempty metadata",
-                ):
-                    writer.update_ad("3521676801", title="Neu")
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"{field}.*empty {child}.*nonempty metadata",
+                    ):
+                        writer.update_ad("3521676801", title="Neu")
 
-                self.assertEqual([call[0] for call in client.calls], ["GET"])
-                self.assertEqual(client.build_calls, [])
+                    self.assertEqual([call[0] for call in client.calls], ["GET"])
+                    self.assertEqual(client.build_calls, [])
 
     def test_empty_collection_child_with_zero_metadata_remains_empty(self):
         cases = (
@@ -268,17 +272,21 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
             ("shipping-options", "shipping-option", "shipping_option_ids"),
         )
         for field, child, invariant_field in cases:
-            with self.subTest(field=field):
-                payload = owner_payload(shipping_options=("HERMES_001",))
-                payload[AD_NS]["value"][field] = {child: [], "count": 0}
-                client = FakeRawClient(payload)
-                writer = MonkrelPrivateHttpContentClient(client)
+            for child_value in ([], None):
+                with self.subTest(field=field, child_value=child_value):
+                    payload = owner_payload(shipping_options=("HERMES_001",))
+                    payload[AD_NS]["value"][field] = {
+                        child: child_value,
+                        "count": 0,
+                    }
+                    client = FakeRawClient(payload)
+                    writer = MonkrelPrivateHttpContentClient(client)
 
-                state = writer.read_invariant("3521676801")
+                    state = writer.read_invariant("3521676801")
 
-                self.assertEqual(getattr(state, invariant_field), ())
-                self.assertEqual([call[0] for call in client.calls], ["GET"])
-                self.assertEqual(client.build_calls, [])
+                    self.assertEqual(getattr(state, invariant_field), ())
+                    self.assertEqual([call[0] for call in client.calls], ["GET"])
+                    self.assertEqual(client.build_calls, [])
 
     def test_populated_collection_count_must_match_items(self):
         cases = (
@@ -339,6 +347,28 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ValueError,
                     rf"{field}.*populated {child}.*nonempty metadata",
+                ):
+                    writer.update_ad("3521676801", title="Neu")
+
+                self.assertEqual([call[0] for call in client.calls], ["GET"])
+                self.assertEqual(client.build_calls, [])
+
+    def test_zero_count_without_expected_collection_child_fails_closed(self):
+        cases = (
+            ("attributes", "attribute"),
+            ("pictures", "picture"),
+            ("shipping-options", "shipping-option"),
+        )
+        for field, child in cases:
+            with self.subTest(field=field):
+                payload = owner_payload()
+                payload[AD_NS]["value"][field] = {"count": 0}
+                client = FakeRawClient(payload)
+                writer = MonkrelPrivateHttpContentClient(client)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"{field}.*missing {child}",
                 ):
                     writer.update_ad("3521676801", title="Neu")
 
@@ -420,6 +450,7 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
 
     def test_structurally_empty_optional_collection_children_remain_empty(self):
         empty_values = (
+            None,
             False,
             "",
             {},
