@@ -373,6 +373,53 @@ class MonkrelPrivateHttpContentClientTests(unittest.TestCase):
                     self.assertEqual([call[0] for call in client.calls], ["GET"])
                     self.assertEqual(client.build_calls, [])
 
+    def test_structurally_empty_optional_collection_children_remain_empty(self):
+        empty_values = (
+            False,
+            "",
+            {},
+            {"value": None},
+            [None],
+        )
+        cases = (
+            ("attributes", "attribute", "attributes"),
+            ("pictures", "picture", "pictures"),
+            ("shipping-options", "shipping-option", "shipping_option_ids"),
+        )
+        for field, child, invariant_field in cases:
+            for empty_value in empty_values:
+                with self.subTest(field=field, empty_value=empty_value):
+                    payload = owner_payload(shipping_options=("HERMES_001",))
+                    payload[AD_NS]["value"][field][child] = empty_value
+                    client = FakeRawClient(payload)
+                    writer = MonkrelPrivateHttpContentClient(client)
+
+                    state = writer.read_invariant("3521676801")
+
+                    self.assertEqual(getattr(state, invariant_field), ())
+                    self.assertEqual([call[0] for call in client.calls], ["GET"])
+                    self.assertEqual(client.build_calls, [])
+
+    def test_nonempty_scalar_optional_collection_children_fail_closed(self):
+        cases = (
+            ("attributes", "attribute"),
+            ("pictures", "picture"),
+            ("shipping-options", "shipping-option"),
+        )
+        for field, child in cases:
+            for child_value in (0, 1):
+                with self.subTest(field=field, child_value=child_value):
+                    payload = owner_payload(shipping_options=("HERMES_001",))
+                    payload[AD_NS]["value"][field][child] = child_value
+                    client = FakeRawClient(payload)
+                    writer = MonkrelPrivateHttpContentClient(client)
+
+                    with self.assertRaisesRegex(ValueError, "malformed"):
+                        writer.update_ad("3521676801", title="Neu")
+
+                    self.assertEqual([call[0] for call in client.calls], ["GET"])
+                    self.assertEqual(client.build_calls, [])
+
     def test_zero_optional_collection_wrapper_is_not_structurally_empty(self):
         for field in ("attributes", "pictures", "shipping-options"):
             with self.subTest(field=field):

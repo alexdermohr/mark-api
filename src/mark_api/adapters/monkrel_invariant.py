@@ -163,7 +163,7 @@ def _collection_items(
             )
         return []
 
-    items = _as_sequence(raw_items)
+    items = [] if _is_structurally_empty(raw_items) else _as_sequence(raw_items)
     sibling_values = {
         key: item
         for key, item in container.items()
