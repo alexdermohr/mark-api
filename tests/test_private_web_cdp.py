@@ -5,19 +5,24 @@ import os
 import subprocess
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
+from mark_api.domain import AdSnapshot, LifecycleState, OperationOutcome
+from mark_api.orchestrator import SafeWriteOrchestrator
 from mark_api.private_web import PrivateWebEditorSnapshot, PrivateWebEditorState
 from mark_api.private_web_cdp import (
     CdpCookieProvider,
+    CdpPrivateWebOwnerReader,
     CdpPrivateWebPage,
     PrivateWebCdpError,
     _LoopbackCdpClient,
     _proxy_free_loopback_opener,
     _validated_loopback_endpoint,
 )
+from mark_api.results import ReadResult, ReadStatus
 
 
 AD_ID = "3524046688"
@@ -1152,6 +1157,210 @@ class CdpPrivateWebPageTests(unittest.TestCase):
             result.stdout + result.stderr,
         )
         self.assertEqual(result.stdout.strip(), "[]")
+
+
+class CdpPrivateWebOwnerReaderTests(unittest.TestCase):
+    @staticmethod
+    def owner_snapshot(
+        *,
+        ad_id: str = AD_ID,
+        title: str = "Management title",
+        description: str | None = None,
+    ) -> AdSnapshot:
+        return AdSnapshot(
+            ad_id=ad_id,
+            observed_at=datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc),
+            source="kleinanzeigen-management",
+            lifecycle_state=LifecycleState.ACTIVE,
+            title=title,
+            description=description,
+            views=7,
+            watch_count=2,
+            reply_count=1,
+        )
+
+    def test_owner_reader_enriches_exact_target_from_fresh_editor_read(self) -> None:
+        target = self.owner_snapshot()
+        other = self.owner_snapshot(ad_id="9999999999", title="Other")
+        owner_result = ReadResult.success_nonempty((other, target))
+
+        class OwnerReader:
+            def read_ads(self):
+                return owner_result
+
+        class Page:
+            def __init__(self) -> None:
+                self.opened: list[str] = []
+                self.closed = False
+
+            def open_editor(self, ad_id: str) -> None:
+                self.opened.append(ad_id)
+
+            def read_editor(self) -> PrivateWebEditorSnapshot:
+                return PrivateWebEditorSnapshot(
+                    state=PrivateWebEditorState.READY,
+                    ad_id=AD_ID,
+                    title="Fresh title",
+                    description="Fresh description",
+                )
+
+            def close(self) -> None:
+                self.closed = True
+
+        pages: list[Page] = []
+
+        def page_factory():
+            page = Page()
+            pages.append(page)
+            return page
+
+        result = CdpPrivateWebOwnerReader(
+            owner_reader=OwnerReader(),
+            page_factory=page_factory,
+            ad_id=AD_ID,
+        ).read_ads()
+
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        self.assertEqual(result.value[0], other)
+        enriched = result.value[1]
+        self.assertEqual(enriched.ad_id, AD_ID)
+        self.assertEqual(enriched.title, "Fresh title")
+        self.assertEqual(enriched.description, "Fresh description")
+        self.assertEqual(enriched.lifecycle_state, LifecycleState.ACTIVE)
+        self.assertEqual(enriched.views, 7)
+        self.assertEqual(enriched.watch_count, 2)
+        self.assertEqual(enriched.reply_count, 1)
+        self.assertEqual(
+            enriched.source,
+            "kleinanzeigen-management+private-web",
+        )
+        self.assertEqual(pages[0].opened, [AD_ID])
+        self.assertTrue(pages[0].closed)
+
+    def test_owner_reader_does_not_open_editor_for_non_owner_target(self) -> None:
+        owner_result = ReadResult.success_nonempty(
+            (self.owner_snapshot(ad_id="9999999999"),)
+        )
+
+        class OwnerReader:
+            def read_ads(self):
+                return owner_result
+
+        def page_factory():
+            raise AssertionError("editor must not open for absent owner target")
+
+        result = CdpPrivateWebOwnerReader(
+            owner_reader=OwnerReader(),
+            page_factory=page_factory,
+            ad_id=AD_ID,
+        ).read_ads()
+
+        self.assertIs(result, owner_result)
+
+    def test_owner_reader_fails_closed_on_editor_target_or_challenge_drift(self) -> None:
+        owner_result = ReadResult.success_nonempty((self.owner_snapshot(),))
+        snapshots = (
+            PrivateWebEditorSnapshot(
+                state=PrivateWebEditorState.READY,
+                ad_id="9999999999",
+                title="Wrong",
+                description="Wrong",
+            ),
+            PrivateWebEditorSnapshot(
+                state=PrivateWebEditorState.CAPTCHA_REQUIRED,
+            ),
+        )
+
+        class OwnerReader:
+            def read_ads(self):
+                return owner_result
+
+        for editor_snapshot in snapshots:
+            with self.subTest(state=editor_snapshot.state):
+                class Page:
+                    def open_editor(self, ad_id: str) -> None:
+                        self.ad_id = ad_id
+
+                    def read_editor(self):
+                        return editor_snapshot
+
+                    def close(self) -> None:
+                        self.closed = True
+
+                result = CdpPrivateWebOwnerReader(
+                    owner_reader=OwnerReader(),
+                    page_factory=Page,
+                    ad_id=AD_ID,
+                ).read_ads()
+
+                self.assertEqual(result.status, ReadStatus.TRANSPORT_ERROR)
+                self.assertIsNone(result.value)
+
+    def test_description_update_can_be_confirmed_by_safe_orchestrator(self) -> None:
+        state = {
+            "title": "Existing title",
+            "description": "Existing description",
+        }
+        target = self.owner_snapshot(title="Inventory title")
+
+        class OwnerReader:
+            def read_ads(self):
+                return ReadResult.success_nonempty((target,))
+
+        class Page:
+            def open_editor(self, ad_id: str) -> None:
+                if ad_id != AD_ID:
+                    raise AssertionError("wrong target")
+
+            def read_editor(self):
+                return PrivateWebEditorSnapshot(
+                    state=PrivateWebEditorState.READY,
+                    ad_id=AD_ID,
+                    title=state["title"],
+                    description=state["description"],
+                )
+
+            def close(self) -> None:
+                return None
+
+        class Writer:
+            calls = 0
+
+            def update_content(
+                self,
+                ad_id: str,
+                *,
+                title: str | None = None,
+                description: str | None = None,
+            ) -> None:
+                self.calls += 1
+                if ad_id != AD_ID:
+                    raise AssertionError("wrong target")
+                if title is not None:
+                    state["title"] = title
+                if description is not None:
+                    state["description"] = description
+
+        reader = CdpPrivateWebOwnerReader(
+            owner_reader=OwnerReader(),
+            page_factory=Page,
+            ad_id=AD_ID,
+        )
+        writer = Writer()
+
+        receipt = SafeWriteOrchestrator(writes_enabled=True).update_content(
+            ad_id=AD_ID,
+            reader=reader,
+            writer=writer,
+            description="Updated description",
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(
+            receipt.post_snapshot.description,
+            "Updated description",
+        )
 
 
 if __name__ == "__main__":

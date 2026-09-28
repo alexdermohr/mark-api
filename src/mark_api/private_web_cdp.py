@@ -5,15 +5,19 @@ import math
 import socket
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
+from .domain import AdSnapshot
+from .ports import AdsReader
 from .private_web import (
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
     _validated_ad_id,
 )
+from .results import ReadResult, ReadStatus
 
 _KLEINANZEIGEN_ORIGIN = "https://www.kleinanzeigen.de"
 _EDITOR_PATH = "/p-anzeige-bearbeiten.html"
@@ -897,3 +901,73 @@ class CdpPrivateWebPage:
             raise PrivateWebCdpError(exc.stage) from None
         except Exception:  # noqa: BLE001 - ambiguous submit stays non-retryable.
             raise PrivateWebCdpError("submit") from None
+
+
+class CdpPrivateWebOwnerReader:
+    """Enrich one fresh owner-inventory target with a normal-Web editor read."""
+
+    def __init__(
+        self,
+        *,
+        owner_reader: AdsReader,
+        page_factory: Callable[[], CdpPrivateWebPage],
+        ad_id: str,
+    ) -> None:
+        self._owner_reader = owner_reader
+        self._page_factory = page_factory
+        self._ad_id = _validated_ad_id(ad_id)
+
+    def read_ads(self) -> ReadResult[tuple[AdSnapshot, ...]]:
+        owner_result = self._owner_reader.read_ads()
+        if not owner_result.is_success:
+            return owner_result
+
+        snapshots = owner_result.value or ()
+        matching = [
+            (index, snapshot)
+            for index, snapshot in enumerate(snapshots)
+            if snapshot.ad_id == self._ad_id
+        ]
+        if not matching:
+            return owner_result
+        if len(matching) != 1:
+            return ReadResult.failure(
+                ReadStatus.PARSE_ERROR,
+                error="duplicate_owner_target",
+            )
+
+        page = None
+        try:
+            page = self._page_factory()
+            page.open_editor(self._ad_id)
+            editor = page.read_editor()
+            if (
+                not isinstance(editor, PrivateWebEditorSnapshot)
+                or editor.state is not PrivateWebEditorState.READY
+                or editor.ad_id != self._ad_id
+                or editor.title is None
+                or editor.description is None
+            ):
+                return ReadResult.failure(
+                    ReadStatus.TRANSPORT_ERROR,
+                    error="private_web_owner_read_unavailable",
+                )
+        except Exception:  # noqa: BLE001 - sanitize browser/provider boundary.
+            return ReadResult.failure(
+                ReadStatus.TRANSPORT_ERROR,
+                error="private_web_owner_read_failed",
+            )
+        finally:
+            if page is not None:
+                page.close()
+
+        index, target = matching[0]
+        enriched = replace(
+            target,
+            title=editor.title,
+            description=editor.description,
+            source=f"{target.source}+private-web",
+        )
+        result = list(snapshots)
+        result[index] = enriched
+        return ReadResult.success_nonempty(tuple(result))
