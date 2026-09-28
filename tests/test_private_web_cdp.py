@@ -235,6 +235,26 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertIn("Anzeige speichern", expression)
         self.assertIn("/p-anzeige-bearbeiten.html", expression)
 
+    def test_captcha_detection_does_not_scan_entire_editor_body(self) -> None:
+        page, clients = page_with_results(
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "title": "Captcha collection",
+                "description": "Ordinary listing text mentioning captcha.",
+            }
+        )
+
+        snapshot = page.read_editor()
+
+        self.assertEqual(snapshot.state, PrivateWebEditorState.READY)
+        expression = clients[0].calls[0][1]["expression"]
+        self.assertNotIn("document.body", expression)
+        self.assertNotIn('body.includes("captcha")', expression)
+        self.assertIn('challengeText.includes("captcha")', expression)
+        self.assertIn('[role="dialog"]', expression)
+        self.assertIn('[aria-modal="true"]', expression)
+
     def test_challenge_states_return_no_ad_content(self) -> None:
         for raw_state in (
             "login_required",

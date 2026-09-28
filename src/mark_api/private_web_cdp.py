@@ -442,24 +442,34 @@ class CdpPrivateWebPage:
         expression = f"""
 (() => {{
   const stateOnly = (state) => ({{state}});
-  const body = (document.body && document.body.innerText || "").toLowerCase();
   const currentOrigin = location.origin;
   const currentPath = location.pathname;
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((element) => (element.innerText || "").toLowerCase())
+    .join("\n");
   const hasCaptcha = Boolean(
     document.querySelector(
       'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
     )
-  ) || body.includes("captcha") || body.includes("ich bin kein roboter");
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
   const hasMfa = Boolean(
     document.querySelector(
       'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
     )
-  ) || body.includes("bestätigungscode") || body.includes("sicherheitscode");
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
   const hasSecurityChallenge =
-    body.includes("sicherheitsprüfung") ||
-    body.includes("sicherheitscheck") ||
-    body.includes("ungewöhnliche aktivität") ||
-    body.includes("bestätige, dass du ein mensch bist");
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
   const hasLogin =
     currentPath.startsWith("/u/login/") ||
     Boolean(document.querySelector('input[type="password"]'));
