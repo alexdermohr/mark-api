@@ -94,3 +94,16 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - Ein Import offizieller PRO-Statistikdownloads wird erst implementiert, wenn ein reales Exportformat als Contract-Evidenz vorliegt.
 - Der lokale E2E-Smoke darf ausschließlich nutzerbereitgestellte lokale Eingaben, eine ephemere SQLite-Datenbank und die loopback-only read-only Dashboard/API-Surface verbinden. Er konstruiert keinen Plattformadapter, aktiviert keine Plattformwrites und ist keine Freigabe für private/mobile/browserbasierte Automation.
 - Ein späterer ProSellers-Adapter benötigt ein eigenes Credentials-/Entitlement-/Write-Authority-Gate und bleibt bis dahin deaktiviert.
+
+## D-009 — ProSellers-Netzwerkpfad nur nach expliziter lokaler Admission
+
+**Entscheidung:** Ein zukünftiger offizieller ProSellers-Netzwerkclient darf erst hinter einer lokalen fail-closed Admission konstruiert werden. Die Admission ist nur positiv, wenn der Account ausdrücklich professionell ist, das Paket Power oder Premium ist, das konkrete API-Entitlement bestätigt wurde, nichtleere provisionierte `client_id`/`client_secret` vorliegen und die Write-Authority `api_originated_only` ist.
+
+**Begründung:** Die am 28.09.2026 erneut gelesene offizielle Kleinanzeigen-Dokumentation beschreibt den OAuth-Client-Credentials-Flow mit `client_id`, `client_secret`, `grant_type=client_credentials` und Audience `consumer-goods-api`; die ProSellers API ist dort ausdrücklich nur für professionelle Power-/Premium-Nutzer verfügbar. Das Vorhandensein eines Paketnamens oder beliebiger Credential-Strings beweist aber weder ein konkretes Entitlement noch die geplante Write-Authority.
+
+**Folgen:**
+- `mark_api.prosellers` ist vollständig lokal und netzwerkfrei; der Slice führt weder Token- noch Goods-API-Requests aus.
+- Private Accounts, Basic, fehlendes/unklares Entitlement, fehlende Credentials und jede andere Write-Authority werden deterministisch abgewiesen.
+- Admission-Diagnostik enthält nur Reason-Codes; Credentials erscheinen nicht in `repr`, Decision-Payloads oder Exceptions.
+- API-originierte Listings dürfen später nur unter expliziter API-Write-Authority geschrieben werden; Mischbetrieb mit manuellen Web-Writes für dieselben API-originierte Listings wird nicht freigegeben.
+- OAuth- und Goods-Transport bleiben ein separater Slice und müssen die Admission erneut als Konstruktor-/Factory-Gate erzwingen.
