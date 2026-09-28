@@ -89,6 +89,24 @@ class ReactionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class InboundMessageEvent:
+    """Minimal local evidence for one inbound Kleinanzeigen message notification."""
+
+    ad_id: str
+    conversation_id: str
+    provider_message_id: str
+    observed_at: datetime
+    source: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty(self.ad_id, "ad_id")
+        _require_nonempty(self.conversation_id, "conversation_id")
+        _require_nonempty(self.provider_message_id, "provider_message_id")
+        _require_nonempty(self.source, "source")
+        _require_aware(self.observed_at, "observed_at")
+
+
+@dataclass(frozen=True, slots=True)
 class AdClassification:
     ad_id: str
     observed_at: datetime

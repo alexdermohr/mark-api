@@ -10,6 +10,7 @@ from typing import Iterable, Mapping
 from .domain import (
     AdClassification,
     AdSnapshot,
+    InboundMessageEvent,
     LifecycleState,
     OperationReceipt,
     ReactionSnapshot,
@@ -70,6 +71,18 @@ class SnapshotStore:
 
                 CREATE INDEX IF NOT EXISTS idx_reaction_snapshots_ad_id_observed
                     ON reaction_snapshots(ad_id, observed_at, id);
+
+                CREATE TABLE IF NOT EXISTS inbound_message_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider_message_id TEXT NOT NULL UNIQUE,
+                    ad_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    source TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_inbound_message_events_ad_id_observed
+                    ON inbound_message_events(ad_id, observed_at, id);
 
                 CREATE TABLE IF NOT EXISTS ad_classifications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,6 +164,81 @@ class SnapshotStore:
                     snapshot.inbound_message_count,
                 ),
             )
+
+    def append_inbound_message_events(
+        self,
+        events: Iterable[InboundMessageEvent],
+    ) -> int:
+        """Atomically append minimal inbound-message events.
+
+        Exact provider-message duplicates are idempotent. Reusing one provider
+        message ID for different event data fails closed and rolls back the
+        complete batch.
+        """
+
+        unique_events: dict[str, InboundMessageEvent] = {}
+        for event in tuple(events):
+            previous = unique_events.get(event.provider_message_id)
+            if previous is not None and previous != event:
+                raise ValueError(
+                    "provider_message_id conflict inside import batch"
+                )
+            unique_events[event.provider_message_id] = event
+
+        if not unique_events:
+            return 0
+
+        inserted = 0
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for event in unique_events.values():
+                row = connection.execute(
+                    """
+                    SELECT ad_id, conversation_id, provider_message_id,
+                           observed_at, source
+                    FROM inbound_message_events
+                    WHERE provider_message_id = ?
+                    """,
+                    (event.provider_message_id,),
+                ).fetchone()
+                candidate = (
+                    event.ad_id,
+                    event.conversation_id,
+                    event.provider_message_id,
+                    event.observed_at.isoformat(),
+                    event.source,
+                )
+                if row is not None:
+                    stored = (
+                        row["ad_id"],
+                        row["conversation_id"],
+                        row["provider_message_id"],
+                        row["observed_at"],
+                        row["source"],
+                    )
+                    if stored != candidate:
+                        raise ValueError(
+                            "provider_message_id conflict with stored event"
+                        )
+                    continue
+
+                connection.execute(
+                    """
+                    INSERT INTO inbound_message_events (
+                        provider_message_id, ad_id, conversation_id,
+                        observed_at, source
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.provider_message_id,
+                        event.ad_id,
+                        event.conversation_id,
+                        event.observed_at.isoformat(),
+                        event.source,
+                    ),
+                )
+                inserted += 1
+        return inserted
 
     @staticmethod
     def _insert_classification(
@@ -440,6 +528,68 @@ class SnapshotStore:
             )
             for row in rows
         )
+
+    def inbound_message_history(
+        self,
+        ad_id: str,
+    ) -> tuple[InboundMessageEvent, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, ad_id, conversation_id, provider_message_id,
+                       observed_at, source
+                FROM inbound_message_events
+                WHERE ad_id = ?
+                """,
+                (ad_id,),
+            ).fetchall()
+
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: (
+                datetime.fromisoformat(row["observed_at"]),
+                int(row["id"]),
+            ),
+        )
+        return tuple(
+            InboundMessageEvent(
+                ad_id=row["ad_id"],
+                conversation_id=row["conversation_id"],
+                provider_message_id=row["provider_message_id"],
+                observed_at=datetime.fromisoformat(row["observed_at"]),
+                source=row["source"],
+            )
+            for row in ordered_rows
+        )
+
+    def inbound_message_ad_ids(self) -> tuple[str, ...]:
+        """Return every ad ID represented by imported inbound-message events."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT ad_id
+                FROM inbound_message_events
+                ORDER BY ad_id ASC
+                """
+            ).fetchall()
+        return tuple(str(row["ad_id"]) for row in rows)
+
+    def inbound_message_counts(self, ad_id: str) -> tuple[int, int]:
+        """Return (conversation_count, inbound_message_count) for one ad."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(DISTINCT conversation_id) AS conversations,
+                       COUNT(*) AS messages
+                FROM inbound_message_events
+                WHERE ad_id = ?
+                """,
+                (ad_id,),
+            ).fetchone()
+        assert row is not None
+        return int(row["conversations"]), int(row["messages"])
 
     def classification_history(self, ad_id: str) -> tuple[AdClassification, ...]:
         with self._connect() as connection:

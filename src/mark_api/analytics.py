@@ -21,12 +21,18 @@ ANALYTICS_METRICS = (
     "conversation_count",
     "unique_buyer_count",
     "inbound_message_count",
+    "email_conversation_count",
+    "email_inbound_message_count",
 )
 
 _AD_METRICS = frozenset(("views", "watch_count", "reply_count"))
 _REACTION_METRICS = frozenset(
     ("conversation_count", "unique_buyer_count", "inbound_message_count")
 )
+_EMAIL_REACTION_METRICS = {
+    "email_conversation_count": "conversation_count",
+    "email_inbound_message_count": "inbound_message_count",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,8 +40,8 @@ class AdMetricRanking:
     ad_id: str
     metric: str
     value: int
-    present: bool
-    lifecycle_state: LifecycleState
+    present: bool | None
+    lifecycle_state: LifecycleState | None
     title: str | None
 
 
@@ -53,6 +59,9 @@ class AnalyticsService:
     This is a current projection: the latest explicit classification is paired
     with the latest/last-known metric projection. It is not a time-aligned or
     causal comparison of historical classification periods.
+
+    Email-derived metrics are explicitly source-prefixed and never replace or
+    combine with ReactionSnapshot metrics.
     """
 
     def __init__(self, store: SnapshotStore) -> None:
@@ -85,10 +94,39 @@ class AnalyticsService:
             value = getattr(latest, metric)
             return value if isinstance(value, int) else None
 
+        if metric in _EMAIL_REACTION_METRICS:
+            item = self._query.email_reaction(ad.ad_id)
+            if item is None:
+                return None
+            value = getattr(item, _EMAIL_REACTION_METRICS[metric])
+            return value if isinstance(value, int) else None
+
         raise ValueError(f"unknown analytics metric: {metric}")
 
     def rank_ads(self, metric: str) -> tuple[AdMetricRanking, ...]:
         self._validate_metric(metric)
+
+        if metric in _EMAIL_REACTION_METRICS:
+            known_ads = {item.ad_id: item for item in self._query.latest_ads()}
+            rows = []
+            field_name = _EMAIL_REACTION_METRICS[metric]
+            for email_item in self._query.email_reactions():
+                ad = known_ads.get(email_item.ad_id)
+                rows.append(
+                    AdMetricRanking(
+                        ad_id=email_item.ad_id,
+                        metric=metric,
+                        value=getattr(email_item, field_name),
+                        present=ad.present if ad is not None else None,
+                        lifecycle_state=(
+                            ad.lifecycle_state if ad is not None else None
+                        ),
+                        title=ad.title if ad is not None else None,
+                    )
+                )
+            rows.sort(key=lambda item: (-item.value, item.ad_id))
+            return tuple(rows)
+
         rows: list[AdMetricRanking] = []
         for ad in self._query.latest_ads():
             value = self._metric_value(ad, metric)
@@ -155,7 +193,11 @@ def ad_metric_ranking_to_dict(item: AdMetricRanking) -> dict[str, object]:
         "metric": item.metric,
         "value": item.value,
         "present": item.present,
-        "lifecycle_state": item.lifecycle_state.value,
+        "lifecycle_state": (
+            item.lifecycle_state.value
+            if item.lifecycle_state is not None
+            else None
+        ),
         "title": item.title,
     }
 

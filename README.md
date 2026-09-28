@@ -4,7 +4,7 @@
 
 ## Status
 
-**Core, Adapter, Dashboard und Analytics implementiert / technischer Read-only-Livepfad belegt / Plattformwrites bis zur Integrationsfreigabe gesperrt** — Stand: 25.09.2026.
+**Core, Adapter, Dashboard und Analytics implementiert / technischer PoC abgeschlossen / zulässiger lokaler E-Mail-Import implementiert / inoffizielle Plattformautomation nicht als Produktpfad freigegeben** — Stand: 28.09.2026.
 
 Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Der MVP-Fokus liegt auf Anzeigenverwaltung, Synchronisation, Verkäufermetriken, Inbox/Interessenten, Dashboard und datenbasierter Auswertung. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
 
@@ -12,8 +12,8 @@ Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkreti
 
 - Python-3.12+-Core mit diskriminierten Read-Ergebnissen, Safe-Write-Orchestrierung und SQLite-Snapshot-Persistenz.
 - `ManagementReadAdapter` für den autoritativen Besitzerbestand sowie Verkäuferstatus, Views, Merker und Replies.
-- `MonkrelMobileApiAdapter` für eigene Anzeigen, ID-gebundene Pause/Aktivierung, Delete und Inbox/Conversation-Zuordnung.
-- `BrowserBotAdapter` als isolierter externer Prozess für Sync und in-place Inhaltsupdate; Browserautomation ist nicht der bevorzugte Zustandsadapter.
+- `MonkrelMobileApiAdapter` als technisch belegter PoC-Adapter für eigene Anzeigen, ID-gebundene Pause/Aktivierung, Delete und Inbox/Conversation-Zuordnung; nach Abschluss von Issue #2 ist er kein Produktpfad für private Accounts.
+- `BrowserBotAdapter` als technisch belegter PoC für Sync und in-place Inhaltsupdate; nach Abschluss von Issue #2 ist Browserautomation kein Produktpfad für private Accounts.
 - `MarkService` als Application-Layer über den Capability-Adaptern.
 - Read-only Dashboard/API auf Loopback sowie Analytics-Rankings auf explizit gespeicherten Klassifikationslabels.
 - Der Ein-Anzeigen-Realtest vom 24.09.2026 belegt Sync, stabiles in-place Update, Pause/Aktivierung, Verkäufermetriken, positiven Inbox/adId-Fall und Delete mit unabhängigen Besitzerlisten-Readbacks.
@@ -43,25 +43,36 @@ mark-api-classify \
 
 Der CLI akzeptiert nur bereits im lokalen Store bekannte Anzeigen-IDs. Er greift weder auf Kleinanzeigen noch auf andere Netzwerkdienste zu und verändert keine Plattformdaten.
 
+## Lokaler Import von Kleinanzeigen-Nachrichtenkopien
+
+Issue #2 erlaubt für private Accounts lokale Auswertung von offiziellen Kleinanzeigen-E-Mail-Kopien, die im eigenen Postfach ankommen. `mark-api` greift dafür **nicht** auf Gmail oder Kleinanzeigen zu. Der Import verarbeitet ausschließlich lokal bereitgestellte rohe RFC822-/`.eml`-Dateien:
+
+```bash
+mark-api-import-mail \
+  --db /pfad/zu/mark.sqlite \
+  /pfad/zu/nachricht-1.eml \
+  /pfad/zu/nachricht-2.eml
+```
+
+Der Parser bindet Kleinanzeigen-Absender, `X-Conversation-ID`, `X-Message-ID`/standardisierte `Message-ID`, Anzeigen-ID und Zeitzone gegeneinander und bricht bei Widersprüchen fail-closed ab. Diese Prüfung validiert die Struktur und Konsistenz der nutzerbereitgestellten Rohmail; sie ist **keine kryptographische Absenderauthentifizierung**. Der Import setzt voraus, dass die rohe Nachricht aus dem eigenen Postfach bereitgestellt wird. Persistiert werden nur Anzeigen-ID, Conversation-ID, Provider-Message-ID, Zeitstempel und Quelle. **Nachrichtentext und Personennamen werden nicht gespeichert.** Exakte Wiederholungsimporte sind idempotent; dieselbe Provider-Message-ID mit abweichenden Daten blockiert den gesamten Batch.
+
+Die daraus ableitbaren Größen bleiben bewusst von `ReactionSnapshot` getrennt. Die read-only Query-Surface `/api/email-reactions` bzw. `/api/ads/{id}/email-reactions` exponiert die importierten Zähler; Analytics führt sie source-explizit als `email_conversation_count` und `email_inbound_message_count`. Die bestehenden Metriken `conversation_count`, `inbound_message_count` und `unique_buyer_count` bleiben unverändert ReactionSnapshot-basiert. Aus E-Mail-Kopien wird insbesondere kein `unique_buyer_count` erfunden und es findet keine additive Doppelzählung zwischen Quellen statt.
+
 ## Offene fachliche Punkte
 
 Die Reaktionsdaten werden absichtlich getrennt als `conversation_count`, `unique_buyer_count` und `inbound_message_count` gespeichert. Welche dieser Größen fachlich „wie viele geschrieben haben“ meint, ist noch nicht festgelegt.
 
 Ebenso ist noch keine fachlich bestätigte Zielfunktion für „beste Lösung“ definiert. Die Analytics-Schicht zeigt deshalb Rohmetriken und Rankings, ohne daraus Kausalität oder Qualität abzuleiten.
 
-## Wichtigstes Gate
+## Zulässige Betriebswege
 
-Der technische PoC ist abgeschlossen; die technische Machbarkeit ist **nicht** mit einer Freigabe für automatisierten Dauerbetrieb gleichzusetzen.
+[Issue #2](https://github.com/alexdermohr/mark-api/issues/2) ist abgeschlossen und trennt den erfolgreichen technischen PoC vom zulässigen Produktbetrieb:
 
-Die aktuell veröffentlichten Kleinanzeigen-Nutzungsbedingungen untersagen ohne ausdrückliche schriftliche Zustimmung den Einsatz von Crawlern, Scrapern oder anderen automatisierten Mechanismen, um auf die Kleinanzeigen-Dienste zuzugreifen und Inhalte zu sammeln. Die offizielle Professional-Sellers-API ist laut Entwicklerdokumentation nur für professionelle Nutzer mit Power- oder Premium-Angebot verfügbar und nicht mit manuell im Web erstellten Anzeigen synchron.
-
-Daher gilt bis zur Klärung von [Issue #2](https://github.com/alexdermohr/mark-api/issues/2):
-
-- keine synthetischen oder testartig erkennbaren Anzeigen/Nachrichten auf dem aktuellen Account,
-- keine Publish/Delete/Pause/Aktivieren-Zyklen nur zu Testzwecken,
-- keine Ableitung einer produktiven Freigabe aus dem erfolgreichen technischen PoC,
-- schreibender Dauerbetrieb bleibt gesperrt,
-- ein dauerhafter Integrationsweg benötigt entweder einen belegten offiziellen API-Pfad für den konkreten Account oder eine ausdrückliche Freigabe/Partnerlösung von Kleinanzeigen.
+- Für private Accounts wird keine inoffizielle Browser-/Mobile-/Private-HTTP-Automation als Produktpfad betrieben.
+- Lokale Analytics dürfen aus vom Nutzer bereitgestellten offiziellen Daten entstehen, insbesondere Kleinanzeigen-E-Mail-Kopien und — sobald das konkrete Dateiformat belegt ist — offiziellen PRO-Statistikdownloads.
+- Die offizielle ProSellers API bleibt ein optionaler zukünftiger Pfad ausschließlich für berechtigte professionelle Power-/Premium-Konten mit provisionierten Zugangsdaten. Für diesen Modus müssen API-Herkunft und Write-Authority der betroffenen Anzeigen separat gebunden werden.
+- Die vorhandenen privaten/mobile/browserbasierten Adapter bleiben als technische PoC-Evidenz im Repository, begründen aber keine Betriebsfreigabe.
+- Plattformwrites bleiben für den aktuellen privaten Produktpfad aus.
 
 ## Projektregistratur
 
@@ -91,4 +102,4 @@ Das Repository ist öffentlich. Zugangsdaten, Tokens, Telefonnummern und sonstig
 
 ## Arbeitsregel
 
-Der Core wird entlang der bereits belegten Adaptergrenzen weiter gehärtet. Plattformwrites bleiben fail-closed: standardmäßig deaktiviert, an genau eine bekannte Anzeigen-ID gebunden, mit frischem Precondition-Read, genau einer Mutation, ohne Blind-Retry und mit unabhängigem Post-Readback. Delete verlangt zusätzlich eine explizite Freigabe für die konkrete Anzeigen-ID. Create/Publish bleibt bis zu einem separaten technischen und zulässigen Betriebs-Gate deaktiviert.
+Der aktuelle Produktpfad für private Accounts ist lokal/read-only gegenüber der Plattform: user-provided offizielle Dateien und E-Mail-Kopien werden lokal verarbeitet. Die inoffiziellen PoC-Adapter bleiben technisch fail-closed erhalten, werden aber nicht als Produktintegration aktiviert. Ein späterer offizieller ProSellers-Writepfad benötigt eine neue, credentials- und entitlement-gebundene Freigabe mit eindeutig gebundener Write-Authority.
