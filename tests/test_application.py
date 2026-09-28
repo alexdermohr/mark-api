@@ -294,6 +294,7 @@ class MarkServiceTests(unittest.TestCase):
         state_writer=None,
         delete_writer=None,
         content_writer=None,
+        content_reader_factory=None,
         writes_enabled=False,
         store=None,
     ):
@@ -318,6 +319,7 @@ class MarkServiceTests(unittest.TestCase):
             delete_writer=delete_writer,
             content_writer=content_writer,
             store=store,
+            content_reader_factory=content_reader_factory,
             writes_enabled=writes_enabled,
             clock=lambda: NOW,
         )
@@ -625,6 +627,85 @@ class MarkServiceTests(unittest.TestCase):
         self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
         self.assertEqual(writer.delete_calls, ["3521676801"])
         self.assertEqual(mobile.calls, 1)
+
+    def test_disabled_content_update_does_not_construct_target_reader(self) -> None:
+        owner = SequenceAdsReader()
+        content = ContentWriter()
+        factory_calls: list[str] = []
+
+        def factory(ad_id: str):
+            factory_calls.append(ad_id)
+            raise AssertionError("content reader factory must stay lazy")
+
+        service, _, _, _ = self.service(
+            owner_reader=owner,
+            management_reader=SequenceAdsReader(),
+            content_writer=content,
+            content_reader_factory=factory,
+            writes_enabled=False,
+        )
+
+        receipt = service.update_content(
+            "3521676801",
+            title="new",
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
+        self.assertEqual(receipt.pre_read_status, "writes_disabled")
+        self.assertEqual(factory_calls, [])
+        self.assertEqual(owner.calls, 0)
+        self.assertEqual(content.calls, [])
+
+    def test_content_update_uses_one_target_reader_factory_for_pre_and_post(self) -> None:
+        owner = SequenceAdsReader()
+        target_reader = SequenceAdsReader(
+            ReadResult.success_nonempty(
+                (
+                    ad(
+                        "3521676801",
+                        state=LifecycleState.ACTIVE,
+                        description="old",
+                        source="management+private-web",
+                    ),
+                )
+            ),
+            ReadResult.success_nonempty(
+                (
+                    ad(
+                        "3521676801",
+                        state=LifecycleState.ACTIVE,
+                        description="new",
+                        source="management+private-web",
+                    ),
+                )
+            ),
+        )
+        factory_calls: list[str] = []
+
+        def factory(ad_id: str):
+            factory_calls.append(ad_id)
+            return target_reader
+
+        service, _, _, content = self.service(
+            owner_reader=owner,
+            management_reader=SequenceAdsReader(),
+            content_reader_factory=factory,
+            writes_enabled=True,
+        )
+
+        receipt = service.update_content(
+            "3521676801",
+            description="new",
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(factory_calls, ["3521676801"])
+        self.assertEqual(target_reader.calls, 2)
+        self.assertEqual(owner.calls, 0)
+        self.assertEqual(
+            content.calls,
+            [("3521676801", None, "new")],
+        )
 
     def test_content_update_uses_enriched_owner_reader(self) -> None:
         owner = SequenceAdsReader(
