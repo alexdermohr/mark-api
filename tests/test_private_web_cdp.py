@@ -13,6 +13,7 @@ from mark_api.private_web_cdp import (
     CdpPrivateWebPage,
     PrivateWebCdpError,
     _LoopbackCdpClient,
+    _proxy_free_loopback_opener,
     _validated_loopback_endpoint,
 )
 
@@ -70,6 +71,14 @@ class FakeSocket:
         self.closed = True
 
 
+class FakeTcpSocket:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def page_with_results(*values):
     clients: list[FakeClient] = []
     remaining = list(values)
@@ -116,13 +125,20 @@ class CdpPrivateWebPageTests(unittest.TestCase):
                     _validated_loopback_endpoint(invalid)
 
     def test_open_editor_navigates_only_to_exact_ad_id(self) -> None:
-        client = FakeClient(
-            lambda method, params: (
-                {}
-                if method == "Page.navigate"
-                else {"result": {"type": "string", "value": "complete"}}
-            )
-        )
+        runtime_values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+        ]
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
         page = CdpPrivateWebPage(
             "http://127.0.0.1:19610",
             client_factory=lambda: client,
@@ -130,8 +146,13 @@ class CdpPrivateWebPageTests(unittest.TestCase):
 
         page.open_editor(AD_ID)
 
-        self.assertEqual(client.calls[0][0], "Page.navigate")
-        target = client.calls[0][1]["url"]
+        self.assertEqual(client.calls[0][0], "Runtime.evaluate")
+        self.assertIn(
+            "__mark_private_web_navigation_probe_",
+            str(client.calls[0][1]["expression"]),
+        )
+        self.assertEqual(client.calls[1][0], "Page.navigate")
+        target = client.calls[1][1]["url"]
         parsed = urlparse(str(target))
         self.assertEqual(parsed.scheme, "https")
         self.assertEqual(parsed.netloc, "www.kleinanzeigen.de")
@@ -140,6 +161,41 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertFalse(client.closed)
         page.close()
         self.assertTrue(client.closed)
+
+    def test_open_editor_waits_until_old_complete_document_is_replaced(self) -> None:
+        runtime_values = [
+            True,
+            {"readyState": "complete", "oldDocument": True},
+            {"readyState": "complete", "oldDocument": False},
+        ]
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+            sleep=lambda _seconds: None,
+        )
+
+        page.open_editor(AD_ID)
+
+        self.assertEqual(runtime_values, [])
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            [
+                "Runtime.evaluate",
+                "Page.navigate",
+                "Runtime.evaluate",
+                "Runtime.evaluate",
+            ],
+        )
 
     def test_invalid_ad_id_never_touches_browser(self) -> None:
         calls = 0
@@ -556,6 +612,16 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "private web cdp failed at cookies")
         self.assertNotIn("secret", str(caught.exception))
 
+    def test_proxy_free_loopback_opener_has_no_configured_proxies(self) -> None:
+        opener = _proxy_free_loopback_opener()
+        director = opener.__self__
+        proxy_handlers = [
+            handler
+            for handler in director.handlers
+            if handler.__class__.__name__ == "ProxyHandler"
+        ]
+        self.assertEqual(proxy_handlers, [])
+
     def test_loopback_client_reuses_one_page_websocket(self) -> None:
         good_target = {
             "type": "page",
@@ -570,14 +636,28 @@ class CdpPrivateWebPageTests(unittest.TestCase):
                 {"id": 2, "result": {"value": 2}},
             ]
         )
+        raw_socket = FakeTcpSocket()
+        tcp_calls: list[tuple[object, object]] = []
+        websocket_kwargs: dict[str, object] = {}
+
+        def tcp_socket_factory(address, *, timeout):
+            tcp_calls.append((address, timeout))
+            return raw_socket
+
+        def websocket_factory(*args, **kwargs):
+            websocket_kwargs.update(kwargs)
+            return socket
 
         client = _LoopbackCdpClient(
             "http://127.0.0.1:19610",
             timeout_seconds=1,
             opener=lambda *args, **kwargs: FakeResponse([good_target]),
-            websocket_factory=lambda *args, **kwargs: socket,
+            websocket_factory=websocket_factory,
+            tcp_socket_factory=tcp_socket_factory,
         )
 
+        self.assertEqual(tcp_calls, [(("127.0.0.1", 19610), 1)])
+        self.assertIs(websocket_kwargs["socket"], raw_socket)
         self.assertEqual(client.call("Runtime.one"), {"value": 1})
         self.assertEqual(client.call("Runtime.two"), {"value": 2})
         self.assertEqual(
@@ -587,6 +667,30 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertEqual([message["id"] for message in socket.sent], [1, 2])
         client.close()
         self.assertTrue(socket.closed)
+
+    def test_loopback_client_closes_direct_socket_on_websocket_failure(self) -> None:
+        good_target = {
+            "type": "page",
+            "webSocketDebuggerUrl": (
+                "ws://127.0.0.1:19610/devtools/page/opaque-target"
+            ),
+        }
+        raw_socket = FakeTcpSocket()
+
+        with self.assertRaises(PrivateWebCdpError) as caught:
+            _LoopbackCdpClient(
+                "http://127.0.0.1:19610",
+                timeout_seconds=1,
+                opener=lambda *args, **kwargs: FakeResponse([good_target]),
+                websocket_factory=lambda *args, **kwargs: (
+                    (_ for _ in ()).throw(RuntimeError("provider secret"))
+                ),
+                tcp_socket_factory=lambda *args, **kwargs: raw_socket,
+            )
+
+        self.assertEqual(caught.exception.stage, "connect")
+        self.assertTrue(raw_socket.closed)
+        self.assertNotIn("secret", str(caught.exception))
 
     def test_loopback_client_requires_one_same_port_page_target(self) -> None:
         good_target = {

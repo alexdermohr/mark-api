@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import socket
 import time
 from collections.abc import Callable
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
-from urllib.request import urlopen as _urlopen
+from urllib.request import ProxyHandler, build_opener
 
 from .private_web import (
     PrivateWebEditorSnapshot,
@@ -16,6 +17,10 @@ from .private_web import (
 _KLEINANZEIGEN_ORIGIN = "https://www.kleinanzeigen.de"
 _EDITOR_PATH = "/p-anzeige-bearbeiten.html"
 _MAX_TARGET_BYTES = 64 * 1024
+
+
+def _proxy_free_loopback_opener() -> Callable[..., Any]:
+    return build_opener(ProxyHandler({})).open
 
 
 class PrivateWebCdpError(RuntimeError):
@@ -89,13 +94,15 @@ class _LoopbackCdpClient:
         endpoint: str,
         *,
         timeout_seconds: float,
-        opener: Callable[..., Any] = _urlopen,
+        opener: Callable[..., Any] | None = None,
         websocket_factory: Callable[..., Any] | None = None,
+        tcp_socket_factory: Callable[..., Any] = socket.create_connection,
     ) -> None:
         self._endpoint, self._port = _validated_loopback_endpoint(endpoint)
         self._timeout_seconds = timeout_seconds
-        self._opener = opener
+        self._opener = opener or _proxy_free_loopback_opener()
         self._websocket_factory = websocket_factory
+        self._tcp_socket_factory = tcp_socket_factory
         self._next_id = 0
         self._socket = self._connect()
 
@@ -140,11 +147,23 @@ class _LoopbackCdpClient:
                 import websocket  # type: ignore[import-not-found]
 
                 factory = websocket.create_connection
-            return factory(
-                websocket_url,
+            raw_socket = self._tcp_socket_factory(
+                ("127.0.0.1", self._port),
                 timeout=self._timeout_seconds,
-                suppress_origin=True,
             )
+            try:
+                return factory(
+                    websocket_url,
+                    timeout=self._timeout_seconds,
+                    suppress_origin=True,
+                    socket=raw_socket,
+                )
+            except Exception:
+                try:
+                    raw_socket.close()
+                except Exception:
+                    pass
+                raise
         except Exception:  # noqa: BLE001 - never expose browser/provider detail.
             raise PrivateWebCdpError("connect") from None
 
@@ -366,20 +385,46 @@ class CdpPrivateWebPage:
         )
         self._submit_attempted = False
         client = self._client()
+        marker = json.dumps(
+            f"__mark_private_web_navigation_probe_{target_ad_id}__"
+        )
         try:
+            armed = self._runtime_value(
+                client,
+                (
+                    "(() => { const key = "
+                    + marker
+                    + "; globalThis[key] = true; "
+                    + "return globalThis[key] === true; })()"
+                ),
+            )
+            if armed is not True:
+                raise PrivateWebCdpError("navigate")
             navigation = client.call("Page.navigate", {"url": target_url})
             if navigation.get("errorText"):
                 raise PrivateWebCdpError("navigate")
             deadline = self._monotonic() + self._timeout_seconds
+            readiness_expression = (
+                "(() => ({"
+                + "readyState: document.readyState,"
+                + "oldDocument: globalThis["
+                + marker
+                + "] === true"
+                + "}))()"
+            )
             while True:
                 try:
-                    ready_state = self._runtime_value(
+                    readiness = self._runtime_value(
                         client,
-                        "document.readyState",
+                        readiness_expression,
                     )
                 except PrivateWebCdpError:
-                    ready_state = None
-                if ready_state == "complete":
+                    readiness = None
+                if (
+                    isinstance(readiness, dict)
+                    and readiness.get("readyState") == "complete"
+                    and readiness.get("oldDocument") is False
+                ):
                     return
                 if self._monotonic() >= deadline:
                     raise PrivateWebCdpError("navigate")
