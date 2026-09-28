@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
-from urllib.request import ProxyHandler, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
 from .private_web import (
     PrivateWebEditorSnapshot,
@@ -20,8 +20,13 @@ _EDITOR_PATH = "/p-anzeige-bearbeiten.html"
 _MAX_TARGET_BYTES = 64 * 1024
 
 
+class _RejectRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _proxy_free_loopback_opener() -> Callable[..., Any]:
-    return build_opener(ProxyHandler({})).open
+    return build_opener(ProxyHandler({}), _RejectRedirectHandler()).open
 
 
 class PrivateWebCdpError(RuntimeError):
@@ -109,10 +114,14 @@ class _LoopbackCdpClient:
 
     def _connect(self):
         try:
+            discovery_url = f"{self._endpoint}/json/list"
             with self._opener(
-                f"{self._endpoint}/json/list",
+                discovery_url,
                 timeout=self._timeout_seconds,
             ) as response:
+                geturl = getattr(response, "geturl", None)
+                if not callable(geturl) or geturl() != discovery_url:
+                    raise ValueError("target discovery escaped loopback binding")
                 payload = response.read(_MAX_TARGET_BYTES + 1)
             if len(payload) > _MAX_TARGET_BYTES:
                 raise ValueError("target list too large")
@@ -330,6 +339,8 @@ class CdpPrivateWebPage:
         self._sleep = sleep
         self._monotonic = monotonic
         self._submit_attempted = False
+        self._bound_ad_id: str | None = None
+        self._last_ready_snapshot: PrivateWebEditorSnapshot | None = None
 
     @classmethod
     def from_port(
@@ -352,6 +363,8 @@ class CdpPrivateWebPage:
     def close(self) -> None:
         client = self._client_instance
         self._client_instance = None
+        self._bound_ad_id = None
+        self._last_ready_snapshot = None
         if client is not None:
             client.close()
 
@@ -393,6 +406,8 @@ class CdpPrivateWebPage:
             + urlencode({"adId": target_ad_id})
         )
         self._submit_attempted = False
+        self._bound_ad_id = None
+        self._last_ready_snapshot = None
         client = self._client()
         marker = json.dumps(
             f"__mark_private_web_navigation_probe_{target_ad_id}__"
@@ -434,6 +449,7 @@ class CdpPrivateWebPage:
                     and readiness.get("readyState") == "complete"
                     and readiness.get("oldDocument") is False
                 ):
+                    self._bound_ad_id = target_ad_id
                     return
                 if self._monotonic() >= deadline:
                     raise PrivateWebCdpError("navigate")
@@ -446,6 +462,7 @@ class CdpPrivateWebPage:
             pass
 
     def read_editor(self) -> PrivateWebEditorSnapshot:
+        self._last_ready_snapshot = None
         origin = json.dumps(self._expected_origin)
         path = json.dumps(_EDITOR_PATH)
         expression = f"""
@@ -546,7 +563,7 @@ class CdpPrivateWebPage:
         if not isinstance(title, str) or not isinstance(description, str):
             return PrivateWebEditorSnapshot(state=PrivateWebEditorState.UNKNOWN)
         try:
-            return PrivateWebEditorSnapshot(
+            snapshot = PrivateWebEditorSnapshot(
                 state=PrivateWebEditorState.READY,
                 ad_id=ad_id,
                 title=title,
@@ -554,6 +571,9 @@ class CdpPrivateWebPage:
             )
         except (TypeError, ValueError):
             return PrivateWebEditorSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        if ad_id == self._bound_ad_id:
+            self._last_ready_snapshot = snapshot
+        return snapshot
 
     def _replace_field(
         self,
@@ -566,81 +586,124 @@ class CdpPrivateWebPage:
     ) -> None:
         if not isinstance(value, str):
             raise TypeError("field value must be a string")
-        prepare_expression = f"""
+        target_ad_id = self._bound_ad_id
+        snapshot = self._last_ready_snapshot
+        if (
+            target_ad_id is None
+            or snapshot is None
+            or snapshot.state is not PrivateWebEditorState.READY
+            or snapshot.ad_id != target_ad_id
+            or snapshot.title is None
+            or snapshot.description is None
+        ):
+            raise PrivateWebCdpError(stage)
+
+        origin = json.dumps(self._expected_origin)
+        path = json.dumps(_EDITOR_PATH)
+        ad_id = json.dumps(target_ad_id)
+        expected_title = json.dumps(snapshot.title)
+        expected_description = json.dumps(snapshot.description)
+        replacement = json.dumps(value)
+        expression = f"""
 (() => {{
-  const element = document.querySelector({json.dumps(selector)});
-  if (!(element instanceof {prototype})) return false;
-  if (element.getAttribute("name") !== {json.dumps(expected_name)}) return false;
-  element.focus();
-  return document.activeElement === element;
-}})()
-"""
-        verify_expression = f"""
-(() => {{
-  const element = document.querySelector({json.dumps(selector)});
-  return (
-    element instanceof {prototype} &&
-    element.getAttribute("name") === {json.dumps(expected_name)} &&
-    element.value === {json.dumps(value)}
+  const currentOrigin = location.origin;
+  const currentPath = location.pathname;
+  const currentAdId = new URL(location.href).searchParams.get("adId");
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((candidate) => (candidate.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const title = document.querySelector("#ad-title");
+  const description = document.querySelector("#ad-description");
+  const saveButtons = Array.from(document.querySelectorAll("button")).filter(
+    (button) => (button.innerText || "").trim() === "Anzeige speichern"
   );
+  const element = document.querySelector({json.dumps(selector)});
+  if (
+    currentOrigin !== {origin} ||
+    currentPath !== {path} ||
+    currentAdId !== {ad_id} ||
+    hasCaptcha ||
+    hasMfa ||
+    hasSecurityChallenge ||
+    document.querySelector('input[type="password"]') ||
+    !(title instanceof HTMLInputElement) ||
+    title.getAttribute("name") !== "title" ||
+    !(description instanceof HTMLTextAreaElement) ||
+    description.getAttribute("name") !== "description" ||
+    title.value !== {expected_title} ||
+    description.value !== {expected_description} ||
+    saveButtons.length !== 1 ||
+    saveButtons[0].getAttribute("type") !== "button" ||
+    saveButtons[0].disabled ||
+    !(element instanceof {prototype}) ||
+    element.getAttribute("name") !== {json.dumps(expected_name)}
+  ) {{
+    return false;
+  }}
+  const descriptor = Object.getOwnPropertyDescriptor(
+    {prototype}.prototype,
+    "value"
+  );
+  if (!descriptor || typeof descriptor.set !== "function") return false;
+  element.focus();
+  if (document.activeElement !== element) return false;
+  descriptor.set.call(element, {replacement});
+  element.dispatchEvent(
+    new InputEvent(
+      "input",
+      {{bubbles: true, inputType: "insertText", data: {replacement}}}
+    )
+  );
+  element.dispatchEvent(new Event("change", {{bubbles: true}}));
+  return element.value === {replacement};
 }})()
 """
         client = self._client()
+        self._last_ready_snapshot = None
         try:
-            if self._runtime_value(client, prepare_expression) is not True:
+            if self._runtime_value(client, expression) is not True:
                 raise PrivateWebCdpError(stage)
-
-            client.call(
-                "Input.dispatchKeyEvent",
-                {
-                    "type": "keyDown",
-                    "key": "a",
-                    "code": "KeyA",
-                    "windowsVirtualKeyCode": 65,
-                    "nativeVirtualKeyCode": 65,
-                    "modifiers": 2,
-                },
-            )
-            client.call(
-                "Input.dispatchKeyEvent",
-                {
-                    "type": "keyUp",
-                    "key": "a",
-                    "code": "KeyA",
-                    "windowsVirtualKeyCode": 65,
-                    "nativeVirtualKeyCode": 65,
-                    "modifiers": 2,
-                },
-            )
-            client.call("Input.insertText", {"text": value})
-            client.call(
-                "Input.dispatchKeyEvent",
-                {
-                    "type": "keyDown",
-                    "key": "Tab",
-                    "code": "Tab",
-                    "windowsVirtualKeyCode": 9,
-                    "nativeVirtualKeyCode": 9,
-                },
-            )
-            client.call(
-                "Input.dispatchKeyEvent",
-                {
-                    "type": "keyUp",
-                    "key": "Tab",
-                    "code": "Tab",
-                    "windowsVirtualKeyCode": 9,
-                    "nativeVirtualKeyCode": 9,
-                },
-            )
-            if self._runtime_value(client, verify_expression) is not True:
-                raise PrivateWebCdpError(stage)
+            if expected_name == "title":
+                self._last_ready_snapshot = PrivateWebEditorSnapshot(
+                    state=PrivateWebEditorState.READY,
+                    ad_id=target_ad_id,
+                    title=value,
+                    description=snapshot.description,
+                )
+            else:
+                self._last_ready_snapshot = PrivateWebEditorSnapshot(
+                    state=PrivateWebEditorState.READY,
+                    ad_id=target_ad_id,
+                    title=snapshot.title,
+                    description=value,
+                )
         except PrivateWebCdpError:
             raise PrivateWebCdpError(stage) from None
         except Exception:  # noqa: BLE001 - sanitize browser/provider boundary.
             raise PrivateWebCdpError(stage) from None
-        finally:
-            pass
 
     def replace_title(self, value: str) -> None:
         self._replace_field(
@@ -664,23 +727,90 @@ class CdpPrivateWebPage:
         if self._submit_attempted:
             raise PrivateWebCdpError("submit_already_attempted")
         self._submit_attempted = True
-        expression = """
-(() => {
+        target_ad_id = self._bound_ad_id
+        snapshot = self._last_ready_snapshot
+        self._last_ready_snapshot = None
+        if (
+            target_ad_id is None
+            or snapshot is None
+            or snapshot.state is not PrivateWebEditorState.READY
+            or snapshot.ad_id != target_ad_id
+            or snapshot.title is None
+            or snapshot.description is None
+        ):
+            raise PrivateWebCdpError("submit")
+
+        origin = json.dumps(self._expected_origin)
+        path = json.dumps(_EDITOR_PATH)
+        ad_id = json.dumps(target_ad_id)
+        expected_title = json.dumps(snapshot.title)
+        expected_description = json.dumps(snapshot.description)
+        expression = f"""
+(() => {{
+  const currentOrigin = location.origin;
+  const currentPath = location.pathname;
+  const currentAdId = new URL(location.href).searchParams.get("adId");
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((candidate) => (candidate.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const title = document.querySelector("#ad-title");
+  const description = document.querySelector("#ad-description");
   const buttons = Array.from(document.querySelectorAll("button")).filter(
     (button) => (button.innerText || "").trim() === "Anzeige speichern"
   );
-  if (buttons.length !== 1) return null;
+  if (
+    currentOrigin !== {origin} ||
+    currentPath !== {path} ||
+    currentAdId !== {ad_id} ||
+    hasCaptcha ||
+    hasMfa ||
+    hasSecurityChallenge ||
+    document.querySelector('input[type="password"]') ||
+    !(title instanceof HTMLInputElement) ||
+    title.getAttribute("name") !== "title" ||
+    !(description instanceof HTMLTextAreaElement) ||
+    description.getAttribute("name") !== "description" ||
+    title.value !== {expected_title} ||
+    description.value !== {expected_description} ||
+    buttons.length !== 1
+  ) {{
+    return false;
+  }}
   const button = buttons[0];
-  if (button.getAttribute("type") !== "button" || button.disabled) return null;
-  button.scrollIntoView({block: "center", inline: "center"});
+  if (button.getAttribute("type") !== "button" || button.disabled) return false;
+  button.scrollIntoView({{block: "center", inline: "center"}});
   const rect = button.getBoundingClientRect();
-  if (rect.width <= 0 || rect.height <= 0) return null;
+  if (rect.width <= 0 || rect.height <= 0) return false;
   const x = rect.left + rect.width / 2;
   const y = rect.top + rect.height / 2;
   const hit = document.elementFromPoint(x, y);
-  if (hit !== button && !button.contains(hit)) return null;
-  return {x, y};
-})()
+  if (hit !== button && !button.contains(hit)) return false;
+  button.click();
+  return true;
+}})()
 """
         client = self._client()
         try:
@@ -703,61 +833,13 @@ class CdpPrivateWebPage:
             ):
                 raise PrivateWebCdpError("submit_settle")
 
-            point = self._runtime_value(client, expression)
-            if not isinstance(point, dict):
+            if self._runtime_value(client, expression) is not True:
                 raise PrivateWebCdpError("submit")
-            x = point.get("x")
-            y = point.get("y")
-            if (
-                isinstance(x, bool)
-                or not isinstance(x, (int, float))
-                or isinstance(y, bool)
-                or not isinstance(y, (int, float))
-                or x < 0
-                or y < 0
-            ):
-                raise PrivateWebCdpError("submit")
-            position = {
-                "x": float(x),
-                "y": float(y),
-            }
-            client.call(
-                "Input.dispatchMouseEvent",
-                {
-                    "type": "mouseMoved",
-                    **position,
-                    "button": "none",
-                    "buttons": 0,
-                    "pointerType": "mouse",
-                },
-            )
-            client.call(
-                "Input.dispatchMouseEvent",
-                {
-                    "type": "mousePressed",
-                    **position,
-                    "button": "left",
-                    "buttons": 1,
-                    "clickCount": 1,
-                    "pointerType": "mouse",
-                },
-            )
-            client.call(
-                "Input.dispatchMouseEvent",
-                {
-                    "type": "mouseReleased",
-                    **position,
-                    "button": "left",
-                    "buttons": 0,
-                    "clickCount": 1,
-                    "pointerType": "mouse",
-                },
-            )
 
             deadline = self._monotonic() + self._timeout_seconds
             while True:
-                path = self._runtime_value(client, "location.pathname")
-                if path != _EDITOR_PATH:
+                current_path = self._runtime_value(client, "location.pathname")
+                if current_path != _EDITOR_PATH:
                     return
                 if self._monotonic() >= deadline:
                     raise PrivateWebCdpError("submit_unconfirmed")
@@ -766,5 +848,3 @@ class CdpPrivateWebPage:
             raise PrivateWebCdpError(exc.stage) from None
         except Exception:  # noqa: BLE001 - ambiguous submit stays non-retryable.
             raise PrivateWebCdpError("submit") from None
-        finally:
-            pass
