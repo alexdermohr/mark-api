@@ -4,7 +4,7 @@
 
 ## Status
 
-**Core, Adapter, Dashboard und Analytics implementiert / technischer PoC abgeschlossen / zulässiger lokaler E-Mail-Import implementiert / inoffizielle Plattformautomation nicht als Produktpfad freigegeben** — Stand: 28.09.2026.
+**Core, Adapter, Dashboard und Analytics implementiert / technischer PoC abgeschlossen / zulässiger lokaler E-Mail-Import und lokaler E2E-Smoke implementiert / inoffizielle Plattformautomation nicht als Produktpfad freigegeben** — Stand: 28.09.2026.
 
 Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Der MVP-Fokus liegt auf Anzeigenverwaltung, Synchronisation, Verkäufermetriken, Inbox/Interessenten, Dashboard und datenbasierter Auswertung. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
 
@@ -57,6 +57,20 @@ mark-api-import-mail \
 Der Parser bindet Kleinanzeigen-Absender, `X-Conversation-ID`, `X-Message-ID`/standardisierte `Message-ID`, Anzeigen-ID und Zeitzone gegeneinander und bricht bei Widersprüchen fail-closed ab. Diese Prüfung validiert die Struktur und Konsistenz der nutzerbereitgestellten Rohmail; sie ist **keine kryptographische Absenderauthentifizierung**. Der Import setzt voraus, dass die rohe Nachricht aus dem eigenen Postfach bereitgestellt wird. Persistiert werden nur Anzeigen-ID, Conversation-ID, Provider-Message-ID, Zeitstempel und Quelle. **Nachrichtentext und Personennamen werden nicht gespeichert.** Exakte Wiederholungsimporte sind idempotent; dieselbe Provider-Message-ID mit abweichenden Daten blockiert den gesamten Batch.
 
 Die daraus ableitbaren Größen bleiben bewusst von `ReactionSnapshot` getrennt. Die read-only Query-Surface `/api/email-reactions` bzw. `/api/ads/{id}/email-reactions` exponiert die importierten Zähler; Analytics führt sie source-explizit als `email_conversation_count` und `email_inbound_message_count`. Die bestehenden Metriken `conversation_count`, `inbound_message_count` und `unique_buyer_count` bleiben unverändert ReactionSnapshot-basiert. Aus E-Mail-Kopien wird insbesondere kein `unique_buyer_count` erfunden und es findet keine additive Doppelzählung zwischen Quellen statt.
+
+## Lokaler E2E-Smoke
+
+Der zulässige lokale Datenpfad kann ohne Plattformzugriff end-to-end geprüft werden:
+
+```bash
+mark-api-local-smoke \
+  /pfad/zu/nachricht-1.eml \
+  /pfad/zu/nachricht-2.eml
+```
+
+Der Smoke erzeugt dafür ausschließlich eine **ephemere SQLite-Datenbank**, importiert die angegebenen lokalen RFC822-Dateien, startet den bestehenden Dashboard-Server auf `127.0.0.1` mit einem temporären Port und liest anschließend `/healthz`, `/api/email-reactions` sowie das Ranking `email_inbound_message_count`. Für die Loopback-Probes werden HTTP-Proxies deaktiviert. Danach wird zusätzlich geprüft, dass ein `POST` auf die read-only API mit `405 Allow: GET` abgewiesen wird und dass `/api/write/delete` nicht existiert (`404`).
+
+Der Smoke konstruiert **keinen** Kleinanzeigen-, Browser-, Mobile- oder Private-HTTP-Adapter, kontaktiert Kleinanzeigen nicht und aktiviert keine Plattformwrites. Die ephemere Datenbank wird nach dem Lauf verworfen. Er belegt damit nur die lokale Kette `user-provided .eml -> SQLite -> Query/Analytics -> Loopback-Dashboard`; er ist keine Freigabe für Plattformautomation und ersetzt keine noch fehlende Contract-Evidenz für das konkrete PRO-Statistikformat.
 
 ## Offene fachliche Punkte
 
