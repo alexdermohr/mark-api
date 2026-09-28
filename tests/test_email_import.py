@@ -124,6 +124,47 @@ class KleinanzeigenEmailImportTests(unittest.TestCase):
                 )
             )
 
+    def test_parser_rejects_message_id_case_mismatch(self) -> None:
+        provider_id = "AbCd1111-2222-3333-4444-555555555555"
+        with self.assertRaisesRegex(ValueError, "message id headers disagree"):
+            parse_kleinanzeigen_email(
+                notification(
+                    provider_message_id=provider_id,
+                    standard_message_id=(
+                        "<abcd1111-2222-3333-4444-555555555555"
+                        "@chat.kleinanzeigen.de>"
+                    ),
+                )
+            )
+
+    def test_case_distinct_provider_ids_remain_distinct_events(self) -> None:
+        _, store = self.make_store()
+        upper = "AbCd1111-2222-3333-4444-555555555555"
+        lower = "abcd1111-2222-3333-4444-555555555555"
+        first = parse_kleinanzeigen_email(
+            notification(provider_message_id=upper)
+        )
+        second = parse_kleinanzeigen_email(
+            notification(
+                provider_message_id=lower,
+                date="Thu, 24 Sep 2026 10:37:49 +0000",
+            )
+        )
+
+        self.assertEqual(first.provider_message_id, upper)
+        self.assertEqual(second.provider_message_id, lower)
+        self.assertEqual(
+            store.append_inbound_message_events((first, second)),
+            2,
+        )
+        self.assertEqual(
+            tuple(
+                item.provider_message_id
+                for item in store.inbound_message_history(first.ad_id)
+            ),
+            (upper, lower),
+        )
+
     def test_parser_rejects_naive_date(self) -> None:
         with self.assertRaisesRegex(ValueError, "timezone"):
             parse_kleinanzeigen_email(

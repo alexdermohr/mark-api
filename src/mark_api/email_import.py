@@ -101,9 +101,9 @@ def _provider_message_id(message: Message) -> str:
         raise ValueError("email Message-ID is not a Kleinanzeigen chat message id")
 
     standard_provider_id = match.group(1)
-    if provider_id.casefold() != standard_provider_id.casefold():
+    if provider_id != standard_provider_id:
         raise ValueError("email message id headers disagree")
-    return provider_id.casefold()
+    return provider_id
 
 
 def _conversation_id(message: Message, decoded_text: str) -> str:
