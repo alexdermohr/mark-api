@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import socket
 import time
 from collections.abc import Callable
@@ -220,8 +221,12 @@ class CdpCookieProvider:
         self._expected_origin = _validated_https_origin(expected_origin)
         if not isinstance(timeout_seconds, (int, float)):
             raise TypeError("timeout_seconds must be numeric")
-        if timeout_seconds <= 0 or timeout_seconds > 30:
-            raise ValueError("timeout_seconds must be in (0, 30]")
+        if (
+            timeout_seconds <= 0
+            or timeout_seconds > 30
+            or not math.isfinite(timeout_seconds)
+        ):
+            raise ValueError("timeout_seconds must be finite and in (0, 30]")
         self._timeout_seconds = float(timeout_seconds)
         self._target_url = (
             f"{self._expected_origin}/m-meine-anzeigen-verwalten.json"
@@ -308,8 +313,12 @@ class CdpPrivateWebPage:
         self._expected_origin = _validated_https_origin(expected_origin)
         if not isinstance(timeout_seconds, (int, float)):
             raise TypeError("timeout_seconds must be numeric")
-        if timeout_seconds <= 0 or timeout_seconds > 30:
-            raise ValueError("timeout_seconds must be in (0, 30]")
+        if (
+            timeout_seconds <= 0
+            or timeout_seconds > 30
+            or not math.isfinite(timeout_seconds)
+        ):
+            raise ValueError("timeout_seconds must be finite and in (0, 30]")
         self._timeout_seconds = float(timeout_seconds)
         self._client_factory = client_factory or (
             lambda: _LoopbackCdpClient(

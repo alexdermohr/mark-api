@@ -124,6 +124,23 @@ class CdpPrivateWebPageTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _validated_loopback_endpoint(invalid)
 
+    def test_nonfinite_timeouts_are_rejected(self) -> None:
+        for constructor in (CdpCookieProvider, CdpPrivateWebPage):
+            for timeout_seconds in (
+                float("nan"),
+                float("inf"),
+                float("-inf"),
+            ):
+                with self.subTest(
+                    constructor=constructor.__name__,
+                    timeout_seconds=timeout_seconds,
+                ):
+                    with self.assertRaisesRegex(ValueError, "finite"):
+                        constructor(
+                            "http://127.0.0.1:19610",
+                            timeout_seconds=timeout_seconds,
+                        )
+
     def test_open_editor_navigates_only_to_exact_ad_id(self) -> None:
         runtime_values = [
             True,
