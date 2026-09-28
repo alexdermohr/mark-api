@@ -476,7 +476,7 @@ class CdpPrivateWebPage:
     )
   )
     .map((element) => (element.innerText || "").toLowerCase())
-    .join("\n");
+    .join("\\n");
   const hasCaptcha = Boolean(
     document.querySelector(
       'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'

@@ -275,6 +275,20 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertIn("#ad-description", expression)
         self.assertIn("Anzeige speichern", expression)
         self.assertIn("/p-anzeige-bearbeiten.html", expression)
+        self.assertIn('.join("\\n")', expression)
+        javascript_check = subprocess.run(
+            ["node", "--check", "-"],
+            input=expression,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(
+            javascript_check.returncode,
+            0,
+            javascript_check.stdout + javascript_check.stderr,
+        )
 
     def test_captcha_detection_does_not_scan_entire_editor_body(self) -> None:
         page, clients = page_with_results(
