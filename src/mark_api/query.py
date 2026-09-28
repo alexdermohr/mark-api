@@ -22,6 +22,15 @@ class AdView:
 
 
 @dataclass(frozen=True, slots=True)
+class EmailReactionView:
+    ad_id: str
+    conversation_count: int
+    inbound_message_count: int
+    first_observed_at: datetime
+    last_observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class DashboardSummary:
     tracked_ads: int
     current_ads: int
@@ -80,6 +89,27 @@ class MarkQueryService:
 
     def reaction_history(self, ad_id: str) -> tuple[ReactionSnapshot, ...]:
         return self._store.reaction_history(ad_id)
+
+    def email_reaction(self, ad_id: str) -> EmailReactionView | None:
+        history = self._store.inbound_message_history(ad_id)
+        if not history:
+            return None
+        conversations, messages = self._store.inbound_message_counts(ad_id)
+        return EmailReactionView(
+            ad_id=ad_id,
+            conversation_count=conversations,
+            inbound_message_count=messages,
+            first_observed_at=history[0].observed_at,
+            last_observed_at=history[-1].observed_at,
+        )
+
+    def email_reactions(self) -> tuple[EmailReactionView, ...]:
+        rows: list[EmailReactionView] = []
+        for ad_id in self._store.inbound_message_ad_ids():
+            item = self.email_reaction(ad_id)
+            if item is not None:
+                rows.append(item)
+        return tuple(rows)
 
     def summary(self) -> DashboardSummary:
         ads = self.latest_ads()
@@ -158,6 +188,16 @@ def reaction_snapshot_to_dict(item: ReactionSnapshot) -> dict[str, object]:
         "conversation_count": item.conversation_count,
         "unique_buyer_count": item.unique_buyer_count,
         "inbound_message_count": item.inbound_message_count,
+    }
+
+
+def email_reaction_view_to_dict(item: EmailReactionView) -> dict[str, object]:
+    return {
+        "ad_id": item.ad_id,
+        "conversation_count": item.conversation_count,
+        "inbound_message_count": item.inbound_message_count,
+        "first_observed_at": item.first_observed_at.isoformat(),
+        "last_observed_at": item.last_observed_at.isoformat(),
     }
 
 

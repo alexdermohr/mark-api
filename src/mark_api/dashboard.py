@@ -17,6 +17,7 @@ from .query import (
     MarkQueryService,
     ad_snapshot_to_dict,
     ad_view_to_dict,
+    email_reaction_view_to_dict,
     reaction_snapshot_to_dict,
     summary_to_dict,
 )
@@ -317,7 +318,7 @@ function renderRanking(items) {
     row.append(td(item.ad_id));
     row.append(td(item.title, "title"));
     row.append(td(item.value));
-    row.append(td(item.present ? "ja" : "nein"));
+    row.append(td(item.present === null ? "—" : (item.present ? "ja" : "nein")));
     row.append(td(item.lifecycle_state));
     body.append(row);
   }
@@ -515,6 +516,15 @@ def _handler_factory(query: MarkQueryService, analytics: AnalyticsService):
                     [ad_view_to_dict(item) for item in query.latest_ads()],
                 )
                 return
+            if path == "/api/email-reactions":
+                self._send_json(
+                    200,
+                    [
+                        email_reaction_view_to_dict(item)
+                        for item in query.email_reactions()
+                    ],
+                )
+                return
             if path == "/api/analytics/metrics":
                 self._send_json(200, {"metrics": list(ANALYTICS_METRICS)})
                 return
@@ -560,7 +570,7 @@ def _handler_factory(query: MarkQueryService, analytics: AnalyticsService):
                 len(parts) == 4
                 and parts[0] == "api"
                 and parts[1] == "ads"
-                and parts[3] in {"history", "reactions"}
+                and parts[3] in {"history", "reactions", "email-reactions"}
             ):
                 ad_id = parts[2]
                 if not _valid_ad_id(ad_id):
@@ -575,6 +585,17 @@ def _handler_factory(query: MarkQueryService, analytics: AnalyticsService):
                     self._send_json(
                         200,
                         [ad_snapshot_to_dict(item) for item in history],
+                    )
+                    return
+
+                if parts[3] == "email-reactions":
+                    email_reaction = query.email_reaction(ad_id)
+                    if email_reaction is None:
+                        self._send_json(404, {"error": "ad_not_found"})
+                        return
+                    self._send_json(
+                        200,
+                        email_reaction_view_to_dict(email_reaction),
                     )
                     return
 

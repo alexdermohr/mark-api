@@ -13,12 +13,14 @@ from mark_api.dashboard import create_server
 from mark_api.domain import (
     AdClassification,
     AdSnapshot,
+    InboundMessageEvent,
     LifecycleState,
     ReactionSnapshot,
 )
 from mark_api.query import (
     MarkQueryService,
     ad_view_to_dict,
+    email_reaction_view_to_dict,
     summary_to_dict,
 )
 from mark_api.storage import SnapshotStore
@@ -136,6 +138,42 @@ class MarkQueryServiceTests(SeededStoreMixin, unittest.TestCase):
         self.assertEqual(summary.replies_total_known, 1)
         self.assertEqual(summary.replies_observed_ads, 2)
 
+    def test_email_reaction_projection_supports_email_only_ad(self) -> None:
+        store = self.make_store()
+        store.append_inbound_message_events(
+            (
+                InboundMessageEvent(
+                    ad_id="3",
+                    conversation_id="conversation-a",
+                    provider_message_id="message-a",
+                    observed_at=T0,
+                    source="kleinanzeigen-email",
+                ),
+                InboundMessageEvent(
+                    ad_id="3",
+                    conversation_id="conversation-a",
+                    provider_message_id="message-b",
+                    observed_at=T1,
+                    source="kleinanzeigen-email",
+                ),
+            )
+        )
+        query = MarkQueryService(store)
+
+        item = query.email_reaction("3")
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item.conversation_count, 1)
+        self.assertEqual(item.inbound_message_count, 2)
+        self.assertEqual(item.first_observed_at, T0)
+        self.assertEqual(item.last_observed_at, T1)
+        self.assertEqual(query.email_reactions(), (item,))
+        payload = email_reaction_view_to_dict(item)
+        self.assertNotIn("unique_buyer_count", payload)
+        self.assertNotIn("message_text", payload)
+        self.assertNotIn("present", payload)
+
     def test_serializers_are_json_safe_and_do_not_add_message_text(self) -> None:
         query = MarkQueryService(self.make_store())
         ad_payload = ad_view_to_dict(query.latest_ads()[0])
@@ -223,6 +261,8 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
                 "conversation_count",
                 "unique_buyer_count",
                 "inbound_message_count",
+                "email_conversation_count",
+                "email_inbound_message_count",
             ],
         )
         self.assertEqual(
@@ -255,6 +295,64 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         encoded = json.dumps(groups).lower()
         self.assertNotIn("winner", encoded)
         self.assertNotIn("recommend", encoded)
+
+    def test_email_reactions_endpoints_and_explicit_analytics_metric(self) -> None:
+        self.store.append_inbound_message_events(
+            (
+                InboundMessageEvent(
+                    ad_id="1",
+                    conversation_id="email-conversation-a",
+                    provider_message_id="email-message-a",
+                    observed_at=T0,
+                    source="kleinanzeigen-email",
+                ),
+                InboundMessageEvent(
+                    ad_id="1",
+                    conversation_id="email-conversation-a",
+                    provider_message_id="email-message-b",
+                    observed_at=T1,
+                    source="kleinanzeigen-email",
+                ),
+                InboundMessageEvent(
+                    ad_id="3",
+                    conversation_id="email-conversation-b",
+                    provider_message_id="email-message-c",
+                    observed_at=T1,
+                    source="kleinanzeigen-email",
+                ),
+            )
+        )
+
+        _, _, all_body = self.get("/api/email-reactions")
+        all_rows = json.loads(all_body)
+        self.assertEqual([item["ad_id"] for item in all_rows], ["1", "3"])
+
+        _, _, item_body = self.get("/api/ads/3/email-reactions")
+        item = json.loads(item_body)
+        self.assertEqual(item["conversation_count"], 1)
+        self.assertEqual(item["inbound_message_count"], 1)
+        self.assertNotIn("unique_buyer_count", item)
+
+        _, _, email_ranking_body = self.get(
+            "/api/analytics/ads?metric=email_inbound_message_count"
+        )
+        email_ranking = json.loads(email_ranking_body)
+        self.assertEqual(
+            [(row["ad_id"], row["value"]) for row in email_ranking],
+            [("1", 2), ("3", 1)],
+        )
+        email_only = email_ranking[1]
+        self.assertIsNone(email_only["present"])
+        self.assertIsNone(email_only["lifecycle_state"])
+
+        _, _, mobile_ranking_body = self.get(
+            "/api/analytics/ads?metric=inbound_message_count"
+        )
+        mobile_ranking = json.loads(mobile_ranking_body)
+        self.assertEqual(
+            [(row["ad_id"], row["value"]) for row in mobile_ranking],
+            [("1", 1)],
+        )
 
     def test_reaction_ranking_excludes_ads_without_reaction_history(self) -> None:
         _, _, body = self.get(
@@ -357,6 +455,7 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         javascript = js_body.decode("utf-8")
         self.assertIn("summary.views_total_known", javascript)
         self.assertIn("/api/analytics/groups", javascript)
+        self.assertIn('item.present === null ? "—"', javascript)
         self.assertIn("let analyticsRequestGeneration = 0;", javascript)
         self.assertIn(
             "const generation = ++analyticsRequestGeneration;",

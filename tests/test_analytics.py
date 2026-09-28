@@ -16,6 +16,7 @@ from mark_api.analytics import (
 from mark_api.domain import (
     AdClassification,
     AdSnapshot,
+    InboundMessageEvent,
     LifecycleState,
     ReactionSnapshot,
 )
@@ -335,6 +336,113 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("winner", encoded)
         self.assertNotIn("best", encoded)
 
+    def test_email_metrics_are_source_explicit_and_do_not_replace_reactions(self) -> None:
+        store = self.make_store()
+        store.append_ad_snapshot(
+            AdSnapshot(
+                ad_id="1",
+                observed_at=T0,
+                source="management",
+                lifecycle_state=LifecycleState.ACTIVE,
+                views=1,
+            )
+        )
+        store.append_reaction_snapshot(
+            ReactionSnapshot(
+                ad_id="1",
+                observed_at=T0,
+                source="mobile",
+                conversation_count=1,
+                unique_buyer_count=1,
+                inbound_message_count=1,
+            )
+        )
+        store.append_classification(
+            AdClassification(
+                ad_id="1",
+                observed_at=T0,
+                source="manual",
+                city="Berlin",
+            )
+        )
+        store.append_inbound_message_events(
+            (
+                InboundMessageEvent(
+                    ad_id="1",
+                    conversation_id="conversation-a",
+                    provider_message_id="message-a",
+                    observed_at=T0,
+                    source="kleinanzeigen-email",
+                ),
+                InboundMessageEvent(
+                    ad_id="1",
+                    conversation_id="conversation-a",
+                    provider_message_id="message-b",
+                    observed_at=T1,
+                    source="kleinanzeigen-email",
+                ),
+                InboundMessageEvent(
+                    ad_id="1",
+                    conversation_id="conversation-b",
+                    provider_message_id="message-c",
+                    observed_at=T2,
+                    source="kleinanzeigen-email",
+                ),
+            )
+        )
+        analytics = AnalyticsService(store)
+
+        mobile_messages = analytics.rank_ads("inbound_message_count")
+        email_messages = analytics.rank_ads("email_inbound_message_count")
+        email_conversations = analytics.rank_ads("email_conversation_count")
+        email_groups = analytics.group_rankings(
+            "city",
+            "email_inbound_message_count",
+        )
+
+        self.assertEqual(
+            [(row.ad_id, row.value) for row in mobile_messages],
+            [("1", 1)],
+        )
+        self.assertEqual(
+            [(row.ad_id, row.value) for row in email_messages],
+            [("1", 3)],
+        )
+        self.assertEqual(
+            [(row.ad_id, row.value) for row in email_conversations],
+            [("1", 2)],
+        )
+        self.assertEqual(
+            [(row.label, row.metric_sum) for row in email_groups],
+            [("Berlin", 3)],
+        )
+
+    def test_email_metric_ranking_includes_email_only_ad_without_presence_inference(self) -> None:
+        store = self.make_store()
+        store.append_inbound_message_events(
+            (
+                InboundMessageEvent(
+                    ad_id="9",
+                    conversation_id="conversation-only",
+                    provider_message_id="message-only",
+                    observed_at=T0,
+                    source="kleinanzeigen-email",
+                ),
+            )
+        )
+
+        rows = AnalyticsService(store).rank_ads("email_inbound_message_count")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].ad_id, "9")
+        self.assertEqual(rows[0].value, 1)
+        self.assertIsNone(rows[0].present)
+        self.assertIsNone(rows[0].lifecycle_state)
+        self.assertIsNone(rows[0].title)
+        payload = ad_metric_ranking_to_dict(rows[0])
+        self.assertIsNone(payload["present"])
+        self.assertIsNone(payload["lifecycle_state"])
+
     def test_allowed_contracts_are_exact_and_separate(self) -> None:
         self.assertEqual(
             ANALYTICS_DIMENSIONS,
@@ -349,6 +457,8 @@ class AnalyticsTests(unittest.TestCase):
                 "conversation_count",
                 "unique_buyer_count",
                 "inbound_message_count",
+                "email_conversation_count",
+                "email_inbound_message_count",
             ),
         )
 

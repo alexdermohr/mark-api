@@ -90,6 +90,6 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 **Folgen:**
 - Private/mobile HTTP und Browserautomation bleiben als technische PoC-Adapter im Repository, werden aber nicht als Produktintegration aktiviert.
 - Kleinanzeigen-E-Mail-Kopien dürfen lokal importiert werden. Der Import speichert nur Anzeigen-ID, Conversation-ID, Provider-Message-ID, Zeitstempel und Quelle; Nachrichtentext und Personennamen werden nicht persistiert. Die Header-/Body-Prüfung ist eine Format-/Konsistenzprüfung und keine kryptographische Absenderauthentifizierung; der Nutzer stellt die rohe Nachricht aus dem eigenen Postfach bereit.
-- Aus E-Mail-Kopien werden `conversation_count` und `inbound_message_count` ableitbar. `unique_buyer_count` wird daraus nicht erfunden.
+- Aus E-Mail-Kopien werden getrennte read-only Projektionen für Conversation- und Inbound-Message-Zähler abgeleitet. In Analytics heißen sie source-explizit `email_conversation_count` und `email_inbound_message_count`; bestehende ReactionSnapshot-Metriken werden nicht ersetzt oder additiv vermischt. `unique_buyer_count` wird aus E-Mail-Kopien nicht erfunden.
 - Ein Import offizieller PRO-Statistikdownloads wird erst implementiert, wenn ein reales Exportformat als Contract-Evidenz vorliegt.
 - Ein späterer ProSellers-Adapter benötigt ein eigenes Credentials-/Entitlement-/Write-Authority-Gate und bleibt bis dahin deaktiviert.

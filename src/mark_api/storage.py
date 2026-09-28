@@ -562,6 +562,19 @@ class SnapshotStore:
             for row in ordered_rows
         )
 
+    def inbound_message_ad_ids(self) -> tuple[str, ...]:
+        """Return every ad ID represented by imported inbound-message events."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT ad_id
+                FROM inbound_message_events
+                ORDER BY ad_id ASC
+                """
+            ).fetchall()
+        return tuple(str(row["ad_id"]) for row in rows)
+
     def inbound_message_counts(self, ad_id: str) -> tuple[int, int]:
         """Return (conversation_count, inbound_message_count) for one ad."""
 
