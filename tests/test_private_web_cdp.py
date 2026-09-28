@@ -1296,6 +1296,55 @@ class CdpPrivateWebOwnerReaderTests(unittest.TestCase):
                 self.assertEqual(result.status, ReadStatus.TRANSPORT_ERROR)
                 self.assertIsNone(result.value)
 
+    def test_owner_reader_rejects_invalid_owner_snapshot_before_editor(self) -> None:
+        class OwnerReader:
+            def read_ads(self):
+                return ReadResult.success_nonempty((object(),))
+
+        result = CdpPrivateWebOwnerReader(
+            owner_reader=OwnerReader(),
+            page_factory=lambda: (_ for _ in ()).throw(
+                AssertionError("editor must not open for invalid owner snapshot")
+            ),
+            ad_id=AD_ID,
+        ).read_ads()
+
+        self.assertEqual(result.status, ReadStatus.PARSE_ERROR)
+        self.assertEqual(result.error, "invalid_owner_snapshot")
+
+    def test_owner_reader_sanitizes_page_close_failure(self) -> None:
+        owner_result = ReadResult.success_nonempty((self.owner_snapshot(),))
+
+        class OwnerReader:
+            def read_ads(self):
+                return owner_result
+
+        class Page:
+            def open_editor(self, ad_id: str) -> None:
+                if ad_id != AD_ID:
+                    raise AssertionError("wrong target")
+
+            def read_editor(self):
+                return PrivateWebEditorSnapshot(
+                    state=PrivateWebEditorState.READY,
+                    ad_id=AD_ID,
+                    title="Fresh title",
+                    description="Fresh description",
+                )
+
+            def close(self) -> None:
+                raise RuntimeError("provider secret")
+
+        result = CdpPrivateWebOwnerReader(
+            owner_reader=OwnerReader(),
+            page_factory=Page,
+            ad_id=AD_ID,
+        ).read_ads()
+
+        self.assertEqual(result.status, ReadStatus.TRANSPORT_ERROR)
+        self.assertEqual(result.error, "private_web_owner_read_failed")
+        self.assertNotIn("secret", result.error)
+
     def test_description_update_can_be_confirmed_by_safe_orchestrator(self) -> None:
         state = {
             "title": "Existing title",

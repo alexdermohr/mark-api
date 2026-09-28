@@ -923,6 +923,11 @@ class CdpPrivateWebOwnerReader:
             return owner_result
 
         snapshots = owner_result.value or ()
+        if any(not isinstance(snapshot, AdSnapshot) for snapshot in snapshots):
+            return ReadResult.failure(
+                ReadStatus.PARSE_ERROR,
+                error="invalid_owner_snapshot",
+            )
         matching = [
             (index, snapshot)
             for index, snapshot in enumerate(snapshots)
@@ -941,25 +946,36 @@ class CdpPrivateWebOwnerReader:
             page = self._page_factory()
             page.open_editor(self._ad_id)
             editor = page.read_editor()
-            if (
-                not isinstance(editor, PrivateWebEditorSnapshot)
-                or editor.state is not PrivateWebEditorState.READY
-                or editor.ad_id != self._ad_id
-                or editor.title is None
-                or editor.description is None
-            ):
-                return ReadResult.failure(
-                    ReadStatus.TRANSPORT_ERROR,
-                    error="private_web_owner_read_unavailable",
-                )
+        except Exception:  # noqa: BLE001 - sanitize browser/provider boundary.
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:  # noqa: BLE001 - preserve sanitized boundary.
+                    pass
+            return ReadResult.failure(
+                ReadStatus.TRANSPORT_ERROR,
+                error="private_web_owner_read_failed",
+            )
+
+        try:
+            page.close()
         except Exception:  # noqa: BLE001 - sanitize browser/provider boundary.
             return ReadResult.failure(
                 ReadStatus.TRANSPORT_ERROR,
                 error="private_web_owner_read_failed",
             )
-        finally:
-            if page is not None:
-                page.close()
+
+        if (
+            not isinstance(editor, PrivateWebEditorSnapshot)
+            or editor.state is not PrivateWebEditorState.READY
+            or editor.ad_id != self._ad_id
+            or editor.title is None
+            or editor.description is None
+        ):
+            return ReadResult.failure(
+                ReadStatus.TRANSPORT_ERROR,
+                error="private_web_owner_read_unavailable",
+            )
 
         index, target = matching[0]
         enriched = replace(
