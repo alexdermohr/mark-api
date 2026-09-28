@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
+from xml.sax.saxutils import quoteattr
+
+from .monkrel_invariant import OwnerAdInvariant, owner_ad_invariant
 
 
 API_HOST = "https://api.kleinanzeigen.de"
 _AD_NAMESPACE_SUFFIX = "}ad"
+_OWNER_INVARIANT_SOURCE = "monkrel-private-owner-http"
 
 
 class MonkrelHttpResponse(Protocol):
@@ -92,20 +96,11 @@ def _optional_scalar(value: Any, field: str) -> Any:
     if value is None:
         return None
     value = _unwrap_value(value)
+    if value is None:
+        return None
     if isinstance(value, (str, int, float)) and not isinstance(value, bool):
         return value
     raise ValueError(f"{field} must be a scalar or null")
-
-
-def _is_structurally_empty(value: Any) -> bool:
-    value = _unwrap_value(value)
-    if value is None or value is False or value == "":
-        return True
-    if isinstance(value, Mapping):
-        return all(_is_structurally_empty(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return all(_is_structurally_empty(item) for item in value)
-    return False
 
 
 def _unwrap_ad_payload(payload: Any) -> Mapping[str, Any]:
@@ -127,104 +122,33 @@ def _unwrap_ad_payload(payload: Any) -> Mapping[str, Any]:
     return payload
 
 
-def _single_location_id(ad: Mapping[str, Any]) -> str:
-    locations = ad.get("locations")
-    if locations is not None:
-        block = _mapping(locations, "locations")
-        location = _unwrap_value(block.get("location"))
-    else:
-        location = _unwrap_value(ad.get("location"))
-
-    if isinstance(location, list):
-        if len(location) != 1:
-            raise ValueError("exactly one owner ad location is required")
-        location = _unwrap_value(location[0])
-
-    location_map = _mapping(location, "location")
-    return _required_text(location_map.get("id"), "location.id")
+def _ensure_supported_optional_features(ad: Mapping[str, Any]) -> OwnerAdInvariant:
+    state = owner_ad_invariant(dict(ad), source=_OWNER_INVARIANT_SOURCE)
+    state.require_content_update_safe()
+    return state
 
 
-def _attributes(ad: Mapping[str, Any]) -> dict[str, str]:
-    raw = ad.get("attributes")
-    if raw is None or _is_structurally_empty(raw):
-        return {}
-
-    block = _mapping(raw, "attributes")
-    items = _unwrap_value(block.get("attribute"))
-    if isinstance(items, Mapping):
-        items = [items]
-    if not isinstance(items, list):
-        raise ValueError("attributes.attribute must be a list")
-
-    result: dict[str, str] = {}
-    for index, item in enumerate(items):
-        attr = _mapping(item, f"attributes[{index}]")
-        name = _required_text(attr.get("name"), f"attributes[{index}].name")
-        values = attr.get("value")
-        if isinstance(values, list):
-            if len(values) != 1:
-                raise ValueError("multi-value attributes are not update-safe yet")
-            value = _unwrap_value(values[0])
-        else:
-            value = _unwrap_value(values)
-        if isinstance(value, bool) or value is None:
-            raise ValueError(f"attribute {name} has no scalar value")
-        if isinstance(value, (Mapping, list, tuple)):
-            raise ValueError(f"attribute {name} is not scalar")
-        if name in result:
-            raise ValueError(f"duplicate attribute {name}")
-        result[name] = str(value)
-    return result
-
-
-def _picture_urls(ad: Mapping[str, Any]) -> list[str]:
-    raw = ad.get("pictures")
-    if raw is None or _is_structurally_empty(raw):
-        return []
-
-    block = _mapping(raw, "pictures")
-    pictures = _unwrap_value(block.get("picture"))
-    if isinstance(pictures, Mapping):
-        pictures = [pictures]
-    if not isinstance(pictures, list):
-        raise ValueError("pictures.picture must be a list")
-
-    urls: list[str] = []
-    for index, item in enumerate(pictures):
-        picture = _mapping(item, f"pictures[{index}]")
-        links = _unwrap_value(picture.get("link"))
-        if isinstance(links, Mapping):
-            links = [links]
-        if not isinstance(links, list) or not links:
-            raise ValueError(f"pictures[{index}] has no links")
-
-        xxl: list[str] = []
-        for link_item in links:
-            link = _mapping(link_item, f"pictures[{index}].link")
-            rel = _required_text(link.get("rel"), f"pictures[{index}].link.rel")
-            href = _required_text(link.get("href"), f"pictures[{index}].link.href")
-            if rel.upper() == "XXL":
-                xxl.append(href)
-        if len(xxl) != 1:
-            raise ValueError(
-                f"pictures[{index}] must expose exactly one XXL link"
-            )
-        urls.append(xxl[0])
-    return urls
-
-
-def _ensure_supported_optional_features(ad: Mapping[str, Any]) -> None:
-    for field in ("shipping", "shipping-options", "medias", "productsafety", "product-safety"):
-        if field in ad and not _is_structurally_empty(ad[field]):
-            raise ValueError(f"{field} is not update-safe yet")
-
-    buy_now = ad.get("buy-now")
-    if buy_now is None or _is_structurally_empty(buy_now):
-        return
-    block = _mapping(buy_now, "buy-now")
-    selected = _unwrap_value(block.get("selected"))
-    if selected not in {False, "false", "False", 0, "0", None}:
-        raise ValueError("buy-now enabled ads are not update-safe yet")
+def _inject_shipping_options(xml: str, option_ids: tuple[str, ...]) -> str:
+    if not option_ids:
+        return xml
+    if 'xmlns:shipping="http://www.ebayclassifiedsgroup.com/schema/shipping/v1"' not in xml:
+        raise RuntimeError("monkrel XML builder does not declare the shipping namespace")
+    if "<shipping:shipping-options" in xml:
+        raise RuntimeError("monkrel XML builder already emits shipping options")
+    marker = '<payment:buy-now selected="false"/>'
+    if xml.count(marker) != 1:
+        raise RuntimeError(
+            "monkrel XML builder does not expose the expected buy-now=false marker"
+        )
+    block = (
+        "<shipping:shipping-options>"
+        + "".join(
+            f"<shipping:shipping-option id={quoteattr(option_id)}/>"
+            for option_id in option_ids
+        )
+        + "</shipping:shipping-options>"
+    )
+    return xml.replace(marker, block + marker, 1)
 
 
 class MonkrelPrivateHttpContentClient:
@@ -262,6 +186,24 @@ class MonkrelPrivateHttpContentClient:
             raise ValueError("owner ad email is unavailable")
         return fallback
 
+    def _owner_ad(self, target_id: str) -> tuple[str, Mapping[str, Any]]:
+        uid = _required_text(self._client.user_id, "user_id")
+        response = self._client._request(
+            "GET",
+            f"{self._api_host}/api/users/{uid}/ads/{target_id}.json",
+            authed=True,
+        )
+        ad = _unwrap_ad_payload(response.json())
+        returned_id = _required_text(ad.get("id"), "owner_ad.id")
+        if returned_id != target_id:
+            raise ValueError("owner ad id does not match requested ad_id")
+        return uid, ad
+
+    def read_invariant(self, ad_id: str) -> OwnerAdInvariant:
+        target_id = _required_text(ad_id, "ad_id")
+        _, ad = self._owner_ad(target_id)
+        return owner_ad_invariant(dict(ad), source=_OWNER_INVARIANT_SOURCE)
+
     def update_ad(
         self,
         ad_id: str,
@@ -283,19 +225,8 @@ class MonkrelPrivateHttpContentClient:
                 "monkrel write client must be configured with max_retries=1"
             )
 
-        uid = _required_text(self._client.user_id, "user_id")
-        response = self._client._request(
-            "GET",
-            f"{self._api_host}/api/users/{uid}/ads/{target_id}.json",
-            authed=True,
-        )
-        ad = _unwrap_ad_payload(response.json())
-
-        returned_id = _required_text(ad.get("id"), "owner_ad.id")
-        if returned_id != target_id:
-            raise ValueError("owner ad id does not match requested ad_id")
-
-        _ensure_supported_optional_features(ad)
+        uid, ad = self._owner_ad(target_id)
+        invariant = _ensure_supported_optional_features(ad)
 
         current_title = _required_content_text(ad.get("title"), "title")
         current_description = _required_content_text(
@@ -334,7 +265,7 @@ class MonkrelPrivateHttpContentClient:
             title=new_title,
             description=new_description,
             category_id=_required_text(category.get("id"), "category.id"),
-            location_id=_single_location_id(ad),
+            location_id=invariant.location_id,
             price=amount,
             price_type=price_type,
             poster_type=_required_text(ad.get("poster-type"), "poster-type"),
@@ -342,13 +273,14 @@ class MonkrelPrivateHttpContentClient:
             contact_name=_optional_text(ad.get("contact-name"), "contact-name") or "",
             email=self._email(ad),
             phone=_optional_text(ad.get("phone"), "phone"),
-            attributes=_attributes(ad),
-            picture_urls=_picture_urls(ad),
+            attributes=invariant.single_value_attributes(),
+            picture_urls=invariant.xxl_picture_urls(),
             latitude=_optional_scalar(address.get("latitude"), "ad-address.latitude"),
             longitude=_optional_scalar(address.get("longitude"), "ad-address.longitude"),
         )
         if not isinstance(xml, str) or not xml.strip():
             raise RuntimeError("monkrel XML builder returned an empty payload")
+        xml = _inject_shipping_options(xml, invariant.shipping_option_ids)
 
         self._client._request(
             "PUT",

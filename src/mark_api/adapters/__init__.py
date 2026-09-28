@@ -14,6 +14,7 @@ from .monkrel_runtime import (
     MonkrelPrivateHttpRuntimeClient,
     build_monkrel_private_http_adapter,
     build_monkrel_private_http_runtime_client,
+    build_monkrel_private_http_smoke,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "MonkrelPrivateHttpRuntimeClient",
     "build_monkrel_private_http_adapter",
     "build_monkrel_private_http_runtime_client",
+    "build_monkrel_private_http_smoke",
 ]
