@@ -17,6 +17,7 @@ from .private_web import (
 
 _KLEINANZEIGEN_ORIGIN = "https://www.kleinanzeigen.de"
 _EDITOR_PATH = "/p-anzeige-bearbeiten.html"
+_POST_SUBMIT_PATH = "/m-meine-anzeigen.html"
 _MAX_TARGET_BYTES = 64 * 1024
 
 
@@ -836,11 +837,59 @@ class CdpPrivateWebPage:
             if self._runtime_value(client, expression) is not True:
                 raise PrivateWebCdpError("submit")
 
+            confirmation_expression = f"""
+(() => {{
+  const currentOrigin = location.origin;
+  const currentPath = location.pathname;
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((candidate) => (candidate.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const hasLogin =
+    currentPath.startsWith("/u/login/") ||
+    Boolean(document.querySelector('input[type="password"]'));
+
+  if (currentOrigin !== {origin}) return "unconfirmed";
+  if (hasCaptcha || hasMfa || hasSecurityChallenge || hasLogin) {{
+    return "unconfirmed";
+  }}
+  if (currentPath === {json.dumps(_POST_SUBMIT_PATH)}) return "confirmed";
+  if (currentPath === {path}) return "pending";
+  return "unconfirmed";
+}})()
+"""
             deadline = self._monotonic() + self._timeout_seconds
             while True:
-                current_path = self._runtime_value(client, "location.pathname")
-                if current_path != _EDITOR_PATH:
+                confirmation = self._runtime_value(
+                    client,
+                    confirmation_expression,
+                )
+                if confirmation == "confirmed":
                     return
+                if confirmation != "pending":
+                    raise PrivateWebCdpError("submit_unconfirmed")
                 if self._monotonic() >= deadline:
                     raise PrivateWebCdpError("submit_unconfirmed")
                 self._sleep(0.05)

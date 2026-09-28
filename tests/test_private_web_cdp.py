@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 from mark_api.private_web import PrivateWebEditorSnapshot, PrivateWebEditorState
@@ -330,6 +332,84 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertIn('challengeText.includes("captcha")', challenge_probe)
         self.assertIn('input[type="password"]', challenge_probe)
 
+    def test_open_editor_rejects_ready_snapshot_for_different_ad_id(self) -> None:
+        wrong_ad_id = "9999999999"
+        runtime_values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+            {
+                "state": "ready",
+                "ad_id": wrong_ad_id,
+                "title": "Other title",
+                "description": "Other description",
+            },
+        ]
+        monotonic_values = iter((0.0, 0.2))
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+            timeout_seconds=0.1,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(monotonic_values),
+        )
+
+        with self.assertRaisesRegex(PrivateWebCdpError, "navigate"):
+            page.open_editor(AD_ID)
+
+        self.assertEqual(runtime_values, [])
+        self.assertIsNone(page._bound_ad_id)
+        self.assertIsNone(page._last_ready_snapshot)
+
+    def test_wrong_target_ready_snapshot_does_not_arm_mutation(self) -> None:
+        wrong_ad_id = "9999999999"
+        client = FakeClient(
+            lambda method, params: (
+                {
+                    "result": {
+                        "type": "object",
+                        "value": {
+                            "state": "ready",
+                            "ad_id": wrong_ad_id,
+                            "title": "Other title",
+                            "description": "Other description",
+                        },
+                    }
+                }
+                if method == "Runtime.evaluate"
+                else (_ for _ in ()).throw(
+                    AssertionError(f"unexpected method: {method}")
+                )
+            )
+        )
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        page._bound_ad_id = AD_ID
+
+        snapshot = page.read_editor()
+        self.assertEqual(snapshot.state, PrivateWebEditorState.READY)
+        self.assertEqual(snapshot.ad_id, wrong_ad_id)
+        self.assertIsNone(page._last_ready_snapshot)
+
+        with self.assertRaisesRegex(PrivateWebCdpError, "replace_title"):
+            page.replace_title("Must not write")
+
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            ["Runtime.evaluate"],
+        )
+
     def test_open_editor_times_out_while_editor_contract_is_unknown(self) -> None:
         runtime_values = [
             True,
@@ -591,17 +671,17 @@ class CdpPrivateWebPageTests(unittest.TestCase):
             if method != "Runtime.evaluate":
                 raise AssertionError(f"unexpected method: {method}")
             expression = params.get("expression")
-            if expression == "location.pathname":
+            if "button.click()" in str(expression):
                 return {
                     "result": {
-                        "type": "string",
-                        "value": "/m-meine-anzeigen.html",
+                        "type": "boolean",
+                        "value": True,
                     }
                 }
             return {
                 "result": {
-                    "type": "boolean",
-                    "value": True,
+                    "type": "string",
+                    "value": "confirmed",
                 }
             }
 
@@ -631,7 +711,24 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertIn("getBoundingClientRect", expression)
         self.assertIn("button.click()", expression)
         self.assertNotIn("Input.dispatchMouseEvent", str(client.calls))
-        self.assertEqual(client.calls[1][1]["expression"], "location.pathname")
+        confirmation_expression = client.calls[1][1]["expression"]
+        self.assertIn("location.origin", confirmation_expression)
+        self.assertIn("/m-meine-anzeigen.html", confirmation_expression)
+        self.assertIn('currentPath.startsWith("/u/login/")', confirmation_expression)
+        self.assertIn('challengeText.includes("captcha")', confirmation_expression)
+        javascript_check = subprocess.run(
+            ["node", "--check", "-"],
+            input=confirmation_expression,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(
+            javascript_check.returncode,
+            0,
+            javascript_check.stdout + javascript_check.stderr,
+        )
         self.assertFalse(client.closed)
         page.close()
         self.assertTrue(client.closed)
@@ -690,14 +787,9 @@ class CdpPrivateWebPageTests(unittest.TestCase):
             if method != "Runtime.evaluate":
                 raise AssertionError(f"unexpected method: {method}")
             expression = params.get("expression")
-            if expression == "location.pathname":
-                return {
-                    "result": {
-                        "type": "string",
-                        "value": "/p-anzeige-bearbeiten.html",
-                    }
-                }
-            return {"result": {"type": "boolean", "value": True}}
+            if "button.click()" in str(expression):
+                return {"result": {"type": "boolean", "value": True}}
+            return {"result": {"type": "string", "value": "pending"}}
 
         client = FakeClient(handler)
         page = CdpPrivateWebPage(
@@ -721,6 +813,37 @@ class CdpPrivateWebPageTests(unittest.TestCase):
             ["Runtime.evaluate", "Runtime.evaluate"],
         )
         page.close()
+
+    def test_submit_untrusted_redirect_is_unconfirmed_and_not_retryable(self) -> None:
+        def handler(method, params):
+            if method != "Runtime.evaluate":
+                raise AssertionError(f"unexpected method: {method}")
+            expression = params.get("expression")
+            if "button.click()" in str(expression):
+                return {"result": {"type": "boolean", "value": True}}
+            return {"result": {"type": "string", "value": "unconfirmed"}}
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        bind_ready_editor(page)
+
+        with self.assertRaises(PrivateWebCdpError) as caught:
+            page.submit()
+        self.assertEqual(caught.exception.stage, "submit_unconfirmed")
+
+        with self.assertRaises(PrivateWebCdpError) as second:
+            page.submit()
+        self.assertEqual(second.exception.stage, "submit_already_attempted")
+
+        confirmation_expression = client.calls[1][1]["expression"]
+        self.assertIn('currentOrigin !== "https://www.kleinanzeigen.de"', confirmation_expression)
+        self.assertIn('currentPath.startsWith("/u/login/")', confirmation_expression)
+        self.assertIn('challengeText.includes("captcha")', confirmation_expression)
+        self.assertIn('challengeText.includes("sicherheitsprüfung")', confirmation_expression)
+        self.assertIn("/m-meine-anzeigen.html", confirmation_expression)
 
     def test_ambiguous_submit_failure_cannot_be_retried(self) -> None:
         def handler(method, params):
@@ -843,6 +966,27 @@ class CdpPrivateWebPageTests(unittest.TestCase):
                 "https://example.invalid/",
             )
         )
+
+    def test_proxy_free_opener_ignores_environment_proxy_configuration(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HTTP_PROXY": "http://127.0.0.1:9",
+                "http_proxy": "http://127.0.0.1:9",
+                "NO_PROXY": "",
+                "no_proxy": "",
+            },
+            clear=False,
+        ):
+            opener = _proxy_free_loopback_opener()
+
+        director = opener.__self__
+        proxy_handlers = [
+            handler
+            for handler in director.handlers
+            if handler.__class__.__name__ == "ProxyHandler"
+        ]
+        self.assertEqual(proxy_handlers, [])
 
     def test_loopback_client_rejects_discovery_final_url_escape(self) -> None:
         tcp_calls = 0
