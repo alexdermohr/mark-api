@@ -1,6 +1,8 @@
 # Technische Write-Machbarkeit und Umsetzungsplan — 26.09.2026
 
-Status: **technisch machbar; Umsetzung ist aktiver Projektplan. Vertrags-/Produktfreigabe bleibt ein separates Gate.**
+Status: **historische technische Machbarkeitsdokumentation. Der aktive Betriebsweg wurde am 28.09.2026 durch D-008 / Issue #2 neu gebunden.**
+
+> Die folgenden private/mobile/browserbasierten Write-Pfade bleiben technische PoC-Evidenz. Sie sind nach D-008 kein Produktpfad für private Accounts. Zulässige Weiterentwicklung priorisiert lokale nutzerbereitgestellte Daten und optional die offizielle ProSellers API unter einem separaten Credentials-/Entitlement-/Write-Authority-Gate.
 
 ## Auftrag
 

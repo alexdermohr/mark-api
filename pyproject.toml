@@ -12,6 +12,7 @@ dependencies = []
 [project.scripts]
 mark-api-dashboard = "mark_api.dashboard:main"
 mark-api-classify = "mark_api.classification_cli:main"
+mark-api-import-mail = "mark_api.email_import_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

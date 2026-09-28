@@ -4,6 +4,7 @@ from .application import EnrichedOwnerReader, MarkService
 from .domain import (
     AdSnapshot,
     DeleteApproval,
+    InboundMessageEvent,
     LifecycleState,
     OperationOutcome,
     OperationReceipt,
@@ -18,6 +19,7 @@ __all__ = [
     "DashboardSummary",
     "DeleteApproval",
     "EnrichedOwnerReader",
+    "InboundMessageEvent",
     "LifecycleState",
     "MarkQueryService",
     "MarkService",
