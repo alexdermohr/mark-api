@@ -4,7 +4,7 @@
 
 ## Status
 
-**Core, Adapter, Dashboard und Analytics implementiert / technischer PoC abgeschlossen / zulässiger lokaler E-Mail-Import und lokaler E2E-Smoke implementiert / inoffizielle Plattformautomation nicht als Produktpfad freigegeben** — Stand: 28.09.2026.
+**Core, Dashboard und Analytics implementiert / lokaler Datenpfad gehärtet / ProSellers-Gate gemergt / PrivateWebWriter-Contract implementiert; konkreter Browserdriver noch gegated** — Stand: 28.09.2026.
 
 Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Der MVP-Fokus liegt auf Anzeigenverwaltung, Synchronisation, Verkäufermetriken, Inbox/Interessenten, Dashboard und datenbasierter Auswertung. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
 
@@ -13,7 +13,8 @@ Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkreti
 - Python-3.12+-Core mit diskriminierten Read-Ergebnissen, Safe-Write-Orchestrierung und SQLite-Snapshot-Persistenz.
 - `ManagementReadAdapter` für den autoritativen Besitzerbestand sowie Verkäuferstatus, Views, Merker und Replies.
 - `MonkrelMobileApiAdapter` als technisch belegter PoC-Adapter für eigene Anzeigen, ID-gebundene Pause/Aktivierung, Delete und Inbox/Conversation-Zuordnung; nach Abschluss von Issue #2 ist er kein Produktpfad für private Accounts.
-- `BrowserBotAdapter` als technisch belegter PoC für Sync und in-place Inhaltsupdate; nach Abschluss von Issue #2 ist Browserautomation kein Produktpfad für private Accounts.
+- `BrowserBotAdapter` bleibt als historisch belegter Fremdprozess-PoC für Sync und in-place Inhaltsupdate im Repository; er wird nicht automatisch zum Produkt-Backend.
+- `PrivateWebContentWriter` bildet den neuen, davon getrennten privaten Writer-Contract für die normale Kleinanzeigen-Weboberfläche in einer vom Nutzer selbst authentifizierten Browser-Sitzung. Der erste Slice implementiert die fail-closed Port-/Adaptersemantik; ein konkreter Browserdriver und ein eigener Live-Smoke bleiben separate Gates.
 - `MarkService` als Application-Layer über den Capability-Adaptern.
 - Read-only Dashboard/API auf Loopback sowie Analytics-Rankings auf explizit gespeicherten Klassifikationslabels.
 - Der Ein-Anzeigen-Realtest vom 24.09.2026 belegt Sync, stabiles in-place Update, Pause/Aktivierung, Verkäufermetriken, positiven Inbox/adId-Fall und Delete mit unabhängigen Besitzerlisten-Readbacks.
@@ -88,6 +89,22 @@ Die Entscheidung liefert nur stabile Reason-Codes wie `plan_not_api_eligible` od
 
 Dieser Slice implementiert nur das Gate. OAuth-Tokenabruf (`client_credentials`, Audience `consumer-goods-api`) und Requests an die Goods API bleiben separate spätere Arbeit und dürfen erst hinter diesem Gate ergänzt werden.
 
+## Privater Web-UI-Writer
+
+Der zentrale private Writer-Pfad wird als eigener `PrivateWebWriter` gegen die **normale Kleinanzeigen-Weboberfläche** aufgebaut. Er ist ausdrücklich nicht der historische `BrowserBotAdapter` und kein Fallback auf private/mobile Reverse-Engineering-HTTP-APIs.
+
+Der erste Contract `PrivateWebPage -> PrivateWebContentWriter` ist eng begrenzt:
+
+- jede Operation erhält genau eine explizite eigene `ad_id`,
+- vor einer Feldänderung muss der geöffnete Editor `ready` sein und exakt dieselbe Anzeigen-ID zeigen,
+- `login_required`, `mfa_required`, `captcha_required`, `security_challenge` und unbekannte Zustände blockieren ohne Submit,
+- nur angeforderte und tatsächlich abweichende Titel-/Beschreibungsfelder werden lokal im Editor geändert,
+- unmittelbar vor dem Speichern werden Anzeigen-ID **und beide Editorwerte** erneut geprüft,
+- es gibt höchstens einen Submit; Browser-/Providerfehler werden ohne Inhalte, URLs, Cookies oder Secrets auf eine Stage-Klasse reduziert,
+- der Plattform-Outcome wird weiterhin nur durch den bestehenden `SafeWriteOrchestrator` mit frischem Owner-Pre-Read und Post-Read bestätigt; ein unklarer Submit wird nicht wiederholt.
+
+Passwörter, MFA-Codes und Cookies sind kein `mark-api`-Konfigurationsmodell. Der Nutzer authentifiziert die persistente Browser-Sitzung selbst. Dieser Contract führt noch keinen Live-Write aus; ein konkreter Browserdriver und der separate Smoke auf genau einer frisch owner-verifizierten eigenen Anzeige folgen als nächste Gates.
+
 ## Offene fachliche Punkte
 
 Die Reaktionsdaten werden absichtlich getrennt als `conversation_count`, `unique_buyer_count` und `inbound_message_count` gespeichert. Welche dieser Größen fachlich „wie viele geschrieben haben“ meint, ist noch nicht festgelegt.
@@ -98,11 +115,11 @@ Ebenso ist noch keine fachlich bestätigte Zielfunktion für „beste Lösung“
 
 [Issue #2](https://github.com/alexdermohr/mark-api/issues/2) ist abgeschlossen und trennt den erfolgreichen technischen PoC vom zulässigen Produktbetrieb:
 
-- Für private Accounts wird keine inoffizielle Browser-/Mobile-/Private-HTTP-Automation als Produktpfad betrieben.
-- Lokale Analytics dürfen aus vom Nutzer bereitgestellten offiziellen Daten entstehen, insbesondere Kleinanzeigen-E-Mail-Kopien und — sobald das konkrete Dateiformat belegt ist — offiziellen PRO-Statistikdownloads.
-- Die offizielle ProSellers API bleibt ein optionaler zukünftiger Pfad ausschließlich für berechtigte professionelle Power-/Premium-Konten mit provisionierten Zugangsdaten. Für diesen Modus müssen API-Herkunft und Write-Authority der betroffenen Anzeigen separat gebunden werden.
-- Die vorhandenen privaten/mobile/browserbasierten Adapter bleiben als technische PoC-Evidenz im Repository, begründen aber keine Betriebsfreigabe.
-- Plattformwrites bleiben für den aktuellen privaten Produktpfad aus.
+- Private/mobile Reverse-Engineering-HTTP und der historische `BrowserBotAdapter` bleiben technische PoC-Evidenz und werden nicht als automatische Produkt-Fallbacks aktiviert.
+- Für private Konten ist der getrennte lokale `PrivateWebWriter` der vorgesehene Write-Backendpfad: normale Weboberfläche, eigene nutzer-authentifizierte Sitzung, exakte eigene Anzeigen-ID und Challenge-Stop ohne Auth-/CAPTCHA-Umgehung.
+- Lokale Analytics dürfen weiterhin aus vom Nutzer bereitgestellten offiziellen Daten entstehen, insbesondere Kleinanzeigen-E-Mail-Kopien und — sobald das konkrete Dateiformat belegt ist — offiziellen PRO-Statistikdownloads.
+- Die offizielle ProSellers API bleibt ein optionaler paralleler Pfad ausschließlich für berechtigte professionelle Power-/Premium-Konten mit provisionierten Zugangsdaten. Für diesen Modus müssen API-Herkunft und Write-Authority der betroffenen Anzeigen separat gebunden werden.
+- Plattformwrites bleiben im Core standardmäßig deaktiviert. Der private Web-Writer darf erst mit einem konkreten gehärteten Browserdriver und einem separaten eigenen Live-Smoke aktiviert werden.
 
 ## Projektregistratur
 
@@ -132,4 +149,4 @@ Das Repository ist öffentlich. Zugangsdaten, Tokens, Telefonnummern und sonstig
 
 ## Arbeitsregel
 
-Der aktuelle Produktpfad für private Accounts ist lokal/read-only gegenüber der Plattform: user-provided offizielle Dateien und E-Mail-Kopien werden lokal verarbeitet. Die inoffiziellen PoC-Adapter bleiben technisch fail-closed erhalten, werden aber nicht als Produktintegration aktiviert. Ein späterer offizieller ProSellers-Writepfad benötigt eine neue, credentials- und entitlement-gebundene Freigabe mit eindeutig gebundener Write-Authority.
+Der private Produktpfad kombiniert den bestehenden lokalen/read-only Datenpfad mit dem separat gegateten `PrivateWebWriter` für eigene Anzeigen über die normale nutzer-authentifizierte Weboberfläche. Private/mobile Reverse-Engineering-APIs und der historische BrowserBot bleiben PoC-Evidenz und werden nicht automatisch aktiviert. Login/MFA/CAPTCHA/Sicherheitschecks werden nicht umgangen. ProSellers bleibt ein optionales zweites Backend hinter seinem Credentials-/Entitlement-/Write-Authority-Gate.

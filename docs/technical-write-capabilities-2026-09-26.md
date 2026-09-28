@@ -1,8 +1,8 @@
 # Technische Write-Machbarkeit und Umsetzungsplan — 26.09.2026
 
-Status: **historische technische Machbarkeitsdokumentation. Der aktive Betriebsweg wurde am 28.09.2026 durch D-008 / Issue #2 neu gebunden.**
+Status: **historische technische Machbarkeitsdokumentation. D-008 band den Betrieb zunächst read-only; D-010 präzisiert seit 28.09.2026 den neuen privaten Web-UI-Writer.**
 
-> Die folgenden private/mobile/browserbasierten Write-Pfade bleiben technische PoC-Evidenz. Sie sind nach D-008 kein Produktpfad für private Accounts. Zulässige Weiterentwicklung priorisiert lokale nutzerbereitgestellte Daten und optional die offizielle ProSellers API unter einem separaten Credentials-/Entitlement-/Write-Authority-Gate.
+> Private/mobile Reverse-Engineering-Pfade und der historische `BrowserBotAdapter` bleiben PoC-Evidenz. D-010 führt stattdessen einen getrennten `PrivateWebWriter` über die normale, vom Nutzer selbst authentifizierte Weboberfläche ein. ProSellers bleibt optional hinter dem separaten Credentials-/Entitlement-/Write-Authority-Gate.
 
 ## Auftrag
 
@@ -177,16 +177,37 @@ Der bestehende PoC hat gegen eigene Testdaten bereits praktisch bestätigt:
 - Inbox/Conversation mit konkreter Anzeigen-ID,
 - Delete-Staleness: Besitzerlisten sind authoritative; Detail-GET/Public-URL können nachlaufen.
 
-Diese Befunde bleiben gültige Regressionsevidenz. Der neue HTTP-first-Plan ersetzt sie nicht, sondern reduziert die Browserabhängigkeit.
+Diese Befunde bleiben gültige Regressionsevidenz. Der damalige HTTP-first-Plan ordnete sie neu ein; D-010 supersediert inzwischen nur den aktiven Produktpfad, nicht die historische Evidenz.
 
-## Aktive Architekturentscheidung ab 26.09.2026
+## Historische Architekturentscheidung ab 26.09.2026
 
-1. **HTTP-first als Zielarchitektur.** Für private/eigene Accounts wird die Mobile-CAPI als primärer technischer Write-Kandidat weiter ausgebaut.
-2. **Browser bis zum Remote-Beleg primär.** Für bestehende Inhaltsupdates bleibt der BrowserBotAdapter der operative primäre Writer, weil dieser Pfad remote belegt ist. Erst nach erfolgreichem Slice-B-HTTP-Readback wird er zum Fallback; das Zielbild bleibt HTTP-first.
-3. **Offizielle API parallel anschließbar.** Ein ProSellersAdapter soll denselben Mark-Domainvertrag bedienen.
-4. **Keine Providersemantik im Mark-API-Vertrag.** Mark exponiert eigene Operationen; UUID/adId/Publication-Details bleiben im Adapter.
-5. **Fail closed.** Nicht belegte Fähigkeiten bleiben deaktiviert; kein Blind-Retry bei unklarem Write-Ergebnis.
-6. **Kein Live-Write in diesem Slice.** Zuerst Adaptervertrag und lokale Regressionstests, danach separater explizit gegateter Remote-Smoke.
+1. **HTTP-first als damaliges Zielbild.** Für private/eigene Accounts sollte die Mobile-CAPI als primärer technischer Write-Kandidat weiter ausgebaut werden.
+2. **Browser bis zum Remote-Beleg primär.** Für bestehende Inhaltsupdates blieb der `BrowserBotAdapter` operativ primär.
+3. **Offizielle API parallel anschließbar.** Ein ProSellersAdapter sollte denselben Mark-Domainvertrag bedienen.
+4. **Keine Providersemantik im Mark-API-Vertrag.**
+5. **Fail closed.** Kein Blind-Retry bei unklarem Write-Ergebnis.
+6. **Kein Live-Write im damaligen Slice.**
+
+Diese Reihenfolge bleibt historische technische Evidenz, ist aber seit D-010 **nicht mehr der aktive private Produktplan**.
+
+## Fortschreibung 28.09.2026 — aktiver privater Writer
+
+Der aktive private Writepfad ist jetzt:
+
+```text
+MarkService / SafeWriteOrchestrator
+        |
+        +-- PrivateWebContentWriter
+        |       |
+        |       +-- PrivateWebPage (browserdriver-neutral)
+        |               |
+        |               +-- normale Kleinanzeigen-Weboberfläche
+        |                   in eigener nutzer-authentifizierter Sitzung
+        |
+        +-- ProSellersApiWriter (optional, nur nach Admission)
+```
+
+Private/mobile HTTP und der historische BrowserBot werden nicht automatisch als Fallback reaktiviert. Der erste Private-Web-Slice implementiert nur die browserdriver-neutrale Content-Write-Grenze: exakte Anzeigen-ID, harte Auth-/Challenge-Zustände, vollständiger Editor-Readback vor einem einzigen Submit und danach der bereits vorhandene Core-Post-Read. Der konkrete persistente Browserdriver sowie der Live-Smoke folgen getrennt.
 
 ## Geplante Mark-HTTP-API
 
@@ -271,4 +292,4 @@ Erst nach diesem Beleg wird der Browser-Content-Updatepfad zum Fallback degradie
 
 Die Frage, **ob** eine schreibfähige Mark-API technisch möglich ist, ist mit **ja** beantwortet.
 
-Die offene technische Arbeit ist jetzt konkret: den privaten HTTP-in-place-Updatepfad remote belegen, anschließend Create/Media/Reply vervollständigen und darauf die eigene Mark-Write-API setzen. Das ist der aktive Umsetzungsplan.
+Die aktive technische Arbeit folgt D-010: zuerst den `PrivateWebWriter` mit einem persistenten nutzer-authentifizierten Browserdriver verbinden und den in-place Content-Write auf genau einer frisch owner-verifizierten eigenen Anzeige reversibel smoken. Danach werden Create/Media/Lifecycle/Delete einzeln über denselben fail-closed Web-UI-Pfad ergänzt; ProSellers bleibt das optionale offizielle zweite Backend. Die privaten/mobile Reverse-Engineering-Pfade bleiben historische PoC-Evidenz.

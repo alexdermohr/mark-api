@@ -88,7 +88,7 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 **Begründung:** Issue #2 hat den Integrations-Gate abgeschlossen. Für private Accounts liegt kein freigegebener offizieller Automationspfad für die im PoC genutzten privaten/mobile/browserbasierten Mechanismen vor. Die offizielle ProSellers API ist ein anderer Betriebsmodus für berechtigte professionelle Power-/Premium-Konten und setzt provisionierte Zugangsdaten sowie eine klare API-Write-Authority voraus.
 
 **Folgen:**
-- Private/mobile HTTP und Browserautomation bleiben als technische PoC-Adapter im Repository, werden aber nicht als Produktintegration aktiviert.
+- Private/mobile Reverse-Engineering-HTTP und der historische `BrowserBotAdapter` bleiben als technische PoC-Adapter im Repository und werden nicht als automatische Produktintegration aktiviert. Der davon getrennte normale Web-UI-Writer wird ab D-010 separat gegated.
 - Kleinanzeigen-E-Mail-Kopien dürfen lokal importiert werden. Der Import speichert nur Anzeigen-ID, Conversation-ID, Provider-Message-ID, Zeitstempel und Quelle; Nachrichtentext und Personennamen werden nicht persistiert. Die Header-/Body-Prüfung ist eine Format-/Konsistenzprüfung und keine kryptographische Absenderauthentifizierung; der Nutzer stellt die rohe Nachricht aus dem eigenen Postfach bereit.
 - Aus E-Mail-Kopien werden getrennte read-only Projektionen für Conversation- und Inbound-Message-Zähler abgeleitet. In Analytics heißen sie source-explizit `email_conversation_count` und `email_inbound_message_count`; bestehende ReactionSnapshot-Metriken werden nicht ersetzt oder additiv vermischt. `unique_buyer_count` wird aus E-Mail-Kopien nicht erfunden.
 - Ein Import offizieller PRO-Statistikdownloads wird erst implementiert, wenn ein reales Exportformat als Contract-Evidenz vorliegt.
@@ -107,3 +107,19 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - Admission-Diagnostik enthält nur Reason-Codes; Credentials erscheinen nicht in `repr`, Decision-Payloads oder Exceptions.
 - API-originierte Listings dürfen später nur unter expliziter API-Write-Authority geschrieben werden; Mischbetrieb mit manuellen Web-Writes für dieselben API-originierte Listings wird nicht freigegeben.
 - OAuth- und Goods-Transport bleiben ein separater Slice und müssen die Admission erneut als Konstruktor-/Factory-Gate erzwingen.
+
+## D-010 — Privater Writer über die normale nutzer-authentifizierte Weboberfläche
+
+**Entscheidung:** Für eigene private Kleinanzeigen-Accounts wird ein eigener `PrivateWebWriter` als Produkt-Writepfad aufgebaut. Er steuert ausschließlich die normale Kleinanzeigen-Weboberfläche in einer vom Nutzer selbst authentifizierten Browser-Sitzung. D-010 supersediert D-008 nur insoweit, als D-008 sämtliche Browserautomation pauschal dem PoC zuordnete; private/mobile Reverse-Engineering-HTTP sowie der historische `BrowserBotAdapter` bleiben weiterhin PoC und sind keine automatischen Fallbacks.
+
+**Begründung:** Der Auftraggeber hat am 28.09.2026 klargestellt, dass echte Schreiboperationen auch ohne PRO-Konto zentraler Projektauftrag sind. Die normale Weboberfläche stellt diese Operationen dem privaten Kontoinhaber selbst bereit. Der neue Pfad bindet deshalb die vorhandenen Core-Sicherheitsregeln an eine nutzerkontrollierte Browser-Sitzung, ohne Passwörter, MFA oder Anti-Automation-Challenges zu automatisieren oder zu umgehen.
+
+**Folgen:**
+- jede Mutation betrifft genau eine explizite, frisch owner-verifizierte Anzeigen-ID des eigenen Kontos,
+- Login, MFA, CAPTCHA und sonstige Sicherheitschallenges sind harte Stop-Zustände; `mark-api` speichert keine Passwörter oder MFA-Codes,
+- der erste Content-Writer öffnet genau den Editor der Ziel-ID, prüft vor jeder Änderung `ready` + exakte ID, ändert nur angeforderte Felder und prüft vor einem einzigen Submit nochmals ID sowie den vollständigen erwarteten Editorzustand,
+- Browser-/Providerfehler werden in Receipts nur als sanitizierte Fehlerklasse/Stage geführt; kein Cookie, Token, URL-Fragment oder Anzeigeninhalt wird als Fehlertext persistiert,
+- der bestehende `SafeWriteOrchestrator` bleibt alleinige Write-Semantik: frischer Owner-Pre-Read, genau ein Mutationsversuch, kein Blind-Retry und Post-Readback,
+- der Contract selbst ist browserdriver-neutral. Ein konkreter persistenter Browserdriver und ein eigener, reversibler Live-Smoke sind separate Gates vor Aktivierung,
+- Create, Bilder, Pause/Aktivieren und Delete werden erst nach dem Content-Update-Grundpfad einzeln erweitert; Delete behält zusätzlich seine explizite ID-Freigabe,
+- ProSellers bleibt ein separates optionales Backend für tatsächlich berechtigte Power/Premium-Konten.
