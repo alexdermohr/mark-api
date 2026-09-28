@@ -814,25 +814,6 @@ class CdpPrivateWebPage:
 """
         client = self._client()
         try:
-            settled = client.call(
-                "Runtime.evaluate",
-                {
-                    "expression": (
-                        "new Promise(resolve => "
-                        "requestAnimationFrame(() => "
-                        "requestAnimationFrame(() => resolve(true))))"
-                    ),
-                    "returnByValue": True,
-                    "awaitPromise": True,
-                },
-            )
-            settled_remote = settled.get("result")
-            if (
-                not isinstance(settled_remote, dict)
-                or settled_remote.get("value") is not True
-            ):
-                raise PrivateWebCdpError("submit_settle")
-
             if self._runtime_value(client, expression) is not True:
                 raise PrivateWebCdpError("submit")
 

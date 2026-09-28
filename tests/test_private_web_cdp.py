@@ -469,13 +469,6 @@ class CdpPrivateWebPageTests(unittest.TestCase):
             if method != "Runtime.evaluate":
                 raise AssertionError(f"unexpected method: {method}")
             expression = params.get("expression")
-            if "requestAnimationFrame" in str(expression):
-                return {
-                    "result": {
-                        "type": "boolean",
-                        "value": True,
-                    }
-                }
             if expression == "location.pathname":
                 return {
                     "result": {
@@ -504,12 +497,9 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertEqual(caught.exception.stage, "submit_already_attempted")
         self.assertEqual(
             [method for method, _params in client.calls],
-            ["Runtime.evaluate", "Runtime.evaluate", "Runtime.evaluate"],
+            ["Runtime.evaluate", "Runtime.evaluate"],
         )
-        settle = client.calls[0][1]
-        self.assertIn("requestAnimationFrame", settle["expression"])
-        self.assertTrue(settle["awaitPromise"])
-        expression = client.calls[1][1]["expression"]
+        expression = client.calls[0][1]["expression"]
         self.assertIn("location.origin", expression)
         self.assertIn("/p-anzeige-bearbeiten.html", expression)
         self.assertIn(AD_ID, expression)
@@ -519,7 +509,7 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertIn("getBoundingClientRect", expression)
         self.assertIn("button.click()", expression)
         self.assertNotIn("Input.dispatchMouseEvent", str(client.calls))
-        self.assertEqual(client.calls[2][1]["expression"], "location.pathname")
+        self.assertEqual(client.calls[1][1]["expression"], "location.pathname")
         self.assertFalse(client.closed)
         page.close()
         self.assertTrue(client.closed)
@@ -548,8 +538,6 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         def handler(method, params):
             if method != "Runtime.evaluate":
                 raise AssertionError(f"unexpected method: {method}")
-            if "requestAnimationFrame" in str(params.get("expression")):
-                return {"result": {"type": "boolean", "value": True}}
             return {"result": {"type": "boolean", "value": False}}
 
         client = FakeClient(handler)
@@ -565,9 +553,9 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertEqual(caught.exception.stage, "submit")
         self.assertEqual(
             [method for method, _params in client.calls],
-            ["Runtime.evaluate", "Runtime.evaluate"],
+            ["Runtime.evaluate"],
         )
-        expression = client.calls[1][1]["expression"]
+        expression = client.calls[0][1]["expression"]
         self.assertIn(AD_ID, expression)
         self.assertIn("Existing title", expression)
         self.assertIn("Existing description", expression)
@@ -580,8 +568,6 @@ class CdpPrivateWebPageTests(unittest.TestCase):
             if method != "Runtime.evaluate":
                 raise AssertionError(f"unexpected method: {method}")
             expression = params.get("expression")
-            if "requestAnimationFrame" in str(expression):
-                return {"result": {"type": "boolean", "value": True}}
             if expression == "location.pathname":
                 return {
                     "result": {
@@ -610,7 +596,7 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertEqual(second.exception.stage, "submit_already_attempted")
         self.assertEqual(
             [method for method, _params in client.calls],
-            ["Runtime.evaluate", "Runtime.evaluate", "Runtime.evaluate"],
+            ["Runtime.evaluate", "Runtime.evaluate"],
         )
         page.close()
 
@@ -618,8 +604,6 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         def handler(method, params):
             if method != "Runtime.evaluate":
                 raise AssertionError(f"unexpected method: {method}")
-            if "requestAnimationFrame" in str(params.get("expression")):
-                return {"result": {"type": "boolean", "value": True}}
             raise RuntimeError(
                 "provider https://example.invalid Cookie secret listing content"
             )
@@ -641,7 +625,7 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertEqual(second.exception.stage, "submit_already_attempted")
         self.assertEqual(
             [method for method, _params in client.calls],
-            ["Runtime.evaluate", "Runtime.evaluate"],
+            ["Runtime.evaluate"],
         )
         self.assertFalse(client.closed)
         page.close()
