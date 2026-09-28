@@ -192,16 +192,26 @@ def run_local_smoke(
             raise RuntimeError("email analytics ranking does not match import")
 
         try:
+            reaction_message_counts = {
+                str(item["ad_id"]): int(item["inbound_message_count"])
+                for item in reactions
+            }
+            ranking_message_counts = {
+                str(item["ad_id"]): int(item["value"])
+                for item in ranking
+            }
             conversation_total = sum(
                 int(item["conversation_count"]) for item in reactions
             )
-            message_total = sum(
-                int(item["inbound_message_count"]) for item in reactions
-            )
-            ranking_total = sum(int(item["value"]) for item in ranking)
+            message_total = sum(reaction_message_counts.values())
+            ranking_total = sum(ranking_message_counts.values())
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("dashboard email metrics are malformed") from exc
 
+        if reaction_message_counts != ranking_message_counts:
+            raise RuntimeError(
+                "email analytics per-ad message counts are inconsistent"
+            )
         if message_total != import_report.inserted_events:
             raise RuntimeError("email projection message total is inconsistent")
         if ranking_total != message_total:

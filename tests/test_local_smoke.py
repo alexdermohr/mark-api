@@ -13,6 +13,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
 
+import mark_api.local_smoke as local_smoke
 from mark_api.local_smoke import main, run_local_smoke
 
 
@@ -121,6 +122,60 @@ class LocalSmokeTests(unittest.TestCase):
         encoded = output.getvalue().lower()
         self.assertNotIn("anfrage zu deiner anzeige", encoded)
         self.assertNotIn("owner@example.invalid", encoded)
+
+    def test_swapped_per_ad_analytics_values_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = (
+                self.make_email(
+                    root,
+                    "one.eml",
+                    ad_id="1234567890",
+                    conversation_id="conv-a:thread:one",
+                    provider_message_id="message-a",
+                    date="Thu, 24 Sep 2026 10:37:48 +0000",
+                ),
+                self.make_email(
+                    root,
+                    "two.eml",
+                    ad_id="1234567890",
+                    conversation_id="conv-a:thread:one",
+                    provider_message_id="message-b",
+                    date="Thu, 24 Sep 2026 10:38:48 +0000",
+                ),
+                self.make_email(
+                    root,
+                    "three.eml",
+                    ad_id="9876543210",
+                    conversation_id="conv-b:thread:two",
+                    provider_message_id="message-c",
+                    date="Thu, 24 Sep 2026 10:39:48 +0000",
+                ),
+            )
+            original_json_get = local_smoke._json_get
+
+            def swapped_ranking(opener, base: str, path: str):
+                payload = original_json_get(opener, base, path)
+                if path.endswith(
+                    "metric=email_inbound_message_count"
+                ):
+                    rows = [dict(item) for item in payload]
+                    rows[0]["value"], rows[1]["value"] = (
+                        rows[1]["value"],
+                        rows[0]["value"],
+                    )
+                    return rows
+                return payload
+
+            with patch(
+                "mark_api.local_smoke._json_get",
+                side_effect=swapped_ranking,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "per-ad message counts",
+                ):
+                    run_local_smoke(paths)
 
     def test_importing_smoke_does_not_load_platform_adapters(self) -> None:
         code = (
