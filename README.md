@@ -72,6 +72,22 @@ Der Smoke erzeugt dafür ausschließlich eine **ephemere SQLite-Datenbank**, imp
 
 Der Smoke konstruiert **keinen** Kleinanzeigen-, Browser-, Mobile- oder Private-HTTP-Adapter, kontaktiert Kleinanzeigen nicht und aktiviert keine Plattformwrites. Die ephemere Datenbank wird nach dem Lauf verworfen. Er belegt damit nur die lokale Kette `user-provided .eml -> SQLite -> Query/Analytics -> Loopback-Dashboard`; er ist keine Freigabe für Plattformautomation und ersetzt keine noch fehlende Contract-Evidenz für das konkrete PRO-Statistikformat.
 
+## Offizielles ProSellers-Admission-Gate
+
+Der optionale offizielle ProSellers-Pfad bleibt standardmäßig gesperrt. `mark_api.prosellers` führt ausschließlich eine **lokale** Zulassungsprüfung durch; das Modul fordert keinen Token an und sendet keinen Request an Kleinanzeigen.
+
+Ein zukünftiger offizieller API-Client darf nur konstruiert werden, wenn gleichzeitig alle folgenden Voraussetzungen erfüllt sind:
+
+- Kontotyp `professional`,
+- PRO-Paket `power` oder `premium`,
+- das konkrete API-Entitlement wurde ausdrücklich bestätigt,
+- tatsächlich provisionierte `client_id` und `client_secret` liegen nichtleer vor,
+- die Write-Authority ist explizit `api_originated_only`: API-originierte Anzeigen werden nicht mit manuellen Web-Writes vermischt.
+
+Die Entscheidung liefert nur stabile Reason-Codes wie `plan_not_api_eligible` oder `api_entitlement_not_confirmed`. Credential-Werte werden weder normalisiert noch persistiert und sind aus `repr`, Decision-Payloads und Admission-Exceptions ausgeschlossen. Power/Premium oder vorhandene Strings allein gelten ausdrücklich **nicht** als Entitlement-Beweis.
+
+Dieser Slice implementiert nur das Gate. OAuth-Tokenabruf (`client_credentials`, Audience `consumer-goods-api`) und Requests an die Goods API bleiben separate spätere Arbeit und dürfen erst hinter diesem Gate ergänzt werden.
+
 ## Offene fachliche Punkte
 
 Die Reaktionsdaten werden absichtlich getrennt als `conversation_count`, `unique_buyer_count` und `inbound_message_count` gespeichert. Welche dieser Größen fachlich „wie viele geschrieben haben“ meint, ist noch nicht festgelegt.
