@@ -436,6 +436,12 @@ class CdpPrivateWebPage:
                 + "] === true"
                 + "}))()"
             )
+            terminal_challenge_states = {
+                PrivateWebEditorState.LOGIN_REQUIRED,
+                PrivateWebEditorState.MFA_REQUIRED,
+                PrivateWebEditorState.CAPTCHA_REQUIRED,
+                PrivateWebEditorState.SECURITY_CHALLENGE,
+            }
             while True:
                 try:
                     readiness = self._runtime_value(
@@ -450,7 +456,20 @@ class CdpPrivateWebPage:
                     and readiness.get("oldDocument") is False
                 ):
                     self._bound_ad_id = target_ad_id
-                    return
+                    try:
+                        snapshot = self.read_editor()
+                    except PrivateWebCdpError:
+                        snapshot = None
+                    self._last_ready_snapshot = None
+                    if snapshot is not None and (
+                        (
+                            snapshot.state is PrivateWebEditorState.READY
+                            and snapshot.ad_id == target_ad_id
+                        )
+                        or snapshot.state in terminal_challenge_states
+                    ):
+                        return
+                    self._bound_ad_id = None
                 if self._monotonic() >= deadline:
                     raise PrivateWebCdpError("navigate")
                 self._sleep(0.05)

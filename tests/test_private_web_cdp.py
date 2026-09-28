@@ -169,6 +169,12 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         runtime_values = [
             True,
             {"readyState": "complete", "oldDocument": False},
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "title": "Existing title",
+                "description": "Existing description",
+            },
         ]
 
         def handler(method, params):
@@ -208,6 +214,12 @@ class CdpPrivateWebPageTests(unittest.TestCase):
             True,
             {"readyState": "complete", "oldDocument": True},
             {"readyState": "complete", "oldDocument": False},
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "title": "Existing title",
+                "description": "Existing description",
+            },
         ]
 
         def handler(method, params):
@@ -235,8 +247,118 @@ class CdpPrivateWebPageTests(unittest.TestCase):
                 "Page.navigate",
                 "Runtime.evaluate",
                 "Runtime.evaluate",
+                "Runtime.evaluate",
             ],
         )
+
+    def test_open_editor_waits_for_client_rendered_editor_contract(self) -> None:
+        runtime_values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+            {"state": "unknown"},
+            {"readyState": "complete", "oldDocument": False},
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "title": "Existing title",
+                "description": "Existing description",
+            },
+        ]
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+            sleep=lambda _seconds: None,
+        )
+
+        page.open_editor(AD_ID)
+
+        self.assertEqual(runtime_values, [])
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            [
+                "Runtime.evaluate",
+                "Page.navigate",
+                "Runtime.evaluate",
+                "Runtime.evaluate",
+                "Runtime.evaluate",
+                "Runtime.evaluate",
+            ],
+        )
+        first_contract_probe = client.calls[3][1]["expression"]
+        second_contract_probe = client.calls[5][1]["expression"]
+        for expression in (first_contract_probe, second_contract_probe):
+            self.assertIn("#ad-title", expression)
+            self.assertIn("#ad-description", expression)
+            self.assertIn("Anzeige speichern", expression)
+            self.assertIn("/p-anzeige-bearbeiten.html", expression)
+
+    def test_open_editor_releases_known_challenge_for_classification(self) -> None:
+        runtime_values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+            {"state": "captcha_required"},
+        ]
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+
+        page.open_editor(AD_ID)
+
+        self.assertEqual(runtime_values, [])
+        challenge_probe = client.calls[3][1]["expression"]
+        self.assertIn('challengeText.includes("captcha")', challenge_probe)
+        self.assertIn('input[type="password"]', challenge_probe)
+
+    def test_open_editor_times_out_while_editor_contract_is_unknown(self) -> None:
+        runtime_values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+            {"state": "unknown"},
+        ]
+        monotonic_values = iter((0.0, 0.2))
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+            timeout_seconds=0.1,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(monotonic_values),
+        )
+
+        with self.assertRaisesRegex(PrivateWebCdpError, "navigate"):
+            page.open_editor(AD_ID)
+
+        self.assertEqual(runtime_values, [])
 
     def test_invalid_ad_id_never_touches_browser(self) -> None:
         calls = 0
