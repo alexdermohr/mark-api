@@ -12,7 +12,12 @@ from urllib.parse import parse_qs, urlparse
 
 from mark_api.domain import AdSnapshot, LifecycleState, OperationOutcome
 from mark_api.orchestrator import SafeWriteOrchestrator
-from mark_api.private_web import PrivateWebEditorSnapshot, PrivateWebEditorState
+from mark_api.private_web import (
+    PrivateWebEditorSnapshot,
+    PrivateWebEditorState,
+    PrivateWebStateSnapshot,
+    PrivateWebSubmitUnknownError,
+)
 from mark_api.private_web_cdp import (
     CdpCookieProvider,
     CdpPrivateWebOwnerReader,
@@ -1577,6 +1582,330 @@ class CdpPrivateWebOwnerReaderTests(unittest.TestCase):
             receipt.post_snapshot.description,
             "Updated description",
         )
+
+
+class CdpPrivateWebStatePageTests(unittest.TestCase):
+    def bind_state(
+        self,
+        page: CdpPrivateWebPage,
+        state: LifecycleState,
+    ) -> None:
+        page._bound_state_ad_id = AD_ID
+        page._last_state_snapshot = PrivateWebStateSnapshot(
+            state=PrivateWebEditorState.READY,
+            ad_id=AD_ID,
+            lifecycle_state=state,
+        )
+
+    def test_open_state_controls_navigates_to_owner_management_and_binds_target(self) -> None:
+        values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "lifecycle_state": "active",
+            },
+        ]
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                self.assertEqual(
+                    params["url"],
+                    "https://www.kleinanzeigen.de/m-meine-anzeigen.html",
+                )
+                return {}
+            if method == "Runtime.evaluate":
+                if not values:
+                    raise AssertionError("unexpected Runtime.evaluate")
+                value = values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+
+        page.open_state_controls(AD_ID)
+
+        self.assertEqual(page._bound_state_ad_id, AD_ID)
+        self.assertEqual(values, [])
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            [
+                "Runtime.evaluate",
+                "Page.navigate",
+                "Runtime.evaluate",
+                "Runtime.evaluate",
+            ],
+        )
+
+    def test_read_state_controls_is_exact_owner_and_control_bound(self) -> None:
+        page, clients = page_with_results(
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "lifecycle_state": "active",
+            }
+        )
+        page._bound_state_ad_id = AD_ID
+
+        snapshot = page.read_state_controls()
+
+        self.assertEqual(snapshot.state, PrivateWebEditorState.READY)
+        self.assertEqual(snapshot.ad_id, AD_ID)
+        self.assertEqual(snapshot.lifecycle_state, LifecycleState.ACTIVE)
+        self.assertEqual(page._last_state_snapshot, snapshot)
+        expression = clients[0].calls[0][1]["expression"]
+        self.assertIn("/m-meine-anzeigen.html", expression)
+        self.assertIn("/p-anzeige-bearbeiten.html", expression)
+        self.assertIn('url.searchParams.get("adId")', expression)
+        self.assertIn("targetEditLinks.length !== 1", expression)
+        self.assertIn("editIds.length === 1", expression)
+        self.assertIn('label === "reservieren"', expression)
+        self.assertIn('label === "aktivieren"', expression)
+        self.assertIn("controls.length === 1", expression)
+        self.assertNotIn("document.body", expression)
+        javascript_check = subprocess.run(
+            ["node", "--check", "-"],
+            input=expression,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(
+            javascript_check.returncode,
+            0,
+            javascript_check.stdout + javascript_check.stderr,
+        )
+
+    def test_state_challenges_hide_target_data(self) -> None:
+        for raw_state in (
+            "login_required",
+            "mfa_required",
+            "captcha_required",
+            "security_challenge",
+            "unknown",
+        ):
+            with self.subTest(raw_state=raw_state):
+                page, _ = page_with_results({"state": raw_state})
+                page._bound_state_ad_id = AD_ID
+
+                snapshot = page.read_state_controls()
+
+                self.assertEqual(snapshot.state.value, raw_state)
+                self.assertIsNone(snapshot.ad_id)
+                self.assertIsNone(snapshot.lifecycle_state)
+                self.assertIsNone(page._last_state_snapshot)
+
+    def test_malformed_state_snapshot_fails_closed(self) -> None:
+        for value in (
+            {"state": "ready", "ad_id": AD_ID, "lifecycle_state": "pending"},
+            {"state": "ready", "ad_id": "bad", "lifecycle_state": "active"},
+            {"state": "ready", "ad_id": AD_ID, "lifecycle_state": 7},
+            {"state": "not-a-state"},
+            "not-a-dict",
+        ):
+            with self.subTest(value=value):
+                page, _ = page_with_results(value)
+                page._bound_state_ad_id = AD_ID
+
+                snapshot = page.read_state_controls()
+
+                self.assertEqual(snapshot.state, PrivateWebEditorState.UNKNOWN)
+                self.assertIsNone(page._last_state_snapshot)
+
+    def test_state_submit_uses_one_browser_level_hit_tested_activation(self) -> None:
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"x": 120.5, "y": 240.25},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        self.bind_state(page, LifecycleState.ACTIVE)
+
+        page.submit_state(LifecycleState.PAUSED)
+
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            [
+                "Runtime.evaluate",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+            ],
+        )
+        expression = client.calls[0][1]["expression"]
+        self.assertIn('"reservieren"', expression)
+        self.assertIn("getComputedStyle(control)", expression)
+        self.assertIn("control.disabled", expression)
+        self.assertIn('control.getAttribute("aria-disabled")', expression)
+        self.assertIn("getBoundingClientRect", expression)
+        self.assertIn("elementFromPoint", expression)
+        self.assertNotIn(".click(", expression)
+        javascript_check = subprocess.run(
+            ["node", "--check", "-"],
+            input=expression,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(
+            javascript_check.returncode,
+            0,
+            javascript_check.stdout + javascript_check.stderr,
+        )
+        self.assertEqual(
+            client.calls[1][1],
+            {
+                "type": "mousePressed",
+                "x": 120.5,
+                "y": 240.25,
+                "button": "left",
+                "buttons": 1,
+                "clickCount": 1,
+            },
+        )
+        self.assertEqual(
+            client.calls[2][1],
+            {
+                "type": "mouseReleased",
+                "x": 120.5,
+                "y": 240.25,
+                "button": "left",
+                "buttons": 0,
+                "clickCount": 1,
+            },
+        )
+        with self.assertRaisesRegex(
+            PrivateWebCdpError,
+            "state_submit_already_attempted",
+        ):
+            page.submit_state(LifecycleState.PAUSED)
+
+    def test_activate_requires_paused_snapshot_and_activate_control(self) -> None:
+        client = FakeClient(
+            lambda method, params: (
+                {
+                    "result": {
+                        "type": "object",
+                        "value": {"x": 10.0, "y": 20.0},
+                    }
+                }
+                if method == "Runtime.evaluate"
+                else {}
+            )
+        )
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        self.bind_state(page, LifecycleState.PAUSED)
+
+        page.submit_state(LifecycleState.ACTIVE)
+
+        expression = client.calls[0][1]["expression"]
+        self.assertIn('"aktivieren"', expression)
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+
+    def test_state_submit_fails_safe_before_browser_input(self) -> None:
+        client = FakeClient(
+            lambda method, params: (
+                {"result": {"type": "object", "value": None}}
+                if method == "Runtime.evaluate"
+                else (_ for _ in ()).throw(
+                    AssertionError("input must not be attempted")
+                )
+            )
+        )
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        self.bind_state(page, LifecycleState.ACTIVE)
+
+        with self.assertRaisesRegex(PrivateWebCdpError, "state_submit"):
+            page.submit_state(LifecycleState.PAUSED)
+
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            ["Runtime.evaluate"],
+        )
+        with self.assertRaisesRegex(
+            PrivateWebCdpError,
+            "state_submit_already_attempted",
+        ):
+            page.submit_state(LifecycleState.PAUSED)
+
+    def test_state_submit_provider_failure_after_input_is_submit_unknown(self) -> None:
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                raise RuntimeError("provider response lost")
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        self.bind_state(page, LifecycleState.ACTIVE)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            page.submit_state(LifecycleState.PAUSED)
+
+        self.assertEqual(caught.exception.stage, "state_submit")
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            ["Runtime.evaluate", "Input.dispatchMouseEvent"],
+        )
+        with self.assertRaisesRegex(
+            PrivateWebCdpError,
+            "state_submit_already_attempted",
+        ):
+            page.submit_state(LifecycleState.PAUSED)
+
+    def test_state_submit_rejects_wrong_prestate_before_browser_access(self) -> None:
+        client = FakeClient(
+            lambda method, params: (_ for _ in ()).throw(
+                AssertionError("browser must not be touched")
+            )
+        )
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        self.bind_state(page, LifecycleState.PAUSED)
+
+        with self.assertRaisesRegex(PrivateWebCdpError, "state_submit"):
+            page.submit_state(LifecycleState.PAUSED)
+
+        self.assertEqual(client.calls, [])
 
 
 if __name__ == "__main__":

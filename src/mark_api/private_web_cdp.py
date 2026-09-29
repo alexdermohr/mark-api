@@ -10,18 +10,21 @@ from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
-from .domain import AdSnapshot
-from .ports import AdsReader
+from .domain import AdSnapshot, LifecycleState
+from .ports import AdsReader, WriteNotAttemptedError
 from .private_web import (
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
+    PrivateWebStateSnapshot,
+    PrivateWebSubmitUnknownError,
     _validated_ad_id,
 )
 from .results import ReadResult, ReadStatus
 
 _KLEINANZEIGEN_ORIGIN = "https://www.kleinanzeigen.de"
 _EDITOR_PATH = "/p-anzeige-bearbeiten.html"
-_POST_SUBMIT_PATH = "/m-meine-anzeigen.html"
+_MANAGEMENT_PATH = "/m-meine-anzeigen.html"
+_POST_SUBMIT_PATH = _MANAGEMENT_PATH
 _MAX_TARGET_BYTES = 64 * 1024
 
 
@@ -40,6 +43,13 @@ class PrivateWebCdpError(RuntimeError):
     def __init__(self, stage: str) -> None:
         self.stage = stage
         super().__init__(f"private web cdp failed at {stage}")
+
+
+class PrivateWebCdpWriteNotAttemptedError(
+    PrivateWebCdpError,
+    WriteNotAttemptedError,
+):
+    """CDP failed before browser input could reach the platform."""
 
 
 class _CdpClient(Protocol):
@@ -346,6 +356,9 @@ class CdpPrivateWebPage:
         self._submit_attempted = False
         self._bound_ad_id: str | None = None
         self._last_ready_snapshot: PrivateWebEditorSnapshot | None = None
+        self._state_submit_attempted = False
+        self._bound_state_ad_id: str | None = None
+        self._last_state_snapshot: PrivateWebStateSnapshot | None = None
 
     @classmethod
     def from_port(
@@ -370,6 +383,8 @@ class CdpPrivateWebPage:
         self._client_instance = None
         self._bound_ad_id = None
         self._last_ready_snapshot = None
+        self._bound_state_ad_id = None
+        self._last_state_snapshot = None
         if client is not None:
             client.close()
 
@@ -413,6 +428,9 @@ class CdpPrivateWebPage:
         self._submit_attempted = False
         self._bound_ad_id = None
         self._last_ready_snapshot = None
+        self._state_submit_attempted = False
+        self._bound_state_ad_id = None
+        self._last_state_snapshot = None
         client = self._client()
         marker = json.dumps(
             f"__mark_private_web_navigation_probe_{target_ad_id}__"
@@ -598,6 +616,380 @@ class CdpPrivateWebPage:
         if ad_id == self._bound_ad_id:
             self._last_ready_snapshot = snapshot
         return snapshot
+
+
+    def _state_control_expression(
+        self,
+        target_ad_id: str,
+        *,
+        activation_label: str | None = None,
+    ) -> str:
+        origin = json.dumps(self._expected_origin)
+        management_path = json.dumps(_MANAGEMENT_PATH)
+        editor_path = json.dumps(_EDITOR_PATH)
+        ad_id = json.dumps(target_ad_id)
+        expected_control = json.dumps(activation_label)
+        return f"""
+(() => {{
+  const stateOnly = (state) => ({{state}});
+  const currentOrigin = location.origin;
+  const currentPath = location.pathname;
+  const targetAdId = {ad_id};
+  const editorPath = {editor_path};
+  const expectedControl = {expected_control};
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((element) => (element.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const hasLogin =
+    currentPath.startsWith("/u/login/") ||
+    Boolean(document.querySelector('input[type="password"]'));
+
+  if (currentOrigin !== {origin}) return stateOnly("unknown");
+  if (hasCaptcha) return stateOnly("captcha_required");
+  if (hasMfa) return stateOnly("mfa_required");
+  if (hasSecurityChallenge) return stateOnly("security_challenge");
+  if (hasLogin) return stateOnly("login_required");
+  if (currentPath !== {management_path}) return stateOnly("unknown");
+
+  const editorId = (link) => {{
+    try {{
+      const raw = link.getAttribute("href");
+      if (!raw) return null;
+      const url = new URL(raw, location.href);
+      if (url.origin !== {origin} || url.pathname !== editorPath) return null;
+      const value = url.searchParams.get("adId");
+      if (
+        typeof value !== "string" ||
+        value.length === 0 ||
+        value.length > 32 ||
+        !/^[0-9]+$/.test(value)
+      ) {{
+        return null;
+      }}
+      return value;
+    }} catch (_error) {{
+      return null;
+    }}
+  }};
+  const controlLabel = (element) =>
+    (element.innerText || "").trim().toLowerCase();
+  const lifecycleControls = (root) =>
+    Array.from(root.querySelectorAll('button, a[href], [role="button"]')).filter(
+      (element) => {{
+        const label = controlLabel(element);
+        return label === "reservieren" || label === "aktivieren";
+      }}
+    );
+  const targetEditLinks = Array.from(
+    document.querySelectorAll("a[href]")
+  ).filter((link) => editorId(link) === targetAdId);
+  if (targetEditLinks.length !== 1) return stateOnly("unknown");
+
+  let node = targetEditLinks[0].parentElement;
+  let bound = null;
+  for (let depth = 0; node && depth < 10; depth += 1) {{
+    const editIds = Array.from(node.querySelectorAll("a[href]"))
+      .map(editorId)
+      .filter((value) => value !== null);
+    const controls = lifecycleControls(node);
+    if (
+      editIds.length === 1 &&
+      editIds[0] === targetAdId &&
+      controls.length === 1
+    ) {{
+      bound = {{
+        container: node,
+        control: controls[0],
+        label: controlLabel(controls[0]),
+      }};
+      break;
+    }}
+    node = node.parentElement;
+  }}
+  if (bound === null) return stateOnly("unknown");
+
+  const lifecycleState =
+    bound.label === "reservieren"
+      ? "active"
+      : bound.label === "aktivieren"
+        ? "paused"
+        : null;
+  if (lifecycleState === null) return stateOnly("unknown");
+
+  if (expectedControl === null) {{
+    return {{
+      state: "ready",
+      ad_id: targetAdId,
+      lifecycle_state: lifecycleState,
+    }};
+  }}
+  if (bound.label !== expectedControl) return null;
+
+  const control = bound.control;
+  if (
+    (control instanceof HTMLButtonElement && control.disabled) ||
+    control.getAttribute("aria-disabled") === "true"
+  ) {{
+    return null;
+  }}
+  const style = getComputedStyle(control);
+  if (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.visibility === "collapse" ||
+    style.pointerEvents === "none" ||
+    Number(style.opacity) === 0
+  ) {{
+    return null;
+  }}
+  control.scrollIntoView({{block: "center", inline: "center"}});
+  const rect = control.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const hit = document.elementFromPoint(x, y);
+  if (hit !== control && !control.contains(hit)) return null;
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    y < 0 ||
+    x > window.innerWidth ||
+    y > window.innerHeight
+  ) {{
+    return null;
+  }}
+  return {{x, y}};
+}})()
+"""
+
+    def open_state_controls(self, ad_id: str) -> None:
+        target_ad_id = _validated_ad_id(ad_id)
+        target_url = f"{self._expected_origin}{_MANAGEMENT_PATH}"
+        self._state_submit_attempted = False
+        self._bound_state_ad_id = None
+        self._last_state_snapshot = None
+        self._submit_attempted = False
+        self._bound_ad_id = None
+        self._last_ready_snapshot = None
+        client = self._client()
+        marker = json.dumps(
+            f"__mark_private_web_state_navigation_probe_{target_ad_id}__"
+        )
+        try:
+            armed = self._runtime_value(
+                client,
+                (
+                    "(() => { const key = "
+                    + marker
+                    + "; globalThis[key] = true; "
+                    + "return globalThis[key] === true; })()"
+                ),
+            )
+            if armed is not True:
+                raise PrivateWebCdpError("navigate_state")
+            navigation = client.call("Page.navigate", {"url": target_url})
+            if navigation.get("errorText"):
+                raise PrivateWebCdpError("navigate_state")
+            deadline = self._monotonic() + self._timeout_seconds
+            readiness_expression = (
+                "(() => ({"
+                + "readyState: document.readyState,"
+                + "oldDocument: globalThis["
+                + marker
+                + "] === true"
+                + "}))()"
+            )
+            terminal_challenge_states = {
+                PrivateWebEditorState.LOGIN_REQUIRED,
+                PrivateWebEditorState.MFA_REQUIRED,
+                PrivateWebEditorState.CAPTCHA_REQUIRED,
+                PrivateWebEditorState.SECURITY_CHALLENGE,
+            }
+            while True:
+                try:
+                    readiness = self._runtime_value(
+                        client,
+                        readiness_expression,
+                    )
+                except PrivateWebCdpError:
+                    readiness = None
+                if (
+                    isinstance(readiness, dict)
+                    and readiness.get("readyState") == "complete"
+                    and readiness.get("oldDocument") is False
+                ):
+                    self._bound_state_ad_id = target_ad_id
+                    try:
+                        snapshot = self.read_state_controls()
+                    except PrivateWebCdpError:
+                        snapshot = None
+                    self._last_state_snapshot = None
+                    if snapshot is not None and (
+                        (
+                            snapshot.state is PrivateWebEditorState.READY
+                            and snapshot.ad_id == target_ad_id
+                        )
+                        or snapshot.state in terminal_challenge_states
+                    ):
+                        return
+                    self._bound_state_ad_id = None
+                if self._monotonic() >= deadline:
+                    raise PrivateWebCdpError("navigate_state")
+                self._sleep(0.05)
+        except PrivateWebCdpError:
+            raise
+        except Exception:  # noqa: BLE001 - sanitize runtime boundary.
+            raise PrivateWebCdpError("navigate_state") from None
+
+    def read_state_controls(self) -> PrivateWebStateSnapshot:
+        target_ad_id = self._bound_state_ad_id
+        self._last_state_snapshot = None
+        if target_ad_id is None:
+            raise PrivateWebCdpError("read_state_controls")
+        value = self._evaluate(
+            "read_state_controls",
+            self._state_control_expression(target_ad_id),
+        )
+        if not isinstance(value, dict):
+            return PrivateWebStateSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        raw_state = value.get("state")
+        try:
+            state = PrivateWebEditorState(raw_state)
+        except (TypeError, ValueError):
+            return PrivateWebStateSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        if state is not PrivateWebEditorState.READY:
+            return PrivateWebStateSnapshot(state=state)
+        ad_id = value.get("ad_id")
+        raw_lifecycle_state = value.get("lifecycle_state")
+        if not isinstance(ad_id, str):
+            return PrivateWebStateSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        try:
+            lifecycle_state = LifecycleState(raw_lifecycle_state)
+            snapshot = PrivateWebStateSnapshot(
+                state=PrivateWebEditorState.READY,
+                ad_id=ad_id,
+                lifecycle_state=lifecycle_state,
+            )
+        except (TypeError, ValueError):
+            return PrivateWebStateSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        if ad_id == target_ad_id:
+            self._last_state_snapshot = snapshot
+        return snapshot
+
+    def submit_state(self, state: LifecycleState) -> None:
+        if not isinstance(state, LifecycleState):
+            raise TypeError("state must be LifecycleState")
+        if state not in {LifecycleState.ACTIVE, LifecycleState.PAUSED}:
+            raise ValueError("state must be ACTIVE or PAUSED")
+        if self._state_submit_attempted:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "state_submit_already_attempted"
+            )
+        self._state_submit_attempted = True
+
+        target_ad_id = self._bound_state_ad_id
+        snapshot = self._last_state_snapshot
+        self._last_state_snapshot = None
+        expected_pre_state = (
+            LifecycleState.PAUSED
+            if state is LifecycleState.ACTIVE
+            else LifecycleState.ACTIVE
+        )
+        if (
+            target_ad_id is None
+            or snapshot is None
+            or snapshot.state is not PrivateWebEditorState.READY
+            or snapshot.ad_id != target_ad_id
+            or snapshot.lifecycle_state is not expected_pre_state
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError("state_submit")
+
+        expected_label = (
+            "aktivieren"
+            if state is LifecycleState.ACTIVE
+            else "reservieren"
+        )
+        try:
+            client = self._client()
+            activation = self._runtime_value(
+                client,
+                self._state_control_expression(
+                    target_ad_id,
+                    activation_label=expected_label,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - no browser input was attempted.
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "state_submit"
+            ) from None
+        if not isinstance(activation, dict):
+            raise PrivateWebCdpWriteNotAttemptedError("state_submit")
+        raw_x = activation.get("x")
+        raw_y = activation.get("y")
+        if (
+            isinstance(raw_x, bool)
+            or not isinstance(raw_x, (int, float))
+            or not math.isfinite(float(raw_x))
+            or float(raw_x) < 0
+            or isinstance(raw_y, bool)
+            or not isinstance(raw_y, (int, float))
+            or not math.isfinite(float(raw_y))
+            or float(raw_y) < 0
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError("state_submit")
+        x = float(raw_x)
+        y = float(raw_y)
+
+        try:
+            client.call(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mousePressed",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "buttons": 1,
+                    "clickCount": 1,
+                },
+            )
+            client.call(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mouseReleased",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "buttons": 0,
+                    "clickCount": 1,
+                },
+            )
+        except Exception:  # noqa: BLE001 - possible submit is never retried.
+            raise PrivateWebSubmitUnknownError("state_submit") from None
+
 
     def _replace_field(
         self,

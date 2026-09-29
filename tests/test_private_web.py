@@ -15,6 +15,9 @@ from mark_api.private_web import (
     PrivateWebEditorState,
     PrivateWebInteractionError,
     PrivateWebPreconditionError,
+    PrivateWebStateSnapshot,
+    PrivateWebStateWriter,
+    PrivateWebSubmitUnknownError,
 )
 from mark_api.results import ReadResult
 
@@ -419,6 +422,427 @@ class PrivateWebContentWriterTests(unittest.TestCase):
             "PrivateWebInteractionError",
         )
         self.assertEqual(page.calls.count(("submit",)), 1)
+        self.assertEqual(reader.calls, 2)
+
+
+def state_snapshot(
+    lifecycle_state: LifecycleState = LifecycleState.ACTIVE,
+    *,
+    state: PrivateWebEditorState = PrivateWebEditorState.READY,
+    ad_id: str | None = AD_ID,
+) -> PrivateWebStateSnapshot:
+    if state is not PrivateWebEditorState.READY:
+        ad_id = None
+        lifecycle = None
+    else:
+        lifecycle = lifecycle_state
+    return PrivateWebStateSnapshot(
+        state=state,
+        ad_id=ad_id,
+        lifecycle_state=lifecycle,
+    )
+
+
+class FakeStatePage:
+    def __init__(
+        self,
+        *snapshots: PrivateWebStateSnapshot,
+        fail_stage: str | None = None,
+        submit_unknown: bool = False,
+    ) -> None:
+        self.snapshots = list(snapshots)
+        self.fail_stage = fail_stage
+        self.submit_unknown = submit_unknown
+        self.calls: list[tuple[object, ...]] = []
+
+    def _maybe_fail(self, stage: str) -> None:
+        if self.fail_stage == stage:
+            raise RuntimeError("provider details must not escape")
+
+    def open_state_controls(self, ad_id: str) -> None:
+        self.calls.append(("open_state_controls", ad_id))
+        self._maybe_fail("open_state_controls")
+
+    def read_state_controls(self) -> PrivateWebStateSnapshot:
+        self.calls.append(("read_state_controls",))
+        self._maybe_fail("read_state_controls")
+        if not self.snapshots:
+            raise AssertionError("unexpected read_state_controls")
+        return self.snapshots.pop(0)
+
+    def submit_state(self, state: LifecycleState) -> None:
+        self.calls.append(("submit_state", state))
+        if self.submit_unknown:
+            raise PrivateWebSubmitUnknownError("state_submit")
+        self._maybe_fail("submit_state")
+
+
+class PrivateWebStateWriterTests(unittest.TestCase):
+    def test_active_paused_transitions_submit_once(self) -> None:
+        cases = (
+            (LifecycleState.ACTIVE, LifecycleState.PAUSED),
+            (LifecycleState.PAUSED, LifecycleState.ACTIVE),
+        )
+        for current, target in cases:
+            with self.subTest(current=current, target=target):
+                page = FakeStatePage(
+                    state_snapshot(current),
+                    state_snapshot(current),
+                )
+
+                PrivateWebStateWriter(page).set_state(AD_ID, target)
+
+                self.assertEqual(
+                    page.calls,
+                    [
+                        ("open_state_controls", AD_ID),
+                        ("read_state_controls",),
+                        ("read_state_controls",),
+                        ("submit_state", target),
+                    ],
+                )
+
+    def test_same_state_is_noop_without_submit(self) -> None:
+        for state in (LifecycleState.ACTIVE, LifecycleState.PAUSED):
+            with self.subTest(state=state):
+                page = FakeStatePage(state_snapshot(state))
+
+                PrivateWebStateWriter(page).set_state(AD_ID, state)
+
+                self.assertEqual(
+                    page.calls,
+                    [
+                        ("open_state_controls", AD_ID),
+                        ("read_state_controls",),
+                    ],
+                )
+
+    def test_auth_and_security_states_fail_before_submit(self) -> None:
+        for state in (
+            PrivateWebEditorState.LOGIN_REQUIRED,
+            PrivateWebEditorState.MFA_REQUIRED,
+            PrivateWebEditorState.CAPTCHA_REQUIRED,
+            PrivateWebEditorState.SECURITY_CHALLENGE,
+            PrivateWebEditorState.UNKNOWN,
+        ):
+            with self.subTest(state=state):
+                page = FakeStatePage(state_snapshot(state=state))
+
+                with self.assertRaises(PrivateWebPreconditionError) as caught:
+                    PrivateWebStateWriter(page).set_state(
+                        AD_ID,
+                        LifecycleState.PAUSED,
+                    )
+
+                self.assertEqual(caught.exception.reason, f"before:{state.value}")
+                self.assertNotIn(
+                    ("submit_state", LifecycleState.PAUSED),
+                    page.calls,
+                )
+
+    def test_wrong_target_id_fails_closed_before_submit(self) -> None:
+        page = FakeStatePage(
+            state_snapshot(LifecycleState.ACTIVE, ad_id="1234567890")
+        )
+
+        with self.assertRaisesRegex(
+            PrivateWebPreconditionError,
+            "ad_id_mismatch",
+        ):
+            PrivateWebStateWriter(page).set_state(
+                AD_ID,
+                LifecycleState.PAUSED,
+            )
+
+        self.assertFalse(
+            any(call[0] == "submit_state" for call in page.calls)
+        )
+
+    def test_challenge_or_target_change_immediately_before_submit_fails_closed(self) -> None:
+        cases = (
+            state_snapshot(state=PrivateWebEditorState.CAPTCHA_REQUIRED),
+            state_snapshot(
+                LifecycleState.ACTIVE,
+                ad_id="1234567890",
+            ),
+        )
+        for second in cases:
+            with self.subTest(second=second):
+                page = FakeStatePage(
+                    state_snapshot(LifecycleState.ACTIVE),
+                    second,
+                )
+
+                with self.assertRaises(PrivateWebPreconditionError):
+                    PrivateWebStateWriter(page).set_state(
+                        AD_ID,
+                        LifecycleState.PAUSED,
+                    )
+
+                self.assertFalse(
+                    any(call[0] == "submit_state" for call in page.calls)
+                )
+
+    def test_invalid_id_and_target_state_fail_before_page_access(self) -> None:
+        page = FakeStatePage()
+
+        with self.assertRaises(ValueError):
+            PrivateWebStateWriter(page).set_state(
+                "1;bad",
+                LifecycleState.PAUSED,
+            )
+        with self.assertRaises(TypeError):
+            PrivateWebStateWriter(page).set_state(
+                3521676801,  # type: ignore[arg-type]
+                LifecycleState.PAUSED,
+            )
+        with self.assertRaises(TypeError):
+            PrivateWebStateWriter(page).set_state(
+                AD_ID,
+                "paused",  # type: ignore[arg-type]
+            )
+        with self.assertRaises(ValueError):
+            PrivateWebStateWriter(page).set_state(
+                AD_ID,
+                LifecycleState.PENDING,
+            )
+
+        self.assertEqual(page.calls, [])
+
+    def test_pre_submit_interaction_failure_is_sanitized_without_submit(self) -> None:
+        page = FakeStatePage(
+            state_snapshot(LifecycleState.ACTIVE),
+            fail_stage="read_state_controls",
+        )
+
+        with self.assertRaises(PrivateWebInteractionError) as caught:
+            PrivateWebStateWriter(page).set_state(
+                AD_ID,
+                LifecycleState.PAUSED,
+            )
+
+        self.assertEqual(caught.exception.stage, "read_state_before")
+        self.assertNotIn("provider", str(caught.exception))
+        self.assertFalse(
+            any(call[0] == "submit_state" for call in page.calls)
+        )
+
+    def test_submit_unknown_is_preserved_and_never_retried(self) -> None:
+        page = FakeStatePage(
+            state_snapshot(LifecycleState.ACTIVE),
+            state_snapshot(LifecycleState.ACTIVE),
+            submit_unknown=True,
+        )
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            PrivateWebStateWriter(page).set_state(
+                AD_ID,
+                LifecycleState.PAUSED,
+            )
+
+        self.assertEqual(caught.exception.stage, "state_submit")
+        self.assertEqual(
+            sum(call[0] == "submit_state" for call in page.calls),
+            1,
+        )
+
+    def test_orchestrator_confirms_only_matching_management_post_read(self) -> None:
+        page = FakeStatePage(
+            state_snapshot(LifecycleState.ACTIVE),
+            state_snapshot(LifecycleState.ACTIVE),
+        )
+        reader = SequenceReader(
+            ReadResult.success_nonempty(
+                (
+                    AdSnapshot(
+                        ad_id=AD_ID,
+                        observed_at=NOW,
+                        source="management",
+                        lifecycle_state=LifecycleState.ACTIVE,
+                    ),
+                )
+            ),
+            ReadResult.success_nonempty(
+                (
+                    AdSnapshot(
+                        ad_id=AD_ID,
+                        observed_at=NOW,
+                        source="management",
+                        lifecycle_state=LifecycleState.PAUSED,
+                    ),
+                )
+            ),
+        )
+
+        receipt = SafeWriteOrchestrator(
+            writes_enabled=True,
+            clock=lambda: NOW,
+        ).set_state(
+            ad_id=AD_ID,
+            target_state=LifecycleState.PAUSED,
+            reader=reader,
+            writer=PrivateWebStateWriter(page),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(
+            sum(call[0] == "submit_state" for call in page.calls),
+            1,
+        )
+        self.assertEqual(reader.calls, 2)
+
+
+    def test_orchestrator_classifies_pre_submit_interaction_failure_as_safe(self) -> None:
+        page = FakeStatePage(
+            state_snapshot(LifecycleState.ACTIVE),
+            fail_stage="read_state_controls",
+        )
+        reader = SequenceReader(
+            ReadResult.success_nonempty(
+                (
+                    AdSnapshot(
+                        ad_id=AD_ID,
+                        observed_at=NOW,
+                        source="management",
+                        lifecycle_state=LifecycleState.ACTIVE,
+                    ),
+                )
+            ),
+        )
+
+        receipt = SafeWriteOrchestrator(
+            writes_enabled=True,
+            clock=lambda: NOW,
+        ).set_state(
+            ad_id=AD_ID,
+            target_state=LifecycleState.PAUSED,
+            reader=reader,
+            writer=PrivateWebStateWriter(page),
+        )
+
+        self.assertEqual(
+            receipt.outcome,
+            OperationOutcome.PRECONDITION_FAILED,
+        )
+        self.assertEqual(
+            receipt.writer_error,
+            "PrivateWebWriteNotAttemptedError",
+        )
+        self.assertIsNone(receipt.post_read_status)
+        self.assertEqual(reader.calls, 1)
+        self.assertFalse(
+            any(call[0] == "submit_state" for call in page.calls)
+        )
+
+    def test_orchestrator_classifies_challenge_before_submit_as_safe(self) -> None:
+        page = FakeStatePage(
+            state_snapshot(state=PrivateWebEditorState.CAPTCHA_REQUIRED),
+        )
+        reader = SequenceReader(
+            ReadResult.success_nonempty(
+                (
+                    AdSnapshot(
+                        ad_id=AD_ID,
+                        observed_at=NOW,
+                        source="management",
+                        lifecycle_state=LifecycleState.ACTIVE,
+                    ),
+                )
+            ),
+        )
+
+        receipt = SafeWriteOrchestrator(
+            writes_enabled=True,
+            clock=lambda: NOW,
+        ).set_state(
+            ad_id=AD_ID,
+            target_state=LifecycleState.PAUSED,
+            reader=reader,
+            writer=PrivateWebStateWriter(page),
+        )
+
+        self.assertEqual(
+            receipt.outcome,
+            OperationOutcome.PRECONDITION_FAILED,
+        )
+        self.assertEqual(receipt.writer_error, "PrivateWebPreconditionError")
+        self.assertIsNone(receipt.post_read_status)
+        self.assertEqual(reader.calls, 1)
+        self.assertFalse(
+            any(call[0] == "submit_state" for call in page.calls)
+        )
+
+    def test_orchestrator_treats_unmarked_submit_failure_as_ambiguous(self) -> None:
+        page = FakeStatePage(
+            state_snapshot(LifecycleState.ACTIVE),
+            state_snapshot(LifecycleState.ACTIVE),
+            fail_stage="submit_state",
+        )
+        active = AdSnapshot(
+            ad_id=AD_ID,
+            observed_at=NOW,
+            source="management",
+            lifecycle_state=LifecycleState.ACTIVE,
+        )
+        reader = SequenceReader(
+            ReadResult.success_nonempty((active,)),
+            ReadResult.success_nonempty((active,)),
+        )
+
+        receipt = SafeWriteOrchestrator(
+            writes_enabled=True,
+            clock=lambda: NOW,
+        ).set_state(
+            ad_id=AD_ID,
+            target_state=LifecycleState.PAUSED,
+            reader=reader,
+            writer=PrivateWebStateWriter(page),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertEqual(receipt.writer_error, "PrivateWebInteractionError")
+        self.assertEqual(
+            sum(call[0] == "submit_state" for call in page.calls),
+            1,
+        )
+        self.assertEqual(reader.calls, 2)
+
+    def test_orchestrator_does_not_retry_submit_unknown(self) -> None:
+        page = FakeStatePage(
+            state_snapshot(LifecycleState.ACTIVE),
+            state_snapshot(LifecycleState.ACTIVE),
+            submit_unknown=True,
+        )
+        active = AdSnapshot(
+            ad_id=AD_ID,
+            observed_at=NOW,
+            source="management",
+            lifecycle_state=LifecycleState.ACTIVE,
+        )
+        reader = SequenceReader(
+            ReadResult.success_nonempty((active,)),
+            ReadResult.success_nonempty((active,)),
+        )
+
+        receipt = SafeWriteOrchestrator(
+            writes_enabled=True,
+            clock=lambda: NOW,
+        ).set_state(
+            ad_id=AD_ID,
+            target_state=LifecycleState.PAUSED,
+            reader=reader,
+            writer=PrivateWebStateWriter(page),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertEqual(
+            receipt.writer_error,
+            "PrivateWebSubmitUnknownError",
+        )
+        self.assertEqual(
+            sum(call[0] == "submit_state" for call in page.calls),
+            1,
+        )
         self.assertEqual(reader.calls, 2)
 
 

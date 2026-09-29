@@ -6,6 +6,10 @@ from .domain import AdSnapshot, LifecycleState, ReactionSnapshot
 from .results import ReadResult
 
 
+class WriteNotAttemptedError(RuntimeError):
+    """The writer failed before any external mutation could be attempted."""
+
+
 class AdsReader(Protocol):
     def read_ads(self) -> ReadResult[tuple[AdSnapshot, ...]]:
         """Read the current owner inventory."""

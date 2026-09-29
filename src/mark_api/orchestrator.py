@@ -15,6 +15,7 @@ from .ports import (
     AdDeleteWriter,
     AdsReader,
     AdStateWriter,
+    WriteNotAttemptedError,
 )
 from .results import ReadResult
 from .storage import SnapshotStore
@@ -148,6 +149,27 @@ class SafeWriteOrchestrator:
         writer_error: str | None = None
         try:
             writer_call()
+        except WriteNotAttemptedError as exc:
+            # This marker is a writer-contract assertion that no externally
+            # visible mutation was attempted. Keep the failure non-ambiguous
+            # and do not manufacture a post-read for a write that cannot have
+            # reached the provider.
+            return self._persist(
+                OperationReceipt(
+                    operation=operation,
+                    ad_id=ad_id,
+                    started_at=started_at,
+                    completed_at=self._clock(),
+                    outcome=OperationOutcome.PRECONDITION_FAILED,
+                    pre_read_status=pre.status.value,
+                    post_read_status=None,
+                    writer_invoked=True,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                    writer_error=type(exc).__name__,
+                    pre_snapshot=pre_snapshot,
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - outcome is reconciled by readback.
             # Do not persist exception messages here: adapter exceptions may contain
             # cookies, URLs or provider response bodies. The type is enough for the
