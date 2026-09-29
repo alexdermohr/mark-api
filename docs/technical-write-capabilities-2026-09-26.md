@@ -197,17 +197,27 @@ Der aktive private Writepfad ist jetzt:
 ```text
 MarkService / SafeWriteOrchestrator
         |
-        +-- PrivateWebContentWriter
+        +-- PrivateWebContentRuntime
         |       |
-        |       +-- PrivateWebPage (browserdriver-neutral)
-        |               |
-        |               +-- normale Kleinanzeigen-Weboberfläche
-        |                   in eigener nutzer-authentifizierter Sitzung
+        |       +-- content_reader_for(ad_id)
+        |       |       -> ManagementReadAdapter
+        |       |       -> CdpPrivateWebOwnerReader (target-bound)
+        |       |
+        |       +-- content_writer
+        |               -> frische CdpPrivateWebPage pro Write
+        |               -> PrivateWebContentWriter
+        |                       |
+        |                       +-- normale Kleinanzeigen-Weboberfläche
+        |                           in eigener nutzer-authentifizierter Sitzung
         |
         +-- ProSellersApiWriter (optional, nur nach Admission)
 ```
 
-Private/mobile HTTP und der historische BrowserBot werden nicht automatisch als Fallback reaktiviert. Der erste Private-Web-Slice implementiert nur die browserdriver-neutrale Content-Write-Grenze: exakte Anzeigen-ID, harte Auth-/Challenge-Zustände, vollständiger Editor-Readback vor einem einzigen Submit und danach der bereits vorhandene Core-Post-Read. Der konkrete persistente Browserdriver sowie der Live-Smoke folgen getrennt.
+Private/mobile HTTP und der historische BrowserBot werden nicht automatisch als Fallback reaktiviert. Der browserdriver-neutrale Contract, der persistente loopback-only CDP-Driver und der gegatete Real-Smoke sind inzwischen belegt. Die Runtime-Komposition bleibt bewusst enger als ein Browser-Lifecycle: sie konsumiert nur einen bereits gestarteten, vom Nutzer authentifizierten CDP-Worker, erzeugt target-bound Content-Reader und frische Page-Adapter pro Writer-Aufruf und schließt nur ihre eigenen CDP-Verbindungen. Browser-Start/-Stop, Login und Reauthentifizierung bleiben außerhalb des Core.
+
+Die optionale Runtime-Dependency ist als `.[private-web]` deklariert. Der Runtime-Builder prüft `websocket-client` vor Browserzugriff fail-closed; er installiert keine Pakete selbst. `MarkService` nimmt optional eine `content_reader_factory(ad_id)` entgegen. Diese Factory wird lazy erst hinter dem zentralen `writes_enabled`-Gate konstruiert und für Pre-/Post-Read desselben Writes wiederverwendet.
+
+Der Real-Smoke auf einer eigenen, frisch owner-verifizierten Anzeige bestätigte einen einmaligen Titel-Write durch den unabhängigen Owner/Web-Post-Read, obwohl die lokale Submit-Bestätigung unbestimmt blieb. Ein separater Restore-Versuch blieb `AMBIGUOUS`; entsprechend wurde er nicht wiederholt. Damit ist gerade die gewünschte No-Retry/Reconciliation-Semantik real belegt, ohne aus dem unbestimmten Restore eine unbelegte Fehlerursache abzuleiten.
 
 ## Geplante Mark-HTTP-API
 
@@ -292,4 +302,4 @@ Erst nach diesem Beleg wird der Browser-Content-Updatepfad zum Fallback degradie
 
 Die Frage, **ob** eine schreibfähige Mark-API technisch möglich ist, ist mit **ja** beantwortet.
 
-Die aktive technische Arbeit folgt D-010: zuerst den `PrivateWebWriter` mit einem persistenten nutzer-authentifizierten Browserdriver verbinden und den in-place Content-Write auf genau einer frisch owner-verifizierten eigenen Anzeige reversibel smoken. Danach werden Create/Media/Lifecycle/Delete einzeln über denselben fail-closed Web-UI-Pfad ergänzt; ProSellers bleibt das optionale offizielle zweite Backend. Die privaten/mobile Reverse-Engineering-Pfade bleiben historische PoC-Evidenz.
+Die aktive technische Arbeit folgt D-010: `PrivateWebWriter`, persistenter CDP-Driver und der ownergebundene in-place Content-Smoke sind belegt; die Runtime-Komposition verbindet diese Flächen jetzt ohne Browser-Lifecycle im Core mit `MarkService`. Danach werden Create/Media/Lifecycle/Delete einzeln über denselben fail-closed Web-UI-Pfad ergänzt; ProSellers bleibt das optionale offizielle zweite Backend. Die privaten/mobile Reverse-Engineering-Pfade bleiben historische PoC-Evidenz.

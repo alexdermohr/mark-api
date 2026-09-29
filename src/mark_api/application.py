@@ -26,6 +26,19 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class _LazyAdsReader:
+    """Instantiate one target-bound reader only when a read is actually needed."""
+
+    def __init__(self, factory: Callable[[], AdsReader]) -> None:
+        self._factory = factory
+        self._reader: AdsReader | None = None
+
+    def read_ads(self) -> ReadResult[tuple[AdSnapshot, ...]]:
+        if self._reader is None:
+            self._reader = self._factory()
+        return self._reader.read_ads()
+
+
 class EnrichedOwnerReader:
     """Combine authoritative owner inventory with optional mobile content.
 
@@ -166,6 +179,7 @@ class MarkService:
         delete_writer: AdDeleteWriter,
         content_writer: AdContentUpdater,
         store: SnapshotStore,
+        content_reader_factory: Callable[[str], AdsReader] | None = None,
         writes_enabled: bool = False,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
@@ -176,6 +190,7 @@ class MarkService:
         self._state_writer = state_writer
         self._delete_writer = delete_writer
         self._content_writer = content_writer
+        self._content_reader_factory = content_reader_factory
         self._store = store
         self._clock = clock
         self._writes = SafeWriteOrchestrator(
@@ -241,9 +256,16 @@ class MarkService:
         title: str | None = None,
         description: str | None = None,
     ) -> OperationReceipt:
+        reader = (
+            self._owner_reader
+            if self._content_reader_factory is None
+            else _LazyAdsReader(
+                lambda: self._content_reader_factory(ad_id)
+            )
+        )
         return self._writes.update_content(
             ad_id=ad_id,
-            reader=self._owner_reader,
+            reader=reader,
             writer=self._content_writer,
             title=title,
             description=description,
