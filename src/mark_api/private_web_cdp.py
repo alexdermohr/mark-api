@@ -832,14 +832,61 @@ class CdpPrivateWebPage:
   const y = rect.top + rect.height / 2;
   const hit = document.elementFromPoint(x, y);
   if (hit !== button && !button.contains(hit)) return false;
-  button.click();
-  return true;
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    y < 0 ||
+    x > window.innerWidth ||
+    y > window.innerHeight
+  ) {{
+    return false;
+  }}
+  return {{x, y}};
 }})()
 """
         client = self._client()
         try:
-            if self._runtime_value(client, expression) is not True:
+            activation = self._runtime_value(client, expression)
+            if not isinstance(activation, dict):
                 raise PrivateWebCdpError("submit")
+            raw_x = activation.get("x")
+            raw_y = activation.get("y")
+            if (
+                isinstance(raw_x, bool)
+                or not isinstance(raw_x, (int, float))
+                or not math.isfinite(float(raw_x))
+                or float(raw_x) < 0
+                or isinstance(raw_y, bool)
+                or not isinstance(raw_y, (int, float))
+                or not math.isfinite(float(raw_y))
+                or float(raw_y) < 0
+            ):
+                raise PrivateWebCdpError("submit")
+            x = float(raw_x)
+            y = float(raw_y)
+            client.call(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mousePressed",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "buttons": 1,
+                    "clickCount": 1,
+                },
+            )
+            client.call(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mouseReleased",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "buttons": 0,
+                    "clickCount": 1,
+                },
+            )
 
             confirmation_expression = f"""
 (() => {{

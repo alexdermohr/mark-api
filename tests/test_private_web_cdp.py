@@ -673,22 +673,24 @@ class CdpPrivateWebPageTests(unittest.TestCase):
 
     def test_submit_is_atomic_and_bound_to_verified_editor(self) -> None:
         def handler(method, params):
-            if method != "Runtime.evaluate":
-                raise AssertionError(f"unexpected method: {method}")
-            expression = params.get("expression")
-            if "button.click()" in str(expression):
+            if method == "Runtime.evaluate":
+                expression = params.get("expression")
+                if "scrollIntoView" in str(expression):
+                    return {
+                        "result": {
+                            "type": "object",
+                            "value": {"x": 120.5, "y": 240.25},
+                        }
+                    }
                 return {
                     "result": {
-                        "type": "boolean",
-                        "value": True,
+                        "type": "string",
+                        "value": "confirmed",
                     }
                 }
-            return {
-                "result": {
-                    "type": "string",
-                    "value": "confirmed",
-                }
-            }
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
 
         client = FakeClient(handler)
         page = CdpPrivateWebPage(
@@ -704,7 +706,12 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertEqual(caught.exception.stage, "submit_already_attempted")
         self.assertEqual(
             [method for method, _params in client.calls],
-            ["Runtime.evaluate", "Runtime.evaluate"],
+            [
+                "Runtime.evaluate",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+                "Runtime.evaluate",
+            ],
         )
         expression = client.calls[0][1]["expression"]
         self.assertIn("location.origin", expression)
@@ -714,9 +721,47 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertIn("Existing description", expression)
         self.assertIn("Anzeige speichern", expression)
         self.assertIn("getBoundingClientRect", expression)
-        self.assertIn("button.click()", expression)
-        self.assertNotIn("Input.dispatchMouseEvent", str(client.calls))
-        confirmation_expression = client.calls[1][1]["expression"]
+        self.assertIn("elementFromPoint", expression)
+        self.assertIn("Number.isFinite(x)", expression)
+        self.assertNotIn("button.click()", expression)
+        activation_javascript_check = subprocess.run(
+            ["node", "--check", "-"],
+            input=expression,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(
+            activation_javascript_check.returncode,
+            0,
+            activation_javascript_check.stdout + activation_javascript_check.stderr,
+        )
+        pressed = client.calls[1][1]
+        released = client.calls[2][1]
+        self.assertEqual(
+            pressed,
+            {
+                "type": "mousePressed",
+                "x": 120.5,
+                "y": 240.25,
+                "button": "left",
+                "buttons": 1,
+                "clickCount": 1,
+            },
+        )
+        self.assertEqual(
+            released,
+            {
+                "type": "mouseReleased",
+                "x": 120.5,
+                "y": 240.25,
+                "button": "left",
+                "buttons": 0,
+                "clickCount": 1,
+            },
+        )
+        confirmation_expression = client.calls[3][1]["expression"]
         self.assertIn("location.origin", confirmation_expression)
         self.assertIn("/m-meine-anzeigen.html", confirmation_expression)
         self.assertIn('currentPath.startsWith("/u/login/")', confirmation_expression)
@@ -758,7 +803,7 @@ class CdpPrivateWebPageTests(unittest.TestCase):
             page.submit()
         self.assertEqual(second.exception.stage, "submit_already_attempted")
 
-    def test_submit_rejects_editor_drift_before_click(self) -> None:
+    def test_submit_rejects_editor_drift_before_activation(self) -> None:
         def handler(method, params):
             if method != "Runtime.evaluate":
                 raise AssertionError(f"unexpected method: {method}")
@@ -783,17 +828,51 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertIn(AD_ID, expression)
         self.assertIn("Existing title", expression)
         self.assertIn("Existing description", expression)
-        self.assertIn("button.click()", expression)
+        self.assertNotIn("button.click()", expression)
+
+    def test_submit_rejects_invalid_activation_coordinates_before_mouse_dispatch(self) -> None:
+        client = FakeClient(
+            lambda method, params: {
+                "result": {
+                    "type": "object",
+                    "value": {"x": True, "y": 10.0},
+                }
+            }
+        )
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        bind_ready_editor(page)
+
+        with self.assertRaises(PrivateWebCdpError) as caught:
+            page.submit()
+
+        self.assertEqual(caught.exception.stage, "submit")
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            ["Runtime.evaluate"],
+        )
+        with self.assertRaises(PrivateWebCdpError) as second:
+            page.submit()
+        self.assertEqual(second.exception.stage, "submit_already_attempted")
 
     def test_submit_staying_in_editor_is_unconfirmed_and_not_retryable(self) -> None:
         times = iter((0.0, 10.0))
 
         def handler(method, params):
+            if method == "Input.dispatchMouseEvent":
+                return {}
             if method != "Runtime.evaluate":
                 raise AssertionError(f"unexpected method: {method}")
             expression = params.get("expression")
-            if "button.click()" in str(expression):
-                return {"result": {"type": "boolean", "value": True}}
+            if "scrollIntoView" in str(expression):
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"x": 100.0, "y": 200.0},
+                    }
+                }
             return {"result": {"type": "string", "value": "pending"}}
 
         client = FakeClient(handler)
@@ -815,17 +894,29 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertEqual(second.exception.stage, "submit_already_attempted")
         self.assertEqual(
             [method for method, _params in client.calls],
-            ["Runtime.evaluate", "Runtime.evaluate"],
+            [
+                "Runtime.evaluate",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+                "Runtime.evaluate",
+            ],
         )
         page.close()
 
     def test_submit_untrusted_redirect_is_unconfirmed_and_not_retryable(self) -> None:
         def handler(method, params):
+            if method == "Input.dispatchMouseEvent":
+                return {}
             if method != "Runtime.evaluate":
                 raise AssertionError(f"unexpected method: {method}")
             expression = params.get("expression")
-            if "button.click()" in str(expression):
-                return {"result": {"type": "boolean", "value": True}}
+            if "scrollIntoView" in str(expression):
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"x": 100.0, "y": 200.0},
+                    }
+                }
             return {"result": {"type": "string", "value": "unconfirmed"}}
 
         client = FakeClient(handler)
@@ -843,7 +934,7 @@ class CdpPrivateWebPageTests(unittest.TestCase):
             page.submit()
         self.assertEqual(second.exception.stage, "submit_already_attempted")
 
-        confirmation_expression = client.calls[1][1]["expression"]
+        confirmation_expression = client.calls[3][1]["expression"]
         self.assertIn('currentOrigin !== "https://www.kleinanzeigen.de"', confirmation_expression)
         self.assertIn('currentPath.startsWith("/u/login/")', confirmation_expression)
         self.assertIn('challengeText.includes("captcha")', confirmation_expression)
@@ -880,6 +971,80 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertFalse(client.closed)
         page.close()
         self.assertTrue(client.closed)
+
+    def test_mouse_press_failure_is_ambiguous_and_not_retryable(self) -> None:
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"x": 100.0, "y": 200.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                raise RuntimeError("provider secret")
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        bind_ready_editor(page)
+
+        with self.assertRaises(PrivateWebCdpError) as caught:
+            page.submit()
+        self.assertEqual(caught.exception.stage, "submit")
+        self.assertNotIn("secret", str(caught.exception))
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            ["Runtime.evaluate", "Input.dispatchMouseEvent"],
+        )
+        with self.assertRaises(PrivateWebCdpError) as second:
+            page.submit()
+        self.assertEqual(second.exception.stage, "submit_already_attempted")
+
+    def test_mouse_release_failure_is_ambiguous_and_not_retryable(self) -> None:
+        dispatches = 0
+
+        def handler(method, params):
+            nonlocal dispatches
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"x": 100.0, "y": 200.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                dispatches += 1
+                if dispatches == 1:
+                    return {}
+                raise RuntimeError("provider secret")
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        bind_ready_editor(page)
+
+        with self.assertRaises(PrivateWebCdpError) as caught:
+            page.submit()
+        self.assertEqual(caught.exception.stage, "submit")
+        self.assertNotIn("secret", str(caught.exception))
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            [
+                "Runtime.evaluate",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+            ],
+        )
+        with self.assertRaises(PrivateWebCdpError) as second:
+            page.submit()
+        self.assertEqual(second.exception.stage, "submit_already_attempted")
 
     def test_cookie_provider_reuses_client_and_closes_explicitly(self) -> None:
         client = FakeClient(
