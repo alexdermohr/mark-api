@@ -8,7 +8,6 @@ from typing import Protocol
 from .adapters.management import (
     DEFAULT_SOURCE as MANAGEMENT_SOURCE,
     MANAGEMENT_URL,
-    HttpTransport,
     ManagementReadAdapter,
 )
 from .ports import AdContentUpdater, AdsReader
@@ -163,8 +162,6 @@ def build_private_web_content_runtime(
     *,
     cdp_port: int,
     timeout_seconds: float = 5.0,
-    management_transport: HttpTransport | None = None,
-    management_endpoint: str = MANAGEMENT_URL,
     management_source: str = MANAGEMENT_SOURCE,
     clock: Callable[[], datetime] | None = None,
 ) -> PrivateWebContentRuntime:
@@ -185,11 +182,12 @@ def build_private_web_content_runtime(
 
     management_kwargs = {
         "cookie_provider": cookie_provider,
-        "endpoint": management_endpoint,
+        # Browser-authenticated cookies are deliberately coupled to the fixed
+        # Kleinanzeigen management endpoint. The production runtime exposes no
+        # endpoint or transport override that could receive that Cookie header.
+        "endpoint": MANAGEMENT_URL,
         "source": management_source,
     }
-    if management_transport is not None:
-        management_kwargs["transport"] = management_transport
     if clock is not None:
         management_kwargs["clock"] = clock
 

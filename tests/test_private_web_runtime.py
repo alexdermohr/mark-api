@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from importlib import metadata
 from unittest.mock import patch
 
+from mark_api.adapters.management import MANAGEMENT_URL
 from mark_api.domain import AdSnapshot, LifecycleState
 from mark_api.private_web import (
     PrivateWebEditorSnapshot,
@@ -249,6 +250,18 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
         ):
             require_private_web_runtime_dependency()
 
+    def test_builder_rejects_cookie_bearing_management_overrides(self) -> None:
+        with self.assertRaises(TypeError):
+            build_private_web_content_runtime(
+                cdp_port=19610,
+                management_endpoint="https://attacker.invalid/collect",
+            )
+        with self.assertRaises(TypeError):
+            build_private_web_content_runtime(
+                cdp_port=19610,
+                management_transport=object(),
+            )
+
     def test_builder_consumes_existing_cdp_port_without_opening_page_eagerly(self) -> None:
         class CookieDelegate:
             def __init__(self) -> None:
@@ -261,6 +274,7 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
                 self.closed += 1
 
         delegate = CookieDelegate()
+        owner_reader = OwnerReader(ReadResult.success_empty(()))
 
         with (
             patch(
@@ -270,6 +284,10 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
                 "mark_api.private_web_runtime.CdpCookieProvider.from_port",
                 return_value=delegate,
             ) as cookies,
+            patch(
+                "mark_api.private_web_runtime.ManagementReadAdapter",
+                return_value=owner_reader,
+            ) as management,
             patch(
                 "mark_api.private_web_runtime.CdpPrivateWebPage.from_port",
                 side_effect=AssertionError("page must be lazy"),
@@ -282,6 +300,9 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
 
         dependency.assert_called_once_with()
         cookies.assert_called_once_with(19610, timeout_seconds=4.0)
+        self.assertEqual(management.call_count, 1)
+        self.assertEqual(management.call_args.kwargs["endpoint"], MANAGEMENT_URL)
+        self.assertNotIn("transport", management.call_args.kwargs)
         pages.assert_not_called()
 
         runtime.close()
