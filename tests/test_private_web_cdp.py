@@ -982,7 +982,8 @@ class CdpPrivateWebPageTests(unittest.TestCase):
                     }
                 }
             if method == "Input.dispatchMouseEvent":
-                raise RuntimeError("provider secret")
+                # Mirror _LoopbackCdpClient.call's production sanitization.
+                raise PrivateWebCdpError("call")
             raise AssertionError(f"unexpected method: {method}")
 
         client = FakeClient(handler)
@@ -1020,7 +1021,8 @@ class CdpPrivateWebPageTests(unittest.TestCase):
                 dispatches += 1
                 if dispatches == 1:
                     return {}
-                raise RuntimeError("provider secret")
+                # Mirror _LoopbackCdpClient.call's production sanitization.
+                raise PrivateWebCdpError("call")
             raise AssertionError(f"unexpected method: {method}")
 
         client = FakeClient(handler)

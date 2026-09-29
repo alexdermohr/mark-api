@@ -865,28 +865,39 @@ class CdpPrivateWebPage:
                 raise PrivateWebCdpError("submit")
             x = float(raw_x)
             y = float(raw_y)
-            client.call(
-                "Input.dispatchMouseEvent",
-                {
-                    "type": "mousePressed",
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "buttons": 1,
-                    "clickCount": 1,
-                },
-            )
-            client.call(
-                "Input.dispatchMouseEvent",
-                {
-                    "type": "mouseReleased",
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "buttons": 0,
-                    "clickCount": 1,
-                },
-            )
+            # Browser-level activation is necessarily coordinate-based. The exact
+            # target/state/hit-test above minimizes, but cannot eliminate, the
+            # narrow TOCTOU before Chrome consumes the next CDP command. Keep
+            # that accepted residual window minimal and never retry a possible
+            # activation.
+            try:
+                client.call(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mousePressed",
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "buttons": 1,
+                        "clickCount": 1,
+                    },
+                )
+                client.call(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mouseReleased",
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "buttons": 0,
+                        "clickCount": 1,
+                    },
+                )
+            except PrivateWebCdpError:
+                # _LoopbackCdpClient.call sanitizes provider failures as
+                # PrivateWebCdpError("call"). At this boundary the attempted
+                # browser activation is semantically an ambiguous submit.
+                raise PrivateWebCdpError("submit") from None
 
             confirmation_expression = f"""
 (() => {{
