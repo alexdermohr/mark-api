@@ -4,11 +4,15 @@ from collections.abc import Callable
 from datetime import datetime
 from importlib import import_module, metadata
 from typing import Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from .adapters.management import (
     DEFAULT_SOURCE as MANAGEMENT_SOURCE,
     MANAGEMENT_URL,
+    HttpResponse,
     ManagementReadAdapter,
+    TransportFailure,
 )
 from .ports import AdContentUpdater, AdsReader
 from .private_web import PrivateWebContentWriter, PrivateWebPage
@@ -25,6 +29,35 @@ class PrivateWebRuntimeDependencyError(RuntimeError):
 
 class PrivateWebRuntimeClosedError(RuntimeError):
     """The private-Web runtime bundle has already been closed."""
+
+
+class _RejectManagementRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class _NoRedirectManagementTransport:
+    """HTTP transport that never forwards browser cookies through redirects."""
+
+    def __init__(self, *, timeout_seconds: float = 15.0) -> None:
+        self._timeout_seconds = timeout_seconds
+        self._open = build_opener(
+            ProxyHandler({}),
+            _RejectManagementRedirectHandler(),
+        ).open
+
+    def get(self, url: str, *, headers: dict[str, str]) -> HttpResponse:
+        request = Request(url, headers=headers, method="GET")
+        try:
+            with self._open(request, timeout=self._timeout_seconds) as response:
+                return HttpResponse(
+                    status_code=int(response.status),
+                    body=response.read(),
+                )
+        except HTTPError as exc:
+            return HttpResponse(status_code=int(exc.code), body=exc.read())
+        except (URLError, TimeoutError, OSError) as exc:
+            raise TransportFailure(type(exc).__name__) from exc
 
 
 class _CloseablePrivateWebPage(PrivateWebPage, Protocol):
@@ -187,6 +220,7 @@ def build_private_web_content_runtime(
         # endpoint or transport override that could receive that Cookie header.
         "endpoint": MANAGEMENT_URL,
         "source": management_source,
+        "transport": _NoRedirectManagementTransport(),
     }
     if clock is not None:
         management_kwargs["clock"] = clock

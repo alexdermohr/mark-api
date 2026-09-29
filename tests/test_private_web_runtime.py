@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timezone
 from importlib import metadata
 from unittest.mock import patch
+from urllib.request import ProxyHandler
 
 from mark_api.adapters.management import MANAGEMENT_URL
 from mark_api.domain import AdSnapshot, LifecycleState
@@ -15,6 +16,8 @@ from mark_api.private_web_runtime import (
     PrivateWebContentRuntime,
     PrivateWebRuntimeClosedError,
     PrivateWebRuntimeDependencyError,
+    _NoRedirectManagementTransport,
+    _RejectManagementRedirectHandler,
     build_private_web_content_runtime,
     require_private_web_runtime_dependency,
 )
@@ -262,6 +265,35 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
                 management_transport=object(),
             )
 
+    def test_management_redirect_handler_rejects_redirect(self) -> None:
+        handler = _RejectManagementRedirectHandler()
+        self.assertIsNone(
+            handler.redirect_request(
+                None,
+                None,
+                302,
+                "Found",
+                {},
+                "https://attacker.invalid/collect",
+            )
+        )
+
+    def test_management_transport_disables_proxies_and_redirects(self) -> None:
+        opener = type("Opener", (), {"open": lambda *args, **kwargs: None})()
+        with patch(
+            "mark_api.private_web_runtime.build_opener",
+            return_value=opener,
+        ) as build:
+            _NoRedirectManagementTransport()
+
+        proxy_handler, redirect_handler = build.call_args.args
+        self.assertIsInstance(proxy_handler, ProxyHandler)
+        self.assertEqual(proxy_handler.proxies, {})
+        self.assertIsInstance(
+            redirect_handler,
+            _RejectManagementRedirectHandler,
+        )
+
     def test_builder_consumes_existing_cdp_port_without_opening_page_eagerly(self) -> None:
         class CookieDelegate:
             def __init__(self) -> None:
@@ -275,6 +307,7 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
 
         delegate = CookieDelegate()
         owner_reader = OwnerReader(ReadResult.success_empty(()))
+        management_transport = object()
 
         with (
             patch(
@@ -284,6 +317,10 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
                 "mark_api.private_web_runtime.CdpCookieProvider.from_port",
                 return_value=delegate,
             ) as cookies,
+            patch(
+                "mark_api.private_web_runtime._NoRedirectManagementTransport",
+                return_value=management_transport,
+            ) as transport_factory,
             patch(
                 "mark_api.private_web_runtime.ManagementReadAdapter",
                 return_value=owner_reader,
@@ -300,9 +337,13 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
 
         dependency.assert_called_once_with()
         cookies.assert_called_once_with(19610, timeout_seconds=4.0)
+        transport_factory.assert_called_once_with()
         self.assertEqual(management.call_count, 1)
         self.assertEqual(management.call_args.kwargs["endpoint"], MANAGEMENT_URL)
-        self.assertNotIn("transport", management.call_args.kwargs)
+        self.assertIs(
+            management.call_args.kwargs["transport"],
+            management_transport,
+        )
         pages.assert_not_called()
 
         runtime.close()
