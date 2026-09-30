@@ -1642,6 +1642,130 @@ class CdpPrivateWebStatePageTests(unittest.TestCase):
             ],
         )
 
+    def test_open_state_controls_follows_management_pagination_to_target(self) -> None:
+        values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+            {
+                "state": "target_absent",
+                "page_ad_ids": ["1111111111"],
+                "next_page": {"x": 40.0, "y": 60.0},
+            },
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "lifecycle_state": "active",
+            },
+        ]
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                if not values:
+                    raise AssertionError("unexpected Runtime.evaluate")
+                value = values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+            sleep=lambda _seconds: None,
+        )
+
+        page.open_state_controls(AD_ID)
+
+        self.assertEqual(values, [])
+        self.assertEqual(page._bound_state_ad_id, AD_ID)
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            [
+                "Runtime.evaluate",
+                "Page.navigate",
+                "Runtime.evaluate",
+                "Runtime.evaluate",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+                "Runtime.evaluate",
+            ],
+        )
+        self.assertEqual(
+            client.calls[4][1],
+            {
+                "type": "mousePressed",
+                "x": 40.0,
+                "y": 60.0,
+                "button": "left",
+                "buttons": 1,
+                "clickCount": 1,
+            },
+        )
+        self.assertEqual(
+            client.calls[5][1],
+            {
+                "type": "mouseReleased",
+                "x": 40.0,
+                "y": 60.0,
+                "button": "left",
+                "buttons": 0,
+                "clickCount": 1,
+            },
+        )
+        pagination_expression = client.calls[3][1]["expression"]
+        self.assertIn('button[aria-label="Nächste"]', pagination_expression)
+        self.assertIn("elementFromPoint", pagination_expression)
+        self.assertNotIn(".click(", pagination_expression)
+
+    def test_open_state_controls_fails_closed_when_target_is_absent_on_last_page(self) -> None:
+        values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+            {
+                "state": "target_absent",
+                "page_ad_ids": ["1111111111"],
+                "next_page": None,
+            },
+        ]
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                if not values:
+                    raise AssertionError("unexpected Runtime.evaluate")
+                value = values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                raise AssertionError("pagination input must not be attempted")
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+            sleep=lambda _seconds: None,
+        )
+
+        with self.assertRaises(PrivateWebCdpError) as caught:
+            page.open_state_controls(AD_ID)
+
+        self.assertEqual(caught.exception.stage, "navigate_state")
+        self.assertIsNone(page._bound_state_ad_id)
+        self.assertEqual(values, [])
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            [
+                "Runtime.evaluate",
+                "Page.navigate",
+                "Runtime.evaluate",
+                "Runtime.evaluate",
+            ],
+        )
+
     def test_read_state_controls_is_exact_owner_and_control_bound(self) -> None:
         page, clients = page_with_results(
             {
@@ -1662,7 +1786,8 @@ class CdpPrivateWebStatePageTests(unittest.TestCase):
         self.assertIn("/m-meine-anzeigen.html", expression)
         self.assertIn("/p-anzeige-bearbeiten.html", expression)
         self.assertIn('url.searchParams.get("adId")', expression)
-        self.assertIn("targetEditLinks.length !== 1", expression)
+        self.assertIn("targetEditLinks.length > 1", expression)
+        self.assertIn("targetEditLinks.length === 1", expression)
         self.assertIn("editIds.length === 1", expression)
         self.assertIn('label === "reservieren"', expression)
         self.assertIn('label === "aktivieren"', expression)
