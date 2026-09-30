@@ -696,11 +696,34 @@ class CdpPrivateWebPage:
   }};
   const controlLabel = (element) =>
     (element.innerText || "").trim().toLowerCase();
+  const isEligibleLifecycleControl = (element) => {{
+    if (
+      (element instanceof HTMLButtonElement && element.disabled) ||
+      element.getAttribute("aria-disabled") === "true"
+    ) {{
+      return false;
+    }}
+    const style = getComputedStyle(element);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse" ||
+      style.pointerEvents === "none" ||
+      Number(style.opacity) === 0
+    ) {{
+      return false;
+    }}
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }};
   const lifecycleControls = (root) =>
     Array.from(root.querySelectorAll('button, a[href], [role="button"]')).filter(
       (element) => {{
         const label = controlLabel(element);
-        return label === "reservieren" || label === "aktivieren";
+        return (
+          (label === "reservieren" || label === "aktivieren") &&
+          isEligibleLifecycleControl(element)
+        );
       }}
     );
   const targetEditLinks = Array.from(

@@ -1682,6 +1682,102 @@ class CdpPrivateWebStatePageTests(unittest.TestCase):
             javascript_check.stdout + javascript_check.stderr,
         )
 
+    def test_state_binding_ignores_collapsed_counter_control(self) -> None:
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: None,
+        )
+        expression = page._state_control_expression(AD_ID)
+        template = """
+global.HTMLButtonElement = class HTMLButtonElement {};
+const editLink = {
+  getAttribute: (name) =>
+    name === "href"
+      ? "/p-anzeige-bearbeiten.html?adId=__AD_ID__"
+      : null,
+  parentElement: null,
+};
+const makeControl = (label, rect) => {
+  const control = new HTMLButtonElement();
+  control.innerText = label;
+  control.disabled = false;
+  control.getAttribute = (_name) => null;
+  control.getBoundingClientRect = () => rect;
+  return control;
+};
+const visibleControl = makeControl(
+  __VISIBLE_LABEL__,
+  {left: 20, top: 20, width: 120, height: 30}
+);
+const collapsedCounterControl = makeControl(
+  __COLLAPSED_LABEL__,
+  {left: 0, top: 0, width: 0, height: 0}
+);
+const container = {
+  parentElement: null,
+  querySelectorAll: (selector) => {
+    if (selector === "a[href]") return [editLink];
+    if (selector === 'button, a[href], [role="button"]') {
+      return [visibleControl, collapsedCounterControl];
+    }
+    return [];
+  },
+};
+editLink.parentElement = container;
+global.location = {
+  origin: "https://www.kleinanzeigen.de",
+  pathname: "/m-meine-anzeigen.html",
+  href: "https://www.kleinanzeigen.de/m-meine-anzeigen.html",
+};
+global.document = {
+  querySelector: (_selector) => null,
+  querySelectorAll: (selector) =>
+    selector === "a[href]" ? [editLink] : [],
+};
+global.getComputedStyle = (_element) => ({
+  display: "block",
+  visibility: "visible",
+  pointerEvents: "auto",
+  opacity: "1",
+});
+const result = eval(__EXPRESSION__);
+process.stdout.write(JSON.stringify(result));
+"""
+        cases = (
+            ("Reservieren", "Aktivieren", "active"),
+            ("Aktivieren", "Reservieren", "paused"),
+        )
+        for visible_label, collapsed_label, expected_state in cases:
+            with self.subTest(expected_state=expected_state):
+                script = (
+                    template.replace("__AD_ID__", AD_ID)
+                    .replace("__VISIBLE_LABEL__", json.dumps(visible_label))
+                    .replace("__COLLAPSED_LABEL__", json.dumps(collapsed_label))
+                    .replace("__EXPRESSION__", json.dumps(expression))
+                )
+                completed = subprocess.run(
+                    ["node", "-"],
+                    input=script,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stdout + completed.stderr,
+                )
+                self.assertEqual(
+                    json.loads(completed.stdout),
+                    {
+                        "state": "ready",
+                        "ad_id": AD_ID,
+                        "lifecycle_state": expected_state,
+                    },
+                )
+
     def test_state_challenges_hide_target_data(self) -> None:
         for raw_state in (
             "login_required",

@@ -15,7 +15,7 @@ from .adapters.management import (
     TransportFailure,
 )
 from .domain import LifecycleState
-from .ports import AdContentUpdater, AdStateWriter, AdsReader
+from .ports import AdContentUpdater, AdStateWriter, AdsReader, WriteNotAttemptedError
 from .private_web import (
     PrivateWebContentWriter,
     PrivateWebPage,
@@ -33,8 +33,12 @@ class PrivateWebRuntimeDependencyError(RuntimeError):
     """The optional private-Web runtime dependency set is unavailable."""
 
 
-class PrivateWebRuntimeClosedError(RuntimeError):
-    """The private-Web runtime bundle has already been closed."""
+class PrivateWebRuntimeClosedError(WriteNotAttemptedError):
+    """The private-Web runtime bundle has already been closed before a write."""
+
+
+class PrivateWebRuntimeSetupError(WriteNotAttemptedError):
+    """Per-call private-Web page setup failed before any platform write."""
 
 
 class _RejectManagementRedirectHandler(HTTPRedirectHandler):
@@ -108,7 +112,12 @@ class _PerCallPrivateWebContentWriter:
         description: str | None = None,
     ) -> None:
         self._ensure_open()
-        page = self._page_factory()
+        try:
+            page = self._page_factory()
+        except WriteNotAttemptedError:
+            raise
+        except Exception:
+            raise PrivateWebRuntimeSetupError("private Web page setup failed") from None
         try:
             PrivateWebContentWriter(page).update_content(
                 ad_id,
@@ -137,7 +146,12 @@ class _PerCallPrivateWebStateWriter:
 
     def set_state(self, ad_id: str, state: LifecycleState) -> None:
         self._ensure_open()
-        page = self._page_factory()
+        try:
+            page = self._page_factory()
+        except WriteNotAttemptedError:
+            raise
+        except Exception:
+            raise PrivateWebRuntimeSetupError("private Web page setup failed") from None
         try:
             PrivateWebStateWriter(page).set_state(ad_id, state)
         finally:

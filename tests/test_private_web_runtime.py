@@ -7,7 +7,9 @@ from unittest.mock import patch
 from urllib.request import ProxyHandler
 
 from mark_api.adapters.management import MANAGEMENT_URL
-from mark_api.domain import AdSnapshot, LifecycleState
+from mark_api.domain import AdSnapshot, LifecycleState, OperationOutcome
+from mark_api.orchestrator import SafeWriteOrchestrator
+from mark_api.ports import WriteNotAttemptedError
 from mark_api.private_web import (
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
@@ -18,6 +20,7 @@ from mark_api.private_web_runtime import (
     PrivateWebContentRuntime,
     PrivateWebRuntimeClosedError,
     PrivateWebRuntimeDependencyError,
+    PrivateWebRuntimeSetupError,
     _NoRedirectManagementTransport,
     _RejectManagementRedirectHandler,
     build_private_web_content_runtime,
@@ -284,6 +287,64 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
             [event for event in events if event[0] == "close_state"],
             [("close_state", AD_ID)],
         )
+
+    def test_content_writer_page_setup_failure_is_write_not_attempted(self) -> None:
+        runtime = PrivateWebContentRuntime(
+            owner_reader=OwnerReader(ReadResult.success_empty(())),
+            page_factory=lambda: (_ for _ in ()).throw(
+                OSError("page setup failed")
+            ),
+            close_runtime=lambda: None,
+        )
+
+        with self.assertRaises(PrivateWebRuntimeSetupError) as caught:
+            runtime.content_writer.update_content(AD_ID, title="new")
+
+        self.assertIsInstance(caught.exception, WriteNotAttemptedError)
+
+    def test_state_writer_page_setup_failure_is_write_not_attempted(self) -> None:
+        runtime = PrivateWebContentRuntime(
+            owner_reader=OwnerReader(ReadResult.success_empty(())),
+            page_factory=lambda: (_ for _ in ()).throw(
+                OSError("page setup failed")
+            ),
+            close_runtime=lambda: None,
+        )
+
+        with self.assertRaises(PrivateWebRuntimeSetupError) as caught:
+            runtime.state_writer.set_state(AD_ID, LifecycleState.PAUSED)
+
+        self.assertIsInstance(caught.exception, WriteNotAttemptedError)
+
+    def test_state_setup_failure_is_non_ambiguous_in_orchestrator(self) -> None:
+        owner = OwnerReader(ReadResult.success_nonempty((owner_snapshot(),)))
+        page_calls = 0
+
+        def page_factory():
+            nonlocal page_calls
+            page_calls += 1
+            raise OSError("page setup failed")
+
+        runtime = PrivateWebContentRuntime(
+            owner_reader=owner,
+            page_factory=page_factory,
+            close_runtime=lambda: None,
+        )
+
+        receipt = SafeWriteOrchestrator(writes_enabled=True).set_state(
+            ad_id=AD_ID,
+            target_state=LifecycleState.PAUSED,
+            reader=owner,
+            writer=runtime.state_writer,
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
+        self.assertTrue(receipt.writer_invoked)
+        self.assertEqual(receipt.writer_error, "PrivateWebRuntimeSetupError")
+        self.assertIsNone(receipt.post_read_status)
+        self.assertIsNone(receipt.post_snapshot)
+        self.assertEqual(owner.calls, 1)
+        self.assertEqual(page_calls, 1)
 
     def test_closed_runtime_rejects_reader_and_writer_before_page_creation(self) -> None:
         page_calls = 0
