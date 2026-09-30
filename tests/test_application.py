@@ -7,6 +7,7 @@ from pathlib import Path
 
 from mark_api.application import EnrichedOwnerReader, MarkService
 from mark_api.domain import (
+    AdCreateRequest,
     AdSnapshot,
     DeleteApproval,
     LifecycleState,
@@ -91,6 +92,14 @@ class ContentWriter:
         description: str | None = None,
     ) -> None:
         self.calls.append((ad_id, title, description))
+
+
+class CreateWriter:
+    def __init__(self):
+        self.calls = []
+
+    def create_ad(self, request: AdCreateRequest) -> None:
+        self.calls.append(request)
 
 
 class EnrichedOwnerReaderTests(unittest.TestCase):
@@ -294,6 +303,7 @@ class MarkServiceTests(unittest.TestCase):
         state_writer=None,
         delete_writer=None,
         content_writer=None,
+        create_writer=None,
         content_reader_factory=None,
         writes_enabled=False,
         store=None,
@@ -308,6 +318,8 @@ class MarkServiceTests(unittest.TestCase):
             delete_writer = state_writer
         if content_writer is None:
             content_writer = ContentWriter()
+        if create_writer is None:
+            create_writer = CreateWriter()
         if store is None:
             store = self.make_store()
         service = MarkService(
@@ -319,6 +331,7 @@ class MarkServiceTests(unittest.TestCase):
             delete_writer=delete_writer,
             content_writer=content_writer,
             store=store,
+            create_writer=create_writer,
             content_reader_factory=content_reader_factory,
             writes_enabled=writes_enabled,
             clock=lambda: NOW,
@@ -407,6 +420,69 @@ class MarkServiceTests(unittest.TestCase):
             store.reaction_history("3521676801"),
             (reactions,),
         )
+
+    def test_create_uses_two_inventories_and_target_content_confirmation(self) -> None:
+        request = AdCreateRequest(
+            category_path=("Haus & Garten", "Dekoration", "Weitere Dekoration"),
+            title="Neue Vase",
+            description="Beschreibung",
+            price_eur=12,
+        )
+        candidate_management = ad(
+            "200",
+            state=LifecycleState.ACTIVE,
+            title=request.title,
+            source="management",
+        )
+        candidate_owner = ad(
+            "200",
+            state=LifecycleState.ACTIVE,
+            title=request.title,
+            source="owner",
+        )
+        candidate_content = ad(
+            "200",
+            state=LifecycleState.ACTIVE,
+            title=request.title,
+            description=request.description,
+            source="management+private-web",
+        )
+        management = SequenceAdsReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((candidate_management,)),
+        )
+        owner = SequenceAdsReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((candidate_owner,)),
+        )
+        content = SequenceAdsReader(
+            ReadResult.success_nonempty((candidate_content,))
+        )
+        create_writer = CreateWriter()
+        factory_calls: list[str] = []
+
+        def factory(ad_id: str):
+            factory_calls.append(ad_id)
+            return content
+
+        service, _, _, _ = self.service(
+            owner_reader=SequenceAdsReader(),
+            management_reader=management,
+            delete_confirmation_reader=owner,
+            create_writer=create_writer,
+            content_reader_factory=factory,
+            writes_enabled=True,
+        )
+
+        receipt = service.create(request)
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(receipt.created_ad_id, "200")
+        self.assertEqual(create_writer.calls, [request])
+        self.assertEqual(management.calls, 2)
+        self.assertEqual(owner.calls, 2)
+        self.assertEqual(content.calls, 1)
+        self.assertEqual(factory_calls, ["200"])
 
     def test_writes_default_disabled_before_any_reader_or_writer_call(self) -> None:
         management = SequenceAdsReader()

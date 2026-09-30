@@ -7,10 +7,12 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mark_api.domain import AdSnapshot, LifecycleState, OperationOutcome
+from mark_api.domain import AdCreateRequest, AdSnapshot, LifecycleState, OperationOutcome
 from mark_api.orchestrator import SafeWriteOrchestrator
 from mark_api.private_web import (
     PrivateWebContentWriter,
+    PrivateWebCreateSnapshot,
+    PrivateWebCreateWriter,
     PrivateWebDeleteSnapshot,
     PrivateWebDeleteWriter,
     PrivateWebEditorSnapshot,
@@ -20,6 +22,7 @@ from mark_api.private_web import (
     PrivateWebStateSnapshot,
     PrivateWebStateWriter,
     PrivateWebSubmitUnknownError,
+    PrivateWebWriteNotAttemptedError,
 )
 from mark_api.results import ReadResult
 
@@ -163,6 +166,197 @@ def ad_snapshot(
         title=title,
         description=description,
     )
+
+
+def create_snapshot(
+    state: PrivateWebEditorState = PrivateWebEditorState.READY,
+    *,
+    title: str | None = "",
+    description: str | None = "",
+    price_amount: str | None = "",
+) -> PrivateWebCreateSnapshot:
+    if state is not PrivateWebEditorState.READY:
+        title = None
+        description = None
+        price_amount = None
+    return PrivateWebCreateSnapshot(
+        state=state,
+        title=title,
+        description=description,
+        price_amount=price_amount,
+    )
+
+
+class FakeCreatePage:
+    def __init__(
+        self,
+        *snapshots: PrivateWebCreateSnapshot,
+        fail_stage: str | None = None,
+        submit_unknown: bool = False,
+    ) -> None:
+        self.snapshots = list(snapshots)
+        self.fail_stage = fail_stage
+        self.submit_unknown = submit_unknown
+        self.calls: list[tuple[object, ...]] = []
+
+    def _maybe_fail(self, stage: str) -> None:
+        if self.fail_stage == stage:
+            raise RuntimeError("provider details must not escape")
+
+    def open_create_form(self, category_path: tuple[str, ...]) -> None:
+        self.calls.append(("open_create_form", category_path))
+        self._maybe_fail("open_create_form")
+
+    def read_create_form(self) -> PrivateWebCreateSnapshot:
+        self.calls.append(("read_create_form",))
+        self._maybe_fail("read_create_form")
+        if not self.snapshots:
+            raise AssertionError("unexpected create read")
+        return self.snapshots.pop(0)
+
+    def replace_create_title(self, value: str) -> None:
+        self.calls.append(("replace_create_title", value))
+        self._maybe_fail("replace_create_title")
+
+    def replace_create_description(self, value: str) -> None:
+        self.calls.append(("replace_create_description", value))
+        self._maybe_fail("replace_create_description")
+
+    def replace_create_price(self, value: str) -> None:
+        self.calls.append(("replace_create_price", value))
+        self._maybe_fail("replace_create_price")
+
+    def submit_create(self) -> None:
+        self.calls.append(("submit_create",))
+        if self.submit_unknown:
+            raise PrivateWebSubmitUnknownError("create_submit")
+        self._maybe_fail("submit_create")
+
+
+def create_request() -> AdCreateRequest:
+    return AdCreateRequest(
+        category_path=("Haus & Garten", "Dekoration", "Weitere Dekoration"),
+        title="Neue Vase",
+        description="Beschreibung der neuen Vase",
+        price_eur=12,
+    )
+
+
+class PrivateWebCreateWriterTests(unittest.TestCase):
+    def test_exact_create_form_is_filled_and_submitted_once(self) -> None:
+        request = create_request()
+        page = FakeCreatePage(
+            create_snapshot(),
+            create_snapshot(
+                title=request.title,
+                description=request.description,
+                price_amount="12",
+            ),
+        )
+
+        PrivateWebCreateWriter(page).create_ad(request)
+
+        self.assertEqual(
+            page.calls,
+            [
+                ("open_create_form", request.category_path),
+                ("read_create_form",),
+                ("replace_create_title", request.title),
+                ("replace_create_description", request.description),
+                ("replace_create_price", "12"),
+                ("read_create_form",),
+                ("submit_create",),
+            ],
+        )
+
+    def test_create_challenge_fails_before_form_mutation(self) -> None:
+        for state in (
+            PrivateWebEditorState.LOGIN_REQUIRED,
+            PrivateWebEditorState.MFA_REQUIRED,
+            PrivateWebEditorState.CAPTCHA_REQUIRED,
+            PrivateWebEditorState.SECURITY_CHALLENGE,
+            PrivateWebEditorState.UNKNOWN,
+        ):
+            with self.subTest(state=state):
+                page = FakeCreatePage(create_snapshot(state))
+
+                with self.assertRaises(PrivateWebPreconditionError):
+                    PrivateWebCreateWriter(page).create_ad(create_request())
+
+                self.assertEqual(
+                    page.calls,
+                    [
+                        ("open_create_form", create_request().category_path),
+                        ("read_create_form",),
+                    ],
+                )
+
+    def test_create_drift_immediately_before_submit_fails_closed(self) -> None:
+        request = create_request()
+        page = FakeCreatePage(
+            create_snapshot(),
+            create_snapshot(
+                title=request.title,
+                description="unexpected",
+                price_amount="12",
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            PrivateWebPreconditionError,
+            "create_values_drift",
+        ):
+            PrivateWebCreateWriter(page).create_ad(request)
+
+        self.assertNotIn(("submit_create",), page.calls)
+
+    def test_create_pre_submit_provider_error_is_write_not_attempted(self) -> None:
+        page = FakeCreatePage(
+            create_snapshot(),
+            fail_stage="replace_create_title",
+        )
+
+        with self.assertRaises(PrivateWebWriteNotAttemptedError) as caught:
+            PrivateWebCreateWriter(page).create_ad(create_request())
+
+        self.assertEqual(caught.exception.stage, "replace_create_title")
+        self.assertNotIn(("submit_create",), page.calls)
+
+    def test_create_unmarked_submit_failure_is_unknown_and_not_retried(self) -> None:
+        request = create_request()
+        page = FakeCreatePage(
+            create_snapshot(),
+            create_snapshot(
+                title=request.title,
+                description=request.description,
+                price_amount="12",
+            ),
+            fail_stage="submit_create",
+        )
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            PrivateWebCreateWriter(page).create_ad(request)
+
+        self.assertEqual(caught.exception.stage, "submit_create")
+        self.assertEqual(page.calls.count(("submit_create",)), 1)
+
+    def test_create_submit_unknown_is_preserved_and_not_retried(self) -> None:
+        request = create_request()
+        page = FakeCreatePage(
+            create_snapshot(),
+            create_snapshot(
+                title=request.title,
+                description=request.description,
+                price_amount="12",
+            ),
+            submit_unknown=True,
+        )
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            PrivateWebCreateWriter(page).create_ad(request)
+
+        self.assertEqual(caught.exception.stage, "create_submit")
+        self.assertEqual(page.calls.count(("submit_create",)), 1)
 
 
 class PrivateWebContentWriterTests(unittest.TestCase):

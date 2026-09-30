@@ -2,7 +2,9 @@
 
 from .application import EnrichedOwnerReader, MarkService
 from .domain import (
+    AdCreateRequest,
     AdSnapshot,
+    CreateOperationReceipt,
     DeleteApproval,
     InboundMessageEvent,
     LifecycleState,
@@ -14,9 +16,11 @@ from .query import AdView, DashboardSummary, MarkQueryService
 from .results import ReadResult, ReadStatus
 
 __all__ = [
+    "AdCreateRequest",
     "AdSnapshot",
     "AdView",
     "DashboardSummary",
+    "CreateOperationReceipt",
     "DeleteApproval",
     "EnrichedOwnerReader",
     "InboundMessageEvent",

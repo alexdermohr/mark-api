@@ -203,6 +203,7 @@ MarkService / SafeWriteOrchestrator
         |       |       -> ManagementReadAdapter
         |       |       -> CdpPrivateWebOwnerReader (target-bound)
         |       |
+        |       +-- create_writer  -> PrivateWebCreateWriter
         |       +-- content_writer -> PrivateWebContentWriter
         |       +-- state_writer   -> PrivateWebStateWriter
         |       +-- delete_writer  -> PrivateWebDeleteWriter
@@ -236,6 +237,30 @@ Die aktuelle eigene Anzeigenzeile zeigte einen sichtbaren, enabled `BUTTON type=
 Darauf baut der neue `PrivateWebDeleteWriter` konservativ auf: exakte eigene `ad_id`/Row-Bindung, browser-level Input ohne DOM-`.click()`, erneute Prüfung des expliziten Bestätigungsmodals, genau ein Confirm-Mutationsversuch und kein Blind-Retry. Jeder Fehler nach möglichem Browser-Input wird als unbekannter Effekt behandelt. Erfolg wird weiterhin **nicht** aus Modal-/UI-Signalen behauptet, sondern nur über die bestehenden autoritativen Besitzer-/Management-Readbacks des `SafeWriteOrchestrator` bestätigt.
 
 Der Delete-Pfad ist in diesem Stand lokal regressionsgetestet; ein Live-Delete wurde bewusst nicht ausgeführt.
+
+### Fortschreibung 30.09.2026 — read-only Create-UI-Evidenz und lokaler Create-Vertrag
+
+Der normale private Create-Flow wurde mit dem bereits nutzer-authentifizierten Webprofil ausschließlich **read-only** kartiert. Es wurde keine Anzeige veröffentlicht, kein Entwurf gespeichert und kein Bild hochgeladen.
+
+Belegt ist ein zweistufiger Ablauf:
+
+- `/p-anzeige-aufgeben.html` führt über einen expliziten Kategoriebaum; der aktuelle Pfad wird durch echte Browseraktivierungen der sichtbaren Kategorien aufgebaut,
+- `Weiter` ist ein `POST` auf `/p-anzeige-aufgeben-schritt2.html` mit CSRF und der gewählten Kategorie-/Attributbindung,
+- das Hauptformular bietet getrennte Controls für `Vorschau`, `Entwurf speichern` und `Anzeige aufgeben`,
+- der Publish-Control `Anzeige aufgeben` ist `type=button` und läuft zuerst durch `renderIfVerificationRequired(...)`; derselbe erste Browser-Input kann daher entweder Telefonverifikation öffnen oder unmittelbar den Publish-Handler erreichen,
+- der aktuelle private Default ist `OFFER` + `FIXED`; `buyNowEligible=false`, `posterType=PRIVATE`, Marketing aus, vollständige Adresse aus, Straße deaktiviert, kein Draft/`adId` und keine hochgeladenen Dateien.
+
+Darauf basiert der neue enge `PrivateWebCreateWriter`:
+
+- expliziter, nichtleerer Kategoriepfad mit eindeutigen Labels,
+- nur `OFFER + FIXED`, Titel, Beschreibung und ganzzahliger EUR-Festpreis,
+- keine Medien, kein Draft, kein Buy-Now, keine Marketing- oder Adressfreigabe,
+- unerwartete kategoriespezifische editierbare Controls blockieren fail-closed,
+- Kategorien und `Weiter` werden ausschließlich per browser-level, hit-tested Input bedient; kein DOM-`.click()`,
+- unmittelbar vor Publish werden Formvertrag und alle drei gesetzten Werte erneut geprüft,
+- exakt ein Browser-Input auf `Anzeige aufgeben`; ab dem ersten möglichen Publish-Input gilt jeder unklare Ausgang als `SubmitUnknown` und wird nicht wiederholt.
+
+Create benötigt wegen der erst nach dem Write bekannten Anzeigen-ID einen eigenen `CreateOperationReceipt`. `SafeWriteOrchestrator.create()` liest vor dem Write Primär- und unabhängiges Bestätigungsinventar. Nach dem einzigen Publish-Versuch müssen beide gegenüber ihrem jeweiligen Pre-State exakt dieselbe einzelne neue ID sehen und den angeforderten Titel tragen; anschließend muss der target-bound Private-Web-Reader für genau diese ID Titel und Beschreibung exakt bestätigen. Nur dann ist der Create `CONFIRMED`. Andernfalls bleibt er `AMBIGUOUS`; eine erkannte `WriteNotAttemptedError` bleibt ohne Post-Read `PRECONDITION_FAILED`.
 
 ## Geplante Mark-HTTP-API
 
@@ -296,8 +321,8 @@ Erst nach diesem Beleg wird der Browser-Content-Updatepfad zum Fallback degradie
 
 ### Slice C — Create/Media/Reply
 
-- privaten Create-Flow kontrolliert belegen,
-- Bilderpfad vollständig kartieren und testen,
+- privater Create-Vertrag lokal implementiert und gegen die aktuelle UI read-only gebunden; ein kontrollierter Live-Publish-Smoke bleibt separat offen,
+- als nächstes Bilderpfad vollständig kartieren und testen,
 - Reply nur in einer bestehenden natürlichen Conversation testen; keine künstliche Testnachricht erzeugen.
 
 ### Slice D — Mark Write API
@@ -320,4 +345,4 @@ Erst nach diesem Beleg wird der Browser-Content-Updatepfad zum Fallback degradie
 
 Die Frage, **ob** eine schreibfähige Mark-API technisch möglich ist, ist mit **ja** beantwortet.
 
-Die aktive technische Arbeit folgt D-010: `PrivateWebWriter`, persistenter CDP-Driver und der ownergebundene in-place Content-Smoke sind belegt; die Runtime-Komposition verbindet diese Flächen ohne Browser-Lifecycle im Core mit `MarkService`. Lifecycle (`ACTIVE`/`PAUSED`) ist inzwischen über denselben fail-closed Web-UI-Pfad implementiert. Der Delete-Writer ist lokal auf die aktuelle, read-only belegte Zwei-Schritt-UI gebunden und regressionsgetestet; ein Live-Delete bleibt unbelegt und wurde in diesem Slice ausdrücklich nicht ausgeführt. Create/Media bleiben separate spätere Slices. ProSellers bleibt das optionale offizielle zweite Backend; die privaten/mobile Reverse-Engineering-Pfade bleiben historische PoC-Evidenz.
+Die aktive technische Arbeit folgt D-010: `PrivateWebWriter`, persistenter CDP-Driver und der ownergebundene in-place Content-Smoke sind belegt; die Runtime-Komposition verbindet diese Flächen ohne Browser-Lifecycle im Core mit `MarkService`. Lifecycle (`ACTIVE`/`PAUSED`) und Delete sind über denselben fail-closed Web-UI-Pfad implementiert. Create ist jetzt ebenfalls als enger lokaler Contract samt eigener Reconciliation-Semantik implementiert und gegen die aktuelle UI read-only gebunden; ein Live-Publish wurde ausdrücklich nicht ausgeführt. Media bleibt der nächste separate Writer-Slice. ProSellers bleibt das optionale offizielle zweite Backend; die privaten/mobile Reverse-Engineering-Pfade bleiben historische PoC-Evidenz.

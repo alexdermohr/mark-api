@@ -7,10 +7,11 @@ from unittest.mock import patch
 from urllib.request import ProxyHandler
 
 from mark_api.adapters.management import MANAGEMENT_URL
-from mark_api.domain import AdSnapshot, DeleteApproval, LifecycleState, OperationOutcome
+from mark_api.domain import AdCreateRequest, AdSnapshot, DeleteApproval, LifecycleState, OperationOutcome
 from mark_api.orchestrator import SafeWriteOrchestrator
 from mark_api.ports import WriteNotAttemptedError
 from mark_api.private_web import (
+    PrivateWebCreateSnapshot,
     PrivateWebDeleteSnapshot,
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
@@ -98,6 +99,62 @@ class SharedPage:
         if not self._closed:
             self._closed = True
             self._events.append(("close", self._ad_id))
+
+
+class CreatePage:
+    def __init__(
+        self,
+        events: list[tuple],
+        *,
+        close_error: Exception | None = None,
+        submit_unknown: bool = False,
+    ) -> None:
+        self._events = events
+        self._category_path: tuple[str, ...] | None = None
+        self._title = ""
+        self._description = ""
+        self._price = ""
+        self._closed = False
+        self._close_error = close_error
+        self._submit_unknown = submit_unknown
+
+    def open_create_form(self, category_path: tuple[str, ...]) -> None:
+        self._category_path = category_path
+        self._events.append(("open_create_form", category_path))
+
+    def read_create_form(self) -> PrivateWebCreateSnapshot:
+        self._events.append(("read_create_form", self._category_path))
+        return PrivateWebCreateSnapshot(
+            state=PrivateWebEditorState.READY,
+            title=self._title,
+            description=self._description,
+            price_amount=self._price,
+        )
+
+    def replace_create_title(self, value: str) -> None:
+        self._events.append(("replace_create_title", value))
+        self._title = value
+
+    def replace_create_description(self, value: str) -> None:
+        self._events.append(("replace_create_description", value))
+        self._description = value
+
+    def replace_create_price(self, value: str) -> None:
+        self._events.append(("replace_create_price", value))
+        self._price = value
+
+    def submit_create(self) -> None:
+        self._events.append(("submit_create", self._category_path))
+        if self._submit_unknown:
+            raise PrivateWebSubmitUnknownError("create_submit")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._events.append(("close_create", self._category_path))
+        if self._close_error is not None:
+            raise self._close_error
 
 
 class LifecyclePage:
@@ -193,6 +250,97 @@ class DeletePage:
 
 
 class PrivateWebContentRuntimeTests(unittest.TestCase):
+    def test_create_writer_uses_fresh_page_per_call_and_closes_each_page(self) -> None:
+        owner = OwnerReader(ReadResult.success_empty(()))
+        events: list[tuple] = []
+        pages: list[CreatePage] = []
+
+        def page_factory() -> CreatePage:
+            page = CreatePage(events)
+            pages.append(page)
+            return page
+
+        runtime = PrivateWebContentRuntime(
+            owner_reader=owner,
+            page_factory=page_factory,
+            close_runtime=lambda: None,
+        )
+        request = AdCreateRequest(
+            category_path=("Haus & Garten", "Dekoration", "Weitere Dekoration"),
+            title="Neue Vase",
+            description="Beschreibung",
+            price_eur=12,
+        )
+
+        runtime.create_writer.create_ad(request)
+        runtime.create_writer.create_ad(request)
+
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(
+            [event for event in events if event[0] == "submit_create"],
+            [
+                ("submit_create", request.category_path),
+                ("submit_create", request.category_path),
+            ],
+        )
+        self.assertEqual(
+            [event for event in events if event[0] == "close_create"],
+            [
+                ("close_create", request.category_path),
+                ("close_create", request.category_path),
+            ],
+        )
+
+    def test_create_writer_cleanup_failure_does_not_replace_submit_unknown(self) -> None:
+        events: list[tuple] = []
+        runtime = PrivateWebContentRuntime(
+            owner_reader=OwnerReader(ReadResult.success_empty(())),
+            page_factory=lambda: CreatePage(
+                events,
+                close_error=RuntimeError("cleanup failed"),
+                submit_unknown=True,
+            ),
+            close_runtime=lambda: None,
+        )
+        request = AdCreateRequest(
+            category_path=("Haus & Garten", "Dekoration", "Weitere Dekoration"),
+            title="Neue Vase",
+            description="Beschreibung",
+            price_eur=12,
+        )
+
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            runtime.create_writer.create_ad(request)
+
+        self.assertEqual(
+            [event for event in events if event[0] == "submit_create"],
+            [("submit_create", request.category_path)],
+        )
+        self.assertEqual(
+            [event for event in events if event[0] == "close_create"],
+            [("close_create", request.category_path)],
+        )
+
+    def test_create_writer_page_setup_failure_is_write_not_attempted(self) -> None:
+        runtime = PrivateWebContentRuntime(
+            owner_reader=OwnerReader(ReadResult.success_empty(())),
+            page_factory=lambda: (_ for _ in ()).throw(
+                OSError("page setup failed")
+            ),
+            close_runtime=lambda: None,
+        )
+        request = AdCreateRequest(
+            category_path=("Haus & Garten", "Dekoration"),
+            title="Neue Vase",
+            description="Beschreibung",
+            price_eur=12,
+        )
+
+        with self.assertRaises(PrivateWebRuntimeSetupError) as caught:
+            runtime.create_writer.create_ad(request)
+
+        self.assertIsInstance(caught.exception, WriteNotAttemptedError)
+
     def test_target_reader_enriches_only_exact_owner_target_and_closes_page(self) -> None:
         owner = OwnerReader(
             ReadResult.success_nonempty(
@@ -520,6 +668,15 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
             runtime.state_writer.set_state(AD_ID, LifecycleState.PAUSED)
         with self.assertRaises(PrivateWebRuntimeClosedError):
             runtime.delete_writer.delete_ad(AD_ID)
+        with self.assertRaises(PrivateWebRuntimeClosedError):
+            runtime.create_writer.create_ad(
+                AdCreateRequest(
+                    category_path=("Haus & Garten", "Dekoration"),
+                    title="Neue Vase",
+                    description="Beschreibung",
+                    price_eur=12,
+                )
+            )
         self.assertEqual(page_calls, 0)
 
     def test_dependency_check_fails_when_distribution_is_missing(self) -> None:
