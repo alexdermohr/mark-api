@@ -903,7 +903,12 @@ class CdpPrivateWebPage:
         *,
         expected: PrivateWebCreateSnapshot | None = None,
         activation: bool = False,
+        allow_media_files: bool = False,
     ) -> str:
+        if activation and allow_media_files:
+            raise ValueError(
+                "media-filled create activation is not supported"
+            )
         origin = json.dumps(self._expected_origin)
         path = json.dumps(_CREATE_FORM_PATH)
         expected_title = json.dumps(
@@ -916,6 +921,7 @@ class CdpPrivateWebPage:
             expected.price_amount if expected is not None else None
         )
         activate = json.dumps(activation)
+        allow_media = json.dumps(allow_media_files)
         return f"""
 (() => {{
   const stateOnly = (state) => ({{state}});
@@ -1038,7 +1044,8 @@ class CdpPrivateWebPage:
     wanted.checked ||
     files.length !== 1 ||
     files[0].files === null ||
-    files[0].files.length !== 0
+    (!{allow_media} && files[0].files.length !== 0) ||
+    ({allow_media} && files[0].files.length === 0)
   ) return stateOnly("unknown");
 
   const form = title.form;
