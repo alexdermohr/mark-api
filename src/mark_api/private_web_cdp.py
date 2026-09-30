@@ -743,16 +743,17 @@ class CdpPrivateWebPage:
         url.search !== "" ||
         url.hash !== ""
       ) return false;
-      if (!visible(link)) return false;
-      const rect = link.getBoundingClientRect();
-      const x = rect.left + rect.width / 2;
-      const y = rect.top + rect.height / 2;
-      const hit = document.elementFromPoint(x, y);
-      return hit === link || link.contains(hit);
+      return visible(link);
     }}
   );
   if (matches.length !== 1) return stateOnly("unknown");
-  const rect = matches[0].getBoundingClientRect();
+  const link = matches[0];
+  link.scrollIntoView({{
+    behavior: "instant",
+    block: "center",
+    inline: "center",
+  }});
+  const rect = link.getBoundingClientRect();
   const x = rect.left + rect.width / 2;
   const y = rect.top + rect.height / 2;
   if (
@@ -763,6 +764,8 @@ class CdpPrivateWebPage:
     x > window.innerWidth ||
     y > window.innerHeight
   ) return stateOnly("unknown");
+  const hit = document.elementFromPoint(x, y);
+  if (!(hit === link || link.contains(hit))) return stateOnly("unknown");
   return {{state: "ready", x, y}};
 }})()
 """

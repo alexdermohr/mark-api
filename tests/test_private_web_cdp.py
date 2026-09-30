@@ -239,6 +239,36 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertIn('"Dekoration"', joined)
         self.assertIn('"Weitere Dekoration"', joined)
         self.assertIn("/p-anzeige-aufgeben-schritt2.html", joined)
+        category_expressions = [
+            expression
+            for expression in expressions
+            if 'if ((link.innerText || "").trim() !==' in expression
+        ]
+        self.assertEqual(len(category_expressions), 3)
+        for expression in category_expressions:
+            self.assertIn("link.scrollIntoView", expression)
+            self.assertIn('behavior: "instant"', expression)
+            self.assertLess(
+                expression.index("matches.length !== 1"),
+                expression.index("link.scrollIntoView"),
+            )
+            self.assertLess(
+                expression.index("link.scrollIntoView"),
+                expression.index("document.elementFromPoint"),
+            )
+            javascript_check = subprocess.run(
+                ["node", "--check", "-"],
+                input=expression,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(
+                javascript_check.returncode,
+                0,
+                javascript_check.stdout + javascript_check.stderr,
+            )
         self.assertNotIn(".click(", joined)
 
     def test_open_create_form_never_retries_ambiguous_continue_input(self) -> None:
