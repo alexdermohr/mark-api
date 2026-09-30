@@ -307,22 +307,70 @@ def run_private_web_runtime_smoke(
                 key=lambda row: (-row["value"], row["ad_id"]),
             )
             try:
-                projected_ads = {
-                    str(item["ad_id"]): {
-                        "ad_id": str(item["ad_id"]),
-                        "lifecycle_state": item["lifecycle_state"],
-                        "present": item["present"],
-                        "observed_at": item["observed_at"],
-                        "source": item["source"],
-                        "title": item["title"],
-                        "description": item["description"],
-                        "views": item["views"],
-                        "watch_count": item["watch_count"],
-                        "reply_count": item["reply_count"],
-                    }
-                    for item in ads
-                    if isinstance(item, dict)
+                projected_ads: dict[str, dict[str, object]] = {}
+                ad_fields = {
+                    "ad_id",
+                    "lifecycle_state",
+                    "present",
+                    "observed_at",
+                    "source",
+                    "title",
+                    "description",
+                    "views",
+                    "watch_count",
+                    "reply_count",
                 }
+                for item in ads:
+                    if not isinstance(item, dict) or set(item) != ad_fields:
+                        raise TypeError("invalid dashboard ad row")
+                    ad_id = item["ad_id"]
+                    lifecycle_state = item["lifecycle_state"]
+                    present = item["present"]
+                    observed_at = item["observed_at"]
+                    source = item["source"]
+                    title = item["title"]
+                    description = item["description"]
+                    views = item["views"]
+                    watch_count = item["watch_count"]
+                    reply_count = item["reply_count"]
+                    if (
+                        not isinstance(ad_id, str)
+                        or not isinstance(lifecycle_state, str)
+                        or type(present) is not bool
+                        or not isinstance(observed_at, str)
+                        or not isinstance(source, str)
+                        or (title is not None and not isinstance(title, str))
+                        or (
+                            description is not None
+                            and not isinstance(description, str)
+                        )
+                        or (
+                            views is not None
+                            and type(views) is not int
+                        )
+                        or (
+                            watch_count is not None
+                            and type(watch_count) is not int
+                        )
+                        or (
+                            reply_count is not None
+                            and type(reply_count) is not int
+                        )
+                        or ad_id in projected_ads
+                    ):
+                        raise TypeError("invalid dashboard ad row")
+                    projected_ads[ad_id] = {
+                        "ad_id": ad_id,
+                        "lifecycle_state": lifecycle_state,
+                        "present": present,
+                        "observed_at": observed_at,
+                        "source": source,
+                        "title": title,
+                        "description": description,
+                        "views": views,
+                        "watch_count": watch_count,
+                        "reply_count": reply_count,
+                    }
                 projected_views_ranking: list[dict[str, object]] = []
                 ranking_fields = {
                     "ad_id",

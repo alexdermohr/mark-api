@@ -174,6 +174,36 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
         self.assertTrue(report.http_write_methods_rejected)
         self.assertEqual(runtime.close_calls, 1)
 
+    def test_smoke_rejects_non_string_dashboard_ad_id(self) -> None:
+        runtime = FakeInventoryRuntime(
+            ReadResult.success_nonempty((snapshot("1234567890"),))
+        )
+        original_json_get = runtime_smoke._json_get
+
+        def corrupt_ad_id_type(opener, base: str, path: str):
+            payload = original_json_get(opener, base, path)
+            if path == "/api/ads":
+                assert isinstance(payload, list)
+                rows = [dict(item) for item in payload]
+                rows[0]["ad_id"] = 1234567890
+                return rows
+            return payload
+
+        with patch(
+            "mark_api.private_web_runtime_smoke._json_get",
+            side_effect=corrupt_ad_id_type,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "dashboard inventory projections are malformed",
+            ):
+                run_private_web_runtime_smoke(
+                    19610,
+                    runtime_factory=lambda **_kwargs: runtime,
+                )
+
+        self.assertEqual(runtime.close_calls, 1)
+
     def test_smoke_rejects_corrupted_dashboard_fields_with_same_ids(self) -> None:
         runtime = FakeInventoryRuntime(
             ReadResult.success_nonempty((snapshot("1234567890"),))
