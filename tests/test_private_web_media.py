@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import subprocess
 import tempfile
 import unittest
@@ -24,6 +25,7 @@ from mark_api.private_web_media import (
     PrivateWebMediaFileSnapshot,
     PrivateWebMediaSource,
     PrivateWebMediaUnknownError,
+    _prepare_local_media,
 )
 
 
@@ -186,6 +188,56 @@ class PrivateWebMediaContractTests(unittest.TestCase):
 
         self.assertEqual(result, media_snapshot("arbitrary.bin", 0))
 
+    def test_prepared_media_finalizer_removes_private_copy(self) -> None:
+        prepared = _prepare_local_media((self.source,))
+        private_path = Path(prepared.paths[0])
+
+        self.assertTrue(private_path.exists())
+        self.assertNotIn(str(private_path), repr(prepared))
+
+        del prepared
+        gc.collect()
+
+        self.assertFalse(private_path.exists())
+
+    def test_original_path_replacement_cannot_change_prepared_bytes(self) -> None:
+        original = b"validated-bytes"
+        replacement = b"replaced--bytes"
+        self.assertEqual(len(original), len(replacement))
+        self.image.write_bytes(original)
+
+        outer = self
+
+        class ReplacingPage(FakeMediaPage):
+            staged_path: str | None = None
+            staged_bytes: bytes | None = None
+
+            def read_create_form(self) -> PrivateWebCreateSnapshot:
+                outer.image.write_bytes(replacement)
+                return super().read_create_form()
+
+            def stage_create_media(self, files: tuple[str, ...]) -> None:
+                self.staged_path = files[0]
+                self.staged_bytes = Path(files[0]).read_bytes()
+                super().stage_create_media(files)
+
+        page = ReplacingPage(
+            after=media_snapshot("photo.jpg", len(original)),
+        )
+
+        result = PrivateWebCreateMediaStager(page).stage_create_media(
+            create_request(),
+            (self.source,),
+        )
+
+        self.assertEqual(result, media_snapshot("photo.jpg", len(original)))
+        self.assertEqual(page.staged_bytes, original)
+        self.assertIsNotNone(page.staged_path)
+        assert page.staged_path is not None
+        self.assertNotEqual(page.staged_path, str(self.image))
+        self.assertFalse(Path(page.staged_path).exists())
+        self.assertEqual(self.image.read_bytes(), replacement)
+
     def test_challenges_and_unknown_fail_before_file_input(self) -> None:
         for state in (
             PrivateWebEditorState.LOGIN_REQUIRED,
@@ -296,8 +348,11 @@ class CdpPrivateWebMediaPageTests(unittest.TestCase):
         self.image = self.root / "photo.jpg"
         self.image.write_bytes(b"123456")
         self.expected_create = create_snapshot()
+        self.pages: list[CdpPrivateWebMediaPage] = []
 
     def tearDown(self) -> None:
+        for page in reversed(self.pages):
+            page.close()
         self.tmp.cleanup()
 
     def page(self, handler) -> tuple[CdpPrivateWebMediaPage, FakeClient]:
@@ -308,6 +363,7 @@ class CdpPrivateWebMediaPageTests(unittest.TestCase):
         )
         page._create_bound = True
         page._last_create_snapshot = self.expected_create
+        self.pages.append(page)
         return page, client
 
     def test_direct_invalid_local_path_never_creates_client(self) -> None:
@@ -378,6 +434,7 @@ class CdpPrivateWebMediaPageTests(unittest.TestCase):
         def handler(method, params):
             if method == "Runtime.evaluate":
                 if params.get("returnByValue") is True:
+                    self.image.write_bytes(b"654321")
                     return {
                         "result": {
                             "type": "object",
@@ -431,10 +488,17 @@ class CdpPrivateWebMediaPageTests(unittest.TestCase):
             for method, params in client.calls
             if method == "DOM.setFileInputFiles"
         ]
-        self.assertEqual(
-            calls,
-            [{"files": [str(self.image)], "objectId": "file-input-1"}],
-        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["objectId"], "file-input-1")
+        selected_paths = calls[0]["files"]
+        self.assertIsInstance(selected_paths, list)
+        self.assertEqual(len(selected_paths), 1)
+        selected_path = Path(selected_paths[0])
+        self.assertNotEqual(selected_path, self.image)
+        self.assertEqual(selected_path.name, self.image.name)
+        self.assertEqual(selected_path.read_bytes(), b"123456")
+        self.assertEqual(self.image.read_bytes(), b"654321")
+        self.assertTrue(selected_path.exists())
 
         with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
             page.stage_create_media((str(self.image),))
@@ -446,6 +510,7 @@ class CdpPrivateWebMediaPageTests(unittest.TestCase):
         )
 
         page.close()
+        self.assertFalse(selected_path.exists())
         self.assertIn(
             ("Runtime.releaseObject", {"objectId": "file-input-1"}),
             client.calls,

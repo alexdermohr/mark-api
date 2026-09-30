@@ -11,14 +11,16 @@ from .private_web_media import (
     PrivateWebMediaFileSnapshot,
     PrivateWebMediaSource,
     PrivateWebMediaUnknownError,
-    _validated_local_media,
+    _PreparedPrivateWebMedia,
+    _prepare_local_media,
 )
 
 
 class CdpPrivateWebMediaPage(CdpPrivateWebPage):
     """Narrow CDP extension for create-form file selection.
 
-    The inherited create-form binding remains authoritative. The exact
+    The inherited create-form binding remains authoritative. Explicit sources
+    are copied into page-owned private files before browser access. The exact
     validated file input is retained as one CDP object handle across the
     single DOM.setFileInputFiles call and the subsequent readback.
     """
@@ -28,6 +30,7 @@ class CdpPrivateWebMediaPage(CdpPrivateWebPage):
         self._media_selection_attempted = False
         self._media_expected_create_snapshot: PrivateWebCreateSnapshot | None = None
         self._media_file_object_id: str | None = None
+        self._media_prepared: _PreparedPrivateWebMedia | None = None
 
     def _release_media_handle(self) -> None:
         object_id = self._media_file_object_id
@@ -40,27 +43,34 @@ class CdpPrivateWebMediaPage(CdpPrivateWebPage):
         except Exception:
             pass
 
+    def _release_media_files(self) -> None:
+        prepared = self._media_prepared
+        self._media_prepared = None
+        if prepared is not None:
+            prepared.close()
+
     def open_create_form(self, category_path: tuple[str, ...]) -> None:
         if self._media_selection_attempted:
             raise PrivateWebCdpWriteNotAttemptedError(
                 "create_media_already_attempted"
             )
         self._release_media_handle()
+        self._release_media_files()
         self._media_expected_create_snapshot = None
         super().open_create_form(category_path)
 
     def close(self) -> None:
         self._release_media_handle()
+        self._release_media_files()
         self._media_expected_create_snapshot = None
         super().close()
 
     @staticmethod
-    def _validated_media_paths(files: tuple[str, ...]) -> tuple[str, ...]:
+    def _prepare_media_paths(files: tuple[str, ...]) -> _PreparedPrivateWebMedia:
         if not isinstance(files, tuple):
             raise TypeError("media files must be a tuple")
         sources = tuple(PrivateWebMediaSource(path=path) for path in files)
-        paths, _snapshots = _validated_local_media(sources)
-        return paths
+        return _prepare_local_media(sources)
 
     def _file_input_handle_expression(
         self,
@@ -93,9 +103,9 @@ class CdpPrivateWebMediaPage(CdpPrivateWebPage):
                 "create_media_already_attempted"
             )
 
-        # Repeat local validation at the CDP boundary so direct callers cannot
-        # bypass the no-browser-before-local-validation rule.
-        paths = self._validated_media_paths(files)
+        # Direct CDP callers get the same stable-copy guarantee as the higher
+        # level stager. These page-owned files remain until close().
+        prepared = self._prepare_media_paths(files)
 
         snapshot = self._last_create_snapshot
         if (
@@ -103,20 +113,21 @@ class CdpPrivateWebMediaPage(CdpPrivateWebPage):
             or snapshot is None
             or snapshot.state is not PrivateWebEditorState.READY
         ):
+            prepared.close()
             raise PrivateWebCdpWriteNotAttemptedError("create_media")
 
         try:
-            current = self.read_create_form()
-        except PrivateWebCdpWriteNotAttemptedError:
-            raise
-        except Exception:
-            raise PrivateWebCdpWriteNotAttemptedError(
-                "create_media_revalidate"
-            ) from None
-        if current != snapshot:
-            raise PrivateWebCdpWriteNotAttemptedError("create_media_drift")
+            try:
+                current = self.read_create_form()
+            except PrivateWebCdpWriteNotAttemptedError:
+                raise
+            except Exception:
+                raise PrivateWebCdpWriteNotAttemptedError(
+                    "create_media_revalidate"
+                ) from None
+            if current != snapshot:
+                raise PrivateWebCdpWriteNotAttemptedError("create_media_drift")
 
-        try:
             client = self._client()
             result = client.call(
                 "Runtime.evaluate",
@@ -141,28 +152,31 @@ class CdpPrivateWebMediaPage(CdpPrivateWebPage):
                     "create_media_bind"
                 )
         except PrivateWebCdpWriteNotAttemptedError:
+            prepared.close()
             raise
         except PrivateWebCdpError:
+            prepared.close()
             raise PrivateWebCdpWriteNotAttemptedError(
                 "create_media_bind"
             ) from None
         except Exception:
+            prepared.close()
             raise PrivateWebCdpWriteNotAttemptedError(
                 "create_media_bind"
             ) from None
 
         # From this point on, file-input mutation may be effective. Mark the
-        # attempt before dispatch and preserve the exact object handle for
-        # readback. No failure below authorizes a second selection attempt.
+        # attempt before dispatch and keep the private files alive until close.
         self._media_selection_attempted = True
         self._media_expected_create_snapshot = current
         self._media_file_object_id = object_id
+        self._media_prepared = prepared
         self._last_create_snapshot = None
         try:
             client.call(
                 "DOM.setFileInputFiles",
                 {
-                    "files": list(paths),
+                    "files": list(prepared.paths),
                     "objectId": object_id,
                 },
             )
@@ -261,6 +275,7 @@ function() {{
             or not self._media_selection_attempted
             or expected is None
             or object_id is None
+            or self._media_prepared is None
         ):
             raise PrivateWebCdpWriteNotAttemptedError(
                 "read_create_media"
