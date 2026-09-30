@@ -90,6 +90,19 @@ class ResultAndDomainTests(unittest.TestCase):
                         price_eur=12,
                     )
 
+    def test_create_request_normalizes_description_line_endings(self) -> None:
+        request = AdCreateRequest(
+            category_path=("Haus & Garten", "Dekoration"),
+            title="Testanzeige",
+            description="Erste Zeile\r\nZweite Zeile\rDritte Zeile\nVierte Zeile",
+            price_eur=12,
+        )
+
+        self.assertEqual(
+            request.description,
+            "Erste Zeile\nZweite Zeile\nDritte Zeile\nVierte Zeile",
+        )
+
     def test_create_request_rejects_non_positive_fixed_price(self) -> None:
         with self.assertRaises(ValueError):
             AdCreateRequest(

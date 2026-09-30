@@ -93,9 +93,11 @@ class AdCreateRequest:
 
         if not isinstance(self.description, str):
             raise ValueError("description must be a string")
-        _require_nonempty(self.description, "description")
-        if len(self.description) > 4000:
+        normalized_description = self.description.replace("\r\n", "\n").replace("\r", "\n")
+        _require_nonempty(normalized_description, "description")
+        if len(normalized_description) > 4000:
             raise ValueError("description must be <= 4000 characters")
+        object.__setattr__(self, "description", normalized_description)
 
         if (
             not isinstance(self.price_eur, int)
