@@ -293,11 +293,18 @@ def run_private_web_runtime_smoke(
             }
             expected_views_ranking = sorted(
                 (
-                    (item.ad_id, item.views)
+                    {
+                        "ad_id": item.ad_id,
+                        "metric": "views",
+                        "value": item.views,
+                        "present": item.lifecycle_state is not LifecycleState.ABSENT,
+                        "lifecycle_state": item.lifecycle_state.value,
+                        "title": item.title,
+                    }
                     for item in snapshots
                     if item.views is not None
                 ),
-                key=lambda pair: (-pair[1], pair[0]),
+                key=lambda row: (-row["value"], row["ad_id"]),
             )
             try:
                 projected_ads = {
@@ -316,20 +323,43 @@ def run_private_web_runtime_smoke(
                     for item in ads
                     if isinstance(item, dict)
                 }
-                ranked_views: list[tuple[str, int]] = []
+                projected_views_ranking: list[dict[str, object]] = []
+                ranking_fields = {
+                    "ad_id",
+                    "metric",
+                    "value",
+                    "present",
+                    "lifecycle_state",
+                    "title",
+                }
                 for item in ranking:
-                    if (
-                        not isinstance(item, dict)
-                        or item.get("metric") != "views"
-                    ):
+                    if not isinstance(item, dict) or set(item) != ranking_fields:
                         raise TypeError("invalid analytics ranking row")
-                    value = item.get("value")
+                    ad_id = item["ad_id"]
+                    metric = item["metric"]
+                    value = item["value"]
+                    present = item["present"]
+                    lifecycle_state = item["lifecycle_state"]
+                    title = item["title"]
                     if (
-                        not isinstance(value, int)
-                        or isinstance(value, bool)
+                        not isinstance(ad_id, str)
+                        or metric != "views"
+                        or type(value) is not int
+                        or type(present) is not bool
+                        or not isinstance(lifecycle_state, str)
+                        or (title is not None and not isinstance(title, str))
                     ):
                         raise TypeError("invalid analytics ranking value")
-                    ranked_views.append((str(item["ad_id"]), value))
+                    projected_views_ranking.append(
+                        {
+                            "ad_id": ad_id,
+                            "metric": metric,
+                            "value": value,
+                            "present": present,
+                            "lifecycle_state": lifecycle_state,
+                            "title": title,
+                        }
+                    )
                 projected_summary = {
                     key: summary[key]
                     for key in expected_summary
@@ -360,8 +390,8 @@ def run_private_web_runtime_smoke(
                 )
             if (
                 len(ranking) != len(expected_views_ranking)
-                or len(ranked_views) != len(ranking)
-                or ranked_views != expected_views_ranking
+                or len(projected_views_ranking) != len(ranking)
+                or projected_views_ranking != expected_views_ranking
             ):
                 raise RuntimeError(
                     "dashboard analytics views ranking does not match inventory"
