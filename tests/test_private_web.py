@@ -11,6 +11,8 @@ from mark_api.domain import AdSnapshot, LifecycleState, OperationOutcome
 from mark_api.orchestrator import SafeWriteOrchestrator
 from mark_api.private_web import (
     PrivateWebContentWriter,
+    PrivateWebDeleteSnapshot,
+    PrivateWebDeleteWriter,
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
     PrivateWebInteractionError,
@@ -79,6 +81,61 @@ class FakePage:
     def submit(self) -> None:
         self.calls.append(("submit",))
         self._maybe_fail("submit")
+
+
+class FakeDeletePage:
+    def __init__(
+        self,
+        *snapshots: PrivateWebDeleteSnapshot,
+        fail_stage: str | None = None,
+        submit_unknown: bool = False,
+    ) -> None:
+        self.snapshots = list(snapshots)
+        self.fail_stage = fail_stage
+        self.submit_unknown = submit_unknown
+        self.calls: list[tuple[object, ...]] = []
+
+    def _maybe_fail(self, stage: str) -> None:
+        if self.fail_stage == stage:
+            raise RuntimeError("provider details must not escape")
+
+    def open_delete_controls(self, ad_id: str) -> None:
+        self.calls.append(("open_delete_controls", ad_id))
+        self._maybe_fail("open_delete_controls")
+
+    def read_delete_controls(self) -> PrivateWebDeleteSnapshot:
+        self.calls.append(("read_delete_controls",))
+        self._maybe_fail("read_delete_controls")
+        if not self.snapshots:
+            raise AssertionError("unexpected delete read")
+        return self.snapshots.pop(0)
+
+    def open_delete_confirmation(self) -> None:
+        self.calls.append(("open_delete_confirmation",))
+        self._maybe_fail("open_delete_confirmation")
+
+    def read_delete_confirmation(self) -> PrivateWebDeleteSnapshot:
+        self.calls.append(("read_delete_confirmation",))
+        self._maybe_fail("read_delete_confirmation")
+        if not self.snapshots:
+            raise AssertionError("unexpected confirmation read")
+        return self.snapshots.pop(0)
+
+    def submit_delete(self) -> None:
+        self.calls.append(("submit_delete",))
+        if self.submit_unknown:
+            raise PrivateWebSubmitUnknownError("delete_submit")
+        self._maybe_fail("submit_delete")
+
+
+def delete_snapshot(
+    state: PrivateWebEditorState = PrivateWebEditorState.READY,
+    *,
+    ad_id: str | None = AD_ID,
+) -> PrivateWebDeleteSnapshot:
+    if state is not PrivateWebEditorState.READY:
+        ad_id = None
+    return PrivateWebDeleteSnapshot(state=state, ad_id=ad_id)
 
 
 class SequenceReader:
@@ -844,6 +901,72 @@ class PrivateWebStateWriterTests(unittest.TestCase):
             1,
         )
         self.assertEqual(reader.calls, 2)
+
+
+class PrivateWebDeleteWriterTests(unittest.TestCase):
+    def test_exact_target_requires_confirmation_and_submits_once(self) -> None:
+        page = FakeDeletePage(delete_snapshot(), delete_snapshot())
+
+        PrivateWebDeleteWriter(page).delete_ad(AD_ID)
+
+        self.assertEqual(
+            page.calls,
+            [
+                ("open_delete_controls", AD_ID),
+                ("read_delete_controls",),
+                ("open_delete_confirmation",),
+                ("read_delete_confirmation",),
+                ("submit_delete",),
+            ],
+        )
+
+    def test_challenge_stops_before_confirmation_input(self) -> None:
+        for state in (
+            PrivateWebEditorState.LOGIN_REQUIRED,
+            PrivateWebEditorState.MFA_REQUIRED,
+            PrivateWebEditorState.CAPTCHA_REQUIRED,
+            PrivateWebEditorState.SECURITY_CHALLENGE,
+            PrivateWebEditorState.UNKNOWN,
+        ):
+            with self.subTest(state=state):
+                page = FakeDeletePage(delete_snapshot(state))
+
+                with self.assertRaises(PrivateWebPreconditionError):
+                    PrivateWebDeleteWriter(page).delete_ad(AD_ID)
+
+                self.assertEqual(
+                    page.calls,
+                    [
+                        ("open_delete_controls", AD_ID),
+                        ("read_delete_controls",),
+                    ],
+                )
+
+    def test_confirmation_must_remain_exact_target(self) -> None:
+        page = FakeDeletePage(
+            delete_snapshot(),
+            delete_snapshot(ad_id="1234567890"),
+        )
+
+        with self.assertRaisesRegex(
+            PrivateWebPreconditionError,
+            "confirmation:ad_id_mismatch",
+        ):
+            PrivateWebDeleteWriter(page).delete_ad(AD_ID)
+
+        self.assertNotIn(("submit_delete",), page.calls)
+
+    def test_submit_unknown_is_preserved_and_never_retried(self) -> None:
+        page = FakeDeletePage(
+            delete_snapshot(),
+            delete_snapshot(),
+            submit_unknown=True,
+        )
+
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            PrivateWebDeleteWriter(page).delete_ad(AD_ID)
+
+        self.assertEqual(page.calls.count(("submit_delete",)), 1)
 
 
 if __name__ == "__main__":

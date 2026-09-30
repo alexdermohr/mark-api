@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 from mark_api.domain import AdSnapshot, LifecycleState, OperationOutcome
 from mark_api.orchestrator import SafeWriteOrchestrator
 from mark_api.private_web import (
+    PrivateWebDeleteSnapshot,
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
     PrivateWebStateSnapshot,
@@ -2297,6 +2298,420 @@ process.stdout.write(JSON.stringify(result));
             page.submit_state(LifecycleState.PAUSED)
 
         self.assertEqual(client.calls, [])
+
+
+class CdpPrivateWebDeletePageTests(unittest.TestCase):
+    def bind_delete(
+        self,
+        page: CdpPrivateWebPage,
+        *,
+        confirmation: bool = False,
+    ) -> None:
+        page._bound_delete_ad_id = AD_ID
+        page._delete_confirmation_attempted = confirmation
+        page._last_delete_snapshot = PrivateWebDeleteSnapshot(
+            state=PrivateWebEditorState.READY,
+            ad_id=AD_ID,
+        )
+
+    def test_delete_control_expression_is_exact_target_and_browser_level_only(self) -> None:
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: None,
+        )
+        expression = page._delete_control_expression(AD_ID)
+
+        self.assertIn("/m-meine-anzeigen.html", expression)
+        self.assertIn("/p-anzeige-bearbeiten.html", expression)
+        self.assertIn('url.searchParams.get("adId")', expression)
+        self.assertIn('label(element) === "löschen"', expression)
+        self.assertIn("targetEditLinks.length > 1", expression)
+        self.assertIn("editIds.length === 1", expression)
+        self.assertIn("controls.length === 1", expression)
+        self.assertIn("elementFromPoint", expression)
+        self.assertNotIn(".click(", expression)
+        javascript_check = subprocess.run(
+            ["node", "--check", "-"],
+            input=expression,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(
+            javascript_check.returncode,
+            0,
+            javascript_check.stdout + javascript_check.stderr,
+        )
+
+    def test_delete_confirmation_expression_matches_observed_single_delete_modal(self) -> None:
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: None,
+        )
+        expression = page._delete_confirmation_expression(AD_ID)
+
+        self.assertIn("/m-meine-anzeigen.html", expression)
+        self.assertIn("#delete-container", expression)
+        self.assertIn("#delete-celebration-sbmt", expression)
+        self.assertIn("anzeige löschen", expression)
+        self.assertIn(
+            "bist du sicher, dass du die anzeige löschen möchtest?",
+            expression,
+        )
+        self.assertIn("ja, anzeige löschen", expression)
+        self.assertIn("abbrechen", expression)
+        self.assertIn("elementFromPoint", expression)
+        self.assertNotIn(".click(", expression)
+        javascript_check = subprocess.run(
+            ["node", "--check", "-"],
+            input=expression,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(
+            javascript_check.returncode,
+            0,
+            javascript_check.stdout + javascript_check.stderr,
+        )
+
+    def test_open_delete_controls_follows_management_pagination_to_target(self) -> None:
+        values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+            {
+                "state": "target_absent",
+                "page_ad_ids": ["1111111111"],
+                "next_page": {"x": 40.0, "y": 60.0},
+            },
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+            },
+        ]
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                if not values:
+                    raise AssertionError("unexpected Runtime.evaluate")
+                value = values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+            sleep=lambda _seconds: None,
+        )
+
+        page.open_delete_controls(AD_ID)
+
+        self.assertEqual(values, [])
+        self.assertEqual(page._bound_delete_ad_id, AD_ID)
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+
+    def test_open_delete_controls_waits_for_transient_next_control(self) -> None:
+        values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+            {
+                "state": "target_absent",
+                "page_ad_ids": ["1111111111"],
+                "next_page": None,
+            },
+            {
+                "state": "target_absent",
+                "page_ad_ids": ["1111111111"],
+                "next_page": {"x": 40.0, "y": 60.0},
+            },
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+            },
+        ]
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                if not values:
+                    raise AssertionError("unexpected Runtime.evaluate")
+                value = values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+            sleep=lambda _seconds: None,
+        )
+
+        page.open_delete_controls(AD_ID)
+
+        self.assertEqual(values, [])
+        self.assertEqual(page._bound_delete_ad_id, AD_ID)
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+
+    def test_open_delete_controls_last_page_miss_is_bounded_and_no_input(self) -> None:
+        setup_values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+        ]
+        last_page = {
+            "state": "target_absent",
+            "page_ad_ids": ["1111111111"],
+            "next_page": None,
+        }
+        monotonic_values = iter((0.0, 0.0, 0.1))
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                value = setup_values.pop(0) if setup_values else last_page
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                raise AssertionError("pagination input must not be attempted")
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            timeout_seconds=0.1,
+            client_factory=lambda: client,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(monotonic_values),
+        )
+
+        with self.assertRaisesRegex(PrivateWebCdpError, "navigate_delete"):
+            page.open_delete_controls(AD_ID)
+
+        self.assertIsNone(page._bound_delete_ad_id)
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            0,
+        )
+
+    def test_open_delete_confirmation_uses_one_browser_input_pair(self) -> None:
+        runtime_values = [
+            {"x": 10.0, "y": 20.0},
+            {"state": "ready", "ad_id": AD_ID},
+        ]
+
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        self.bind_delete(page)
+
+        page.open_delete_confirmation()
+
+        self.assertTrue(page._delete_confirmation_attempted)
+        self.assertEqual(runtime_values, [])
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+
+    def test_open_delete_confirmation_input_failure_is_unknown_no_retry(self) -> None:
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                raise RuntimeError("browser response lost")
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        self.bind_delete(page)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            page.open_delete_confirmation()
+
+        self.assertEqual(caught.exception.stage, "delete_open_confirmation")
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            1,
+        )
+        with self.assertRaisesRegex(
+            PrivateWebCdpError,
+            "delete_confirmation_already_attempted",
+        ):
+            page.open_delete_confirmation()
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            1,
+        )
+
+    def test_submit_delete_uses_one_confirm_input_pair_and_settles(self) -> None:
+        runtime_values = [
+            {"x": 10.0, "y": 20.0},
+            True,
+        ]
+
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        self.bind_delete(page, confirmation=True)
+
+        page.submit_delete()
+
+        self.assertEqual(runtime_values, [])
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+        with self.assertRaisesRegex(
+            PrivateWebCdpError,
+            "delete_submit_already_attempted",
+        ):
+            page.submit_delete()
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+
+    def test_submit_delete_provider_failure_after_input_is_unknown_no_retry(self) -> None:
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                raise RuntimeError("provider response lost")
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        self.bind_delete(page, confirmation=True)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            page.submit_delete()
+
+        self.assertEqual(caught.exception.stage, "delete_submit")
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            1,
+        )
+        with self.assertRaisesRegex(
+            PrivateWebCdpError,
+            "delete_submit_already_attempted",
+        ):
+            page.submit_delete()
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            1,
+        )
+
+    def test_submit_delete_settlement_timeout_is_unknown_no_retry(self) -> None:
+        runtime_values = [
+            {"x": 10.0, "y": 20.0},
+            False,
+        ]
+        monotonic_values = iter((0.0, 0.1))
+
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            timeout_seconds=0.1,
+            client_factory=lambda: client,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(monotonic_values),
+        )
+        self.bind_delete(page, confirmation=True)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            page.submit_delete()
+
+        self.assertEqual(caught.exception.stage, "delete_submit_settle")
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+        with self.assertRaisesRegex(
+            PrivateWebCdpError,
+            "delete_submit_already_attempted",
+        ):
+            page.submit_delete()
 
 
 if __name__ == "__main__":

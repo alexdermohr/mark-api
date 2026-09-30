@@ -15,9 +15,17 @@ from .adapters.management import (
     TransportFailure,
 )
 from .domain import LifecycleState
-from .ports import AdContentUpdater, AdStateWriter, AdsReader, WriteNotAttemptedError
+from .ports import (
+    AdContentUpdater,
+    AdDeleteWriter,
+    AdStateWriter,
+    AdsReader,
+    WriteNotAttemptedError,
+)
 from .private_web import (
     PrivateWebContentWriter,
+    PrivateWebDeletePage,
+    PrivateWebDeleteWriter,
     PrivateWebPage,
     PrivateWebStatePage,
     PrivateWebStateWriter,
@@ -70,7 +78,12 @@ class _NoRedirectManagementTransport:
             raise TransportFailure(type(exc).__name__) from exc
 
 
-class _CloseablePrivateWebPage(PrivateWebPage, PrivateWebStatePage, Protocol):
+class _CloseablePrivateWebPage(
+    PrivateWebPage,
+    PrivateWebStatePage,
+    PrivateWebDeletePage,
+    Protocol,
+):
     def close(self) -> None:
         ...
 
@@ -162,8 +175,38 @@ class _PerCallPrivateWebStateWriter:
                 pass
 
 
+class _PerCallPrivateWebDeleteWriter:
+    """Use one fresh browser-page adapter for each explicit delete write."""
+
+    def __init__(
+        self,
+        *,
+        page_factory: Callable[[], _CloseablePrivateWebPage],
+        ensure_open: Callable[[], None],
+    ) -> None:
+        self._page_factory = page_factory
+        self._ensure_open = ensure_open
+
+    def delete_ad(self, ad_id: str) -> None:
+        self._ensure_open()
+        try:
+            page = self._page_factory()
+        except WriteNotAttemptedError:
+            raise
+        except Exception:
+            raise PrivateWebRuntimeSetupError("private Web page setup failed") from None
+        try:
+            PrivateWebDeleteWriter(page).delete_ad(ad_id)
+        finally:
+            try:
+                page.close()
+            except Exception:
+                # Cleanup must not replace a classified writer outcome.
+                pass
+
+
 class PrivateWebContentRuntime:
-    """Compose target-bound private-Web content/state reads and writes.
+    """Compose target-bound private-Web content/state/delete reads and writes.
 
     The caller owns the browser worker/process. This bundle only consumes an
     already-running loopback CDP endpoint. It creates short-lived page adapters
@@ -187,6 +230,10 @@ class PrivateWebContentRuntime:
             ensure_open=self._ensure_open,
         )
         self.state_writer: AdStateWriter = _PerCallPrivateWebStateWriter(
+            page_factory=page_factory,
+            ensure_open=self._ensure_open,
+        )
+        self.delete_writer: AdDeleteWriter = _PerCallPrivateWebDeleteWriter(
             page_factory=page_factory,
             ensure_open=self._ensure_open,
         )

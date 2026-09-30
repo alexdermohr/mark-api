@@ -88,6 +88,44 @@ class PrivateWebStateSnapshot:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class PrivateWebDeleteSnapshot:
+    state: PrivateWebEditorState
+    ad_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, PrivateWebEditorState):
+            raise TypeError("state must be PrivateWebEditorState")
+        if self.state is PrivateWebEditorState.READY:
+            if self.ad_id is None:
+                raise ValueError("ready delete snapshot requires ad_id")
+            _validated_ad_id(self.ad_id)
+            return
+        if self.ad_id is not None:
+            raise ValueError(
+                "non-ready delete snapshots must not expose ad_id"
+            )
+
+
+class PrivateWebDeletePage(Protocol):
+    """Minimal browser-page boundary for deleting one owner ad."""
+
+    def open_delete_controls(self, ad_id: str) -> None:
+        ...
+
+    def read_delete_controls(self) -> PrivateWebDeleteSnapshot:
+        ...
+
+    def open_delete_confirmation(self) -> None:
+        ...
+
+    def read_delete_confirmation(self) -> PrivateWebDeleteSnapshot:
+        ...
+
+    def submit_delete(self) -> None:
+        ...
+
+
 class PrivateWebStatePage(Protocol):
     """Minimal browser-page boundary for one owner's lifecycle control."""
 
@@ -369,5 +407,93 @@ class PrivateWebStateWriter:
             "submit_state",
             self._page.submit_state,
             target_state,
+            unmarked_error_may_be_submit=True,
+        )
+
+
+class PrivateWebDeleteWriter:
+    """Delete exactly one owner ad through the normal Web UI.
+
+    The first browser activation only opens Kleinanzeigen's explicit single-ad
+    confirmation modal. The second activation is the sole platform delete
+    attempt. This adapter never retries either activation; authoritative success
+    remains the surrounding SafeWriteOrchestrator's owner-inventory readback.
+    """
+
+    def __init__(self, page: PrivateWebDeletePage) -> None:
+        self._page = page
+
+    @staticmethod
+    def _require_ready(
+        snapshot: PrivateWebDeleteSnapshot,
+        *,
+        target_ad_id: str,
+        stage: str,
+    ) -> None:
+        if not isinstance(snapshot, PrivateWebDeleteSnapshot):
+            raise PrivateWebPreconditionError(f"{stage}:invalid_snapshot")
+        if snapshot.state is not PrivateWebEditorState.READY:
+            raise PrivateWebPreconditionError(
+                f"{stage}:{snapshot.state.value}"
+            )
+        if snapshot.ad_id != target_ad_id:
+            raise PrivateWebPreconditionError(f"{stage}:ad_id_mismatch")
+
+    def _call(
+        self,
+        stage: str,
+        func,
+        *args,
+        unmarked_error_may_be_submit: bool = False,
+    ):
+        try:
+            return func(*args)
+        except PrivateWebSubmitUnknownError:
+            raise
+        except WriteNotAttemptedError:
+            raise PrivateWebWriteNotAttemptedError(stage) from None
+        except Exception:  # noqa: BLE001 - sanitize browser/provider boundary.
+            error_type = (
+                PrivateWebInteractionError
+                if unmarked_error_may_be_submit
+                else PrivateWebWriteNotAttemptedError
+            )
+            raise error_type(stage) from None
+
+    def delete_ad(self, ad_id: str) -> None:
+        target_ad_id = _validated_ad_id(ad_id)
+
+        self._call(
+            "open_delete_controls",
+            self._page.open_delete_controls,
+            target_ad_id,
+        )
+        before = self._call(
+            "read_delete_before",
+            self._page.read_delete_controls,
+        )
+        self._require_ready(
+            before,
+            target_ad_id=target_ad_id,
+            stage="before",
+        )
+
+        self._call(
+            "open_delete_confirmation",
+            self._page.open_delete_confirmation,
+        )
+        confirmation = self._call(
+            "read_delete_confirmation",
+            self._page.read_delete_confirmation,
+        )
+        self._require_ready(
+            confirmation,
+            target_ad_id=target_ad_id,
+            stage="confirmation",
+        )
+
+        self._call(
+            "submit_delete",
+            self._page.submit_delete,
             unmarked_error_may_be_submit=True,
         )
