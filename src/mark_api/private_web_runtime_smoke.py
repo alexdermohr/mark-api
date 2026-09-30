@@ -214,21 +214,25 @@ def run_private_web_runtime_smoke(
                 if not isinstance(ranking, list):
                     raise RuntimeError("dashboard analytics ranking is not a list")
 
-                post_error = _expect_http_error(
-                    opener,
-                    Request(
+                write_methods_rejected = True
+                for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+                    request = Request(
                         base + "/api/ads",
-                        data=b"{}",
-                        method="POST",
-                    ),
-                    expected_status=405,
-                )
-                post_rejected = post_error.headers.get("Allow") == "GET"
-                post_error.close()
-                if not post_rejected:
-                    raise RuntimeError(
-                        "dashboard POST rejection lacks Allow: GET"
+                        data=(b"{}" if method in {"POST", "PUT", "PATCH"} else None),
+                        method=method,
                     )
+                    method_error = _expect_http_error(
+                        opener,
+                        request,
+                        expected_status=405,
+                    )
+                    allowed = method_error.headers.get("Allow")
+                    method_error.close()
+                    if allowed != "GET":
+                        write_methods_rejected = False
+                        raise RuntimeError(
+                            f"dashboard {method} rejection lacks Allow: GET"
+                        )
 
                 missing_write_route = _expect_http_error(
                     opener,
@@ -243,6 +247,35 @@ def run_private_web_runtime_smoke(
                 if thread.is_alive():
                     raise RuntimeError("dashboard smoke server did not stop")
 
+            metric_values = {
+                field_name: [
+                    value
+                    for item in snapshots
+                    if (value := getattr(item, field_name)) is not None
+                ]
+                for field_name in ("views", "watch_count", "reply_count")
+            }
+            expected_summary = {
+                "tracked_ads": len(snapshots),
+                "current_ads": sum(
+                    item.lifecycle_state is not LifecycleState.ABSENT
+                    for item in snapshots
+                ),
+                "absent_ads": sum(
+                    item.lifecycle_state is LifecycleState.ABSENT
+                    for item in snapshots
+                ),
+                "unknown_state_ads": sum(
+                    item.lifecycle_state is LifecycleState.UNKNOWN
+                    for item in snapshots
+                ),
+                "views_total_known": sum(metric_values["views"]),
+                "views_observed_ads": len(metric_values["views"]),
+                "watch_total_known": sum(metric_values["watch_count"]),
+                "watch_observed_ads": len(metric_values["watch_count"]),
+                "replies_total_known": sum(metric_values["reply_count"]),
+                "replies_observed_ads": len(metric_values["reply_count"]),
+            }
             expected_ads = {
                 item.ad_id: {
                     "ad_id": item.ad_id,
@@ -297,8 +330,17 @@ def run_private_web_runtime_smoke(
                     ):
                         raise TypeError("invalid analytics ranking value")
                     ranked_views.append((str(item["ad_id"]), value))
-                tracked_ads = int(summary["tracked_ads"])
-                current_ads = int(summary["current_ads"])
+                projected_summary = {
+                    key: summary[key]
+                    for key in expected_summary
+                }
+                if (
+                    set(summary) != set(expected_summary)
+                    or any(type(value) is not int for value in projected_summary.values())
+                ):
+                    raise TypeError("invalid dashboard summary")
+                tracked_ads = projected_summary["tracked_ads"]
+                current_ads = projected_summary["current_ads"]
             except (KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError(
                     "dashboard inventory projections are malformed"
@@ -312,9 +354,9 @@ def run_private_web_runtime_smoke(
                 raise RuntimeError(
                     "dashboard ads projection does not match inventory"
                 )
-            if tracked_ads != len(snapshots):
+            if projected_summary != expected_summary:
                 raise RuntimeError(
-                    "dashboard tracked count does not match inventory"
+                    "dashboard summary does not match inventory"
                 )
             if (
                 len(ranking) != len(expected_views_ranking)
@@ -334,7 +376,7 @@ def run_private_web_runtime_smoke(
                 dashboard_current_ads=current_ads,
                 dashboard_ads=len(ads),
                 analytics_ranked_ads=len(ranking),
-                http_write_methods_rejected=post_rejected,
+                http_write_methods_rejected=write_methods_rejected,
                 write_route_absent=True,
             )
     finally:

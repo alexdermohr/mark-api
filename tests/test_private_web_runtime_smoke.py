@@ -107,6 +107,73 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
         self.assertTrue(report.write_route_absent)
         self.assertFalse(report.platform_writes_enabled)
 
+    def test_smoke_rejects_corrupted_dashboard_summary(self) -> None:
+        original_json_get = runtime_smoke._json_get
+
+        for field_name in ("current_ads", "views_total_known"):
+            with self.subTest(field_name=field_name):
+                runtime = FakeInventoryRuntime(
+                    ReadResult.success_nonempty(
+                        (snapshot("1234567890", views=7),)
+                    )
+                )
+
+                def corrupt_summary(opener, base: str, path: str):
+                    payload = original_json_get(opener, base, path)
+                    if path == "/api/summary":
+                        assert isinstance(payload, dict)
+                        row = dict(payload)
+                        row[field_name] = int(row[field_name]) + 1
+                        return row
+                    return payload
+
+                with patch(
+                    "mark_api.private_web_runtime_smoke._json_get",
+                    side_effect=corrupt_summary,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "dashboard summary does not match inventory",
+                    ):
+                        run_private_web_runtime_smoke(
+                            19610,
+                            runtime_factory=lambda **_kwargs: runtime,
+                        )
+
+                self.assertEqual(runtime.close_calls, 1)
+
+    def test_smoke_exercises_all_http_write_methods(self) -> None:
+        runtime = FakeInventoryRuntime(
+            ReadResult.success_nonempty((snapshot("1234567890"),))
+        )
+        original_expect_http_error = runtime_smoke._expect_http_error
+        methods: list[str] = []
+
+        def record_method(opener, request, *, expected_status: int):
+            if expected_status == 405:
+                methods.append(request.get_method())
+            return original_expect_http_error(
+                opener,
+                request,
+                expected_status=expected_status,
+            )
+
+        with patch(
+            "mark_api.private_web_runtime_smoke._expect_http_error",
+            side_effect=record_method,
+        ):
+            report = run_private_web_runtime_smoke(
+                19610,
+                runtime_factory=lambda **_kwargs: runtime,
+            )
+
+        self.assertEqual(
+            methods,
+            ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        )
+        self.assertTrue(report.http_write_methods_rejected)
+        self.assertEqual(runtime.close_calls, 1)
+
     def test_smoke_rejects_corrupted_dashboard_fields_with_same_ids(self) -> None:
         runtime = FakeInventoryRuntime(
             ReadResult.success_nonempty((snapshot("1234567890"),))
