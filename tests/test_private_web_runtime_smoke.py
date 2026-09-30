@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mark_api.domain import AdSnapshot, LifecycleState
+import mark_api.private_web_runtime_smoke as runtime_smoke
 from mark_api.private_web_runtime_smoke import run_private_web_runtime_smoke
 from mark_api.results import ReadResult, ReadStatus
 
@@ -105,6 +106,66 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
         self.assertTrue(report.http_write_methods_rejected)
         self.assertTrue(report.write_route_absent)
         self.assertFalse(report.platform_writes_enabled)
+
+    def test_smoke_rejects_corrupted_dashboard_fields_with_same_ids(self) -> None:
+        runtime = FakeInventoryRuntime(
+            ReadResult.success_nonempty((snapshot("1234567890"),))
+        )
+        original_json_get = runtime_smoke._json_get
+
+        def corrupt_projection(opener, base: str, path: str):
+            payload = original_json_get(opener, base, path)
+            if path == "/api/ads":
+                assert isinstance(payload, list)
+                rows = [dict(item) for item in payload]
+                rows[0]["title"] = "corrupted title"
+                return rows
+            return payload
+
+        with patch(
+            "mark_api.private_web_runtime_smoke._json_get",
+            side_effect=corrupt_projection,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "dashboard ads projection does not match inventory",
+            ):
+                run_private_web_runtime_smoke(
+                    19610,
+                    runtime_factory=lambda **_kwargs: runtime,
+                )
+
+        self.assertEqual(runtime.close_calls, 1)
+
+    def test_smoke_rejects_incorrect_analytics_value_with_same_id(self) -> None:
+        runtime = FakeInventoryRuntime(
+            ReadResult.success_nonempty((snapshot("1234567890", views=7),))
+        )
+        original_json_get = runtime_smoke._json_get
+
+        def corrupt_ranking(opener, base: str, path: str):
+            payload = original_json_get(opener, base, path)
+            if path == "/api/analytics/ads?metric=views":
+                assert isinstance(payload, list)
+                rows = [dict(item) for item in payload]
+                rows[0]["value"] = 8
+                return rows
+            return payload
+
+        with patch(
+            "mark_api.private_web_runtime_smoke._json_get",
+            side_effect=corrupt_ranking,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "dashboard analytics views ranking does not match inventory",
+            ):
+                run_private_web_runtime_smoke(
+                    19610,
+                    runtime_factory=lambda **_kwargs: runtime,
+                )
+
+        self.assertEqual(runtime.close_calls, 1)
 
     def test_success_empty_inventory_is_valid_and_stays_read_only(self) -> None:
         runtime = FakeInventoryRuntime(ReadResult.success_empty(()))

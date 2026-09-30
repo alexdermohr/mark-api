@@ -12,7 +12,7 @@ from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 from .dashboard import create_server
-from .domain import AdSnapshot
+from .domain import AdSnapshot, LifecycleState
 from .private_web_runtime import build_private_web_inventory_runtime
 from .results import ReadResult
 from .storage import SnapshotStore
@@ -243,18 +243,60 @@ def run_private_web_runtime_smoke(
                 if thread.is_alive():
                     raise RuntimeError("dashboard smoke server did not stop")
 
-            expected_ids = {item.ad_id for item in snapshots}
+            expected_ads = {
+                item.ad_id: {
+                    "ad_id": item.ad_id,
+                    "lifecycle_state": item.lifecycle_state.value,
+                    "present": item.lifecycle_state is not LifecycleState.ABSENT,
+                    "observed_at": item.observed_at.isoformat(),
+                    "source": item.source,
+                    "title": item.title,
+                    "description": item.description,
+                    "views": item.views,
+                    "watch_count": item.watch_count,
+                    "reply_count": item.reply_count,
+                }
+                for item in snapshots
+            }
+            expected_views_ranking = sorted(
+                (
+                    (item.ad_id, item.views)
+                    for item in snapshots
+                    if item.views is not None
+                ),
+                key=lambda pair: (-pair[1], pair[0]),
+            )
             try:
-                projected_ids = {
-                    str(item["ad_id"])
+                projected_ads = {
+                    str(item["ad_id"]): {
+                        "ad_id": str(item["ad_id"]),
+                        "lifecycle_state": item["lifecycle_state"],
+                        "present": item["present"],
+                        "observed_at": item["observed_at"],
+                        "source": item["source"],
+                        "title": item["title"],
+                        "description": item["description"],
+                        "views": item["views"],
+                        "watch_count": item["watch_count"],
+                        "reply_count": item["reply_count"],
+                    }
                     for item in ads
                     if isinstance(item, dict)
                 }
-                ranked_ids = {
-                    str(item["ad_id"])
-                    for item in ranking
-                    if isinstance(item, dict)
-                }
+                ranked_views: list[tuple[str, int]] = []
+                for item in ranking:
+                    if (
+                        not isinstance(item, dict)
+                        or item.get("metric") != "views"
+                    ):
+                        raise TypeError("invalid analytics ranking row")
+                    value = item.get("value")
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                    ):
+                        raise TypeError("invalid analytics ranking value")
+                    ranked_views.append((str(item["ad_id"]), value))
                 tracked_ads = int(summary["tracked_ads"])
                 current_ads = int(summary["current_ads"])
             except (KeyError, TypeError, ValueError) as exc:
@@ -262,7 +304,11 @@ def run_private_web_runtime_smoke(
                     "dashboard inventory projections are malformed"
                 ) from exc
 
-            if len(ads) != len(snapshots) or projected_ids != expected_ids:
+            if (
+                len(ads) != len(snapshots)
+                or len(projected_ads) != len(ads)
+                or projected_ads != expected_ads
+            ):
                 raise RuntimeError(
                     "dashboard ads projection does not match inventory"
                 )
@@ -270,9 +316,13 @@ def run_private_web_runtime_smoke(
                 raise RuntimeError(
                     "dashboard tracked count does not match inventory"
                 )
-            if not ranked_ids.issubset(expected_ids):
+            if (
+                len(ranking) != len(expected_views_ranking)
+                or len(ranked_views) != len(ranking)
+                or ranked_views != expected_views_ranking
+            ):
                 raise RuntimeError(
-                    "dashboard analytics ranking contains unknown ads"
+                    "dashboard analytics views ranking does not match inventory"
                 )
 
             return PrivateWebRuntimeSmokeReport(
