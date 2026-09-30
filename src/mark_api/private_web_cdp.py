@@ -1057,7 +1057,11 @@ class CdpPrivateWebPage:
                         probe_state == "target_absent"
                         and page_fingerprint is not None
                         and page_fingerprint != prior_page_fingerprint
+                        and next_point is not None
                     ):
+                        # The ad list can settle before the pager. A missing
+                        # eligible Next control is provisional until this
+                        # bounded page deadline expires.
                         break
                     if self._monotonic() >= page_deadline:
                         raise PrivateWebCdpError("navigate_state")

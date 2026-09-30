@@ -1720,7 +1720,7 @@ class CdpPrivateWebStatePageTests(unittest.TestCase):
         self.assertIn("elementFromPoint", pagination_expression)
         self.assertNotIn(".click(", pagination_expression)
 
-    def test_open_state_controls_fails_closed_when_target_is_absent_on_last_page(self) -> None:
+    def test_open_state_controls_waits_for_transient_next_control(self) -> None:
         values = [
             True,
             {"readyState": "complete", "oldDocument": False},
@@ -1728,6 +1728,16 @@ class CdpPrivateWebStatePageTests(unittest.TestCase):
                 "state": "target_absent",
                 "page_ad_ids": ["1111111111"],
                 "next_page": None,
+            },
+            {
+                "state": "target_absent",
+                "page_ad_ids": ["1111111111"],
+                "next_page": {"x": 40.0, "y": 60.0},
+            },
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "lifecycle_state": "active",
             },
         ]
 
@@ -1740,7 +1750,7 @@ class CdpPrivateWebStatePageTests(unittest.TestCase):
                 value = values.pop(0)
                 return {"result": {"type": "object", "value": value}}
             if method == "Input.dispatchMouseEvent":
-                raise AssertionError("pagination input must not be attempted")
+                return {}
             raise AssertionError(f"unexpected method: {method}")
 
         client = FakeClient(handler)
@@ -1750,20 +1760,65 @@ class CdpPrivateWebStatePageTests(unittest.TestCase):
             sleep=lambda _seconds: None,
         )
 
+        page.open_state_controls(AD_ID)
+
+        self.assertEqual(values, [])
+        self.assertEqual(page._bound_state_ad_id, AD_ID)
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+
+    def test_open_state_controls_fails_closed_when_target_is_absent_on_last_page(self) -> None:
+        setup_values = [
+            True,
+            {"readyState": "complete", "oldDocument": False},
+        ]
+        last_page = {
+            "state": "target_absent",
+            "page_ad_ids": ["1111111111"],
+            "next_page": None,
+        }
+        monotonic_values = iter((0.0, 0.0, 0.05, 0.1))
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                value = setup_values.pop(0) if setup_values else last_page
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                raise AssertionError("pagination input must not be attempted")
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            timeout_seconds=0.1,
+            client_factory=lambda: client,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(monotonic_values),
+        )
+
         with self.assertRaises(PrivateWebCdpError) as caught:
             page.open_state_controls(AD_ID)
 
         self.assertEqual(caught.exception.stage, "navigate_state")
         self.assertIsNone(page._bound_state_ad_id)
-        self.assertEqual(values, [])
+        self.assertEqual(setup_values, [])
         self.assertEqual(
-            [method for method, _params in client.calls],
-            [
-                "Runtime.evaluate",
-                "Page.navigate",
-                "Runtime.evaluate",
-                "Runtime.evaluate",
-            ],
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            0,
+        )
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Runtime.evaluate"
+            ),
+            4,
         )
 
     def test_read_state_controls_is_exact_owner_and_control_bound(self) -> None:
