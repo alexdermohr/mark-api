@@ -1815,14 +1815,19 @@ process.stdout.write(JSON.stringify(result));
                 self.assertIsNone(page._last_state_snapshot)
 
     def test_state_submit_uses_one_browser_level_hit_tested_activation(self) -> None:
+        runtime_values = [
+            {"x": 120.5, "y": 240.25},
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "lifecycle_state": "paused",
+            },
+        ]
+
         def handler(method, params):
             if method == "Runtime.evaluate":
-                return {
-                    "result": {
-                        "type": "object",
-                        "value": {"x": 120.5, "y": 240.25},
-                    }
-                }
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
             if method == "Input.dispatchMouseEvent":
                 return {}
             raise AssertionError(f"unexpected method: {method}")
@@ -1842,6 +1847,7 @@ process.stdout.write(JSON.stringify(result));
                 "Runtime.evaluate",
                 "Input.dispatchMouseEvent",
                 "Input.dispatchMouseEvent",
+                "Runtime.evaluate",
             ],
         )
         expression = client.calls[0][1]["expression"]
@@ -1894,18 +1900,24 @@ process.stdout.write(JSON.stringify(result));
             page.submit_state(LifecycleState.PAUSED)
 
     def test_activate_requires_paused_snapshot_and_activate_control(self) -> None:
-        client = FakeClient(
-            lambda method, params: (
-                {
-                    "result": {
-                        "type": "object",
-                        "value": {"x": 10.0, "y": 20.0},
-                    }
-                }
-                if method == "Runtime.evaluate"
-                else {}
-            )
-        )
+        runtime_values = [
+            {"x": 10.0, "y": 20.0},
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "lifecycle_state": "active",
+            },
+        ]
+
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
         page = CdpPrivateWebPage(
             "http://127.0.0.1:19610",
             client_factory=lambda: client,
@@ -1951,6 +1963,109 @@ process.stdout.write(JSON.stringify(result));
             "state_submit_already_attempted",
         ):
             page.submit_state(LifecycleState.PAUSED)
+
+    def test_state_submit_waits_for_delayed_lifecycle_settlement(self) -> None:
+        runtime_values = [
+            {"x": 10.0, "y": 20.0},
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "lifecycle_state": "active",
+            },
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "lifecycle_state": "paused",
+            },
+        ]
+        sleeps: list[float] = []
+
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+            sleep=sleeps.append,
+        )
+        self.bind_state(page, LifecycleState.ACTIVE)
+
+        page.submit_state(LifecycleState.PAUSED)
+
+        self.assertEqual(sleeps, [0.05])
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            [
+                "Runtime.evaluate",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+                "Runtime.evaluate",
+                "Runtime.evaluate",
+            ],
+        )
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+
+    def test_state_submit_settlement_timeout_is_unknown_and_never_retried(self) -> None:
+        runtime_values = [
+            {"x": 10.0, "y": 20.0},
+            {
+                "state": "ready",
+                "ad_id": AD_ID,
+                "lifecycle_state": "active",
+            },
+        ]
+        monotonic_values = iter((0.0, 0.1))
+
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            timeout_seconds=0.1,
+            client_factory=lambda: client,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(monotonic_values),
+        )
+        self.bind_state(page, LifecycleState.ACTIVE)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            page.submit_state(LifecycleState.PAUSED)
+
+        self.assertEqual(caught.exception.stage, "state_submit_settle")
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+        with self.assertRaisesRegex(
+            PrivateWebCdpError,
+            "state_submit_already_attempted",
+        ):
+            page.submit_state(LifecycleState.PAUSED)
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
 
     def test_state_submit_provider_failure_after_input_is_submit_unknown(self) -> None:
         def handler(method, params):

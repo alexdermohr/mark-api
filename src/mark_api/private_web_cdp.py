@@ -923,6 +923,40 @@ class CdpPrivateWebPage:
             self._last_state_snapshot = snapshot
         return snapshot
 
+    def _wait_for_state_settlement(
+        self,
+        client: _CdpClient,
+        *,
+        target_ad_id: str,
+        target_state: LifecycleState,
+    ) -> None:
+        deadline = self._monotonic() + self._timeout_seconds
+        while True:
+            try:
+                value = self._runtime_value(
+                    client,
+                    self._state_control_expression(target_ad_id),
+                )
+            except Exception:  # noqa: BLE001 - submit may already have succeeded.
+                value = None
+            if (
+                isinstance(value, dict)
+                and value.get("state") == PrivateWebEditorState.READY.value
+                and value.get("ad_id") == target_ad_id
+                and value.get("lifecycle_state") == target_state.value
+            ):
+                return
+            if self._monotonic() >= deadline:
+                raise PrivateWebSubmitUnknownError(
+                    "state_submit_settle"
+                )
+            try:
+                self._sleep(0.05)
+            except Exception:  # noqa: BLE001 - submit may already have succeeded.
+                raise PrivateWebSubmitUnknownError(
+                    "state_submit_settle"
+                ) from None
+
     def submit_state(self, state: LifecycleState) -> None:
         if not isinstance(state, LifecycleState):
             raise TypeError("state must be LifecycleState")
@@ -1012,6 +1046,12 @@ class CdpPrivateWebPage:
             )
         except Exception:  # noqa: BLE001 - possible submit is never retried.
             raise PrivateWebSubmitUnknownError("state_submit") from None
+
+        self._wait_for_state_settlement(
+            client,
+            target_ad_id=target_ad_id,
+            target_state=state,
+        )
 
 
     def _replace_field(
