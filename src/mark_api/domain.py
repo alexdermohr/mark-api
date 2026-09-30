@@ -86,6 +86,8 @@ class AdCreateRequest:
         _require_nonempty(self.title, "title")
         if self.title != self.title.strip():
             raise ValueError("title must not have surrounding whitespace")
+        if "\r" in self.title or "\n" in self.title:
+            raise ValueError("title must not contain line breaks")
         if len(self.title) > 65:
             raise ValueError("title must be <= 65 characters")
 

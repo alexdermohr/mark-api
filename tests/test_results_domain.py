@@ -79,6 +79,17 @@ class ResultAndDomainTests(unittest.TestCase):
                 price_eur=12,
             )
 
+    def test_create_request_rejects_title_line_breaks(self) -> None:
+        for line_break in ("\n", "\r", "\r\n"):
+            with self.subTest(line_break=repr(line_break)):
+                with self.assertRaisesRegex(ValueError, "title must not contain line breaks"):
+                    AdCreateRequest(
+                        category_path=("Haus & Garten", "Dekoration"),
+                        title=f"Test{line_break}anzeige",
+                        description="Beschreibung",
+                        price_eur=12,
+                    )
+
     def test_create_request_rejects_non_positive_fixed_price(self) -> None:
         with self.assertRaises(ValueError):
             AdCreateRequest(
