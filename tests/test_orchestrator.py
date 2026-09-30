@@ -10,6 +10,7 @@ from mark_api.domain import (
     OperationOutcome,
 )
 from mark_api.orchestrator import SafeWriteOrchestrator
+from mark_api.ports import WriteNotAttemptedError
 from mark_api.results import ReadResult, ReadStatus
 
 
@@ -294,6 +295,57 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
         self.assertEqual(writer.calls, 1)
+
+
+
+    def test_state_write_not_attempted_error_is_non_ambiguous(self) -> None:
+        reader = SequenceReader(
+            ReadResult.success_nonempty((snapshot(LifecycleState.ACTIVE),)),
+        )
+        writer = StateWriter(
+            error=WriteNotAttemptedError("sanitized safe failure"),
+        )
+
+        receipt = self.service().set_state(
+            ad_id="3521676801",
+            target_state=LifecycleState.PAUSED,
+            reader=reader,
+            writer=writer,
+        )
+
+        self.assertEqual(
+            receipt.outcome,
+            OperationOutcome.PRECONDITION_FAILED,
+        )
+        self.assertTrue(receipt.writer_invoked)
+        self.assertEqual(receipt.writer_error, "WriteNotAttemptedError")
+        self.assertIsNone(receipt.post_read_status)
+        self.assertIsNone(receipt.post_snapshot)
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(writer.calls, 1)
+
+    def test_state_change_same_target_state_is_precondition_noop(self) -> None:
+        for state in (LifecycleState.ACTIVE, LifecycleState.PAUSED):
+            with self.subTest(state=state):
+                reader = SequenceReader(
+                    ReadResult.success_nonempty((snapshot(state),)),
+                )
+                writer = StateWriter()
+
+                receipt = self.service().set_state(
+                    ad_id="3521676801",
+                    target_state=state,
+                    reader=reader,
+                    writer=writer,
+                )
+
+                self.assertEqual(
+                    receipt.outcome,
+                    OperationOutcome.PRECONDITION_FAILED,
+                )
+                self.assertFalse(receipt.writer_invoked)
+                self.assertEqual(writer.calls, 0)
+                self.assertEqual(reader.calls, 1)
 
     def test_state_change_wrong_precondition_does_not_write(self) -> None:
         reader = SequenceReader(

@@ -14,8 +14,14 @@ from .adapters.management import (
     ManagementReadAdapter,
     TransportFailure,
 )
-from .ports import AdContentUpdater, AdsReader
-from .private_web import PrivateWebContentWriter, PrivateWebPage
+from .domain import LifecycleState
+from .ports import AdContentUpdater, AdStateWriter, AdsReader, WriteNotAttemptedError
+from .private_web import (
+    PrivateWebContentWriter,
+    PrivateWebPage,
+    PrivateWebStatePage,
+    PrivateWebStateWriter,
+)
 from .private_web_cdp import (
     CdpCookieProvider,
     CdpPrivateWebOwnerReader,
@@ -27,8 +33,12 @@ class PrivateWebRuntimeDependencyError(RuntimeError):
     """The optional private-Web runtime dependency set is unavailable."""
 
 
-class PrivateWebRuntimeClosedError(RuntimeError):
-    """The private-Web runtime bundle has already been closed."""
+class PrivateWebRuntimeClosedError(WriteNotAttemptedError):
+    """The private-Web runtime bundle has already been closed before a write."""
+
+
+class PrivateWebRuntimeSetupError(WriteNotAttemptedError):
+    """Per-call private-Web page setup failed before any platform write."""
 
 
 class _RejectManagementRedirectHandler(HTTPRedirectHandler):
@@ -60,7 +70,7 @@ class _NoRedirectManagementTransport:
             raise TransportFailure(type(exc).__name__) from exc
 
 
-class _CloseablePrivateWebPage(PrivateWebPage, Protocol):
+class _CloseablePrivateWebPage(PrivateWebPage, PrivateWebStatePage, Protocol):
     def close(self) -> None:
         ...
 
@@ -102,7 +112,12 @@ class _PerCallPrivateWebContentWriter:
         description: str | None = None,
     ) -> None:
         self._ensure_open()
-        page = self._page_factory()
+        try:
+            page = self._page_factory()
+        except WriteNotAttemptedError:
+            raise
+        except Exception:
+            raise PrivateWebRuntimeSetupError("private Web page setup failed") from None
         try:
             PrivateWebContentWriter(page).update_content(
                 ad_id,
@@ -117,8 +132,38 @@ class _PerCallPrivateWebContentWriter:
                 pass
 
 
+class _PerCallPrivateWebStateWriter:
+    """Use one fresh browser-page adapter for each explicit lifecycle write."""
+
+    def __init__(
+        self,
+        *,
+        page_factory: Callable[[], _CloseablePrivateWebPage],
+        ensure_open: Callable[[], None],
+    ) -> None:
+        self._page_factory = page_factory
+        self._ensure_open = ensure_open
+
+    def set_state(self, ad_id: str, state: LifecycleState) -> None:
+        self._ensure_open()
+        try:
+            page = self._page_factory()
+        except WriteNotAttemptedError:
+            raise
+        except Exception:
+            raise PrivateWebRuntimeSetupError("private Web page setup failed") from None
+        try:
+            PrivateWebStateWriter(page).set_state(ad_id, state)
+        finally:
+            try:
+                page.close()
+            except Exception:
+                # Cleanup must not replace a classified writer outcome.
+                pass
+
+
 class PrivateWebContentRuntime:
-    """Compose target-bound private-Web content reads and writes.
+    """Compose target-bound private-Web content/state reads and writes.
 
     The caller owns the browser worker/process. This bundle only consumes an
     already-running loopback CDP endpoint. It creates short-lived page adapters
@@ -138,6 +183,10 @@ class PrivateWebContentRuntime:
         self._close_runtime = close_runtime
         self._closed = False
         self.content_writer: AdContentUpdater = _PerCallPrivateWebContentWriter(
+            page_factory=page_factory,
+            ensure_open=self._ensure_open,
+        )
+        self.state_writer: AdStateWriter = _PerCallPrivateWebStateWriter(
             page_factory=page_factory,
             ensure_open=self._ensure_open,
         )
@@ -198,7 +247,7 @@ def build_private_web_content_runtime(
     management_source: str = MANAGEMENT_SOURCE,
     clock: Callable[[], datetime] | None = None,
 ) -> PrivateWebContentRuntime:
-    """Build the private-account content runtime for an existing CDP worker.
+    """Build the private-account Web runtime for an existing CDP worker.
 
     This function never starts, stops, authenticates or reauthenticates a
     browser. Login/MFA/CAPTCHA/security-challenge handling remains in the

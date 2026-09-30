@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+from .domain import LifecycleState
+from .ports import WriteNotAttemptedError
+
 
 class PrivateWebEditorState(StrEnum):
     READY = "ready"
@@ -56,6 +59,48 @@ class PrivateWebEditorSnapshot:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class PrivateWebStateSnapshot:
+    state: PrivateWebEditorState
+    ad_id: str | None = None
+    lifecycle_state: LifecycleState | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, PrivateWebEditorState):
+            raise TypeError("state must be PrivateWebEditorState")
+        if self.state is PrivateWebEditorState.READY:
+            if self.ad_id is None:
+                raise ValueError("ready state snapshot requires ad_id")
+            _validated_ad_id(self.ad_id)
+            if not isinstance(self.lifecycle_state, LifecycleState):
+                raise TypeError("ready state snapshot requires LifecycleState")
+            if self.lifecycle_state not in {
+                LifecycleState.ACTIVE,
+                LifecycleState.PAUSED,
+            }:
+                raise ValueError(
+                    "ready state snapshot requires ACTIVE or PAUSED"
+                )
+            return
+        if self.ad_id is not None or self.lifecycle_state is not None:
+            raise ValueError(
+                "non-ready state snapshots must not expose ad state"
+            )
+
+
+class PrivateWebStatePage(Protocol):
+    """Minimal browser-page boundary for one owner's lifecycle control."""
+
+    def open_state_controls(self, ad_id: str) -> None:
+        ...
+
+    def read_state_controls(self) -> PrivateWebStateSnapshot:
+        ...
+
+    def submit_state(self, state: LifecycleState) -> None:
+        ...
+
+
 class PrivateWebPage(Protocol):
     """Minimal browser-page boundary for one existing owner's ad editor."""
 
@@ -79,7 +124,7 @@ class PrivateWebError(RuntimeError):
     """Base error for the private-account Web UI writer boundary."""
 
 
-class PrivateWebPreconditionError(PrivateWebError):
+class PrivateWebPreconditionError(PrivateWebError, WriteNotAttemptedError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(f"private web precondition failed: {reason}")
@@ -89,6 +134,21 @@ class PrivateWebInteractionError(PrivateWebError):
     def __init__(self, stage: str) -> None:
         self.stage = stage
         super().__init__(f"private web interaction failed at {stage}")
+
+
+class PrivateWebWriteNotAttemptedError(
+    PrivateWebInteractionError,
+    WriteNotAttemptedError,
+):
+    """A private-Web interaction failed before any platform write attempt."""
+
+
+class PrivateWebSubmitUnknownError(PrivateWebError):
+    """A browser-level activation may have reached the platform."""
+
+    def __init__(self, stage: str) -> None:
+        self.stage = stage
+        super().__init__(f"private web submit outcome unknown at {stage}")
 
 
 class PrivateWebContentWriter:
@@ -200,3 +260,114 @@ class PrivateWebContentWriter:
             )
 
         self._call("submit", self._page.submit)
+
+
+class PrivateWebStateWriter:
+    """Pause or activate exactly one owner ad through the normal Web UI."""
+
+    def __init__(self, page: PrivateWebStatePage) -> None:
+        self._page = page
+
+    @staticmethod
+    def _validated_target_state(state: LifecycleState) -> LifecycleState:
+        if not isinstance(state, LifecycleState):
+            raise TypeError("state must be LifecycleState")
+        if state not in {LifecycleState.ACTIVE, LifecycleState.PAUSED}:
+            raise ValueError("state must be ACTIVE or PAUSED")
+        return state
+
+    @staticmethod
+    def _require_ready(
+        snapshot: PrivateWebStateSnapshot,
+        *,
+        target_ad_id: str,
+        stage: str,
+    ) -> LifecycleState:
+        if not isinstance(snapshot, PrivateWebStateSnapshot):
+            raise PrivateWebPreconditionError(f"{stage}:invalid_snapshot")
+        if snapshot.state is not PrivateWebEditorState.READY:
+            raise PrivateWebPreconditionError(
+                f"{stage}:{snapshot.state.value}"
+            )
+        if snapshot.ad_id != target_ad_id:
+            raise PrivateWebPreconditionError(f"{stage}:ad_id_mismatch")
+        lifecycle_state = snapshot.lifecycle_state
+        if lifecycle_state not in {
+            LifecycleState.ACTIVE,
+            LifecycleState.PAUSED,
+        }:
+            raise PrivateWebPreconditionError(f"{stage}:invalid_lifecycle_state")
+        return lifecycle_state
+
+    def _call(
+        self,
+        stage: str,
+        func,
+        *args,
+        unmarked_error_may_be_submit: bool = False,
+    ):
+        try:
+            return func(*args)
+        except PrivateWebSubmitUnknownError:
+            raise
+        except WriteNotAttemptedError:
+            raise PrivateWebWriteNotAttemptedError(stage) from None
+        except Exception:  # noqa: BLE001 - sanitize browser/provider boundary.
+            error_type = (
+                PrivateWebInteractionError
+                if unmarked_error_may_be_submit
+                else PrivateWebWriteNotAttemptedError
+            )
+            raise error_type(stage) from None
+
+    def set_state(self, ad_id: str, state: LifecycleState) -> None:
+        target_ad_id = _validated_ad_id(ad_id)
+        target_state = self._validated_target_state(state)
+
+        self._call(
+            "open_state_controls",
+            self._page.open_state_controls,
+            target_ad_id,
+        )
+        before = self._call(
+            "read_state_before",
+            self._page.read_state_controls,
+        )
+        current_state = self._require_ready(
+            before,
+            target_ad_id=target_ad_id,
+            stage="before",
+        )
+        if current_state is target_state:
+            return
+
+        expected_pre_state = (
+            LifecycleState.PAUSED
+            if target_state is LifecycleState.ACTIVE
+            else LifecycleState.ACTIVE
+        )
+        if current_state is not expected_pre_state:
+            raise PrivateWebPreconditionError("before:state_mismatch")
+
+        before_submit = self._call(
+            "read_state_before_submit",
+            self._page.read_state_controls,
+        )
+        current_before_submit = self._require_ready(
+            before_submit,
+            target_ad_id=target_ad_id,
+            stage="before_submit",
+        )
+        if current_before_submit is target_state:
+            return
+        if current_before_submit is not expected_pre_state:
+            raise PrivateWebPreconditionError(
+                "before_submit:state_drift"
+            )
+
+        self._call(
+            "submit_state",
+            self._page.submit_state,
+            target_state,
+            unmarked_error_may_be_submit=True,
+        )

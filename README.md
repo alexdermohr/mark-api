@@ -111,7 +111,7 @@ Für diese Runtime muss das deklarierte optionale Extra installiert sein:
 python -m pip install -e '.[private-web]'
 ```
 
-`build_private_web_content_runtime(cdp_port=...)` liefert anschließend genau zwei für den Application-Layer bestimmte Flächen: `content_writer` und die target-bound Factory `content_reader_for(ad_id)`. Jede Writer-Operation erhält eine frische `CdpPrivateWebPage`; jeder Content-Read ist an genau die angeforderte eigene Anzeigen-ID gebunden. `MarkService` kann diese Factory optional injizieren und konstruiert sie bei deaktivierten Writes nicht.
+`build_private_web_content_runtime(cdp_port=...)` liefert anschließend drei für den Application-Layer bestimmte Flächen: `content_writer`, `state_writer` und die target-bound Factory `content_reader_for(ad_id)`. Jede Content- oder Lifecycle-Writer-Operation erhält eine frische `CdpPrivateWebPage`; jeder Content-Read ist an genau die angeforderte eigene Anzeigen-ID gebunden. `MarkService` kann den `state_writer` für `pause()`/`activate()` verwenden; der autoritative Lifecycle-Pre-/Post-Read bleibt dabei der Management-Reader. Die target-bound Content-Reader-Factory wird weiterhin erst bei einem tatsächlich zugelassenen Content-Write konstruiert.
 
 ## Offene fachliche Punkte
 

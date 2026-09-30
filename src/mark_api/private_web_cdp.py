@@ -10,18 +10,24 @@ from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
-from .domain import AdSnapshot
-from .ports import AdsReader
+from .domain import AdSnapshot, LifecycleState
+from .ports import AdsReader, WriteNotAttemptedError
 from .private_web import (
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
+    PrivateWebStateSnapshot,
+    PrivateWebSubmitUnknownError,
     _validated_ad_id,
 )
 from .results import ReadResult, ReadStatus
 
 _KLEINANZEIGEN_ORIGIN = "https://www.kleinanzeigen.de"
 _EDITOR_PATH = "/p-anzeige-bearbeiten.html"
-_POST_SUBMIT_PATH = "/m-meine-anzeigen.html"
+_MANAGEMENT_PATH = "/m-meine-anzeigen.html"
+# Keep this fail-closed traversal bound aligned with the Management reader
+# without importing adapter modules into the browser/CDP boundary.
+_MANAGEMENT_MAX_PAGES = 100
+_POST_SUBMIT_PATH = _MANAGEMENT_PATH
 _MAX_TARGET_BYTES = 64 * 1024
 
 
@@ -40,6 +46,13 @@ class PrivateWebCdpError(RuntimeError):
     def __init__(self, stage: str) -> None:
         self.stage = stage
         super().__init__(f"private web cdp failed at {stage}")
+
+
+class PrivateWebCdpWriteNotAttemptedError(
+    PrivateWebCdpError,
+    WriteNotAttemptedError,
+):
+    """CDP failed before browser input could reach the platform."""
 
 
 class _CdpClient(Protocol):
@@ -346,6 +359,9 @@ class CdpPrivateWebPage:
         self._submit_attempted = False
         self._bound_ad_id: str | None = None
         self._last_ready_snapshot: PrivateWebEditorSnapshot | None = None
+        self._state_submit_attempted = False
+        self._bound_state_ad_id: str | None = None
+        self._last_state_snapshot: PrivateWebStateSnapshot | None = None
 
     @classmethod
     def from_port(
@@ -370,6 +386,8 @@ class CdpPrivateWebPage:
         self._client_instance = None
         self._bound_ad_id = None
         self._last_ready_snapshot = None
+        self._bound_state_ad_id = None
+        self._last_state_snapshot = None
         if client is not None:
             client.close()
 
@@ -413,6 +431,9 @@ class CdpPrivateWebPage:
         self._submit_attempted = False
         self._bound_ad_id = None
         self._last_ready_snapshot = None
+        self._state_submit_attempted = False
+        self._bound_state_ad_id = None
+        self._last_state_snapshot = None
         client = self._client()
         marker = json.dumps(
             f"__mark_private_web_navigation_probe_{target_ad_id}__"
@@ -598,6 +619,647 @@ class CdpPrivateWebPage:
         if ad_id == self._bound_ad_id:
             self._last_ready_snapshot = snapshot
         return snapshot
+
+
+    def _state_control_expression(
+        self,
+        target_ad_id: str,
+        *,
+        activation_label: str | None = None,
+        include_pagination: bool = False,
+    ) -> str:
+        origin = json.dumps(self._expected_origin)
+        management_path = json.dumps(_MANAGEMENT_PATH)
+        editor_path = json.dumps(_EDITOR_PATH)
+        ad_id = json.dumps(target_ad_id)
+        expected_control = json.dumps(activation_label)
+        allow_pagination = json.dumps(include_pagination)
+        return f"""
+(() => {{
+  const stateOnly = (state) => ({{state}});
+  const currentOrigin = location.origin;
+  const currentPath = location.pathname;
+  const targetAdId = {ad_id};
+  const editorPath = {editor_path};
+  const expectedControl = {expected_control};
+  const allowPagination = {allow_pagination};
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((element) => (element.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const hasLogin =
+    currentPath.startsWith("/u/login/") ||
+    Boolean(document.querySelector('input[type="password"]'));
+
+  if (currentOrigin !== {origin}) return stateOnly("unknown");
+  if (hasCaptcha) return stateOnly("captcha_required");
+  if (hasMfa) return stateOnly("mfa_required");
+  if (hasSecurityChallenge) return stateOnly("security_challenge");
+  if (hasLogin) return stateOnly("login_required");
+  if (currentPath !== {management_path}) return stateOnly("unknown");
+
+  const editorId = (link) => {{
+    try {{
+      const raw = link.getAttribute("href");
+      if (!raw) return null;
+      const url = new URL(raw, location.href);
+      if (url.origin !== {origin} || url.pathname !== editorPath) return null;
+      const value = url.searchParams.get("adId");
+      if (
+        typeof value !== "string" ||
+        value.length === 0 ||
+        value.length > 32 ||
+        !/^[0-9]+$/.test(value)
+      ) {{
+        return null;
+      }}
+      return value;
+    }} catch (_error) {{
+      return null;
+    }}
+  }};
+  const controlLabel = (element) =>
+    (element.innerText || "").trim().toLowerCase();
+  const isEligibleControl = (element) => {{
+    if (
+      (element instanceof HTMLButtonElement && element.disabled) ||
+      element.getAttribute("aria-disabled") === "true"
+    ) {{
+      return false;
+    }}
+    const style = getComputedStyle(element);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse" ||
+      style.pointerEvents === "none" ||
+      Number(style.opacity) === 0
+    ) {{
+      return false;
+    }}
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }};
+  const lifecycleControls = (root) =>
+    Array.from(root.querySelectorAll('button, a[href], [role="button"]')).filter(
+      (element) => {{
+        const label = controlLabel(element);
+        return (
+          (label === "reservieren" || label === "aktivieren") &&
+          isEligibleControl(element)
+        );
+      }}
+    );
+  const targetEditLinks = Array.from(
+    document.querySelectorAll("a[href]")
+  ).filter((link) => editorId(link) === targetAdId);
+  if (targetEditLinks.length > 1) return stateOnly("unknown");
+
+  let bound = null;
+  if (targetEditLinks.length === 1) {{
+    let node = targetEditLinks[0].parentElement;
+    for (let depth = 0; node && depth < 10; depth += 1) {{
+      const editIds = Array.from(node.querySelectorAll("a[href]"))
+        .map(editorId)
+        .filter((value) => value !== null);
+      const controls = lifecycleControls(node);
+      if (
+        editIds.length === 1 &&
+        editIds[0] === targetAdId &&
+        controls.length === 1
+      ) {{
+        bound = {{
+          container: node,
+          control: controls[0],
+          label: controlLabel(controls[0]),
+        }};
+        break;
+      }}
+      node = node.parentElement;
+    }}
+    if (bound === null) return stateOnly("unknown");
+  }} else {{
+    if (!allowPagination) return stateOnly("unknown");
+    const pageAdIds = Array.from(document.querySelectorAll("a[href]"))
+      .map(editorId)
+      .filter((value) => value !== null);
+    const uniquePageAdIds = Array.from(new Set(pageAdIds));
+    if (uniquePageAdIds.length === 0) return stateOnly("unknown");
+
+    const nextCandidates = Array.from(
+      document.querySelectorAll('button[aria-label="Nächste"]')
+    ).filter((element) => isEligibleControl(element));
+    if (nextCandidates.length > 1) return stateOnly("unknown");
+    if (nextCandidates.length === 0) {{
+      return {{
+        state: "target_absent",
+        page_ad_ids: uniquePageAdIds,
+        next_page: null,
+      }};
+    }}
+
+    const nextControl = nextCandidates[0];
+    nextControl.scrollIntoView({{block: "center", inline: "center"}});
+    const nextRect = nextControl.getBoundingClientRect();
+    if (nextRect.width <= 0 || nextRect.height <= 0) return stateOnly("unknown");
+    const nextX = nextRect.left + nextRect.width / 2;
+    const nextY = nextRect.top + nextRect.height / 2;
+    const nextHit = document.elementFromPoint(nextX, nextY);
+    if (nextHit !== nextControl && !nextControl.contains(nextHit)) {{
+      return stateOnly("unknown");
+    }}
+    if (
+      !Number.isFinite(nextX) ||
+      !Number.isFinite(nextY) ||
+      nextX < 0 ||
+      nextY < 0 ||
+      nextX > window.innerWidth ||
+      nextY > window.innerHeight
+    ) {{
+      return stateOnly("unknown");
+    }}
+    return {{
+      state: "target_absent",
+      page_ad_ids: uniquePageAdIds,
+      next_page: {{x: nextX, y: nextY}},
+    }};
+  }}
+
+  const lifecycleState =
+    bound.label === "reservieren"
+      ? "active"
+      : bound.label === "aktivieren"
+        ? "paused"
+        : null;
+  if (lifecycleState === null) return stateOnly("unknown");
+
+  if (expectedControl === null) {{
+    return {{
+      state: "ready",
+      ad_id: targetAdId,
+      lifecycle_state: lifecycleState,
+    }};
+  }}
+  if (bound.label !== expectedControl) return null;
+
+  const control = bound.control;
+  if (
+    (control instanceof HTMLButtonElement && control.disabled) ||
+    control.getAttribute("aria-disabled") === "true"
+  ) {{
+    return null;
+  }}
+  const style = getComputedStyle(control);
+  if (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.visibility === "collapse" ||
+    style.pointerEvents === "none" ||
+    Number(style.opacity) === 0
+  ) {{
+    return null;
+  }}
+  control.scrollIntoView({{block: "center", inline: "center"}});
+  const rect = control.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const hit = document.elementFromPoint(x, y);
+  if (hit !== control && !control.contains(hit)) return null;
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    y < 0 ||
+    x > window.innerWidth ||
+    y > window.innerHeight
+  ) {{
+    return null;
+  }}
+  return {{x, y}};
+}})()
+"""
+
+    @staticmethod
+    def _validated_state_page_probe(
+        value: object,
+        *,
+        target_ad_id: str,
+    ) -> tuple[str, tuple[str, ...] | None, tuple[float, float] | None]:
+        if not isinstance(value, dict):
+            return "unknown", None, None
+        raw_state = value.get("state")
+        if raw_state == PrivateWebEditorState.READY.value:
+            ad_id = value.get("ad_id")
+            lifecycle_state = value.get("lifecycle_state")
+            if (
+                ad_id == target_ad_id
+                and lifecycle_state in {
+                    LifecycleState.ACTIVE.value,
+                    LifecycleState.PAUSED.value,
+                }
+            ):
+                return "ready", None, None
+            return "unknown", None, None
+        if raw_state in {
+            PrivateWebEditorState.LOGIN_REQUIRED.value,
+            PrivateWebEditorState.MFA_REQUIRED.value,
+            PrivateWebEditorState.CAPTCHA_REQUIRED.value,
+            PrivateWebEditorState.SECURITY_CHALLENGE.value,
+        }:
+            return str(raw_state), None, None
+        if raw_state != "target_absent":
+            return "unknown", None, None
+
+        raw_page_ad_ids = value.get("page_ad_ids")
+        if (
+            not isinstance(raw_page_ad_ids, list)
+            or not raw_page_ad_ids
+            or len(raw_page_ad_ids) > 1000
+        ):
+            return "unknown", None, None
+        page_ad_ids: list[str] = []
+        for raw_ad_id in raw_page_ad_ids:
+            if not isinstance(raw_ad_id, str):
+                return "unknown", None, None
+            try:
+                page_ad_ids.append(_validated_ad_id(raw_ad_id))
+            except (TypeError, ValueError):
+                return "unknown", None, None
+        if len(set(page_ad_ids)) != len(page_ad_ids):
+            return "unknown", None, None
+
+        raw_next_page = value.get("next_page")
+        if raw_next_page is None:
+            return "target_absent", tuple(page_ad_ids), None
+        if not isinstance(raw_next_page, dict):
+            return "unknown", None, None
+        raw_x = raw_next_page.get("x")
+        raw_y = raw_next_page.get("y")
+        if (
+            isinstance(raw_x, bool)
+            or not isinstance(raw_x, (int, float))
+            or not math.isfinite(float(raw_x))
+            or float(raw_x) < 0
+            or isinstance(raw_y, bool)
+            or not isinstance(raw_y, (int, float))
+            or not math.isfinite(float(raw_y))
+            or float(raw_y) < 0
+        ):
+            return "unknown", None, None
+        return (
+            "target_absent",
+            tuple(page_ad_ids),
+            (float(raw_x), float(raw_y)),
+        )
+
+    @staticmethod
+    def _dispatch_browser_click(
+        client: _CdpClient,
+        *,
+        x: float,
+        y: float,
+    ) -> None:
+        client.call(
+            "Input.dispatchMouseEvent",
+            {
+                "type": "mousePressed",
+                "x": x,
+                "y": y,
+                "button": "left",
+                "buttons": 1,
+                "clickCount": 1,
+            },
+        )
+        client.call(
+            "Input.dispatchMouseEvent",
+            {
+                "type": "mouseReleased",
+                "x": x,
+                "y": y,
+                "button": "left",
+                "buttons": 0,
+                "clickCount": 1,
+            },
+        )
+
+    def open_state_controls(self, ad_id: str) -> None:
+        target_ad_id = _validated_ad_id(ad_id)
+        target_url = f"{self._expected_origin}{_MANAGEMENT_PATH}"
+        self._state_submit_attempted = False
+        self._bound_state_ad_id = None
+        self._last_state_snapshot = None
+        self._submit_attempted = False
+        self._bound_ad_id = None
+        self._last_ready_snapshot = None
+        client = self._client()
+        marker = json.dumps(
+            f"__mark_private_web_state_navigation_probe_{target_ad_id}__"
+        )
+        try:
+            armed = self._runtime_value(
+                client,
+                (
+                    "(() => { const key = "
+                    + marker
+                    + "; globalThis[key] = true; "
+                    + "return globalThis[key] === true; })()"
+                ),
+            )
+            if armed is not True:
+                raise PrivateWebCdpError("navigate_state")
+            navigation = client.call("Page.navigate", {"url": target_url})
+            if navigation.get("errorText"):
+                raise PrivateWebCdpError("navigate_state")
+            initial_deadline = self._monotonic() + self._timeout_seconds
+            readiness_expression = (
+                "(() => ({"
+                + "readyState: document.readyState,"
+                + "oldDocument: globalThis["
+                + marker
+                + "] === true"
+                + "}))()"
+            )
+            while True:
+                try:
+                    readiness = self._runtime_value(
+                        client,
+                        readiness_expression,
+                    )
+                except PrivateWebCdpError:
+                    readiness = None
+                if (
+                    isinstance(readiness, dict)
+                    and readiness.get("readyState") == "complete"
+                    and readiness.get("oldDocument") is False
+                ):
+                    break
+                if self._monotonic() >= initial_deadline:
+                    raise PrivateWebCdpError("navigate_state")
+                self._sleep(0.05)
+
+            self._bound_state_ad_id = target_ad_id
+            prior_page_fingerprint: tuple[str, ...] | None = None
+            seen_page_fingerprints: set[tuple[str, ...]] = set()
+            for _page_number in range(1, _MANAGEMENT_MAX_PAGES + 1):
+                page_deadline = self._monotonic() + self._timeout_seconds
+                while True:
+                    try:
+                        probe_value = self._runtime_value(
+                            client,
+                            self._state_control_expression(
+                                target_ad_id,
+                                include_pagination=True,
+                            ),
+                        )
+                    except PrivateWebCdpError:
+                        probe_value = None
+                    probe_state, page_fingerprint, next_point = (
+                        self._validated_state_page_probe(
+                            probe_value,
+                            target_ad_id=target_ad_id,
+                        )
+                    )
+                    if probe_state == "ready":
+                        self._last_state_snapshot = None
+                        return
+                    if probe_state in {
+                        PrivateWebEditorState.LOGIN_REQUIRED.value,
+                        PrivateWebEditorState.MFA_REQUIRED.value,
+                        PrivateWebEditorState.CAPTCHA_REQUIRED.value,
+                        PrivateWebEditorState.SECURITY_CHALLENGE.value,
+                    }:
+                        self._last_state_snapshot = None
+                        return
+                    if (
+                        probe_state == "target_absent"
+                        and page_fingerprint is not None
+                        and page_fingerprint != prior_page_fingerprint
+                        and next_point is not None
+                    ):
+                        # The ad list can settle before the pager. A missing
+                        # eligible Next control is provisional until this
+                        # bounded page deadline expires.
+                        break
+                    if self._monotonic() >= page_deadline:
+                        raise PrivateWebCdpError("navigate_state")
+                    self._sleep(0.05)
+
+                if page_fingerprint in seen_page_fingerprints:
+                    raise PrivateWebCdpError("navigate_state")
+                seen_page_fingerprints.add(page_fingerprint)
+                if next_point is None:
+                    raise PrivateWebCdpError("navigate_state")
+                if len(seen_page_fingerprints) >= _MANAGEMENT_MAX_PAGES:
+                    raise PrivateWebCdpError("navigate_state")
+
+                try:
+                    self._dispatch_browser_click(
+                        client,
+                        x=next_point[0],
+                        y=next_point[1],
+                    )
+                except Exception:  # noqa: BLE001 - pagination is pre-submit.
+                    raise PrivateWebCdpError("navigate_state") from None
+                prior_page_fingerprint = page_fingerprint
+
+            raise PrivateWebCdpError("navigate_state")
+        except PrivateWebCdpError:
+            self._bound_state_ad_id = None
+            self._last_state_snapshot = None
+            raise
+        except Exception:  # noqa: BLE001 - sanitize runtime boundary.
+            self._bound_state_ad_id = None
+            self._last_state_snapshot = None
+            raise PrivateWebCdpError("navigate_state") from None
+
+    def read_state_controls(self) -> PrivateWebStateSnapshot:
+        target_ad_id = self._bound_state_ad_id
+        self._last_state_snapshot = None
+        if target_ad_id is None:
+            raise PrivateWebCdpError("read_state_controls")
+        value = self._evaluate(
+            "read_state_controls",
+            self._state_control_expression(target_ad_id),
+        )
+        if not isinstance(value, dict):
+            return PrivateWebStateSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        raw_state = value.get("state")
+        try:
+            state = PrivateWebEditorState(raw_state)
+        except (TypeError, ValueError):
+            return PrivateWebStateSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        if state is not PrivateWebEditorState.READY:
+            return PrivateWebStateSnapshot(state=state)
+        ad_id = value.get("ad_id")
+        raw_lifecycle_state = value.get("lifecycle_state")
+        if not isinstance(ad_id, str):
+            return PrivateWebStateSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        try:
+            lifecycle_state = LifecycleState(raw_lifecycle_state)
+            snapshot = PrivateWebStateSnapshot(
+                state=PrivateWebEditorState.READY,
+                ad_id=ad_id,
+                lifecycle_state=lifecycle_state,
+            )
+        except (TypeError, ValueError):
+            return PrivateWebStateSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        if ad_id == target_ad_id:
+            self._last_state_snapshot = snapshot
+        return snapshot
+
+    def _wait_for_state_settlement(
+        self,
+        client: _CdpClient,
+        *,
+        target_ad_id: str,
+        target_state: LifecycleState,
+    ) -> None:
+        deadline = self._monotonic() + self._timeout_seconds
+        while True:
+            try:
+                value = self._runtime_value(
+                    client,
+                    self._state_control_expression(target_ad_id),
+                )
+            except Exception:  # noqa: BLE001 - submit may already have succeeded.
+                value = None
+            if (
+                isinstance(value, dict)
+                and value.get("state") == PrivateWebEditorState.READY.value
+                and value.get("ad_id") == target_ad_id
+                and value.get("lifecycle_state") == target_state.value
+            ):
+                return
+            if self._monotonic() >= deadline:
+                raise PrivateWebSubmitUnknownError(
+                    "state_submit_settle"
+                )
+            try:
+                self._sleep(0.05)
+            except Exception:  # noqa: BLE001 - submit may already have succeeded.
+                raise PrivateWebSubmitUnknownError(
+                    "state_submit_settle"
+                ) from None
+
+    def submit_state(self, state: LifecycleState) -> None:
+        if not isinstance(state, LifecycleState):
+            raise TypeError("state must be LifecycleState")
+        if state not in {LifecycleState.ACTIVE, LifecycleState.PAUSED}:
+            raise ValueError("state must be ACTIVE or PAUSED")
+        if self._state_submit_attempted:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "state_submit_already_attempted"
+            )
+        self._state_submit_attempted = True
+
+        target_ad_id = self._bound_state_ad_id
+        snapshot = self._last_state_snapshot
+        self._last_state_snapshot = None
+        expected_pre_state = (
+            LifecycleState.PAUSED
+            if state is LifecycleState.ACTIVE
+            else LifecycleState.ACTIVE
+        )
+        if (
+            target_ad_id is None
+            or snapshot is None
+            or snapshot.state is not PrivateWebEditorState.READY
+            or snapshot.ad_id != target_ad_id
+            or snapshot.lifecycle_state is not expected_pre_state
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError("state_submit")
+
+        expected_label = (
+            "aktivieren"
+            if state is LifecycleState.ACTIVE
+            else "reservieren"
+        )
+        try:
+            client = self._client()
+            activation = self._runtime_value(
+                client,
+                self._state_control_expression(
+                    target_ad_id,
+                    activation_label=expected_label,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - no browser input was attempted.
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "state_submit"
+            ) from None
+        if not isinstance(activation, dict):
+            raise PrivateWebCdpWriteNotAttemptedError("state_submit")
+        raw_x = activation.get("x")
+        raw_y = activation.get("y")
+        if (
+            isinstance(raw_x, bool)
+            or not isinstance(raw_x, (int, float))
+            or not math.isfinite(float(raw_x))
+            or float(raw_x) < 0
+            or isinstance(raw_y, bool)
+            or not isinstance(raw_y, (int, float))
+            or not math.isfinite(float(raw_y))
+            or float(raw_y) < 0
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError("state_submit")
+        x = float(raw_x)
+        y = float(raw_y)
+
+        try:
+            client.call(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mousePressed",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "buttons": 1,
+                    "clickCount": 1,
+                },
+            )
+            client.call(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mouseReleased",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "buttons": 0,
+                    "clickCount": 1,
+                },
+            )
+        except Exception:  # noqa: BLE001 - possible submit is never retried.
+            raise PrivateWebSubmitUnknownError("state_submit") from None
+
+        self._wait_for_state_settlement(
+            client,
+            target_ad_id=target_ad_id,
+            target_state=state,
+        )
+
 
     def _replace_field(
         self,
