@@ -7,10 +7,11 @@ from unittest.mock import patch
 from urllib.request import ProxyHandler
 
 from mark_api.adapters.management import MANAGEMENT_URL
-from mark_api.domain import AdSnapshot, LifecycleState, OperationOutcome
+from mark_api.domain import AdSnapshot, DeleteApproval, LifecycleState, OperationOutcome
 from mark_api.orchestrator import SafeWriteOrchestrator
 from mark_api.ports import WriteNotAttemptedError
 from mark_api.private_web import (
+    PrivateWebDeleteSnapshot,
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
     PrivateWebStateSnapshot,
@@ -138,6 +139,55 @@ class LifecyclePage:
             return
         self._closed = True
         self._events.append(("close_state", self._ad_id))
+        if self._close_error is not None:
+            raise self._close_error
+
+
+class DeletePage:
+    def __init__(
+        self,
+        events: list[tuple],
+        *,
+        close_error: Exception | None = None,
+        submit_unknown: bool = False,
+    ) -> None:
+        self._events = events
+        self._ad_id: str | None = None
+        self._closed = False
+        self._close_error = close_error
+        self._submit_unknown = submit_unknown
+
+    def open_delete_controls(self, ad_id: str) -> None:
+        self._events.append(("open_delete_controls", ad_id))
+        self._ad_id = ad_id
+
+    def read_delete_controls(self) -> PrivateWebDeleteSnapshot:
+        self._events.append(("read_delete_controls", self._ad_id))
+        return PrivateWebDeleteSnapshot(
+            state=PrivateWebEditorState.READY,
+            ad_id=self._ad_id,
+        )
+
+    def open_delete_confirmation(self) -> None:
+        self._events.append(("open_delete_confirmation", self._ad_id))
+
+    def read_delete_confirmation(self) -> PrivateWebDeleteSnapshot:
+        self._events.append(("read_delete_confirmation", self._ad_id))
+        return PrivateWebDeleteSnapshot(
+            state=PrivateWebEditorState.READY,
+            ad_id=self._ad_id,
+        )
+
+    def submit_delete(self) -> None:
+        self._events.append(("submit_delete", self._ad_id))
+        if self._submit_unknown:
+            raise PrivateWebSubmitUnknownError("delete_submit")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._events.append(("close_delete", self._ad_id))
         if self._close_error is not None:
             raise self._close_error
 
@@ -288,6 +338,107 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
             [("close_state", AD_ID)],
         )
 
+    def test_delete_writer_uses_fresh_page_per_call_and_closes_each_page(self) -> None:
+        owner = OwnerReader(ReadResult.success_nonempty((owner_snapshot(),)))
+        events: list[tuple] = []
+        pages: list[DeletePage] = []
+
+        def page_factory() -> DeletePage:
+            page = DeletePage(events)
+            pages.append(page)
+            return page
+
+        runtime = PrivateWebContentRuntime(
+            owner_reader=owner,
+            page_factory=page_factory,
+            close_runtime=lambda: None,
+        )
+
+        runtime.delete_writer.delete_ad(AD_ID)
+        runtime.delete_writer.delete_ad(AD_ID)
+
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(
+            [event for event in events if event[0] == "submit_delete"],
+            [("submit_delete", AD_ID), ("submit_delete", AD_ID)],
+        )
+        self.assertEqual(
+            [event for event in events if event[0] == "close_delete"],
+            [("close_delete", AD_ID), ("close_delete", AD_ID)],
+        )
+
+    def test_delete_writer_cleanup_failure_does_not_replace_submit_unknown(self) -> None:
+        owner = OwnerReader(ReadResult.success_nonempty((owner_snapshot(),)))
+        events: list[tuple] = []
+        runtime = PrivateWebContentRuntime(
+            owner_reader=owner,
+            page_factory=lambda: DeletePage(
+                events,
+                close_error=RuntimeError("cleanup failed"),
+                submit_unknown=True,
+            ),
+            close_runtime=lambda: None,
+        )
+
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            runtime.delete_writer.delete_ad(AD_ID)
+
+        self.assertEqual(
+            [event for event in events if event[0] == "submit_delete"],
+            [("submit_delete", AD_ID)],
+        )
+        self.assertEqual(
+            [event for event in events if event[0] == "close_delete"],
+            [("close_delete", AD_ID)],
+        )
+
+    def test_delete_writer_page_setup_failure_is_write_not_attempted(self) -> None:
+        runtime = PrivateWebContentRuntime(
+            owner_reader=OwnerReader(ReadResult.success_empty(())),
+            page_factory=lambda: (_ for _ in ()).throw(
+                OSError("page setup failed")
+            ),
+            close_runtime=lambda: None,
+        )
+
+        with self.assertRaises(PrivateWebRuntimeSetupError) as caught:
+            runtime.delete_writer.delete_ad(AD_ID)
+
+        self.assertIsInstance(caught.exception, WriteNotAttemptedError)
+
+    def test_delete_setup_failure_is_non_ambiguous_in_orchestrator(self) -> None:
+        owner = OwnerReader(ReadResult.success_nonempty((owner_snapshot(),)))
+        confirmation = OwnerReader(ReadResult.success_empty(()))
+        page_calls = 0
+
+        def page_factory():
+            nonlocal page_calls
+            page_calls += 1
+            raise OSError("page setup failed")
+
+        runtime = PrivateWebContentRuntime(
+            owner_reader=owner,
+            page_factory=page_factory,
+            close_runtime=lambda: None,
+        )
+
+        receipt = SafeWriteOrchestrator(writes_enabled=True).delete(
+            ad_id=AD_ID,
+            approval=DeleteApproval(ad_id=AD_ID, approved_by="test-owner"),
+            reader=owner,
+            writer=runtime.delete_writer,
+            confirmation_reader=confirmation,
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
+        self.assertTrue(receipt.writer_invoked)
+        self.assertEqual(receipt.writer_error, "PrivateWebRuntimeSetupError")
+        self.assertIsNone(receipt.post_read_status)
+        self.assertIsNone(receipt.post_snapshot)
+        self.assertEqual(owner.calls, 1)
+        self.assertEqual(confirmation.calls, 0)
+        self.assertEqual(page_calls, 1)
+
     def test_content_writer_page_setup_failure_is_write_not_attempted(self) -> None:
         runtime = PrivateWebContentRuntime(
             owner_reader=OwnerReader(ReadResult.success_empty(())),
@@ -367,6 +518,8 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
             runtime.content_writer.update_content(AD_ID, title="new")
         with self.assertRaises(PrivateWebRuntimeClosedError):
             runtime.state_writer.set_state(AD_ID, LifecycleState.PAUSED)
+        with self.assertRaises(PrivateWebRuntimeClosedError):
+            runtime.delete_writer.delete_ad(AD_ID)
         self.assertEqual(page_calls, 0)
 
     def test_dependency_check_fails_when_distribution_is_missing(self) -> None:

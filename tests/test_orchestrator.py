@@ -231,6 +231,38 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
         self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
         self.assertEqual(confirmation_reader.calls, 1)
 
+    def test_delete_write_not_attempted_error_is_non_ambiguous(self) -> None:
+        reader = SequenceReader(
+            ReadResult.success_nonempty((snapshot(LifecycleState.ACTIVE),)),
+        )
+        confirmation_reader = SequenceReader()
+        writer = DeleteWriter(
+            error=WriteNotAttemptedError("sanitized safe failure"),
+        )
+
+        receipt = self.service().delete(
+            ad_id="3521676801",
+            approval=DeleteApproval(
+                ad_id="3521676801",
+                approved_by="test-owner",
+            ),
+            reader=reader,
+            writer=writer,
+            confirmation_reader=confirmation_reader,
+        )
+
+        self.assertEqual(
+            receipt.outcome,
+            OperationOutcome.PRECONDITION_FAILED,
+        )
+        self.assertTrue(receipt.writer_invoked)
+        self.assertEqual(receipt.writer_error, "WriteNotAttemptedError")
+        self.assertIsNone(receipt.post_read_status)
+        self.assertIsNone(receipt.post_snapshot)
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(confirmation_reader.calls, 0)
+        self.assertEqual(writer.calls, 1)
+
     def test_writer_exception_is_not_retried_and_unconfirmed_is_ambiguous(self) -> None:
         active = snapshot(LifecycleState.ACTIVE)
         reader = SequenceReader(

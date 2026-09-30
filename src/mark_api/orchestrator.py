@@ -315,6 +315,23 @@ class SafeWriteOrchestrator:
         writer_error: str | None = None
         try:
             writer.delete_ad(ad_id)
+        except WriteNotAttemptedError as exc:
+            return self._persist(
+                OperationReceipt(
+                    operation="delete",
+                    ad_id=ad_id,
+                    started_at=started_at,
+                    completed_at=self._clock(),
+                    outcome=OperationOutcome.PRECONDITION_FAILED,
+                    pre_read_status=pre.status.value,
+                    post_read_status=None,
+                    writer_invoked=True,
+                    authorization_by=approval.approved_by,
+                    authorization_reference=approval.reference,
+                    writer_error=type(exc).__name__,
+                    pre_snapshot=pre_snapshot,
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - reconciled by both owner inventories.
             writer_error = type(exc).__name__
 

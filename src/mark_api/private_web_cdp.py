@@ -13,6 +13,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 from .domain import AdSnapshot, LifecycleState
 from .ports import AdsReader, WriteNotAttemptedError
 from .private_web import (
+    PrivateWebDeleteSnapshot,
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
     PrivateWebStateSnapshot,
@@ -362,6 +363,10 @@ class CdpPrivateWebPage:
         self._state_submit_attempted = False
         self._bound_state_ad_id: str | None = None
         self._last_state_snapshot: PrivateWebStateSnapshot | None = None
+        self._delete_confirmation_attempted = False
+        self._delete_submit_attempted = False
+        self._bound_delete_ad_id: str | None = None
+        self._last_delete_snapshot: PrivateWebDeleteSnapshot | None = None
 
     @classmethod
     def from_port(
@@ -388,6 +393,8 @@ class CdpPrivateWebPage:
         self._last_ready_snapshot = None
         self._bound_state_ad_id = None
         self._last_state_snapshot = None
+        self._bound_delete_ad_id = None
+        self._last_delete_snapshot = None
         if client is not None:
             client.close()
 
@@ -434,6 +441,10 @@ class CdpPrivateWebPage:
         self._state_submit_attempted = False
         self._bound_state_ad_id = None
         self._last_state_snapshot = None
+        self._delete_confirmation_attempted = False
+        self._delete_submit_attempted = False
+        self._bound_delete_ad_id = None
+        self._last_delete_snapshot = None
         client = self._client()
         marker = json.dumps(
             f"__mark_private_web_navigation_probe_{target_ad_id}__"
@@ -974,6 +985,10 @@ class CdpPrivateWebPage:
         self._submit_attempted = False
         self._bound_ad_id = None
         self._last_ready_snapshot = None
+        self._delete_confirmation_attempted = False
+        self._delete_submit_attempted = False
+        self._bound_delete_ad_id = None
+        self._last_delete_snapshot = None
         client = self._client()
         marker = json.dumps(
             f"__mark_private_web_state_navigation_probe_{target_ad_id}__"
@@ -1259,6 +1274,763 @@ class CdpPrivateWebPage:
             target_ad_id=target_ad_id,
             target_state=state,
         )
+
+
+    def _delete_control_expression(
+        self,
+        target_ad_id: str,
+        *,
+        activation: bool = False,
+        include_pagination: bool = False,
+    ) -> str:
+        origin = json.dumps(self._expected_origin)
+        management_path = json.dumps(_MANAGEMENT_PATH)
+        editor_path = json.dumps(_EDITOR_PATH)
+        ad_id = json.dumps(target_ad_id)
+        activate = json.dumps(activation)
+        allow_pagination = json.dumps(include_pagination)
+        return f"""
+(() => {{
+  const stateOnly = (state) => ({{state}});
+  const currentOrigin = location.origin;
+  const currentPath = location.pathname;
+  const targetAdId = {ad_id};
+  const editorPath = {editor_path};
+  const activate = {activate};
+  const allowPagination = {allow_pagination};
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((element) => (element.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const hasLogin =
+    currentPath.startsWith("/u/login/") ||
+    Boolean(document.querySelector('input[type="password"]'));
+
+  if (currentOrigin !== {origin}) return stateOnly("unknown");
+  if (hasCaptcha) return stateOnly("captcha_required");
+  if (hasMfa) return stateOnly("mfa_required");
+  if (hasSecurityChallenge) return stateOnly("security_challenge");
+  if (hasLogin) return stateOnly("login_required");
+  if (currentPath !== {management_path}) return stateOnly("unknown");
+  if (document.querySelector("#delete-container")) return stateOnly("unknown");
+
+  const editorId = (link) => {{
+    try {{
+      const raw = link.getAttribute("href");
+      if (!raw) return null;
+      const url = new URL(raw, location.href);
+      if (url.origin !== {origin} || url.pathname !== editorPath) return null;
+      const value = url.searchParams.get("adId");
+      if (
+        typeof value !== "string" ||
+        value.length === 0 ||
+        value.length > 32 ||
+        !/^[0-9]+$/.test(value)
+      ) {{
+        return null;
+      }}
+      return value;
+    }} catch (_error) {{
+      return null;
+    }}
+  }};
+  const label = (element) => (element.innerText || "").trim().toLowerCase();
+  const isEligibleControl = (element) => {{
+    if (
+      (element instanceof HTMLButtonElement && element.disabled) ||
+      element.getAttribute("aria-disabled") === "true"
+    ) {{
+      return false;
+    }}
+    const style = getComputedStyle(element);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse" ||
+      style.pointerEvents === "none" ||
+      Number(style.opacity) === 0
+    ) {{
+      return false;
+    }}
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }};
+  const deleteControls = (root) =>
+    Array.from(root.querySelectorAll('button, [role="button"]')).filter(
+      (element) => label(element) === "löschen" && isEligibleControl(element)
+    );
+  const targetEditLinks = Array.from(
+    document.querySelectorAll("a[href]")
+  ).filter((link) => editorId(link) === targetAdId);
+  if (targetEditLinks.length > 1) return stateOnly("unknown");
+
+  let bound = null;
+  if (targetEditLinks.length === 1) {{
+    let node = targetEditLinks[0].parentElement;
+    for (let depth = 0; node && depth < 10; depth += 1) {{
+      const editIds = Array.from(node.querySelectorAll("a[href]"))
+        .map(editorId)
+        .filter((value) => value !== null);
+      const controls = deleteControls(node);
+      if (
+        editIds.length === 1 &&
+        editIds[0] === targetAdId &&
+        controls.length === 1
+      ) {{
+        bound = {{control: controls[0]}};
+        break;
+      }}
+      node = node.parentElement;
+    }}
+    if (bound === null) return stateOnly("unknown");
+  }} else {{
+    if (!allowPagination) return stateOnly("unknown");
+    const pageAdIds = Array.from(document.querySelectorAll("a[href]"))
+      .map(editorId)
+      .filter((value) => value !== null);
+    const uniquePageAdIds = Array.from(new Set(pageAdIds));
+    if (uniquePageAdIds.length === 0) return stateOnly("unknown");
+
+    const nextCandidates = Array.from(
+      document.querySelectorAll('button[aria-label="Nächste"]')
+    ).filter((element) => isEligibleControl(element));
+    if (nextCandidates.length > 1) return stateOnly("unknown");
+    if (nextCandidates.length === 0) {{
+      return {{
+        state: "target_absent",
+        page_ad_ids: uniquePageAdIds,
+        next_page: null,
+      }};
+    }}
+    const nextControl = nextCandidates[0];
+    nextControl.scrollIntoView({{block: "center", inline: "center"}});
+    const nextRect = nextControl.getBoundingClientRect();
+    if (nextRect.width <= 0 || nextRect.height <= 0) return stateOnly("unknown");
+    const nextX = nextRect.left + nextRect.width / 2;
+    const nextY = nextRect.top + nextRect.height / 2;
+    const nextHit = document.elementFromPoint(nextX, nextY);
+    if (nextHit !== nextControl && !nextControl.contains(nextHit)) {{
+      return stateOnly("unknown");
+    }}
+    if (
+      !Number.isFinite(nextX) ||
+      !Number.isFinite(nextY) ||
+      nextX < 0 ||
+      nextY < 0 ||
+      nextX > window.innerWidth ||
+      nextY > window.innerHeight
+    ) {{
+      return stateOnly("unknown");
+    }}
+    return {{
+      state: "target_absent",
+      page_ad_ids: uniquePageAdIds,
+      next_page: {{x: nextX, y: nextY}},
+    }};
+  }}
+
+  if (!activate) return {{state: "ready", ad_id: targetAdId}};
+
+  const control = bound.control;
+  control.scrollIntoView({{block: "center", inline: "center"}});
+  const rect = control.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const hit = document.elementFromPoint(x, y);
+  if (hit !== control && !control.contains(hit)) return null;
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    y < 0 ||
+    x > window.innerWidth ||
+    y > window.innerHeight
+  ) {{
+    return null;
+  }}
+  return {{x, y}};
+}})()
+"""
+
+    @staticmethod
+    def _validated_delete_page_probe(
+        value: object,
+        *,
+        target_ad_id: str,
+    ) -> tuple[str, tuple[str, ...] | None, tuple[float, float] | None]:
+        if not isinstance(value, dict):
+            return "unknown", None, None
+        raw_state = value.get("state")
+        if raw_state == PrivateWebEditorState.READY.value:
+            if value.get("ad_id") == target_ad_id:
+                return "ready", None, None
+            return "unknown", None, None
+        if raw_state in {
+            PrivateWebEditorState.LOGIN_REQUIRED.value,
+            PrivateWebEditorState.MFA_REQUIRED.value,
+            PrivateWebEditorState.CAPTCHA_REQUIRED.value,
+            PrivateWebEditorState.SECURITY_CHALLENGE.value,
+        }:
+            return str(raw_state), None, None
+        if raw_state != "target_absent":
+            return "unknown", None, None
+        raw_page_ad_ids = value.get("page_ad_ids")
+        if (
+            not isinstance(raw_page_ad_ids, list)
+            or not raw_page_ad_ids
+            or len(raw_page_ad_ids) > 1000
+        ):
+            return "unknown", None, None
+        page_ad_ids: list[str] = []
+        for raw_ad_id in raw_page_ad_ids:
+            if not isinstance(raw_ad_id, str):
+                return "unknown", None, None
+            try:
+                page_ad_ids.append(_validated_ad_id(raw_ad_id))
+            except (TypeError, ValueError):
+                return "unknown", None, None
+        if len(set(page_ad_ids)) != len(page_ad_ids):
+            return "unknown", None, None
+        raw_next_page = value.get("next_page")
+        if raw_next_page is None:
+            return "target_absent", tuple(page_ad_ids), None
+        if not isinstance(raw_next_page, dict):
+            return "unknown", None, None
+        raw_x = raw_next_page.get("x")
+        raw_y = raw_next_page.get("y")
+        if (
+            isinstance(raw_x, bool)
+            or not isinstance(raw_x, (int, float))
+            or not math.isfinite(float(raw_x))
+            or float(raw_x) < 0
+            or isinstance(raw_y, bool)
+            or not isinstance(raw_y, (int, float))
+            or not math.isfinite(float(raw_y))
+            or float(raw_y) < 0
+        ):
+            return "unknown", None, None
+        return (
+            "target_absent",
+            tuple(page_ad_ids),
+            (float(raw_x), float(raw_y)),
+        )
+
+    def open_delete_controls(self, ad_id: str) -> None:
+        target_ad_id = _validated_ad_id(ad_id)
+        target_url = f"{self._expected_origin}{_MANAGEMENT_PATH}"
+        self._delete_confirmation_attempted = False
+        self._delete_submit_attempted = False
+        self._bound_delete_ad_id = None
+        self._last_delete_snapshot = None
+        self._submit_attempted = False
+        self._bound_ad_id = None
+        self._last_ready_snapshot = None
+        self._state_submit_attempted = False
+        self._bound_state_ad_id = None
+        self._last_state_snapshot = None
+        client = self._client()
+        marker = json.dumps(
+            f"__mark_private_web_delete_navigation_probe_{target_ad_id}__"
+        )
+        try:
+            armed = self._runtime_value(
+                client,
+                (
+                    "(() => { const key = "
+                    + marker
+                    + "; globalThis[key] = true; "
+                    + "return globalThis[key] === true; })()"
+                ),
+            )
+            if armed is not True:
+                raise PrivateWebCdpError("navigate_delete")
+            navigation = client.call("Page.navigate", {"url": target_url})
+            if navigation.get("errorText"):
+                raise PrivateWebCdpError("navigate_delete")
+            initial_deadline = self._monotonic() + self._timeout_seconds
+            readiness_expression = (
+                "(() => ({"
+                + "readyState: document.readyState,"
+                + "oldDocument: globalThis["
+                + marker
+                + "] === true"
+                + "}))()"
+            )
+            while True:
+                try:
+                    readiness = self._runtime_value(client, readiness_expression)
+                except PrivateWebCdpError:
+                    readiness = None
+                if (
+                    isinstance(readiness, dict)
+                    and readiness.get("readyState") == "complete"
+                    and readiness.get("oldDocument") is False
+                ):
+                    break
+                if self._monotonic() >= initial_deadline:
+                    raise PrivateWebCdpError("navigate_delete")
+                self._sleep(0.05)
+
+            self._bound_delete_ad_id = target_ad_id
+            prior_page_fingerprint: tuple[str, ...] | None = None
+            seen_page_fingerprints: set[tuple[str, ...]] = set()
+            for _page_number in range(1, _MANAGEMENT_MAX_PAGES + 1):
+                page_deadline = self._monotonic() + self._timeout_seconds
+                while True:
+                    try:
+                        probe_value = self._runtime_value(
+                            client,
+                            self._delete_control_expression(
+                                target_ad_id,
+                                include_pagination=True,
+                            ),
+                        )
+                    except PrivateWebCdpError:
+                        probe_value = None
+                    probe_state, page_fingerprint, next_point = (
+                        self._validated_delete_page_probe(
+                            probe_value,
+                            target_ad_id=target_ad_id,
+                        )
+                    )
+                    if probe_state == "ready":
+                        self._last_delete_snapshot = None
+                        return
+                    if probe_state in {
+                        PrivateWebEditorState.LOGIN_REQUIRED.value,
+                        PrivateWebEditorState.MFA_REQUIRED.value,
+                        PrivateWebEditorState.CAPTCHA_REQUIRED.value,
+                        PrivateWebEditorState.SECURITY_CHALLENGE.value,
+                    }:
+                        self._last_delete_snapshot = None
+                        return
+                    if (
+                        probe_state == "target_absent"
+                        and page_fingerprint is not None
+                        and page_fingerprint != prior_page_fingerprint
+                        and next_point is not None
+                    ):
+                        break
+                    if self._monotonic() >= page_deadline:
+                        raise PrivateWebCdpError("navigate_delete")
+                    self._sleep(0.05)
+
+                if page_fingerprint in seen_page_fingerprints:
+                    raise PrivateWebCdpError("navigate_delete")
+                seen_page_fingerprints.add(page_fingerprint)
+                if next_point is None:
+                    raise PrivateWebCdpError("navigate_delete")
+                if len(seen_page_fingerprints) >= _MANAGEMENT_MAX_PAGES:
+                    raise PrivateWebCdpError("navigate_delete")
+                try:
+                    self._dispatch_browser_click(
+                        client,
+                        x=next_point[0],
+                        y=next_point[1],
+                    )
+                except Exception:  # noqa: BLE001 - pagination is pre-submit.
+                    raise PrivateWebCdpError("navigate_delete") from None
+                prior_page_fingerprint = page_fingerprint
+            raise PrivateWebCdpError("navigate_delete")
+        except PrivateWebCdpError:
+            self._bound_delete_ad_id = None
+            self._last_delete_snapshot = None
+            raise
+        except Exception:  # noqa: BLE001 - sanitize runtime boundary.
+            self._bound_delete_ad_id = None
+            self._last_delete_snapshot = None
+            raise PrivateWebCdpError("navigate_delete") from None
+
+    def read_delete_controls(self) -> PrivateWebDeleteSnapshot:
+        target_ad_id = self._bound_delete_ad_id
+        self._last_delete_snapshot = None
+        if target_ad_id is None:
+            raise PrivateWebCdpError("read_delete_controls")
+        value = self._evaluate(
+            "read_delete_controls",
+            self._delete_control_expression(target_ad_id),
+        )
+        if not isinstance(value, dict):
+            return PrivateWebDeleteSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        raw_state = value.get("state")
+        try:
+            state = PrivateWebEditorState(raw_state)
+        except (TypeError, ValueError):
+            return PrivateWebDeleteSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        if state is not PrivateWebEditorState.READY:
+            return PrivateWebDeleteSnapshot(state=state)
+        ad_id = value.get("ad_id")
+        if not isinstance(ad_id, str):
+            return PrivateWebDeleteSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        try:
+            snapshot = PrivateWebDeleteSnapshot(
+                state=PrivateWebEditorState.READY,
+                ad_id=ad_id,
+            )
+        except (TypeError, ValueError):
+            return PrivateWebDeleteSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        if ad_id == target_ad_id:
+            self._last_delete_snapshot = snapshot
+        return snapshot
+
+    def _delete_confirmation_expression(
+        self,
+        target_ad_id: str,
+        *,
+        activation: bool = False,
+    ) -> str:
+        origin = json.dumps(self._expected_origin)
+        management_path = json.dumps(_MANAGEMENT_PATH)
+        ad_id = json.dumps(target_ad_id)
+        activate = json.dumps(activation)
+        return f"""
+(() => {{
+  const stateOnly = (state) => ({{state}});
+  const targetAdId = {ad_id};
+  const activate = {activate};
+  if (location.origin !== {origin}) return stateOnly("unknown");
+  const currentPath = location.pathname;
+  if (currentPath !== {management_path}) return stateOnly("unknown");
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((element) => (element.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const hasLogin =
+    currentPath.startsWith("/u/login/") ||
+    Boolean(document.querySelector('input[type="password"]'));
+  if (hasCaptcha) return stateOnly("captcha_required");
+  if (hasMfa) return stateOnly("mfa_required");
+  if (hasSecurityChallenge) return stateOnly("security_challenge");
+  if (hasLogin) return stateOnly("login_required");
+
+  const containers = Array.from(document.querySelectorAll("#delete-container"));
+  if (containers.length !== 1) return stateOnly("unknown");
+  const container = containers[0];
+  const normalizedText = (container.innerText || "")
+    .replace(/\\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (
+    !normalizedText.includes("anzeige löschen") ||
+    !normalizedText.includes(
+      "bist du sicher, dass du die anzeige löschen möchtest?"
+    )
+  ) {{
+    return stateOnly("unknown");
+  }}
+  const isEligibleControl = (element) => {{
+    if (
+      (element instanceof HTMLButtonElement && element.disabled) ||
+      element.getAttribute("aria-disabled") === "true"
+    ) {{
+      return false;
+    }}
+    const style = getComputedStyle(element);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse" ||
+      style.pointerEvents === "none" ||
+      Number(style.opacity) === 0
+    ) {{
+      return false;
+    }}
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }};
+  const label = (element) => (element.innerText || "").trim().toLowerCase();
+  const confirms = Array.from(
+    container.querySelectorAll(
+      'button#delete-celebration-sbmt, [role="button"]#delete-celebration-sbmt'
+    )
+  ).filter(
+    (element) =>
+      label(element) === "ja, anzeige löschen" &&
+      isEligibleControl(element)
+  );
+  const cancels = Array.from(
+    container.querySelectorAll('button, [role="button"]')
+  ).filter(
+    (element) => label(element) === "abbrechen" && isEligibleControl(element)
+  );
+  if (confirms.length !== 1 || cancels.length !== 1) {{
+    return stateOnly("unknown");
+  }}
+  if (!activate) return {{state: "ready", ad_id: targetAdId}};
+
+  const control = confirms[0];
+  control.scrollIntoView({{block: "center", inline: "center"}});
+  const rect = control.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const hit = document.elementFromPoint(x, y);
+  if (hit !== control && !control.contains(hit)) return null;
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    y < 0 ||
+    x > window.innerWidth ||
+    y > window.innerHeight
+  ) {{
+    return null;
+  }}
+  return {{x, y}};
+}})()
+"""
+
+    def open_delete_confirmation(self) -> None:
+        if self._delete_confirmation_attempted:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "delete_confirmation_already_attempted"
+            )
+        target_ad_id = self._bound_delete_ad_id
+        snapshot = self._last_delete_snapshot
+        self._last_delete_snapshot = None
+        if (
+            target_ad_id is None
+            or snapshot is None
+            or snapshot.state is not PrivateWebEditorState.READY
+            or snapshot.ad_id != target_ad_id
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "delete_open_confirmation"
+            )
+        self._delete_confirmation_attempted = True
+        try:
+            client = self._client()
+            activation = self._runtime_value(
+                client,
+                self._delete_control_expression(
+                    target_ad_id,
+                    activation=True,
+                ),
+            )
+        except Exception:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "delete_open_confirmation"
+            ) from None
+        if not isinstance(activation, dict):
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "delete_open_confirmation"
+            )
+        raw_x = activation.get("x")
+        raw_y = activation.get("y")
+        if (
+            isinstance(raw_x, bool)
+            or not isinstance(raw_x, (int, float))
+            or not math.isfinite(float(raw_x))
+            or float(raw_x) < 0
+            or isinstance(raw_y, bool)
+            or not isinstance(raw_y, (int, float))
+            or not math.isfinite(float(raw_y))
+            or float(raw_y) < 0
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "delete_open_confirmation"
+            )
+        try:
+            self._dispatch_browser_click(
+                client,
+                x=float(raw_x),
+                y=float(raw_y),
+            )
+        except Exception:
+            # Browser input may already have taken effect. Even though the
+            # currently evidenced UI only opens a confirmation modal here,
+            # provider/UI drift must never be classified as safely unattempted.
+            raise PrivateWebSubmitUnknownError(
+                "delete_open_confirmation"
+            ) from None
+
+        deadline = self._monotonic() + self._timeout_seconds
+        while True:
+            try:
+                value = self._runtime_value(
+                    client,
+                    self._delete_confirmation_expression(target_ad_id),
+                )
+            except Exception:
+                value = None
+            if (
+                isinstance(value, dict)
+                and value.get("state") == PrivateWebEditorState.READY.value
+                and value.get("ad_id") == target_ad_id
+            ):
+                return
+            if self._monotonic() >= deadline:
+                raise PrivateWebSubmitUnknownError(
+                    "delete_open_confirmation_settle"
+                )
+            try:
+                self._sleep(0.05)
+            except Exception:
+                raise PrivateWebSubmitUnknownError(
+                    "delete_open_confirmation_settle"
+                ) from None
+
+    def read_delete_confirmation(self) -> PrivateWebDeleteSnapshot:
+        target_ad_id = self._bound_delete_ad_id
+        self._last_delete_snapshot = None
+        if target_ad_id is None or not self._delete_confirmation_attempted:
+            raise PrivateWebCdpError("read_delete_confirmation")
+        value = self._evaluate(
+            "read_delete_confirmation",
+            self._delete_confirmation_expression(target_ad_id),
+        )
+        if not isinstance(value, dict):
+            return PrivateWebDeleteSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        raw_state = value.get("state")
+        try:
+            state = PrivateWebEditorState(raw_state)
+        except (TypeError, ValueError):
+            return PrivateWebDeleteSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        if state is not PrivateWebEditorState.READY:
+            return PrivateWebDeleteSnapshot(state=state)
+        if value.get("ad_id") != target_ad_id:
+            return PrivateWebDeleteSnapshot(state=PrivateWebEditorState.UNKNOWN)
+        snapshot = PrivateWebDeleteSnapshot(
+            state=PrivateWebEditorState.READY,
+            ad_id=target_ad_id,
+        )
+        self._last_delete_snapshot = snapshot
+        return snapshot
+
+    def _delete_settled_expression(self) -> str:
+        origin = json.dumps(self._expected_origin)
+        return f"""
+(() => {{
+  if (location.origin !== {origin}) return false;
+  if (document.querySelector("#celebration-container")) return true;
+  return (
+    document.readyState === "complete" &&
+    document.querySelector("#delete-container") === null &&
+    document.querySelector("#delete-celebration-sbmt") === null
+  );
+}})()
+"""
+
+    def _wait_for_delete_settlement(self, client: _CdpClient) -> None:
+        deadline = self._monotonic() + self._timeout_seconds
+        expression = self._delete_settled_expression()
+        while True:
+            try:
+                settled = self._runtime_value(client, expression)
+            except Exception:
+                settled = False
+            if settled is True:
+                return
+            if self._monotonic() >= deadline:
+                raise PrivateWebSubmitUnknownError(
+                    "delete_submit_settle"
+                )
+            try:
+                self._sleep(0.05)
+            except Exception:
+                raise PrivateWebSubmitUnknownError(
+                    "delete_submit_settle"
+                ) from None
+
+    def submit_delete(self) -> None:
+        if self._delete_submit_attempted:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "delete_submit_already_attempted"
+            )
+        self._delete_submit_attempted = True
+        target_ad_id = self._bound_delete_ad_id
+        snapshot = self._last_delete_snapshot
+        self._last_delete_snapshot = None
+        if (
+            target_ad_id is None
+            or not self._delete_confirmation_attempted
+            or snapshot is None
+            or snapshot.state is not PrivateWebEditorState.READY
+            or snapshot.ad_id != target_ad_id
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError("delete_submit")
+        try:
+            client = self._client()
+            activation = self._runtime_value(
+                client,
+                self._delete_confirmation_expression(
+                    target_ad_id,
+                    activation=True,
+                ),
+            )
+        except Exception:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "delete_submit"
+            ) from None
+        if not isinstance(activation, dict):
+            raise PrivateWebCdpWriteNotAttemptedError("delete_submit")
+        raw_x = activation.get("x")
+        raw_y = activation.get("y")
+        if (
+            isinstance(raw_x, bool)
+            or not isinstance(raw_x, (int, float))
+            or not math.isfinite(float(raw_x))
+            or float(raw_x) < 0
+            or isinstance(raw_y, bool)
+            or not isinstance(raw_y, (int, float))
+            or not math.isfinite(float(raw_y))
+            or float(raw_y) < 0
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError("delete_submit")
+        try:
+            self._dispatch_browser_click(
+                client,
+                x=float(raw_x),
+                y=float(raw_y),
+            )
+        except Exception:
+            raise PrivateWebSubmitUnknownError("delete_submit") from None
+        self._wait_for_delete_settlement(client)
 
 
     def _replace_field(

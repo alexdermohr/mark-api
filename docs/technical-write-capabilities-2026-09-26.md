@@ -203,12 +203,13 @@ MarkService / SafeWriteOrchestrator
         |       |       -> ManagementReadAdapter
         |       |       -> CdpPrivateWebOwnerReader (target-bound)
         |       |
-        |       +-- content_writer
-        |               -> frische CdpPrivateWebPage pro Write
-        |               -> PrivateWebContentWriter
-        |                       |
-        |                       +-- normale Kleinanzeigen-Weboberfläche
-        |                           in eigener nutzer-authentifizierter Sitzung
+        |       +-- content_writer -> PrivateWebContentWriter
+        |       +-- state_writer   -> PrivateWebStateWriter
+        |       +-- delete_writer  -> PrivateWebDeleteWriter
+        |               |
+        |               +-- jeweils frische CdpPrivateWebPage pro Write
+        |               +-- normale Kleinanzeigen-Weboberfläche
+        |                   in eigener nutzer-authentifizierter Sitzung
         |
         +-- ProSellersApiWriter (optional, nur nach Admission)
 ```
@@ -218,6 +219,23 @@ Private/mobile HTTP und der historische BrowserBot werden nicht automatisch als 
 Die optionale Runtime-Dependency ist als `.[private-web]` deklariert. Der Runtime-Builder prüft `websocket-client` vor Browserzugriff fail-closed; er installiert keine Pakete selbst. `MarkService` nimmt optional eine `content_reader_factory(ad_id)` entgegen. Diese Factory wird lazy erst hinter dem zentralen `writes_enabled`-Gate konstruiert und für Pre-/Post-Read desselben Writes wiederverwendet.
 
 Der Real-Smoke auf einer eigenen, frisch owner-verifizierten Anzeige bestätigte einen einmaligen Titel-Write durch den unabhängigen Owner/Web-Post-Read, obwohl die lokale Submit-Bestätigung unbestimmt blieb. Ein separater Restore-Versuch blieb `AMBIGUOUS`; entsprechend wurde er nicht wiederholt. Damit ist gerade die gewünschte No-Retry/Reconciliation-Semantik real belegt, ohne aus dem unbestimmten Restore eine unbelegte Fehlerursache abzuleiten.
+
+### Fortschreibung 30.09.2026 — read-only Delete-UI-Evidenz
+
+Für den privaten Delete-Pfad wurde die aktuell eingeloggte normale Management-Weboberfläche ausschließlich **read-only** untersucht. Es wurde weder der Delete-Button noch dessen Bestätigung aktiviert und keine Kleinanzeigen-Anzeige mutiert.
+
+Die aktuelle eigene Anzeigenzeile zeigte einen sichtbaren, enabled `BUTTON type=button` mit dem Accessibility-/Textnamen `Löschen`. Der geladene UI-Code belegt für genau diesen Control folgende zweistufige Semantik:
+
+- der erste `Löschen`-Handler delegiert die konkrete Anzeige an `handleDeleteSingle(ad)`,
+- dieser Handler setzt `adIdsToDelete=[ad.id]` und öffnet nur das Single-Delete-Modal,
+- das Modal trägt den Titel `Anzeige löschen` und die Frage `Bist du sicher, dass du die Anzeige löschen möchtest?`,
+- der bestätigende Control ist `#delete-celebration-sbmt` mit dem sichtbaren Text `Ja, Anzeige löschen`,
+- daneben existiert der explizite Cancel-Control `Abbrechen`,
+- erst der Confirm-Handler ruft die eigentliche Delete-Funktion für die gebundene `adId` auf.
+
+Darauf baut der neue `PrivateWebDeleteWriter` konservativ auf: exakte eigene `ad_id`/Row-Bindung, browser-level Input ohne DOM-`.click()`, erneute Prüfung des expliziten Bestätigungsmodals, genau ein Confirm-Mutationsversuch und kein Blind-Retry. Jeder Fehler nach möglichem Browser-Input wird als unbekannter Effekt behandelt. Erfolg wird weiterhin **nicht** aus Modal-/UI-Signalen behauptet, sondern nur über die bestehenden autoritativen Besitzer-/Management-Readbacks des `SafeWriteOrchestrator` bestätigt.
+
+Der Delete-Pfad ist in diesem Stand lokal regressionsgetestet; ein Live-Delete wurde bewusst nicht ausgeführt.
 
 ## Geplante Mark-HTTP-API
 
@@ -302,4 +320,4 @@ Erst nach diesem Beleg wird der Browser-Content-Updatepfad zum Fallback degradie
 
 Die Frage, **ob** eine schreibfähige Mark-API technisch möglich ist, ist mit **ja** beantwortet.
 
-Die aktive technische Arbeit folgt D-010: `PrivateWebWriter`, persistenter CDP-Driver und der ownergebundene in-place Content-Smoke sind belegt; die Runtime-Komposition verbindet diese Flächen jetzt ohne Browser-Lifecycle im Core mit `MarkService`. Danach werden Create/Media/Lifecycle/Delete einzeln über denselben fail-closed Web-UI-Pfad ergänzt; ProSellers bleibt das optionale offizielle zweite Backend. Die privaten/mobile Reverse-Engineering-Pfade bleiben historische PoC-Evidenz.
+Die aktive technische Arbeit folgt D-010: `PrivateWebWriter`, persistenter CDP-Driver und der ownergebundene in-place Content-Smoke sind belegt; die Runtime-Komposition verbindet diese Flächen ohne Browser-Lifecycle im Core mit `MarkService`. Lifecycle (`ACTIVE`/`PAUSED`) ist inzwischen über denselben fail-closed Web-UI-Pfad implementiert. Der Delete-Writer ist lokal auf die aktuelle, read-only belegte Zwei-Schritt-UI gebunden und regressionsgetestet; ein Live-Delete bleibt unbelegt und wurde in diesem Slice ausdrücklich nicht ausgeführt. Create/Media bleiben separate spätere Slices. ProSellers bleibt das optionale offizielle zweite Backend; die privaten/mobile Reverse-Engineering-Pfade bleiben historische PoC-Evidenz.
