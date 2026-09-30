@@ -10,7 +10,7 @@ from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
-from .domain import AdSnapshot, LifecycleState
+from .domain import AdSnapshot, LifecycleState, _utf16_code_unit_length
 from .ports import AdsReader, WriteNotAttemptedError
 from .private_web import (
     PrivateWebCreateSnapshot,
@@ -1575,7 +1575,7 @@ class CdpPrivateWebPage:
     def replace_create_title(self, value: str) -> None:
         if not isinstance(value, str):
             raise TypeError("create title must be a string")
-        if len(value) > 65:
+        if _utf16_code_unit_length(value) > 65:
             raise ValueError("create title must be <= 65 characters")
         self._replace_create_field(
             stage="replace_create_title",
@@ -1588,7 +1588,7 @@ class CdpPrivateWebPage:
     def replace_create_description(self, value: str) -> None:
         if not isinstance(value, str):
             raise TypeError("create description must be a string")
-        if len(value) > 4000:
+        if _utf16_code_unit_length(value) > 4000:
             raise ValueError(
                 "create description must be <= 4000 characters"
             )

@@ -79,6 +79,24 @@ class ResultAndDomainTests(unittest.TestCase):
                 price_eur=12,
             )
 
+    def test_create_request_counts_title_limit_in_utf16_code_units(self) -> None:
+        boundary = "😀" * 32 + "x"
+        request = AdCreateRequest(
+            category_path=("Haus & Garten", "Dekoration"),
+            title=boundary,
+            description="Beschreibung",
+            price_eur=12,
+        )
+
+        self.assertEqual(request.title, boundary)
+        with self.assertRaises(ValueError):
+            AdCreateRequest(
+                category_path=("Haus & Garten", "Dekoration"),
+                title="😀" * 33,
+                description="Beschreibung",
+                price_eur=12,
+            )
+
     def test_create_request_rejects_title_line_breaks(self) -> None:
         for line_break in ("\n", "\r", "\r\n"):
             with self.subTest(line_break=repr(line_break)):
@@ -102,6 +120,24 @@ class ResultAndDomainTests(unittest.TestCase):
             request.description,
             "Erste Zeile\nZweite Zeile\nDritte Zeile\nVierte Zeile",
         )
+
+    def test_create_request_counts_description_limit_in_utf16_code_units(self) -> None:
+        boundary = "😀" * 2000
+        request = AdCreateRequest(
+            category_path=("Haus & Garten", "Dekoration"),
+            title="Testanzeige",
+            description=boundary,
+            price_eur=12,
+        )
+
+        self.assertEqual(request.description, boundary)
+        with self.assertRaises(ValueError):
+            AdCreateRequest(
+                category_path=("Haus & Garten", "Dekoration"),
+                title="Testanzeige",
+                description=boundary + "x",
+                price_eur=12,
+            )
 
     def test_create_request_rejects_non_positive_fixed_price(self) -> None:
         with self.assertRaises(ValueError):

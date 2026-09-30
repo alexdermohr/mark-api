@@ -451,6 +451,28 @@ class CdpPrivateWebPageTests(unittest.TestCase):
         self.assertIn('element.getAttribute("name") !== "title"', expression)
         self.assertNotIn(".click(", expression)
 
+    def test_create_field_limits_count_utf16_code_units_before_browser_access(self) -> None:
+        client = FakeClient(
+            lambda method, params: (_ for _ in ()).throw(
+                AssertionError("browser must not be touched")
+            )
+        )
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+
+        with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
+            page.replace_create_title("😀" * 32 + "x")
+        with self.assertRaises(ValueError):
+            page.replace_create_title("😀" * 33)
+        with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
+            page.replace_create_description("😀" * 2000)
+        with self.assertRaises(ValueError):
+            page.replace_create_description("😀" * 2000 + "x")
+
+        self.assertEqual(client.calls, [])
+
     def test_submit_create_uses_one_browser_input_pair_and_is_single_shot(self) -> None:
         client = FakeClient(
             lambda method, params: (

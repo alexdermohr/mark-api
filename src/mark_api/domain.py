@@ -24,6 +24,10 @@ def _require_nonempty(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must not be blank")
 
 
+def _utf16_code_unit_length(value: str) -> int:
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in value)
+
+
 def _require_aware(value: datetime, field_name: str) -> None:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
@@ -88,14 +92,14 @@ class AdCreateRequest:
             raise ValueError("title must not have surrounding whitespace")
         if "\r" in self.title or "\n" in self.title:
             raise ValueError("title must not contain line breaks")
-        if len(self.title) > 65:
+        if _utf16_code_unit_length(self.title) > 65:
             raise ValueError("title must be <= 65 characters")
 
         if not isinstance(self.description, str):
             raise ValueError("description must be a string")
         normalized_description = self.description.replace("\r\n", "\n").replace("\r", "\n")
         _require_nonempty(normalized_description, "description")
-        if len(normalized_description) > 4000:
+        if _utf16_code_unit_length(normalized_description) > 4000:
             raise ValueError("description must be <= 4000 characters")
         object.__setattr__(self, "description", normalized_description)
 
