@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timezone
 
 from mark_api.domain import (
+    AdCreateRequest,
     AdSnapshot,
     DeleteApproval,
     LifecycleState,
@@ -20,11 +21,12 @@ NOW = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
 def snapshot(
     state: LifecycleState,
     *,
+    ad_id: str = "3521676801",
     title: str | None = "title",
     description: str | None = "description",
 ) -> AdSnapshot:
     return AdSnapshot(
-        ad_id="3521676801",
+        ad_id=ad_id,
         observed_at=NOW,
         source="test",
         lifecycle_state=state,
@@ -43,6 +45,28 @@ class SequenceReader:
         if not self.results:
             raise AssertionError("unexpected read")
         return self.results.pop(0)
+
+
+class CreateWriter:
+    def __init__(self, error: Exception | None = None):
+        self.calls = 0
+        self.error = error
+        self.last_request: AdCreateRequest | None = None
+
+    def create_ad(self, request: AdCreateRequest) -> None:
+        self.calls += 1
+        self.last_request = request
+        if self.error is not None:
+            raise self.error
+
+
+def create_request() -> AdCreateRequest:
+    return AdCreateRequest(
+        category_path=("Haus & Garten", "Dekoration", "Weitere Dekoration"),
+        title="Neue Vase",
+        description="Beschreibung der neuen Vase",
+        price_eur=12,
+    )
 
 
 class DeleteWriter:
@@ -90,6 +114,359 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
             clock=lambda: NOW,
             writes_enabled=enabled,
         )
+
+    def test_create_writes_disabled_before_reads_or_writer(self) -> None:
+        reader = SequenceReader()
+        confirmation = SequenceReader()
+        writer = CreateWriter()
+
+        receipt = self.service(enabled=False).create(
+            request=create_request(),
+            reader=reader,
+            confirmation_reader=confirmation,
+            writer=writer,
+            content_reader_factory=lambda _ad_id: SequenceReader(),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
+        self.assertEqual(receipt.pre_read_status, "writes_disabled")
+        self.assertFalse(receipt.writer_invoked)
+        self.assertEqual(reader.calls, 0)
+        self.assertEqual(confirmation.calls, 0)
+        self.assertEqual(writer.calls, 0)
+
+    def test_create_requires_writer_and_content_confirmation_before_reads(self) -> None:
+        reader = SequenceReader()
+        confirmation = SequenceReader()
+
+        missing_writer = self.service().create(
+            request=create_request(),
+            reader=reader,
+            confirmation_reader=confirmation,
+            writer=None,
+            content_reader_factory=lambda _ad_id: SequenceReader(),
+        )
+        self.assertEqual(
+            missing_writer.pre_read_status,
+            "create_writer_unavailable",
+        )
+        self.assertEqual(reader.calls, 0)
+        self.assertEqual(confirmation.calls, 0)
+
+        missing_content = self.service().create(
+            request=create_request(),
+            reader=reader,
+            confirmation_reader=confirmation,
+            writer=CreateWriter(),
+            content_reader_factory=None,
+        )
+        self.assertEqual(
+            missing_content.confirmation_pre_read_status,
+            "content_confirmation_unavailable",
+        )
+        self.assertEqual(reader.calls, 0)
+        self.assertEqual(confirmation.calls, 0)
+
+    def test_create_rejects_same_inventory_reader_before_any_read_or_write(self) -> None:
+        reader = SequenceReader()
+        writer = CreateWriter()
+
+        receipt = self.service().create(
+            request=create_request(),
+            reader=reader,
+            confirmation_reader=reader,
+            writer=writer,
+            content_reader_factory=lambda _ad_id: SequenceReader(),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
+        self.assertEqual(
+            receipt.confirmation_pre_read_status,
+            "confirmation_reader_not_independent",
+        )
+        self.assertEqual(reader.calls, 0)
+        self.assertEqual(writer.calls, 0)
+
+    def test_create_confirms_one_new_id_in_both_inventories_and_exact_content(self) -> None:
+        request = create_request()
+        old_primary = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="100",
+            title="Alt",
+        )
+        old_confirmation = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="100",
+            title="Alt",
+        )
+        new_primary = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="200",
+            title=request.title,
+            description=None,
+        )
+        new_confirmation = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="200",
+            title=request.title,
+            description=None,
+        )
+        exact_content = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="200",
+            title=request.title,
+            description=request.description,
+        )
+        reader = SequenceReader(
+            ReadResult.success_nonempty((old_primary,)),
+            ReadResult.success_nonempty((old_primary, new_primary)),
+        )
+        confirmation = SequenceReader(
+            ReadResult.success_nonempty((old_confirmation,)),
+            ReadResult.success_nonempty((old_confirmation, new_confirmation)),
+        )
+        content_reader = SequenceReader(
+            ReadResult.success_nonempty((exact_content,))
+        )
+        writer = CreateWriter()
+        factory_calls: list[str] = []
+
+        def factory(ad_id: str):
+            factory_calls.append(ad_id)
+            return content_reader
+
+        receipt = self.service().create(
+            request=request,
+            reader=reader,
+            confirmation_reader=confirmation,
+            writer=writer,
+            content_reader_factory=factory,
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(receipt.created_ad_id, "200")
+        self.assertEqual(receipt.content_post_snapshot, exact_content)
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(factory_calls, ["200"])
+        self.assertEqual(reader.calls, 2)
+        self.assertEqual(confirmation.calls, 2)
+        self.assertEqual(content_reader.calls, 1)
+
+    def test_create_rejects_inventory_reader_as_content_confirmation(self) -> None:
+        request = create_request()
+        candidate = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="200",
+            title=request.title,
+        )
+        reader = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((candidate,)),
+        )
+        confirmation = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((candidate,)),
+        )
+
+        receipt = self.service().create(
+            request=request,
+            reader=reader,
+            confirmation_reader=confirmation,
+            writer=CreateWriter(),
+            content_reader_factory=lambda _ad_id: reader,
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertIsNone(receipt.created_ad_id)
+        self.assertEqual(
+            receipt.content_post_read_status,
+            "content_reader_not_independent",
+        )
+        self.assertEqual(reader.calls, 2)
+        self.assertEqual(confirmation.calls, 2)
+
+    def test_create_is_ambiguous_when_inventories_disagree_on_new_id(self) -> None:
+        request = create_request()
+        reader = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty(
+                (
+                    snapshot(
+                        LifecycleState.ACTIVE,
+                        ad_id="200",
+                        title=request.title,
+                    ),
+                )
+            ),
+        )
+        confirmation = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty(
+                (
+                    snapshot(
+                        LifecycleState.ACTIVE,
+                        ad_id="201",
+                        title=request.title,
+                    ),
+                )
+            ),
+        )
+        writer = CreateWriter()
+        factory_calls: list[str] = []
+
+        receipt = self.service().create(
+            request=request,
+            reader=reader,
+            confirmation_reader=confirmation,
+            writer=writer,
+            content_reader_factory=lambda ad_id: (
+                factory_calls.append(ad_id) or SequenceReader()
+            ),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertIsNone(receipt.created_ad_id)
+        self.assertEqual(factory_calls, [])
+        self.assertEqual(writer.calls, 1)
+
+    def test_create_is_ambiguous_when_multiple_new_ids_appear(self) -> None:
+        request = create_request()
+        post = (
+            snapshot(
+                LifecycleState.ACTIVE,
+                ad_id="200",
+                title=request.title,
+            ),
+            snapshot(
+                LifecycleState.ACTIVE,
+                ad_id="201",
+                title=request.title,
+            ),
+        )
+        reader = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty(post),
+        )
+        confirmation = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty(post),
+        )
+        writer = CreateWriter()
+
+        receipt = self.service().create(
+            request=request,
+            reader=reader,
+            confirmation_reader=confirmation,
+            writer=writer,
+            content_reader_factory=lambda _ad_id: SequenceReader(),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertIsNone(receipt.created_ad_id)
+
+    def test_create_exact_inventory_candidate_still_needs_content_match(self) -> None:
+        request = create_request()
+        candidate = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="200",
+            title=request.title,
+        )
+        reader = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((candidate,)),
+        )
+        confirmation = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((candidate,)),
+        )
+        content_reader = SequenceReader(
+            ReadResult.success_nonempty(
+                (
+                    snapshot(
+                        LifecycleState.ACTIVE,
+                        ad_id="200",
+                        title=request.title,
+                        description="anderer Inhalt",
+                    ),
+                )
+            )
+        )
+
+        receipt = self.service().create(
+            request=request,
+            reader=reader,
+            confirmation_reader=confirmation,
+            writer=CreateWriter(),
+            content_reader_factory=lambda _ad_id: content_reader,
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertIsNone(receipt.created_ad_id)
+        self.assertEqual(content_reader.calls, 1)
+
+    def test_create_write_not_attempted_skips_all_post_reads(self) -> None:
+        reader = SequenceReader(ReadResult.success_empty(()))
+        confirmation = SequenceReader(ReadResult.success_empty(()))
+        writer = CreateWriter(
+            error=WriteNotAttemptedError("sanitized safe failure")
+        )
+        factory_calls: list[str] = []
+
+        receipt = self.service().create(
+            request=create_request(),
+            reader=reader,
+            confirmation_reader=confirmation,
+            writer=writer,
+            content_reader_factory=lambda ad_id: (
+                factory_calls.append(ad_id) or SequenceReader()
+            ),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
+        self.assertTrue(receipt.writer_invoked)
+        self.assertEqual(receipt.writer_error, "WriteNotAttemptedError")
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(confirmation.calls, 1)
+        self.assertEqual(factory_calls, [])
+        self.assertIsNone(receipt.post_read_status)
+
+    def test_create_unknown_writer_error_can_be_confirmed_without_retry(self) -> None:
+        request = create_request()
+        candidate = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="200",
+            title=request.title,
+        )
+        exact_content = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="200",
+            title=request.title,
+            description=request.description,
+        )
+        reader = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((candidate,)),
+        )
+        confirmation = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((candidate,)),
+        )
+        writer = CreateWriter(error=TimeoutError("unknown delivery"))
+
+        receipt = self.service().create(
+            request=request,
+            reader=reader,
+            confirmation_reader=confirmation,
+            writer=writer,
+            content_reader_factory=lambda _ad_id: SequenceReader(
+                ReadResult.success_nonempty((exact_content,))
+            ),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(receipt.created_ad_id, "200")
+        self.assertEqual(receipt.writer_error, "TimeoutError")
+        self.assertEqual(writer.calls, 1)
 
     def test_writes_are_disabled_by_default(self) -> None:
         reader = SequenceReader()

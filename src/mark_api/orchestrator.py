@@ -4,7 +4,9 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 
 from .domain import (
+    AdCreateRequest,
     AdSnapshot,
+    CreateOperationReceipt,
     DeleteApproval,
     LifecycleState,
     OperationOutcome,
@@ -12,6 +14,7 @@ from .domain import (
 )
 from .ports import (
     AdContentUpdater,
+    AdCreateWriter,
     AdDeleteWriter,
     AdsReader,
     AdStateWriter,
@@ -55,6 +58,29 @@ class SafeWriteOrchestrator:
         if self._store is not None:
             self._store.append_operation_receipt(receipt)
         return receipt
+
+    def _persist_create(
+        self,
+        receipt: CreateOperationReceipt,
+    ) -> CreateOperationReceipt:
+        if self._store is not None:
+            self._store.append_create_operation_receipt(receipt)
+        return receipt
+
+    @staticmethod
+    def _inventory_index(
+        result: ReadResult[tuple[AdSnapshot, ...]],
+    ) -> dict[str, AdSnapshot] | None:
+        if not result.is_success:
+            return None
+        index: dict[str, AdSnapshot] = {}
+        for snapshot in result.value or ():
+            if not isinstance(snapshot, AdSnapshot):
+                return None
+            if snapshot.ad_id in index:
+                return None
+            index[snapshot.ad_id] = snapshot
+        return index
 
     def _precondition_failed(
         self,
@@ -199,6 +225,184 @@ class SafeWriteOrchestrator:
                 writer_error=writer_error,
                 pre_snapshot=pre_snapshot,
                 post_snapshot=post_snapshot,
+            )
+        )
+
+    def create(
+        self,
+        *,
+        request: AdCreateRequest,
+        reader: AdsReader,
+        confirmation_reader: AdsReader,
+        writer: AdCreateWriter | None,
+        content_reader_factory: Callable[[str], AdsReader] | None,
+    ) -> CreateOperationReceipt:
+        started_at = self._clock()
+
+        def precondition(
+            *,
+            pre_status: str,
+            confirmation_pre_status: str,
+            writer_invoked: bool = False,
+            writer_error: str | None = None,
+        ) -> CreateOperationReceipt:
+            return self._persist_create(
+                CreateOperationReceipt(
+                    operation="create",
+                    started_at=started_at,
+                    completed_at=self._clock(),
+                    outcome=OperationOutcome.PRECONDITION_FAILED,
+                    pre_read_status=pre_status,
+                    confirmation_pre_read_status=confirmation_pre_status,
+                    post_read_status=None,
+                    confirmation_post_read_status=None,
+                    content_post_read_status=None,
+                    writer_invoked=writer_invoked,
+                    writer_error=writer_error,
+                )
+            )
+
+        if not self._writes_enabled:
+            return precondition(
+                pre_status="writes_disabled",
+                confirmation_pre_status="not_read",
+            )
+        if writer is None:
+            return precondition(
+                pre_status="create_writer_unavailable",
+                confirmation_pre_status="not_read",
+            )
+        if confirmation_reader is reader:
+            return precondition(
+                pre_status="not_read",
+                confirmation_pre_status="confirmation_reader_not_independent",
+            )
+        if content_reader_factory is None:
+            return precondition(
+                pre_status="not_read",
+                confirmation_pre_status="content_confirmation_unavailable",
+            )
+
+        pre = reader.read_ads()
+        if not pre.is_success:
+            return precondition(
+                pre_status=pre.status.value,
+                confirmation_pre_status="not_read",
+            )
+        pre_index = self._inventory_index(pre)
+        if pre_index is None:
+            return precondition(
+                pre_status="invalid_inventory_shape",
+                confirmation_pre_status="not_read",
+            )
+
+        confirmation_pre = confirmation_reader.read_ads()
+        if not confirmation_pre.is_success:
+            return precondition(
+                pre_status=pre.status.value,
+                confirmation_pre_status=confirmation_pre.status.value,
+            )
+        confirmation_pre_index = self._inventory_index(confirmation_pre)
+        if confirmation_pre_index is None:
+            return precondition(
+                pre_status=pre.status.value,
+                confirmation_pre_status="invalid_inventory_shape",
+            )
+
+        writer_error: str | None = None
+        try:
+            writer.create_ad(request)
+        except WriteNotAttemptedError as exc:
+            return precondition(
+                pre_status=pre.status.value,
+                confirmation_pre_status=confirmation_pre.status.value,
+                writer_invoked=True,
+                writer_error=type(exc).__name__,
+            )
+        except Exception as exc:  # noqa: BLE001 - reconciled by fresh readbacks.
+            writer_error = type(exc).__name__
+
+        post = reader.read_ads()
+        confirmation_post = confirmation_reader.read_ads()
+
+        post_index = self._inventory_index(post)
+        confirmation_post_index = self._inventory_index(confirmation_post)
+        post_snapshot: AdSnapshot | None = None
+        confirmation_post_snapshot: AdSnapshot | None = None
+        content_post_snapshot: AdSnapshot | None = None
+        content_post_status: str | None = None
+        candidate_id: str | None = None
+
+        if post_index is not None and confirmation_post_index is not None:
+            new_primary = set(post_index) - set(pre_index)
+            new_confirmation = (
+                set(confirmation_post_index) - set(confirmation_pre_index)
+            )
+            if (
+                len(new_primary) == 1
+                and len(new_confirmation) == 1
+                and new_primary == new_confirmation
+            ):
+                candidate_id = next(iter(new_primary))
+                post_snapshot = post_index[candidate_id]
+                confirmation_post_snapshot = confirmation_post_index[candidate_id]
+
+        inventory_match = (
+            candidate_id is not None
+            and post_snapshot is not None
+            and confirmation_post_snapshot is not None
+            and post_snapshot.title == request.title
+            and confirmation_post_snapshot.title == request.title
+        )
+
+        if inventory_match and candidate_id is not None:
+            try:
+                content_reader = content_reader_factory(candidate_id)
+            except Exception:  # noqa: BLE001 - confirmation setup is read-only.
+                content_post_status = "factory_error"
+            else:
+                if (
+                    content_reader is reader
+                    or content_reader is confirmation_reader
+                ):
+                    content_post_status = "content_reader_not_independent"
+                else:
+                    content = content_reader.read_ads()
+                    content_post_status = content.status.value
+                    if content.is_success:
+                        content_post_snapshot = self._find_target(
+                            content,
+                            candidate_id,
+                        )
+
+        confirmed = (
+            inventory_match
+            and content_post_snapshot is not None
+            and content_post_snapshot.title == request.title
+            and content_post_snapshot.description == request.description
+        )
+
+        return self._persist_create(
+            CreateOperationReceipt(
+                operation="create",
+                started_at=started_at,
+                completed_at=self._clock(),
+                outcome=(
+                    OperationOutcome.CONFIRMED
+                    if confirmed
+                    else OperationOutcome.AMBIGUOUS
+                ),
+                pre_read_status=pre.status.value,
+                confirmation_pre_read_status=confirmation_pre.status.value,
+                post_read_status=post.status.value,
+                confirmation_post_read_status=confirmation_post.status.value,
+                content_post_read_status=content_post_status,
+                writer_invoked=True,
+                created_ad_id=candidate_id if confirmed else None,
+                writer_error=writer_error,
+                post_snapshot=post_snapshot,
+                confirmation_post_snapshot=confirmation_post_snapshot,
+                content_post_snapshot=content_post_snapshot,
             )
         )
 

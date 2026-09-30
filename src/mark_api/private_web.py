@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from .domain import LifecycleState
+from .domain import AdCreateRequest, LifecycleState
 from .ports import WriteNotAttemptedError
 
 
@@ -60,6 +60,37 @@ class PrivateWebEditorSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class PrivateWebCreateSnapshot:
+    state: PrivateWebEditorState
+    title: str | None = None
+    description: str | None = None
+    price_amount: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, PrivateWebEditorState):
+            raise TypeError("state must be PrivateWebEditorState")
+        if self.state is PrivateWebEditorState.READY:
+            if not isinstance(self.title, str):
+                raise ValueError("ready create snapshot requires title text")
+            if not isinstance(self.description, str):
+                raise ValueError(
+                    "ready create snapshot requires description text"
+                )
+            if not isinstance(self.price_amount, str):
+                raise ValueError(
+                    "ready create snapshot requires price text"
+                )
+            return
+        if any(
+            value is not None
+            for value in (self.title, self.description, self.price_amount)
+        ):
+            raise ValueError(
+                "non-ready create snapshots must not expose form content"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class PrivateWebStateSnapshot:
     state: PrivateWebEditorState
     ad_id: str | None = None
@@ -105,6 +136,28 @@ class PrivateWebDeleteSnapshot:
             raise ValueError(
                 "non-ready delete snapshots must not expose ad_id"
             )
+
+
+class PrivateWebCreatePage(Protocol):
+    """Minimal browser-page boundary for one new owner ad."""
+
+    def open_create_form(self, category_path: tuple[str, ...]) -> None:
+        ...
+
+    def read_create_form(self) -> PrivateWebCreateSnapshot:
+        ...
+
+    def replace_create_title(self, value: str) -> None:
+        ...
+
+    def replace_create_description(self, value: str) -> None:
+        ...
+
+    def replace_create_price(self, value: str) -> None:
+        ...
+
+    def submit_create(self) -> None:
+        ...
 
 
 class PrivateWebDeletePage(Protocol):
@@ -187,6 +240,99 @@ class PrivateWebSubmitUnknownError(PrivateWebError):
     def __init__(self, stage: str) -> None:
         self.stage = stage
         super().__init__(f"private web submit outcome unknown at {stage}")
+
+
+class PrivateWebCreateWriter:
+    """Publish one narrow OFFER/FIXED ad through the authenticated normal Web UI."""
+
+    def __init__(self, page: PrivateWebCreatePage) -> None:
+        self._page = page
+
+    @staticmethod
+    def _require_ready(
+        snapshot: PrivateWebCreateSnapshot,
+        *,
+        stage: str,
+    ) -> None:
+        if not isinstance(snapshot, PrivateWebCreateSnapshot):
+            raise PrivateWebPreconditionError(f"{stage}:invalid_snapshot")
+        if snapshot.state is not PrivateWebEditorState.READY:
+            raise PrivateWebPreconditionError(
+                f"{stage}:{snapshot.state.value}"
+            )
+
+    def _call(
+        self,
+        stage: str,
+        func,
+        *args,
+        unmarked_error_may_be_submit: bool = False,
+    ):
+        try:
+            return func(*args)
+        except PrivateWebSubmitUnknownError:
+            raise
+        except WriteNotAttemptedError:
+            raise PrivateWebWriteNotAttemptedError(stage) from None
+        except Exception:  # noqa: BLE001 - sanitize browser/provider boundary.
+            if unmarked_error_may_be_submit:
+                raise PrivateWebSubmitUnknownError(stage) from None
+            raise PrivateWebWriteNotAttemptedError(stage) from None
+
+    def create_ad(self, request: AdCreateRequest) -> None:
+        if not isinstance(request, AdCreateRequest):
+            raise TypeError("request must be AdCreateRequest")
+
+        self._call(
+            "open_create_form",
+            self._page.open_create_form,
+            request.category_path,
+        )
+        before = self._call(
+            "read_create_before",
+            self._page.read_create_form,
+        )
+        self._require_ready(before, stage="before")
+
+        expected_price = str(request.price_eur)
+        if before.title != request.title:
+            self._call(
+                "replace_create_title",
+                self._page.replace_create_title,
+                request.title,
+            )
+        if before.description != request.description:
+            self._call(
+                "replace_create_description",
+                self._page.replace_create_description,
+                request.description,
+            )
+        if before.price_amount != expected_price:
+            self._call(
+                "replace_create_price",
+                self._page.replace_create_price,
+                expected_price,
+            )
+
+        before_submit = self._call(
+            "read_create_before_submit",
+            self._page.read_create_form,
+        )
+        self._require_ready(before_submit, stage="before_submit")
+        if (
+            before_submit.title != request.title
+            or before_submit.description != request.description
+            or before_submit.price_amount != expected_price
+        ):
+            raise PrivateWebPreconditionError(
+                "before_submit:create_values_drift"
+            )
+
+        self._call(
+            "submit_create",
+            self._page.submit_create,
+            unmarked_error_may_be_submit=True,
+        )
 
 
 class PrivateWebContentWriter:

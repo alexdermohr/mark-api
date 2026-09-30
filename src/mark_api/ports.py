@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from .domain import AdSnapshot, LifecycleState, ReactionSnapshot
+from .domain import AdCreateRequest, AdSnapshot, LifecycleState, ReactionSnapshot
 from .results import ReadResult
 
 
@@ -23,6 +23,11 @@ class MetricsReader(Protocol):
 class InboxReader(Protocol):
     def read_reactions(self, ad_id: str) -> ReadResult[ReactionSnapshot]:
         """Read normalized reaction metrics for exactly one ad."""
+
+
+class AdCreateWriter(Protocol):
+    def create_ad(self, request: AdCreateRequest) -> None:
+        """Attempt exactly one new-ad publish for the explicit request."""
 
 
 class AdStateWriter(Protocol):

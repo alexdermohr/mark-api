@@ -4,7 +4,9 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 
 from .domain import (
+    AdCreateRequest,
     AdSnapshot,
+    CreateOperationReceipt,
     DeleteApproval,
     LifecycleState,
     OperationReceipt,
@@ -13,6 +15,7 @@ from .domain import (
 from .orchestrator import SafeWriteOrchestrator
 from .ports import (
     AdContentUpdater,
+    AdCreateWriter,
     AdDeleteWriter,
     AdsReader,
     AdStateWriter,
@@ -179,6 +182,7 @@ class MarkService:
         delete_writer: AdDeleteWriter,
         content_writer: AdContentUpdater,
         store: SnapshotStore,
+        create_writer: AdCreateWriter | None = None,
         content_reader_factory: Callable[[str], AdsReader] | None = None,
         writes_enabled: bool = False,
         clock: Callable[[], datetime] = _utc_now,
@@ -190,6 +194,7 @@ class MarkService:
         self._state_writer = state_writer
         self._delete_writer = delete_writer
         self._content_writer = content_writer
+        self._create_writer = create_writer
         self._content_reader_factory = content_reader_factory
         self._store = store
         self._clock = clock
@@ -218,6 +223,15 @@ class MarkService:
         ):
             self._store.append_reaction_snapshot(result.value)
         return result
+
+    def create(self, request: AdCreateRequest) -> CreateOperationReceipt:
+        return self._writes.create(
+            request=request,
+            reader=self._management_reader,
+            confirmation_reader=self._delete_confirmation_reader,
+            writer=self._create_writer,
+            content_reader_factory=self._content_reader_factory,
+        )
 
     def pause(self, ad_id: str) -> OperationReceipt:
         return self._writes.set_state(

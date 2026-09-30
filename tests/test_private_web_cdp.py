@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 from mark_api.domain import AdSnapshot, LifecycleState, OperationOutcome
 from mark_api.orchestrator import SafeWriteOrchestrator
 from mark_api.private_web import (
+    PrivateWebCreateSnapshot,
     PrivateWebDeleteSnapshot,
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
@@ -24,6 +25,7 @@ from mark_api.private_web_cdp import (
     CdpPrivateWebOwnerReader,
     CdpPrivateWebPage,
     PrivateWebCdpError,
+    PrivateWebCdpWriteNotAttemptedError,
     _LoopbackCdpClient,
     _proxy_free_loopback_opener,
     _validated_loopback_endpoint,
@@ -116,6 +118,35 @@ def bind_ready_editor(
     )
 
 
+def create_ready(
+    *,
+    title: str = "",
+    description: str = "",
+    price_amount: str = "",
+) -> PrivateWebCreateSnapshot:
+    return PrivateWebCreateSnapshot(
+        state=PrivateWebEditorState.READY,
+        title=title,
+        description=description,
+        price_amount=price_amount,
+    )
+
+
+def bind_ready_create(
+    page: CdpPrivateWebPage,
+    *,
+    title: str = "Neue Vase",
+    description: str = "Beschreibung",
+    price_amount: str = "12",
+) -> None:
+    page._create_bound = True
+    page._last_create_snapshot = create_ready(
+        title=title,
+        description=description,
+        price_amount=price_amount,
+    )
+
+
 def page_with_results(*values):
     clients: list[FakeClient] = []
     remaining = list(values)
@@ -144,6 +175,385 @@ def page_with_results(*values):
     ), clients
 
 class CdpPrivateWebPageTests(unittest.TestCase):
+
+    def test_open_create_form_uses_exact_labels_and_browser_input_only(self) -> None:
+        ready_form = {
+            "state": "ready",
+            "title": "",
+            "description": "",
+            "price_amount": "",
+        }
+        runtime_values = [
+            True,
+            {
+                "readyState": "complete",
+                "origin": "https://www.kleinanzeigen.de",
+                "path": "/p-anzeige-aufgeben.html",
+                "oldDocument": False,
+            },
+            {"state": "ready", "x": 10.0, "y": 20.0},
+            {"state": "ready", "x": 11.0, "y": 21.0},
+            {"state": "ready", "x": 12.0, "y": 22.0},
+            {"state": "ready", "x": 13.0, "y": 23.0},
+            ready_form,
+        ]
+
+        def handler(method, params):
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                if not runtime_values:
+                    raise AssertionError("unexpected Runtime.evaluate")
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+
+        page.open_create_form(
+            ("Haus & Garten", "Dekoration", "Weitere Dekoration")
+        )
+
+        self.assertEqual(runtime_values, [])
+        self.assertTrue(page._create_bound)
+        self.assertIsNone(page._last_create_snapshot)
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            8,
+        )
+        expressions = [
+            str(params["expression"])
+            for method, params in client.calls
+            if method == "Runtime.evaluate" and "expression" in params
+        ]
+        joined = "\n".join(expressions)
+        self.assertIn('"Haus & Garten"', joined)
+        self.assertIn('"Dekoration"', joined)
+        self.assertIn('"Weitere Dekoration"', joined)
+        self.assertIn("/p-anzeige-aufgeben-schritt2.html", joined)
+        category_expressions = [
+            expression
+            for expression in expressions
+            if 'if ((link.innerText || "").trim() !==' in expression
+        ]
+        self.assertEqual(len(category_expressions), 3)
+        for expression in category_expressions:
+            self.assertIn("link.scrollIntoView", expression)
+            self.assertIn('behavior: "instant"', expression)
+            self.assertLess(
+                expression.index("matches.length !== 1"),
+                expression.index("link.scrollIntoView"),
+            )
+            self.assertLess(
+                expression.index("link.scrollIntoView"),
+                expression.index("document.elementFromPoint"),
+            )
+            javascript_check = subprocess.run(
+                ["node", "--check", "-"],
+                input=expression,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(
+                javascript_check.returncode,
+                0,
+                javascript_check.stdout + javascript_check.stderr,
+            )
+        self.assertNotIn(".click(", joined)
+
+    def test_open_create_form_never_retries_ambiguous_continue_input(self) -> None:
+        runtime_values = [
+            True,
+            {
+                "readyState": "complete",
+                "origin": "https://www.kleinanzeigen.de",
+                "path": "/p-anzeige-aufgeben.html",
+                "oldDocument": False,
+            },
+            {"state": "ready", "x": 10.0, "y": 20.0},
+            {"state": "ready", "x": 11.0, "y": 21.0},
+            {"state": "ready", "x": 12.0, "y": 22.0},
+            {"state": "ready", "x": 13.0, "y": 23.0},
+            {
+                "state": "ready",
+                "title": "",
+                "description": "",
+                "price_amount": "",
+            },
+        ]
+        input_calls = 0
+
+        def handler(method, params):
+            nonlocal input_calls
+            if method == "Page.navigate":
+                return {}
+            if method == "Runtime.evaluate":
+                value = runtime_values.pop(0)
+                return {"result": {"type": "object", "value": value}}
+            if method == "Input.dispatchMouseEvent":
+                input_calls += 1
+                if input_calls == 7:
+                    raise PrivateWebCdpError("call")
+                return {}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+
+        page.open_create_form(
+            ("Haus & Garten", "Dekoration", "Weitere Dekoration")
+        )
+
+        self.assertTrue(page._create_bound)
+        self.assertEqual(input_calls, 7)
+        self.assertEqual(runtime_values, [])
+
+    def test_read_create_form_binds_only_supported_private_offer_baseline(self) -> None:
+        client = FakeClient(
+            lambda method, params: (
+                {
+                    "result": {
+                        "type": "object",
+                        "value": {
+                            "state": "ready",
+                            "title": "Neue Vase",
+                            "description": "Beschreibung",
+                            "price_amount": "12",
+                        },
+                    }
+                }
+                if method == "Runtime.evaluate"
+                else (_ for _ in ()).throw(
+                    AssertionError(f"unexpected method: {method}")
+                )
+            )
+        )
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        page._create_bound = True
+
+        snapshot = page.read_create_form()
+
+        self.assertEqual(
+            snapshot,
+            create_ready(
+                title="Neue Vase",
+                description="Beschreibung",
+                price_amount="12",
+            ),
+        )
+        self.assertEqual(page._last_create_snapshot, snapshot)
+        expression = str(client.calls[0][1]["expression"])
+        for required in (
+            'buyNowEligible.value !== "false"',
+            'posterType.value !== "PRIVATE"',
+            "addressVisibility.checked",
+            "marketing.checked",
+            "files[0].files.length !== 0",
+            'adDraftUuid.value !== ""',
+            'adId.value !== ""',
+            'offer.value !== "OFFER"',
+            'priceType.value !== "FIXED"',
+            "unexpected.length !== 0",
+            'normalizedButtonText(button) === "Anzeige aufgeben"',
+            "city.form !== form",
+            "street.form !== form",
+            "addressVisibility.form !== form",
+            "marketing.form !== form",
+            "priceType.form !== form",
+            "buyNowEligible.form !== form",
+            "posterType.form !== form",
+            "locationId.form !== form",
+            "categoryId.form !== form",
+            "adDraftUuid.form !== form",
+            "adId.form !== form",
+            "offer.form !== form",
+            "wanted.form !== form",
+            "files[0].form !== form",
+        ):
+            self.assertIn(required, expression)
+        self.assertNotIn(".click(", expression)
+        javascript_check = subprocess.run(
+            ["node", "--check", "-"],
+            input=expression,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(
+            javascript_check.returncode,
+            0,
+            javascript_check.stdout + javascript_check.stderr,
+        )
+
+    def test_replace_create_title_uses_native_value_setter(self) -> None:
+        runtime_values = [
+            {
+                "state": "ready",
+                "title": "Alt",
+                "description": "Beschreibung",
+                "price_amount": "12",
+            },
+            True,
+        ]
+
+        def handler(method, params):
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": runtime_values.pop(0),
+                    }
+                }
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        bind_ready_create(
+            page,
+            title="Alt",
+            description="Beschreibung",
+            price_amount="12",
+        )
+
+        page.replace_create_title("Neu")
+
+        self.assertEqual(
+            page._last_create_snapshot,
+            create_ready(
+                title="Neu",
+                description="Beschreibung",
+                price_amount="12",
+            ),
+        )
+        expression = str(client.calls[1][1]["expression"])
+        self.assertIn("Object.getOwnPropertyDescriptor", expression)
+        self.assertIn("new InputEvent", expression)
+        self.assertIn('element.getAttribute("name") !== "title"', expression)
+        self.assertNotIn(".click(", expression)
+
+    def test_create_field_limits_count_utf16_code_units_before_browser_access(self) -> None:
+        client = FakeClient(
+            lambda method, params: (_ for _ in ()).throw(
+                AssertionError("browser must not be touched")
+            )
+        )
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+
+        with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
+            page.replace_create_title("😀" * 32 + "x")
+        with self.assertRaises(ValueError):
+            page.replace_create_title("😀" * 33)
+        with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
+            page.replace_create_description("😀" * 2000)
+        with self.assertRaises(ValueError):
+            page.replace_create_description("😀" * 2000 + "x")
+
+        self.assertEqual(client.calls, [])
+
+    def test_submit_create_uses_one_browser_input_pair_and_is_single_shot(self) -> None:
+        client = FakeClient(
+            lambda method, params: (
+                {
+                    "result": {
+                        "type": "object",
+                        "value": {"state": "ready", "x": 10.0, "y": 20.0},
+                    }
+                }
+                if method == "Runtime.evaluate"
+                else {}
+                if method == "Input.dispatchMouseEvent"
+                else (_ for _ in ()).throw(
+                    AssertionError(f"unexpected method: {method}")
+                )
+            )
+        )
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        bind_ready_create(page)
+
+        page.submit_create()
+
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            [
+                "Runtime.evaluate",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+            ],
+        )
+        expression = str(client.calls[0][1]["expression"])
+        self.assertIn('"Anzeige aufgeben"', expression)
+        self.assertIn('"Neue Vase"', expression)
+        self.assertIn('"Beschreibung"', expression)
+        self.assertIn('"12"', expression)
+        self.assertNotIn(".click(", expression)
+        with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
+            page.submit_create()
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+
+    def test_submit_create_provider_failure_after_input_is_unknown_no_retry(self) -> None:
+        input_calls = 0
+
+        def handler(method, params):
+            nonlocal input_calls
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"state": "ready", "x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                input_calls += 1
+                raise PrivateWebCdpError("call")
+            raise AssertionError(f"unexpected method: {method}")
+
+        client = FakeClient(handler)
+        page = CdpPrivateWebPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        bind_ready_create(page)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            page.submit_create()
+
+        self.assertEqual(caught.exception.stage, "create_submit")
+        self.assertEqual(input_calls, 1)
+        with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
+            page.submit_create()
+        self.assertEqual(input_calls, 1)
+
     def test_endpoint_is_strict_loopback_http(self) -> None:
         self.assertEqual(
             _validated_loopback_endpoint("http://127.0.0.1:19610"),

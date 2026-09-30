@@ -4,7 +4,7 @@
 
 ## Status
 
-**Core, Dashboard und Analytics implementiert / lokaler Datenpfad gehärtet / ProSellers-Gate gemergt / PrivateWebWriter + persistenter CDP-Driver real belegt / Runtime-Komposition implementiert** — Stand: 28.09.2026.
+**Core, Dashboard und Analytics implementiert / lokaler Datenpfad gehärtet / ProSellers-Gate gemergt / PrivateWebWriter + persistenter CDP-Driver real belegt / Create-Contract lokal implementiert** — Stand: 30.09.2026.
 
 Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Der MVP-Fokus liegt auf Anzeigenverwaltung, Synchronisation, Verkäufermetriken, Inbox/Interessenten, Dashboard und datenbasierter Auswertung. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
 
@@ -15,11 +15,12 @@ Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkreti
 - `MonkrelMobileApiAdapter` als technisch belegter PoC-Adapter für eigene Anzeigen, ID-gebundene Pause/Aktivierung, Delete und Inbox/Conversation-Zuordnung; nach Abschluss von Issue #2 ist er kein Produktpfad für private Accounts.
 - `BrowserBotAdapter` bleibt als historisch belegter Fremdprozess-PoC für Sync und in-place Inhaltsupdate im Repository; er wird nicht automatisch zum Produkt-Backend.
 - `PrivateWebContentWriter` bildet den davon getrennten privaten Writer-Contract für die normale Kleinanzeigen-Weboberfläche. `CdpPrivateWebPage`, `CdpCookieProvider` und `CdpPrivateWebOwnerReader` implementieren den gehärteten loopback-only Driver; der gegatete Real-Smoke auf genau einer eigenen Anzeige hat einen Content-Write mit unabhängigem Owner/Web-Post-Read bestätigt.
+- `PrivateWebCreateWriter` bildet den ersten engen Create-Vertrag für private Konten: expliziter Kategoriepfad, `OFFER + FIXED`, Titel/Beschreibung/Festpreis, keine Medien, kein Draft, kein Buy-Now, keine Marketing- oder Adressfreigabe. Der aktuelle Create-Flow wurde ausschließlich read-only kartiert; ein Live-Publish wurde in diesem Slice nicht ausgeführt.
 - `MarkService` als Application-Layer über den Capability-Adaptern.
 - Read-only Dashboard/API auf Loopback sowie Analytics-Rankings auf explizit gespeicherten Klassifikationslabels.
 - Der Ein-Anzeigen-Realtest vom 24.09.2026 belegt Sync, stabiles in-place Update, Pause/Aktivierung, Verkäufermetriken, positiven Inbox/adId-Fall und Delete mit unabhängigen Besitzerlisten-Readbacks.
 - Am 25.09.2026 wurde der aktuell eingeloggte eigene Account read-only durch `ManagementReadAdapter -> EnrichedOwnerReader -> MarkService -> SnapshotStore` geführt: erfolgreicher leerer Besitzerbestand (`success_empty`), keine Plattformmutation.
-- Plattformwrites sind im Core standardmäßig deaktiviert. Create/Publish ist weiterhin nicht für den Dauerbetrieb freigegeben.
+- Plattformwrites sind im Core standardmäßig deaktiviert. Der Create/Publish-Vertrag ist lokal implementiert und regressionsgetestet; ein Live-Publish und damit die Betriebsfreigabe bleiben weiterhin offen.
 
 ## Lokale Klassifikationspflege
 
@@ -111,7 +112,7 @@ Für diese Runtime muss das deklarierte optionale Extra installiert sein:
 python -m pip install -e '.[private-web]'
 ```
 
-`build_private_web_content_runtime(cdp_port=...)` liefert anschließend vier für den Application-Layer bestimmte Flächen: `content_writer`, `state_writer`, `delete_writer` und die target-bound Factory `content_reader_for(ad_id)`. Jede Content-, Lifecycle- oder Delete-Writer-Operation erhält eine frische `CdpPrivateWebPage`; jeder Content-Read ist an genau die angeforderte eigene Anzeigen-ID gebunden. `MarkService` kann den `state_writer` für `pause()`/`activate()` und den `delete_writer` für den bereits bestehenden explizit freigegebenen Delete-Pfad verwenden. Delete behält dabei `DeleteApproval` sowie die unabhängige Bestätigung der Abwesenheit über die autoritativen Besitzer-/Management-Readbacks; ein Browser-UI-Signal allein bestätigt keinen Erfolg. Die target-bound Content-Reader-Factory wird weiterhin erst bei einem tatsächlich zugelassenen Content-Write konstruiert.
+`build_private_web_content_runtime(cdp_port=...)` liefert anschließend fünf für den Application-Layer bestimmte Flächen: `create_writer`, `content_writer`, `state_writer`, `delete_writer` und die target-bound Factory `content_reader_for(ad_id)`. Jede Create-, Content-, Lifecycle- oder Delete-Writer-Operation erhält eine frische `CdpPrivateWebPage`; jeder Content-Read ist an genau die angeforderte eigene Anzeigen-ID gebunden. `MarkService.create()` nimmt vor dem einzigen Publish-Versuch zwei getrennte Inventar-Pre-Reads, verlangt danach in beiden Inventaren exakt dieselbe einzelne neue Anzeigen-ID und bestätigt Titel/Beschreibung zusätzlich über den target-bound Private-Web-Reader. Mehrere oder divergierende neue IDs, ein fehlender Readback oder ein unklarer Browserausgang bleiben `AMBIGUOUS` und werden nicht wiederholt. `MarkService` verwendet den `state_writer` für `pause()`/`activate()` und den `delete_writer` für den explizit freigegebenen Delete-Pfad; Delete behält `DeleteApproval` sowie die unabhängige Bestätigung der Abwesenheit.
 
 ## Offene fachliche Punkte
 

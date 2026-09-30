@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from mark_api.domain import AdSnapshot, LifecycleState
+from mark_api.domain import AdCreateRequest, AdSnapshot, LifecycleState
 from mark_api.results import ReadResult, ReadStatus
 
 
@@ -54,6 +54,117 @@ class ResultAndDomainTests(unittest.TestCase):
                 ad_id="1",
                 observed_at=datetime(2026, 9, 24, 12, 0),
                 source="test",
+            )
+
+
+    def test_create_request_normalizes_category_labels(self) -> None:
+        request = AdCreateRequest(
+            category_path=(" Haus & Garten ", " Dekoration ", " Weitere Dekoration "),
+            title="Testanzeige",
+            description="Beschreibung",
+            price_eur=12,
+        )
+
+        self.assertEqual(
+            request.category_path,
+            ("Haus & Garten", "Dekoration", "Weitere Dekoration"),
+        )
+
+    def test_create_request_rejects_title_outside_current_ui_limit(self) -> None:
+        with self.assertRaises(ValueError):
+            AdCreateRequest(
+                category_path=("Haus & Garten", "Dekoration"),
+                title="x" * 66,
+                description="Beschreibung",
+                price_eur=12,
+            )
+
+    def test_create_request_counts_title_limit_in_utf16_code_units(self) -> None:
+        boundary = "😀" * 32 + "x"
+        request = AdCreateRequest(
+            category_path=("Haus & Garten", "Dekoration"),
+            title=boundary,
+            description="Beschreibung",
+            price_eur=12,
+        )
+
+        self.assertEqual(request.title, boundary)
+        with self.assertRaises(ValueError):
+            AdCreateRequest(
+                category_path=("Haus & Garten", "Dekoration"),
+                title="😀" * 33,
+                description="Beschreibung",
+                price_eur=12,
+            )
+
+    def test_create_request_rejects_title_line_breaks(self) -> None:
+        for line_break in ("\n", "\r", "\r\n"):
+            with self.subTest(line_break=repr(line_break)):
+                with self.assertRaisesRegex(ValueError, "title must not contain line breaks"):
+                    AdCreateRequest(
+                        category_path=("Haus & Garten", "Dekoration"),
+                        title=f"Test{line_break}anzeige",
+                        description="Beschreibung",
+                        price_eur=12,
+                    )
+
+    def test_create_request_normalizes_description_line_endings(self) -> None:
+        request = AdCreateRequest(
+            category_path=("Haus & Garten", "Dekoration"),
+            title="Testanzeige",
+            description="Erste Zeile\r\nZweite Zeile\rDritte Zeile\nVierte Zeile",
+            price_eur=12,
+        )
+
+        self.assertEqual(
+            request.description,
+            "Erste Zeile\nZweite Zeile\nDritte Zeile\nVierte Zeile",
+        )
+
+    def test_create_request_counts_description_limit_in_utf16_code_units(self) -> None:
+        boundary = "😀" * 2000
+        request = AdCreateRequest(
+            category_path=("Haus & Garten", "Dekoration"),
+            title="Testanzeige",
+            description=boundary,
+            price_eur=12,
+        )
+
+        self.assertEqual(request.description, boundary)
+        with self.assertRaises(ValueError):
+            AdCreateRequest(
+                category_path=("Haus & Garten", "Dekoration"),
+                title="Testanzeige",
+                description=boundary + "x",
+                price_eur=12,
+            )
+
+    def test_create_request_rejects_non_positive_fixed_price(self) -> None:
+        with self.assertRaises(ValueError):
+            AdCreateRequest(
+                category_path=("Haus & Garten", "Dekoration"),
+                title="Testanzeige",
+                description="Beschreibung",
+                price_eur=0,
+            )
+
+    def test_create_request_requires_category_hierarchy(self) -> None:
+        with self.assertRaises(ValueError):
+            AdCreateRequest(
+                category_path=("Haus & Garten",),
+                title="Testanzeige",
+                description="Beschreibung",
+                price_eur=12,
+            )
+
+
+    def test_create_request_rejects_duplicate_category_labels(self) -> None:
+        with self.assertRaises(ValueError):
+            AdCreateRequest(
+                category_path=("Haus & Garten", "Haus & Garten"),
+                title="Testanzeige",
+                description="Beschreibung",
+                price_eur=12,
             )
 
 

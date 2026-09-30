@@ -10,6 +10,7 @@ from typing import Iterable, Mapping
 from .domain import (
     AdClassification,
     AdSnapshot,
+    CreateOperationReceipt,
     InboundMessageEvent,
     LifecycleState,
     OperationReceipt,
@@ -113,6 +114,26 @@ class SnapshotStore:
                     writer_error TEXT,
                     pre_snapshot_json TEXT,
                     post_snapshot_json TEXT
+                );
+
+
+                CREATE TABLE IF NOT EXISTS create_operation_receipts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation TEXT NOT NULL,
+                    created_ad_id TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    pre_read_status TEXT NOT NULL,
+                    confirmation_pre_read_status TEXT NOT NULL,
+                    post_read_status TEXT,
+                    confirmation_post_read_status TEXT,
+                    content_post_read_status TEXT,
+                    writer_invoked INTEGER NOT NULL,
+                    writer_error TEXT,
+                    post_snapshot_json TEXT,
+                    confirmation_post_snapshot_json TEXT,
+                    content_post_snapshot_json TEXT
                 );
                 """
             )
@@ -421,6 +442,41 @@ class SnapshotStore:
                     receipt.writer_error,
                     self._snapshot_json(receipt.pre_snapshot),
                     self._snapshot_json(receipt.post_snapshot),
+                ),
+            )
+
+    def append_create_operation_receipt(
+        self,
+        receipt: CreateOperationReceipt,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO create_operation_receipts (
+                    operation, created_ad_id, started_at, completed_at, outcome,
+                    pre_read_status, confirmation_pre_read_status,
+                    post_read_status, confirmation_post_read_status,
+                    content_post_read_status, writer_invoked, writer_error,
+                    post_snapshot_json, confirmation_post_snapshot_json,
+                    content_post_snapshot_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    receipt.operation,
+                    receipt.created_ad_id,
+                    receipt.started_at.isoformat(),
+                    receipt.completed_at.isoformat(),
+                    receipt.outcome.value,
+                    receipt.pre_read_status,
+                    receipt.confirmation_pre_read_status,
+                    receipt.post_read_status,
+                    receipt.confirmation_post_read_status,
+                    receipt.content_post_read_status,
+                    1 if receipt.writer_invoked else 0,
+                    receipt.writer_error,
+                    self._snapshot_json(receipt.post_snapshot),
+                    self._snapshot_json(receipt.confirmation_post_snapshot),
+                    self._snapshot_json(receipt.content_post_snapshot),
                 ),
             )
 

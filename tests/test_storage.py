@@ -10,6 +10,7 @@ from pathlib import Path
 
 from mark_api.domain import (
     AdSnapshot,
+    CreateOperationReceipt,
     LifecycleState,
     OperationOutcome,
     OperationReceipt,
@@ -139,6 +140,55 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(
             row,
             ("test-owner", "issue-3-predelete", "confirmed"),
+        )
+
+    def test_create_receipt_persists_confirmed_id_and_confirmation_statuses(self) -> None:
+        store = self.make_store()
+        candidate = AdSnapshot(
+            ad_id="200",
+            observed_at=NOW,
+            source="management",
+            lifecycle_state=LifecycleState.ACTIVE,
+            title="Neue Vase",
+            description="Beschreibung",
+        )
+        receipt = CreateOperationReceipt(
+            operation="create",
+            started_at=NOW,
+            completed_at=NOW,
+            outcome=OperationOutcome.CONFIRMED,
+            pre_read_status="success_empty",
+            confirmation_pre_read_status="success_empty",
+            post_read_status="success_nonempty",
+            confirmation_post_read_status="success_nonempty",
+            content_post_read_status="success_nonempty",
+            writer_invoked=True,
+            created_ad_id="200",
+            post_snapshot=candidate,
+            confirmation_post_snapshot=candidate,
+            content_post_snapshot=candidate,
+        )
+
+        store.append_create_operation_receipt(receipt)
+
+        with sqlite3.connect(store.path) as connection:
+            row = connection.execute(
+                """
+                SELECT created_ad_id, outcome, confirmation_pre_read_status,
+                       confirmation_post_read_status, content_post_read_status
+                FROM create_operation_receipts
+                """
+            ).fetchone()
+
+        self.assertEqual(
+            row,
+            (
+                "200",
+                "confirmed",
+                "success_empty",
+                "success_nonempty",
+                "success_nonempty",
+            ),
         )
 
     def test_reaction_snapshots_are_append_only(self) -> None:

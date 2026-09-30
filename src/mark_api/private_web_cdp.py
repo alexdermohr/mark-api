@@ -10,9 +10,10 @@ from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
-from .domain import AdSnapshot, LifecycleState
+from .domain import AdSnapshot, LifecycleState, _utf16_code_unit_length
 from .ports import AdsReader, WriteNotAttemptedError
 from .private_web import (
+    PrivateWebCreateSnapshot,
     PrivateWebDeleteSnapshot,
     PrivateWebEditorSnapshot,
     PrivateWebEditorState,
@@ -24,6 +25,8 @@ from .results import ReadResult, ReadStatus
 
 _KLEINANZEIGEN_ORIGIN = "https://www.kleinanzeigen.de"
 _EDITOR_PATH = "/p-anzeige-bearbeiten.html"
+_CREATE_CATEGORY_PATH = "/p-anzeige-aufgeben.html"
+_CREATE_FORM_PATH = "/p-anzeige-aufgeben-schritt2.html"
 _MANAGEMENT_PATH = "/m-meine-anzeigen.html"
 # Keep this fail-closed traversal bound aligned with the Management reader
 # without importing adapter modules into the browser/CDP boundary.
@@ -360,6 +363,9 @@ class CdpPrivateWebPage:
         self._submit_attempted = False
         self._bound_ad_id: str | None = None
         self._last_ready_snapshot: PrivateWebEditorSnapshot | None = None
+        self._create_submit_attempted = False
+        self._create_bound = False
+        self._last_create_snapshot: PrivateWebCreateSnapshot | None = None
         self._state_submit_attempted = False
         self._bound_state_ad_id: str | None = None
         self._last_state_snapshot: PrivateWebStateSnapshot | None = None
@@ -391,6 +397,8 @@ class CdpPrivateWebPage:
         self._client_instance = None
         self._bound_ad_id = None
         self._last_ready_snapshot = None
+        self._create_bound = False
+        self._last_create_snapshot = None
         self._bound_state_ad_id = None
         self._last_state_snapshot = None
         self._bound_delete_ad_id = None
@@ -438,6 +446,9 @@ class CdpPrivateWebPage:
         self._submit_attempted = False
         self._bound_ad_id = None
         self._last_ready_snapshot = None
+        self._create_submit_attempted = False
+        self._create_bound = False
+        self._last_create_snapshot = None
         self._state_submit_attempted = False
         self._bound_state_ad_id = None
         self._last_state_snapshot = None
@@ -631,6 +642,1033 @@ class CdpPrivateWebPage:
             self._last_ready_snapshot = snapshot
         return snapshot
 
+
+
+    @staticmethod
+    def _validated_create_category_path(
+        category_path: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if not isinstance(category_path, tuple):
+            raise TypeError("category_path must be a tuple")
+        if len(category_path) < 2 or len(category_path) > 6:
+            raise ValueError(
+                "category_path must contain between 2 and 6 labels"
+            )
+        normalized: list[str] = []
+        for label in category_path:
+            if not isinstance(label, str):
+                raise TypeError("category labels must be strings")
+            value = label.strip()
+            if not value or len(value) > 120:
+                raise ValueError(
+                    "category labels must be nonblank and <= 120 chars"
+                )
+            normalized.append(value)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(
+                "category_path must not contain duplicate labels"
+            )
+        return tuple(normalized)
+
+    def _create_category_control_expression(self, label: str) -> str:
+        origin = json.dumps(self._expected_origin)
+        path = json.dumps(_CREATE_CATEGORY_PATH)
+        target_label = json.dumps(label)
+        return f"""
+(() => {{
+  const stateOnly = (state) => ({{state}});
+  const currentOrigin = location.origin;
+  const currentPath = location.pathname;
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((element) => (element.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const hasLogin =
+    currentPath.startsWith("/u/login/") ||
+    Boolean(document.querySelector('input[type="password"]'));
+
+  if (currentOrigin !== {origin}) return stateOnly("unknown");
+  if (hasCaptcha) return stateOnly("captcha_required");
+  if (hasMfa) return stateOnly("mfa_required");
+  if (hasSecurityChallenge) return stateOnly("security_challenge");
+  if (hasLogin) return stateOnly("login_required");
+  if (currentPath !== {path}) return stateOnly("unknown");
+
+  const visible = (element) => {{
+    const style = getComputedStyle(element);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse" ||
+      style.pointerEvents === "none" ||
+      Number(style.opacity) === 0
+    ) return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }};
+  const matches = Array.from(document.querySelectorAll("a")).filter(
+    (link) => {{
+      if ((link.innerText || "").trim() !== {target_label}) return false;
+      let url;
+      try {{
+        url = new URL(link.getAttribute("href") || "", location.href);
+      }} catch (_error) {{
+        return false;
+      }}
+      if (
+        url.origin !== {origin} ||
+        url.pathname !== {path} ||
+        url.search !== "" ||
+        url.hash !== ""
+      ) return false;
+      return visible(link);
+    }}
+  );
+  if (matches.length !== 1) return stateOnly("unknown");
+  const link = matches[0];
+  link.scrollIntoView({{
+    behavior: "instant",
+    block: "center",
+    inline: "center",
+  }});
+  const rect = link.getBoundingClientRect();
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    y < 0 ||
+    x > window.innerWidth ||
+    y > window.innerHeight
+  ) return stateOnly("unknown");
+  const hit = document.elementFromPoint(x, y);
+  if (!(hit === link || link.contains(hit))) return stateOnly("unknown");
+  return {{state: "ready", x, y}};
+}})()
+"""
+
+    def _create_continue_expression(self) -> str:
+        origin = json.dumps(self._expected_origin)
+        category_path = json.dumps(_CREATE_CATEGORY_PATH)
+        form_path = json.dumps(_CREATE_FORM_PATH)
+        return f"""
+(() => {{
+  const stateOnly = (state) => ({{state}});
+  const currentOrigin = location.origin;
+  const currentPath = location.pathname;
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((element) => (element.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const hasLogin =
+    currentPath.startsWith("/u/login/") ||
+    Boolean(document.querySelector('input[type="password"]'));
+
+  if (currentOrigin !== {origin}) return stateOnly("unknown");
+  if (hasCaptcha) return stateOnly("captcha_required");
+  if (hasMfa) return stateOnly("mfa_required");
+  if (hasSecurityChallenge) return stateOnly("security_challenge");
+  if (hasLogin) return stateOnly("login_required");
+  if (currentPath !== {category_path}) return stateOnly("unknown");
+
+  const forms = Array.from(document.forms).filter((form) => {{
+    let url;
+    try {{
+      url = new URL(form.action, location.href);
+    }} catch (_error) {{
+      return false;
+    }}
+    return (
+      form.method.toLowerCase() === "post" &&
+      url.origin === {origin} &&
+      url.pathname === {form_path} &&
+      url.search === "" &&
+      url.hash === ""
+    );
+  }});
+  if (forms.length !== 1) return stateOnly("unknown");
+  const form = forms[0];
+  const categoryId = form.querySelector('input[name="categoryId"]');
+  const csrf = form.querySelector('input[name="_csrf"]');
+  if (
+    !(categoryId instanceof HTMLInputElement) ||
+    categoryId.type !== "hidden" ||
+    !categoryId.value ||
+    !(csrf instanceof HTMLInputElement) ||
+    csrf.type !== "hidden" ||
+    !csrf.value
+  ) return stateOnly("unknown");
+
+  const controls = Array.from(form.elements);
+  const allowedHidden = (element) =>
+    element instanceof HTMLInputElement &&
+    element.type === "hidden" &&
+    (
+      element.name === "_csrf" ||
+      element.name === "parentCategoryId" ||
+      element.name === "categoryId" ||
+      /^attributeMap\\[[^\\]]+\\]$/.test(element.name)
+    );
+  const buttons = controls.filter(
+    (element) =>
+      element instanceof HTMLButtonElement &&
+      (element.innerText || "").trim() === "Weiter"
+  );
+  if (
+    buttons.length !== 1 ||
+    buttons[0].type !== "submit" ||
+    buttons[0].disabled ||
+    controls.some(
+      (element) =>
+        element !== buttons[0] &&
+        !allowedHidden(element)
+    )
+  ) return stateOnly("unknown");
+
+  const button = buttons[0];
+  const style = getComputedStyle(button);
+  if (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.visibility === "collapse" ||
+    style.pointerEvents === "none" ||
+    Number(style.opacity) === 0
+  ) return stateOnly("unknown");
+  button.scrollIntoView({{block: "center", inline: "center"}});
+  const rect = button.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return stateOnly("unknown");
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const hit = document.elementFromPoint(x, y);
+  if (hit !== button && !button.contains(hit)) return stateOnly("unknown");
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    y < 0 ||
+    x > window.innerWidth ||
+    y > window.innerHeight
+  ) return stateOnly("unknown");
+  return {{state: "ready", x, y}};
+}})()
+"""
+
+    def _create_form_expression(
+        self,
+        *,
+        expected: PrivateWebCreateSnapshot | None = None,
+        activation: bool = False,
+    ) -> str:
+        origin = json.dumps(self._expected_origin)
+        path = json.dumps(_CREATE_FORM_PATH)
+        expected_title = json.dumps(
+            expected.title if expected is not None else None
+        )
+        expected_description = json.dumps(
+            expected.description if expected is not None else None
+        )
+        expected_price = json.dumps(
+            expected.price_amount if expected is not None else None
+        )
+        activate = json.dumps(activation)
+        return f"""
+(() => {{
+  const stateOnly = (state) => ({{state}});
+  const currentOrigin = location.origin;
+  const currentPath = location.pathname;
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((element) => (element.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const hasLogin =
+    currentPath.startsWith("/u/login/") ||
+    Boolean(document.querySelector('input[type="password"]'));
+
+  if (currentOrigin !== {origin}) return stateOnly("unknown");
+  if (hasCaptcha) return stateOnly("captcha_required");
+  if (hasMfa) return stateOnly("mfa_required");
+  if (hasSecurityChallenge) return stateOnly("security_challenge");
+  if (hasLogin) return stateOnly("login_required");
+  if (currentPath !== {path}) return stateOnly("unknown");
+
+  const title = document.querySelector("#ad-title");
+  const description = document.querySelector("#ad-description");
+  const price = document.querySelector("#ad-price-amount");
+  const zip = document.querySelector("#ad-zip-code");
+  const city = document.querySelector("#ad-city");
+  const contact = document.querySelector("#ad-name");
+  const street = document.querySelector("#ad-street");
+  const addressVisibility = document.querySelector("#ad-address-visibility");
+  const marketing = document.querySelector("#ad-marketing-consent");
+  const priceType = document.querySelector('input[name="priceType"]');
+  const buyNowEligible = document.querySelector('input[name="buyNowEligible"]');
+  const posterType = document.querySelector('input[name="posterType"]');
+  const locationId = document.querySelector('input[name="locationId"]');
+  const categoryId = document.querySelector('input[name="categoryId"]');
+  const adDraftUuid = document.querySelector('input[name="adDraftUuid"]');
+  const adId = document.querySelector('input[name="adId"]');
+  const offer = document.querySelector("#ad-type-OFFER");
+  const wanted = document.querySelector("#ad-type-WANTED");
+  const files = Array.from(document.querySelectorAll('input[type="file"]'));
+
+  if (
+    !(title instanceof HTMLInputElement) ||
+    title.name !== "title" ||
+    title.maxLength !== 65 ||
+    !(description instanceof HTMLTextAreaElement) ||
+    description.name !== "description" ||
+    description.maxLength !== 4000 ||
+    !(price instanceof HTMLInputElement) ||
+    price.name !== "priceAmount" ||
+    price.maxLength !== 8 ||
+    !(zip instanceof HTMLInputElement) ||
+    zip.name !== "zipCode" ||
+    !/^[0-9]{{5}}$/.test(zip.value) ||
+    !(city instanceof HTMLInputElement) ||
+    !city.value.trim() ||
+    !(contact instanceof HTMLInputElement) ||
+    contact.name !== "contactName" ||
+    !contact.value.trim() ||
+    !(street instanceof HTMLInputElement) ||
+    street.name !== "streetName" ||
+    !street.disabled ||
+    !(addressVisibility instanceof HTMLInputElement) ||
+    addressVisibility.type !== "checkbox" ||
+    addressVisibility.checked ||
+    !(marketing instanceof HTMLInputElement) ||
+    marketing.type !== "checkbox" ||
+    marketing.checked ||
+    !(priceType instanceof HTMLInputElement) ||
+    priceType.type !== "hidden" ||
+    priceType.value !== "FIXED" ||
+    !(buyNowEligible instanceof HTMLInputElement) ||
+    buyNowEligible.type !== "hidden" ||
+    buyNowEligible.value !== "false" ||
+    !(posterType instanceof HTMLInputElement) ||
+    posterType.type !== "hidden" ||
+    posterType.value !== "PRIVATE" ||
+    !(locationId instanceof HTMLInputElement) ||
+    locationId.type !== "hidden" ||
+    !locationId.value ||
+    !(categoryId instanceof HTMLInputElement) ||
+    categoryId.type !== "hidden" ||
+    !categoryId.value ||
+    !(adDraftUuid instanceof HTMLInputElement) ||
+    adDraftUuid.type !== "hidden" ||
+    adDraftUuid.value !== "" ||
+    !(adId instanceof HTMLInputElement) ||
+    adId.type !== "hidden" ||
+    adId.value !== "" ||
+    !(offer instanceof HTMLInputElement) ||
+    offer.type !== "radio" ||
+    offer.name !== "adType" ||
+    offer.value !== "OFFER" ||
+    !offer.checked ||
+    !(wanted instanceof HTMLInputElement) ||
+    wanted.type !== "radio" ||
+    wanted.name !== "adType" ||
+    wanted.value !== "WANTED" ||
+    wanted.checked ||
+    files.length !== 1 ||
+    files[0].files === null ||
+    files[0].files.length !== 0
+  ) return stateOnly("unknown");
+
+  const form = title.form;
+  if (
+    !form ||
+    description.form !== form ||
+    price.form !== form ||
+    zip.form !== form ||
+    city.form !== form ||
+    contact.form !== form ||
+    street.form !== form ||
+    addressVisibility.form !== form ||
+    marketing.form !== form ||
+    priceType.form !== form ||
+    buyNowEligible.form !== form ||
+    posterType.form !== form ||
+    locationId.form !== form ||
+    categoryId.form !== form ||
+    adDraftUuid.form !== form ||
+    adId.form !== form ||
+    offer.form !== form ||
+    wanted.form !== form ||
+    files[0].form !== form
+  ) return stateOnly("unknown");
+
+  const normalizedButtonText = (element) =>
+    (element.innerText || "").replace(/\\s+/g, " ").trim();
+  const allowedButtonTexts = new Set([
+    "Vorschlag erstellen",
+    "Vorschau",
+    "Entwurf speichern",
+    "Anzeige aufgeben",
+    "Fototipps",
+    "Festpreis Preistyp",
+  ]);
+  const allowedIds = new Set([
+    "ad-type-OFFER",
+    "ad-type-WANTED",
+    "ad-title",
+    "ad-description",
+    "ad-price-amount",
+    "ad-price-type",
+    "ad-zip-code",
+    "ad-city",
+    "ad-address-visibility",
+    "ad-street",
+    "ad-name",
+    "ad-marketing-consent",
+  ]);
+  const allowedHiddenNames = new Set([
+    "_csrf",
+    "parentCategoryId",
+    "categoryId",
+    "priceType",
+    "buyNowEligible",
+    "locationId",
+    "adDraftUuid",
+    "adId",
+    "posterType",
+    "trackingId",
+    "postAdWenkseSessionId",
+  ]);
+  const unexpected = Array.from(form.elements).filter((element) => {{
+    if (element instanceof HTMLFieldSetElement) return false;
+    if (element instanceof HTMLInputElement && element.type === "hidden") {{
+      return !(
+        allowedHiddenNames.has(element.name) ||
+        /^attributeMap\\[[^\\]]+\\]$/.test(element.name)
+      );
+    }}
+    if (element instanceof HTMLInputElement && element.type === "file") {{
+      return element !== files[0];
+    }}
+    if (
+      element instanceof HTMLInputElement ||
+      element instanceof HTMLTextAreaElement
+    ) {{
+      return !allowedIds.has(element.id);
+    }}
+    if (element instanceof HTMLButtonElement) {{
+      const text = normalizedButtonText(element);
+      return !(
+        allowedButtonTexts.has(text) ||
+        text.startsWith("Zieh deine Fotos hier rein")
+      );
+    }}
+    return true;
+  }});
+  if (unexpected.length !== 0) return stateOnly("unknown");
+
+  const publishButtons = Array.from(form.querySelectorAll("button")).filter(
+    (button) => normalizedButtonText(button) === "Anzeige aufgeben"
+  );
+  const previewButtons = Array.from(form.querySelectorAll("button")).filter(
+    (button) => normalizedButtonText(button) === "Vorschau"
+  );
+  const draftButtons = Array.from(form.querySelectorAll("button")).filter(
+    (button) => normalizedButtonText(button) === "Entwurf speichern"
+  );
+  if (
+    publishButtons.length !== 1 ||
+    previewButtons.length !== 1 ||
+    draftButtons.length !== 1 ||
+    publishButtons[0].type !== "button" ||
+    publishButtons[0].disabled ||
+    publishButtons[0].getAttribute("aria-disabled") === "true"
+  ) return stateOnly("unknown");
+
+  if (
+    {expected_title} !== null &&
+    title.value !== {expected_title}
+  ) return stateOnly("unknown");
+  if (
+    {expected_description} !== null &&
+    description.value !== {expected_description}
+  ) return stateOnly("unknown");
+  if (
+    {expected_price} !== null &&
+    price.value !== {expected_price}
+  ) return stateOnly("unknown");
+
+  if (!{activate}) {{
+    return {{
+      state: "ready",
+      title: title.value,
+      description: description.value,
+      price_amount: price.value,
+    }};
+  }}
+
+  const button = publishButtons[0];
+  const style = getComputedStyle(button);
+  if (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.visibility === "collapse" ||
+    style.pointerEvents === "none" ||
+    Number(style.opacity) === 0
+  ) return stateOnly("unknown");
+  button.scrollIntoView({{block: "center", inline: "center"}});
+  const rect = button.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return stateOnly("unknown");
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const hit = document.elementFromPoint(x, y);
+  if (hit !== button && !button.contains(hit)) return stateOnly("unknown");
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    y < 0 ||
+    x > window.innerWidth ||
+    y > window.innerHeight
+  ) return stateOnly("unknown");
+  return {{state: "ready", x, y}};
+}})()
+"""
+
+    @staticmethod
+    def _create_snapshot_from_value(value: object) -> PrivateWebCreateSnapshot:
+        if not isinstance(value, dict):
+            return PrivateWebCreateSnapshot(
+                state=PrivateWebEditorState.UNKNOWN
+            )
+        try:
+            state = PrivateWebEditorState(value.get("state"))
+        except (TypeError, ValueError):
+            return PrivateWebCreateSnapshot(
+                state=PrivateWebEditorState.UNKNOWN
+            )
+        if state is not PrivateWebEditorState.READY:
+            return PrivateWebCreateSnapshot(state=state)
+        title = value.get("title")
+        description = value.get("description")
+        price_amount = value.get("price_amount")
+        if (
+            not isinstance(title, str)
+            or not isinstance(description, str)
+            or not isinstance(price_amount, str)
+        ):
+            return PrivateWebCreateSnapshot(
+                state=PrivateWebEditorState.UNKNOWN
+            )
+        try:
+            return PrivateWebCreateSnapshot(
+                state=PrivateWebEditorState.READY,
+                title=title,
+                description=description,
+                price_amount=price_amount,
+            )
+        except (TypeError, ValueError):
+            return PrivateWebCreateSnapshot(
+                state=PrivateWebEditorState.UNKNOWN
+            )
+
+    @staticmethod
+    def _create_point(
+        value: object,
+        *,
+        stage: str,
+    ) -> tuple[float, float]:
+        if not isinstance(value, dict) or value.get("state") != "ready":
+            raise PrivateWebCdpWriteNotAttemptedError(stage)
+        raw_x = value.get("x")
+        raw_y = value.get("y")
+        if (
+            isinstance(raw_x, bool)
+            or not isinstance(raw_x, (int, float))
+            or not math.isfinite(float(raw_x))
+            or float(raw_x) < 0
+            or isinstance(raw_y, bool)
+            or not isinstance(raw_y, (int, float))
+            or not math.isfinite(float(raw_y))
+            or float(raw_y) < 0
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError(stage)
+        return float(raw_x), float(raw_y)
+
+    def open_create_form(self, category_path: tuple[str, ...]) -> None:
+        labels = self._validated_create_category_path(category_path)
+        target_url = f"{self._expected_origin}{_CREATE_CATEGORY_PATH}"
+        self._create_submit_attempted = False
+        self._create_bound = False
+        self._last_create_snapshot = None
+        self._submit_attempted = False
+        self._bound_ad_id = None
+        self._last_ready_snapshot = None
+        self._state_submit_attempted = False
+        self._bound_state_ad_id = None
+        self._last_state_snapshot = None
+        self._delete_confirmation_attempted = False
+        self._delete_submit_attempted = False
+        self._bound_delete_ad_id = None
+        self._last_delete_snapshot = None
+
+        client = self._client()
+        marker = json.dumps("__mark_private_web_create_navigation_probe__")
+        try:
+            armed = self._runtime_value(
+                client,
+                (
+                    "(() => { const key = "
+                    + marker
+                    + "; globalThis[key] = true; "
+                    + "return globalThis[key] === true; })()"
+                ),
+            )
+            if armed is not True:
+                raise PrivateWebCdpWriteNotAttemptedError(
+                    "create_navigate"
+                )
+            navigation = client.call(
+                "Page.navigate",
+                {"url": target_url},
+            )
+            if navigation.get("errorText"):
+                raise PrivateWebCdpWriteNotAttemptedError(
+                    "create_navigate"
+                )
+
+            deadline = self._monotonic() + self._timeout_seconds
+            readiness_expression = (
+                "(() => ({"
+                + "readyState: document.readyState,"
+                + "origin: location.origin,"
+                + "path: location.pathname,"
+                + "oldDocument: globalThis["
+                + marker
+                + "] === true"
+                + "}))()"
+            )
+            while True:
+                try:
+                    readiness = self._runtime_value(
+                        client,
+                        readiness_expression,
+                    )
+                except PrivateWebCdpError:
+                    readiness = None
+                if (
+                    isinstance(readiness, dict)
+                    and readiness.get("readyState") == "complete"
+                    and readiness.get("origin") == self._expected_origin
+                    and readiness.get("path") == _CREATE_CATEGORY_PATH
+                    and readiness.get("oldDocument") is False
+                ):
+                    break
+                if self._monotonic() >= deadline:
+                    raise PrivateWebCdpWriteNotAttemptedError(
+                        "create_navigate"
+                    )
+                self._sleep(0.05)
+
+            for label in labels:
+                label_deadline = self._monotonic() + self._timeout_seconds
+                while True:
+                    point: tuple[float, float] | None = None
+                    try:
+                        value = self._runtime_value(
+                            client,
+                            self._create_category_control_expression(
+                                label
+                            ),
+                        )
+                        point = self._create_point(
+                            value,
+                            stage="create_category_select",
+                        )
+                    except PrivateWebCdpWriteNotAttemptedError:
+                        pass
+                    if point is not None:
+                        break
+                    if self._monotonic() >= label_deadline:
+                        raise PrivateWebCdpWriteNotAttemptedError(
+                            "create_category_select"
+                        )
+                    self._sleep(0.05)
+                try:
+                    self._dispatch_browser_click(
+                        client,
+                        x=point[0],
+                        y=point[1],
+                    )
+                except Exception:
+                    raise PrivateWebCdpWriteNotAttemptedError(
+                        "create_category_select"
+                    ) from None
+
+            continue_deadline = self._monotonic() + self._timeout_seconds
+            while True:
+                continue_point: tuple[float, float] | None = None
+                try:
+                    continue_value = self._runtime_value(
+                        client,
+                        self._create_continue_expression(),
+                    )
+                    continue_point = self._create_point(
+                        continue_value,
+                        stage="create_continue",
+                    )
+                except PrivateWebCdpWriteNotAttemptedError:
+                    pass
+                if continue_point is not None:
+                    break
+                if self._monotonic() >= continue_deadline:
+                    raise PrivateWebCdpWriteNotAttemptedError(
+                        "create_continue"
+                    )
+                self._sleep(0.05)
+
+            try:
+                self._dispatch_browser_click(
+                    client,
+                    x=continue_point[0],
+                    y=continue_point[1],
+                )
+            except Exception:
+                # The category POST is not a publish. Never repeat it blindly;
+                # reconcile only by observing whether the exact step-2 form
+                # arrived.
+                pass
+
+            form_deadline = self._monotonic() + self._timeout_seconds
+            terminal_states = {
+                PrivateWebEditorState.LOGIN_REQUIRED,
+                PrivateWebEditorState.MFA_REQUIRED,
+                PrivateWebEditorState.CAPTCHA_REQUIRED,
+                PrivateWebEditorState.SECURITY_CHALLENGE,
+            }
+            while True:
+                try:
+                    value = self._runtime_value(
+                        client,
+                        self._create_form_expression(),
+                    )
+                except PrivateWebCdpError:
+                    value = None
+                snapshot = self._create_snapshot_from_value(value)
+                if (
+                    snapshot.state is PrivateWebEditorState.READY
+                    or snapshot.state in terminal_states
+                ):
+                    self._create_bound = True
+                    self._last_create_snapshot = None
+                    return
+                if self._monotonic() >= form_deadline:
+                    raise PrivateWebCdpWriteNotAttemptedError(
+                        "create_continue"
+                    )
+                self._sleep(0.05)
+        except WriteNotAttemptedError:
+            self._create_bound = False
+            self._last_create_snapshot = None
+            raise
+        except Exception:
+            self._create_bound = False
+            self._last_create_snapshot = None
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "create_open"
+            ) from None
+
+    def read_create_form(self) -> PrivateWebCreateSnapshot:
+        self._last_create_snapshot = None
+        if not self._create_bound:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "read_create_form"
+            )
+        value = self._evaluate(
+            "read_create_form",
+            self._create_form_expression(),
+        )
+        snapshot = self._create_snapshot_from_value(value)
+        if snapshot.state is PrivateWebEditorState.READY:
+            self._last_create_snapshot = snapshot
+        return snapshot
+
+    def _replace_create_field(
+        self,
+        *,
+        stage: str,
+        selector: str,
+        expected_name: str,
+        prototype: str,
+        value: str,
+    ) -> None:
+        if not isinstance(value, str):
+            raise TypeError("create field value must be a string")
+        snapshot = self._last_create_snapshot
+        if (
+            not self._create_bound
+            or snapshot is None
+            or snapshot.state is not PrivateWebEditorState.READY
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError(stage)
+
+        current = self.read_create_form()
+        if current != snapshot:
+            raise PrivateWebCdpWriteNotAttemptedError(stage)
+
+        origin = json.dumps(self._expected_origin)
+        path = json.dumps(_CREATE_FORM_PATH)
+        expected_title = json.dumps(current.title)
+        expected_description = json.dumps(current.description)
+        expected_price = json.dumps(current.price_amount)
+        replacement = json.dumps(value)
+        expression = f"""
+(() => {{
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((candidate) => (candidate.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) || challengeText.includes("captcha") ||
+       challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) || challengeText.includes("bestätigungscode") ||
+       challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const title = document.querySelector("#ad-title");
+  const description = document.querySelector("#ad-description");
+  const price = document.querySelector("#ad-price-amount");
+  const element = document.querySelector({json.dumps(selector)});
+  if (
+    location.origin !== {origin} ||
+    location.pathname !== {path} ||
+    hasCaptcha ||
+    hasMfa ||
+    hasSecurityChallenge ||
+    document.querySelector('input[type="password"]') ||
+    !(title instanceof HTMLInputElement) ||
+    !(description instanceof HTMLTextAreaElement) ||
+    !(price instanceof HTMLInputElement) ||
+    title.value !== {expected_title} ||
+    description.value !== {expected_description} ||
+    price.value !== {expected_price} ||
+    !(element instanceof {prototype}) ||
+    element.getAttribute("name") !== {json.dumps(expected_name)}
+  ) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(
+    {prototype}.prototype,
+    "value"
+  );
+  if (!descriptor || typeof descriptor.set !== "function") return false;
+  element.focus();
+  if (document.activeElement !== element) return false;
+  descriptor.set.call(element, {replacement});
+  element.dispatchEvent(
+    new InputEvent(
+      "input",
+      {{bubbles: true, inputType: "insertText", data: {replacement}}}
+    )
+  );
+  element.dispatchEvent(new Event("change", {{bubbles: true}}));
+  return element.value === {replacement};
+}})()
+"""
+        client = self._client()
+        try:
+            if self._runtime_value(client, expression) is not True:
+                raise PrivateWebCdpWriteNotAttemptedError(stage)
+        except WriteNotAttemptedError:
+            raise
+        except Exception:
+            raise PrivateWebCdpWriteNotAttemptedError(stage) from None
+
+        if expected_name == "title":
+            self._last_create_snapshot = replace(current, title=value)
+        elif expected_name == "description":
+            self._last_create_snapshot = replace(
+                current,
+                description=value,
+            )
+        elif expected_name == "priceAmount":
+            self._last_create_snapshot = replace(
+                current,
+                price_amount=value,
+            )
+        else:
+            raise PrivateWebCdpWriteNotAttemptedError(stage)
+
+    def replace_create_title(self, value: str) -> None:
+        if not isinstance(value, str):
+            raise TypeError("create title must be a string")
+        if _utf16_code_unit_length(value) > 65:
+            raise ValueError("create title must be <= 65 characters")
+        self._replace_create_field(
+            stage="replace_create_title",
+            selector="#ad-title",
+            expected_name="title",
+            prototype="HTMLInputElement",
+            value=value,
+        )
+
+    def replace_create_description(self, value: str) -> None:
+        if not isinstance(value, str):
+            raise TypeError("create description must be a string")
+        if _utf16_code_unit_length(value) > 4000:
+            raise ValueError(
+                "create description must be <= 4000 characters"
+            )
+        self._replace_create_field(
+            stage="replace_create_description",
+            selector="#ad-description",
+            expected_name="description",
+            prototype="HTMLTextAreaElement",
+            value=value,
+        )
+
+    def replace_create_price(self, value: str) -> None:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 8
+            or not value.isascii()
+            or not value.isdigit()
+        ):
+            raise ValueError(
+                "create price must contain 1-8 ASCII digits"
+            )
+        self._replace_create_field(
+            stage="replace_create_price",
+            selector="#ad-price-amount",
+            expected_name="priceAmount",
+            prototype="HTMLInputElement",
+            value=value,
+        )
+
+    def submit_create(self) -> None:
+        if self._create_submit_attempted:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "create_submit_already_attempted"
+            )
+        snapshot = self._last_create_snapshot
+        if (
+            not self._create_bound
+            or snapshot is None
+            or snapshot.state is not PrivateWebEditorState.READY
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "create_submit"
+            )
+
+        self._create_submit_attempted = True
+        self._last_create_snapshot = None
+        client = self._client()
+        try:
+            value = self._runtime_value(
+                client,
+                self._create_form_expression(
+                    expected=snapshot,
+                    activation=True,
+                ),
+            )
+            point = self._create_point(
+                value,
+                stage="create_submit",
+            )
+        except WriteNotAttemptedError:
+            raise
+        except Exception:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "create_submit"
+            ) from None
+
+        try:
+            self._dispatch_browser_click(
+                client,
+                x=point[0],
+                y=point[1],
+            )
+        except Exception:
+            # The first publish-button browser input may directly reach the
+            # publish handler when phone verification is not required. Once
+            # browser input begins, no failure is safe to retry.
+            raise PrivateWebSubmitUnknownError(
+                "create_submit"
+            ) from None
 
     def _state_control_expression(
         self,
@@ -985,6 +2023,9 @@ class CdpPrivateWebPage:
         self._submit_attempted = False
         self._bound_ad_id = None
         self._last_ready_snapshot = None
+        self._create_submit_attempted = False
+        self._create_bound = False
+        self._last_create_snapshot = None
         self._delete_confirmation_attempted = False
         self._delete_submit_attempted = False
         self._bound_delete_ad_id = None
@@ -1548,6 +2589,9 @@ class CdpPrivateWebPage:
         self._submit_attempted = False
         self._bound_ad_id = None
         self._last_ready_snapshot = None
+        self._create_submit_attempted = False
+        self._create_bound = False
+        self._last_create_snapshot = None
         self._state_submit_attempted = False
         self._bound_state_ad_id = None
         self._last_state_snapshot = None
