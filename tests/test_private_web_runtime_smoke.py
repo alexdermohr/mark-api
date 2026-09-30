@@ -234,6 +234,69 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
 
         self.assertEqual(runtime.close_calls, 1)
 
+    def test_smoke_queries_all_inventory_metric_rankings(self) -> None:
+        runtime = FakeInventoryRuntime(
+            ReadResult.success_nonempty((snapshot("1234567890"),))
+        )
+        original_json_get = runtime_smoke._json_get
+        ranking_paths: list[str] = []
+
+        def record_rankings(opener, base: str, path: str):
+            if path.startswith("/api/analytics/ads?metric="):
+                ranking_paths.append(path)
+            return original_json_get(opener, base, path)
+
+        with patch(
+            "mark_api.private_web_runtime_smoke._json_get",
+            side_effect=record_rankings,
+        ):
+            run_private_web_runtime_smoke(
+                19610,
+                runtime_factory=lambda **_kwargs: runtime,
+            )
+
+        self.assertEqual(
+            ranking_paths,
+            [
+                "/api/analytics/ads?metric=views",
+                "/api/analytics/ads?metric=watch_count",
+                "/api/analytics/ads?metric=reply_count",
+            ],
+        )
+        self.assertEqual(runtime.close_calls, 1)
+
+    def test_smoke_rejects_incorrect_watch_ranking_when_views_absent(self) -> None:
+        runtime = FakeInventoryRuntime(
+            ReadResult.success_nonempty(
+                (snapshot("1234567890", views=None),)
+            )
+        )
+        original_json_get = runtime_smoke._json_get
+
+        def corrupt_watch_ranking(opener, base: str, path: str):
+            payload = original_json_get(opener, base, path)
+            if path == "/api/analytics/ads?metric=watch_count":
+                assert isinstance(payload, list)
+                rows = [dict(item) for item in payload]
+                rows[0]["value"] = 3
+                return rows
+            return payload
+
+        with patch(
+            "mark_api.private_web_runtime_smoke._json_get",
+            side_effect=corrupt_watch_ranking,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "dashboard analytics watch_count ranking does not match inventory",
+            ):
+                run_private_web_runtime_smoke(
+                    19610,
+                    runtime_factory=lambda **_kwargs: runtime,
+                )
+
+        self.assertEqual(runtime.close_calls, 1)
+
     def test_smoke_rejects_incorrect_analytics_value_with_same_id(self) -> None:
         runtime = FakeInventoryRuntime(
             ReadResult.success_nonempty((snapshot("1234567890", views=7),))

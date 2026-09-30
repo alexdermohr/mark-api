@@ -19,6 +19,7 @@ from .storage import SnapshotStore
 
 
 _HTTP_TIMEOUT_SECONDS = 2.0
+_INVENTORY_METRICS = ("views", "watch_count", "reply_count")
 
 
 class _InventoryRuntime(Protocol):
@@ -200,19 +201,25 @@ def run_private_web_runtime_smoke(
                 )
                 if (
                     not isinstance(metric_names, list)
-                    or "views" not in metric_names
-                    or "watch_count" not in metric_names
-                    or "reply_count" not in metric_names
+                    or any(
+                        metric not in metric_names
+                        for metric in _INVENTORY_METRICS
+                    )
                 ):
                     raise RuntimeError("dashboard analytics metrics are unavailable")
 
-                ranking = _json_get(
-                    opener,
-                    base,
-                    "/api/analytics/ads?metric=views",
-                )
-                if not isinstance(ranking, list):
-                    raise RuntimeError("dashboard analytics ranking is not a list")
+                rankings: dict[str, list[object]] = {}
+                for metric in _INVENTORY_METRICS:
+                    ranking = _json_get(
+                        opener,
+                        base,
+                        f"/api/analytics/ads?metric={metric}",
+                    )
+                    if not isinstance(ranking, list):
+                        raise RuntimeError(
+                            f"dashboard analytics {metric} ranking is not a list"
+                        )
+                    rankings[metric] = ranking
 
                 write_methods_rejected = True
                 for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
@@ -291,21 +298,24 @@ def run_private_web_runtime_smoke(
                 }
                 for item in snapshots
             }
-            expected_views_ranking = sorted(
-                (
+            expected_rankings: dict[str, list[dict[str, object]]] = {}
+            for metric in _INVENTORY_METRICS:
+                expected_rows = [
                     {
                         "ad_id": item.ad_id,
-                        "metric": "views",
-                        "value": item.views,
+                        "metric": metric,
+                        "value": getattr(item, metric),
                         "present": item.lifecycle_state is not LifecycleState.ABSENT,
                         "lifecycle_state": item.lifecycle_state.value,
                         "title": item.title,
                     }
                     for item in snapshots
-                    if item.views is not None
-                ),
-                key=lambda row: (-row["value"], row["ad_id"]),
-            )
+                    if getattr(item, metric) is not None
+                ]
+                expected_rows.sort(
+                    key=lambda row: (-row["value"], row["ad_id"])
+                )
+                expected_rankings[metric] = expected_rows
             try:
                 projected_ads: dict[str, dict[str, object]] = {}
                 ad_fields = {
@@ -371,7 +381,9 @@ def run_private_web_runtime_smoke(
                         "watch_count": watch_count,
                         "reply_count": reply_count,
                     }
-                projected_views_ranking: list[dict[str, object]] = []
+                projected_rankings: dict[
+                    str, list[dict[str, object]]
+                ] = {}
                 ranking_fields = {
                     "ad_id",
                     "metric",
@@ -380,34 +392,43 @@ def run_private_web_runtime_smoke(
                     "lifecycle_state",
                     "title",
                 }
-                for item in ranking:
-                    if not isinstance(item, dict) or set(item) != ranking_fields:
-                        raise TypeError("invalid analytics ranking row")
-                    ad_id = item["ad_id"]
-                    metric = item["metric"]
-                    value = item["value"]
-                    present = item["present"]
-                    lifecycle_state = item["lifecycle_state"]
-                    title = item["title"]
-                    if (
-                        not isinstance(ad_id, str)
-                        or metric != "views"
-                        or type(value) is not int
-                        or type(present) is not bool
-                        or not isinstance(lifecycle_state, str)
-                        or (title is not None and not isinstance(title, str))
-                    ):
-                        raise TypeError("invalid analytics ranking value")
-                    projected_views_ranking.append(
-                        {
-                            "ad_id": ad_id,
-                            "metric": metric,
-                            "value": value,
-                            "present": present,
-                            "lifecycle_state": lifecycle_state,
-                            "title": title,
-                        }
-                    )
+                for expected_metric, ranking in rankings.items():
+                    projected_rows: list[dict[str, object]] = []
+                    for item in ranking:
+                        if (
+                            not isinstance(item, dict)
+                            or set(item) != ranking_fields
+                        ):
+                            raise TypeError("invalid analytics ranking row")
+                        ad_id = item["ad_id"]
+                        metric = item["metric"]
+                        value = item["value"]
+                        present = item["present"]
+                        lifecycle_state = item["lifecycle_state"]
+                        title = item["title"]
+                        if (
+                            not isinstance(ad_id, str)
+                            or metric != expected_metric
+                            or type(value) is not int
+                            or type(present) is not bool
+                            or not isinstance(lifecycle_state, str)
+                            or (
+                                title is not None
+                                and not isinstance(title, str)
+                            )
+                        ):
+                            raise TypeError("invalid analytics ranking value")
+                        projected_rows.append(
+                            {
+                                "ad_id": ad_id,
+                                "metric": metric,
+                                "value": value,
+                                "present": present,
+                                "lifecycle_state": lifecycle_state,
+                                "title": title,
+                            }
+                        )
+                    projected_rankings[expected_metric] = projected_rows
                 projected_summary = {
                     key: summary[key]
                     for key in expected_summary
@@ -436,14 +457,19 @@ def run_private_web_runtime_smoke(
                 raise RuntimeError(
                     "dashboard summary does not match inventory"
                 )
-            if (
-                len(ranking) != len(expected_views_ranking)
-                or len(projected_views_ranking) != len(ranking)
-                or projected_views_ranking != expected_views_ranking
-            ):
-                raise RuntimeError(
-                    "dashboard analytics views ranking does not match inventory"
-                )
+            for metric in _INVENTORY_METRICS:
+                ranking = rankings[metric]
+                expected_ranking = expected_rankings[metric]
+                projected_ranking = projected_rankings[metric]
+                if (
+                    len(ranking) != len(expected_ranking)
+                    or len(projected_ranking) != len(ranking)
+                    or projected_ranking != expected_ranking
+                ):
+                    raise RuntimeError(
+                        f"dashboard analytics {metric} ranking "
+                        "does not match inventory"
+                    )
 
             return PrivateWebRuntimeSmokeReport(
                 inventory_status=result.status.value,
@@ -453,7 +479,7 @@ def run_private_web_runtime_smoke(
                 dashboard_tracked_ads=tracked_ads,
                 dashboard_current_ads=current_ads,
                 dashboard_ads=len(ads),
-                analytics_ranked_ads=len(ranking),
+                analytics_ranked_ads=len(rankings["views"]),
                 http_write_methods_rejected=write_methods_rejected,
                 write_route_absent=True,
             )
