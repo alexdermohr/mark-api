@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 from unittest.mock import patch
 
 from mark_api.domain import AdSnapshot, LifecycleState
@@ -147,11 +148,13 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
             ReadResult.success_nonempty((snapshot("1234567890"),))
         )
         original_expect_http_error = runtime_smoke._expect_http_error
-        methods: list[str] = []
+        method_probes: list[tuple[str, str]] = []
 
         def record_method(opener, request, *, expected_status: int):
             if expected_status == 405:
-                methods.append(request.get_method())
+                method_probes.append(
+                    (request.get_method(), urlsplit(request.full_url).path)
+                )
             return original_expect_http_error(
                 opener,
                 request,
@@ -167,11 +170,21 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
                 runtime_factory=lambda **_kwargs: runtime,
             )
 
+        expected_methods = ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
         self.assertEqual(
-            methods,
-            ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            [method for method, path in method_probes if path == "/api/ads"],
+            expected_methods,
+        )
+        self.assertEqual(
+            [
+                method
+                for method, path in method_probes
+                if path == "/api/write/delete"
+            ],
+            expected_methods,
         )
         self.assertTrue(report.http_write_methods_rejected)
+        self.assertTrue(report.write_route_absent)
         self.assertEqual(runtime.close_calls, 1)
 
     def test_smoke_rejects_non_string_dashboard_ad_id(self) -> None:

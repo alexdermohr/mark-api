@@ -241,12 +241,34 @@ def run_private_web_runtime_smoke(
                             f"dashboard {method} rejection lacks Allow: GET"
                         )
 
+                write_route_path = "/api/write/delete"
                 missing_write_route = _expect_http_error(
                     opener,
-                    Request(base + "/api/write/delete", method="GET"),
+                    Request(base + write_route_path, method="GET"),
                     expected_status=404,
                 )
                 missing_write_route.close()
+                for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS"):
+                    request = Request(
+                        base + write_route_path,
+                        data=(
+                            b"{}"
+                            if method in {"POST", "PUT", "PATCH"}
+                            else None
+                        ),
+                        method=method,
+                    )
+                    method_error = _expect_http_error(
+                        opener,
+                        request,
+                        expected_status=405,
+                    )
+                    allowed = method_error.headers.get("Allow")
+                    method_error.close()
+                    if allowed != "GET":
+                        raise RuntimeError(
+                            f"sentinel {method} rejection lacks Allow: GET"
+                        )
             finally:
                 server.shutdown()
                 server.server_close()
