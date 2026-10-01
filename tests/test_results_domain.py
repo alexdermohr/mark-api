@@ -86,6 +86,25 @@ class ResultAndDomainTests(unittest.TestCase):
         self.assertIsNone(receipt.authorization_by)
         self.assertIsNone(receipt.authorization_reference)
 
+    def test_create_receipt_rejects_unconfirmed_created_ad_id(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "only confirmed create may expose created_ad_id",
+        ):
+            CreateOperationReceipt(
+                operation="create",
+                started_at=NOW,
+                completed_at=NOW,
+                outcome=OperationOutcome.AMBIGUOUS,
+                pre_read_status="success_empty",
+                confirmation_pre_read_status="success_empty",
+                post_read_status="success_nonempty",
+                confirmation_post_read_status="success_nonempty",
+                content_post_read_status="success_empty",
+                writer_invoked=True,
+                created_ad_id="200",
+            )
+
     def test_create_request_normalizes_category_labels(self) -> None:
         request = AdCreateRequest(
             category_path=(" Haus & Garten ", " Dekoration ", " Weitere Dekoration "),

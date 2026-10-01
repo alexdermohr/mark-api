@@ -294,6 +294,13 @@ class CreateOperationReceipt:
             and self.created_ad_id is None
         ):
             raise ValueError("confirmed create requires created_ad_id")
+        if (
+            self.outcome is not OperationOutcome.CONFIRMED
+            and self.created_ad_id is not None
+        ):
+            raise ValueError(
+                "only confirmed create may expose created_ad_id"
+            )
         if self.created_ad_id is not None:
             for field_name in (
                 "post_snapshot",
