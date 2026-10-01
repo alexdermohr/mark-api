@@ -4,7 +4,7 @@
 
 ## Status
 
-**Core, Dashboard und Analytics implementiert / lokaler Datenpfad gehärtet / ProSellers-Gate gemergt / PrivateWebWriter + persistenter CDP-Driver real belegt / Create-Contract lokal implementiert** — Stand: 30.09.2026.
+**Core, Dashboard und Analytics implementiert / PrivateWebWriter + Runtime-Smoke real belegt / initiale lokale Mark Write API implementiert** — Stand: 01.10.2026.
 
 Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Der MVP-Fokus liegt auf Anzeigenverwaltung, Synchronisation, Verkäufermetriken, Inbox/Interessenten, Dashboard und datenbasierter Auswertung. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
 
@@ -113,6 +113,23 @@ python -m pip install -e '.[private-web]'
 ```
 
 `build_private_web_content_runtime(cdp_port=...)` liefert anschließend fünf für den Application-Layer bestimmte Flächen: `create_writer`, `content_writer`, `state_writer`, `delete_writer` und die target-bound Factory `content_reader_for(ad_id)`. Jede Create-, Content-, Lifecycle- oder Delete-Writer-Operation erhält eine frische `CdpPrivateWebPage`; jeder Content-Read ist an genau die angeforderte eigene Anzeigen-ID gebunden. `MarkService.create()` nimmt vor dem einzigen Publish-Versuch zwei getrennte Inventar-Pre-Reads, verlangt danach in beiden Inventaren exakt dieselbe einzelne neue Anzeigen-ID und bestätigt Titel/Beschreibung zusätzlich über den target-bound Private-Web-Reader. Mehrere oder divergierende neue IDs, ein fehlender Readback oder ein unklarer Browserausgang bleiben `AMBIGUOUS` und werden nicht wiederholt. `MarkService` verwendet den `state_writer` für `pause()`/`activate()` und den `delete_writer` für den explizit freigegebenen Delete-Pfad; Delete behält `DeleteApproval` sowie die unabhängige Bestätigung der Abwesenheit.
+
+## Lokale Mark Write API
+
+Slice D führt eine **separate** loopback-only Write-Surface ein; das bestehende Dashboard bleibt vollständig read-only. Der erste Contract exponiert ausschließlich bereits vorhandene, ID-gebundene `MarkService`-Operationen:
+
+- `PATCH /api/write/ads/{id}` für Titel/Beschreibung,
+- `POST /api/write/ads/{id}/pause`,
+- `POST /api/write/ads/{id}/activate`,
+- `DELETE /api/write/ads/{id}` mit zusätzlicher expliziter `confirm_ad_id`-Bestätigung.
+
+Create, Media-Publish und Reply sind **keine** Routen dieses Slices.
+
+Die Write-Surface bindet ausschließlich an `127.0.0.1` und verlangt vor jedem Service-Aufruf einen Bearer-Token, eine passende Capability und `writes_enabled=true`. Der Core behält seinen eigenen unabhängigen `writes_enabled`-Gate, sodass die HTTP-Surface allein keine Plattformwrites freischaltet. Tokens werden nur zur Laufzeit injiziert und weder persistiert noch in `repr` ausgegeben.
+
+Jede mutierende Anfrage benötigt einen `Idempotency-Key`. Vor dem Aufruf von `MarkService` wird ein Request-Fingerprint atomar in derselben SQLite-Datenbank als `in_progress` gespeichert. Ein identischer bereits abgeschlossener Request replayt ausschließlich die gespeicherte HTTP-Response; ein abweichender Request mit demselben Key wird abgewiesen. Bleibt nach einem Prozessabbruch ein `in_progress`-Eintrag zurück, wird **kein** erneuter Plattformversuch autorisiert. Damit überlebt die No-Blind-Retry-Regel auch einen HTTP-Prozessneustart.
+
+Die HTTP-Antwort exponiert den sanitisierten `OperationReceipt` und setzt `platform_retry_authorized=false`. `CONFIRMED` wird als 200, `PRECONDITION_FAILED` als 409 und `AMBIGUOUS` als 202 zurückgegeben. Dieser Slice startet keinen Browser, baut keine PrivateWeb-Runtime und führt keinen Kleinanzeigen-Plattformwrite aus.
 
 ## Offene fachliche Punkte
 

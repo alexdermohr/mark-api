@@ -468,6 +468,70 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
         self.assertEqual(receipt.writer_error, "TimeoutError")
         self.assertEqual(writer.calls, 1)
 
+    def test_state_receipt_preserves_authorization_metadata(self) -> None:
+        reader = SequenceReader(
+            ReadResult.success_nonempty(
+                (snapshot(LifecycleState.ACTIVE),)
+            ),
+            ReadResult.success_nonempty(
+                (snapshot(LifecycleState.PAUSED),)
+            ),
+        )
+        writer = StateWriter()
+
+        receipt = self.service().set_state(
+            ad_id="3521676801",
+            target_state=LifecycleState.PAUSED,
+            reader=reader,
+            writer=writer,
+            authorization_by="api-owner",
+            authorization_reference="write-api:pause-1",
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(receipt.authorization_by, "api-owner")
+        self.assertEqual(
+            receipt.authorization_reference,
+            "write-api:pause-1",
+        )
+
+    def test_content_receipt_preserves_authorization_metadata(self) -> None:
+        reader = SequenceReader(
+            ReadResult.success_nonempty(
+                (
+                    snapshot(
+                        LifecycleState.ACTIVE,
+                        title="old",
+                    ),
+                )
+            ),
+            ReadResult.success_nonempty(
+                (
+                    snapshot(
+                        LifecycleState.ACTIVE,
+                        title="new",
+                    ),
+                )
+            ),
+        )
+        writer = ContentWriter()
+
+        receipt = self.service().update_content(
+            ad_id="3521676801",
+            reader=reader,
+            writer=writer,
+            title="new",
+            authorization_by="api-owner",
+            authorization_reference="write-api:patch-1",
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(receipt.authorization_by, "api-owner")
+        self.assertEqual(
+            receipt.authorization_reference,
+            "write-api:patch-1",
+        )
+
     def test_writes_are_disabled_by_default(self) -> None:
         reader = SequenceReader()
         writer = DeleteWriter()

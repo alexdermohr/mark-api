@@ -123,3 +123,21 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - der Contract selbst ist browserdriver-neutral. Ein konkreter persistenter Browserdriver und ein eigener, reversibler Live-Smoke sind separate Gates vor Aktivierung,
 - Create, Bilder, Pause/Aktivieren und Delete werden erst nach dem Content-Update-Grundpfad einzeln erweitert; Delete behält zusätzlich seine explizite ID-Freigabe,
 - ProSellers bleibt ein separates optionales Backend für tatsächlich berechtigte Power/Premium-Konten.
+
+## D-011 — Mark Write API bleibt getrennt, loopback-only und crash-idempotent
+
+**Entscheidung:** Die schreibfähige Mark-HTTP-Surface wird nicht in das read-only Dashboard eingebaut. Sie läuft als separater loopback-only Server und exponiert im ersten Slice ausschließlich die bereits gehärteten ID-gebundenen `MarkService`-Operationen Content-Update, Pause, Activate und Delete. Create, Media-Publish und Reply bleiben separate spätere Gates.
+
+**Begründung:** Eine Erweiterung des Dashboard-Handlers um Writes würde eine bereits belegte Read-only-Sicherheitsgrenze aufweichen. Reine In-Memory-Idempotenz wäre ebenfalls unzureichend: Nach einem Prozessabbruch zwischen möglichem Plattforminput und HTTP-Response könnte ein Neustart denselben externen Request erneut ausführen. Die SQLite-Ledger bindet deshalb den Idempotency-Key vor dem Service-Aufruf an einen Request-Fingerprint.
+
+**Folgen:**
+- der Write-Server bindet ausschließlich an `127.0.0.1`,
+- Bearer-Authentisierung, explizite Capability und ein eigener `writes_enabled`-Gate werden vor jedem `MarkService`-Aufruf geprüft; der Core behält zusätzlich seinen unabhängigen Write-Gate,
+- Laufzeit-Tokens werden nicht persistiert und in Konfigurations-`repr` verborgen,
+- jede Mutation benötigt einen syntaktisch validierten `Idempotency-Key`,
+- gleicher Key + gleicher abgeschlossener Request gibt nur die gespeicherte Response zurück und ruft keinen Writer erneut auf,
+- gleicher Key + anderer Request wird fail-closed abgewiesen,
+- ein persistiertes `in_progress` nach Crash bleibt ein harter Retry-Blocker und verlangt Reconciliation statt Wiederholung,
+- Delete benötigt zusätzlich eine explizite, zur Pfad-ID identische `confirm_ad_id` sowie eine Approval-Referenz,
+- Operation-Receipts werden sanitisiert über HTTP exponiert; ein `AMBIGUOUS`-Outcome erteilt ausdrücklich keine Retry-Autorisierung,
+- dieser Slice konstruiert keine Browser-/PrivateWeb-Runtime und führt keinen Kleinanzeigen-Plattformwrite aus.
