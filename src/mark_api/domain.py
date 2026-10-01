@@ -24,6 +24,13 @@ def _require_nonempty(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must not be blank")
 
 
+def _require_unicode_scalar_text(value: str, field_name: str) -> None:
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise ValueError(
+            f"{field_name} must contain only Unicode scalar values"
+        )
+
+
 def _utf16_code_unit_length(value: str) -> int:
     return sum(2 if ord(character) > 0xFFFF else 1 for character in value)
 
@@ -76,6 +83,10 @@ class AdCreateRequest:
             if not isinstance(label, str):
                 raise ValueError("category_path labels must be strings")
             normalized = label.strip()
+            _require_unicode_scalar_text(
+                normalized,
+                "category_path labels",
+            )
             if not normalized:
                 raise ValueError("category_path labels must not be blank")
             if len(normalized) > 120:
@@ -87,6 +98,7 @@ class AdCreateRequest:
 
         if not isinstance(self.title, str):
             raise ValueError("title must be a string")
+        _require_unicode_scalar_text(self.title, "title")
         _require_nonempty(self.title, "title")
         if self.title != self.title.strip():
             raise ValueError("title must not have surrounding whitespace")
@@ -98,6 +110,10 @@ class AdCreateRequest:
         if not isinstance(self.description, str):
             raise ValueError("description must be a string")
         normalized_description = self.description.replace("\r\n", "\n").replace("\r", "\n")
+        _require_unicode_scalar_text(
+            normalized_description,
+            "description",
+        )
         _require_nonempty(normalized_description, "description")
         if _utf16_code_unit_length(normalized_description) > 4000:
             raise ValueError("description must be <= 4000 characters")

@@ -99,6 +99,36 @@ class ResultAndDomainTests(unittest.TestCase):
             ("Haus & Garten", "Dekoration", "Weitere Dekoration"),
         )
 
+    def test_create_request_rejects_unpaired_unicode_surrogates(self) -> None:
+        invalid = "\ud800"
+        cases = (
+            {
+                "category_path": ("Haus & Garten", invalid),
+                "title": "Testanzeige",
+                "description": "Beschreibung",
+            },
+            {
+                "category_path": ("Haus & Garten", "Dekoration"),
+                "title": f"Test{invalid}",
+                "description": "Beschreibung",
+            },
+            {
+                "category_path": ("Haus & Garten", "Dekoration"),
+                "title": "Testanzeige",
+                "description": f"Beschreibung{invalid}",
+            },
+        )
+        for payload in cases:
+            with self.subTest(payload=repr(payload)):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Unicode scalar values",
+                ):
+                    AdCreateRequest(
+                        **payload,
+                        price_eur=12,
+                    )
+
     def test_create_request_rejects_title_outside_current_ui_limit(self) -> None:
         with self.assertRaises(ValueError):
             AdCreateRequest(

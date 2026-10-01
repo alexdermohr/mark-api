@@ -143,14 +143,19 @@ def _request_fingerprint(
     path: str,
     payload: object,
 ) -> str:
-    encoded = _canonical_json(
-        {
-            "principal": principal,
-            "method": method,
-            "path": path,
-            "payload": payload,
-        }
-    ).encode("utf-8")
+    try:
+        encoded = _canonical_json(
+            {
+                "principal": principal,
+                "method": method,
+                "path": path,
+                "payload": payload,
+            }
+        ).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            "request contains invalid Unicode scalar text"
+        ) from exc
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -549,12 +554,20 @@ def _handler_factory(
 
             if action != "create":
                 assert isinstance(ad_id, str)
-            fingerprint = _request_fingerprint(
-                principal=access.principal,
-                method=method,
-                path=urlsplit(self.path).path,
-                payload=payload,
-            )
+            try:
+                fingerprint = _request_fingerprint(
+                    principal=access.principal,
+                    method=method,
+                    path=urlsplit(self.path).path,
+                    payload=payload,
+                )
+            except ValueError:
+                self._error(
+                    400,
+                    "invalid_unicode_text",
+                    platform_retry_authorized=False,
+                )
+                return
             try:
                 claim = store.claim_write_api_request(
                     idempotency_key=idempotency_key,

@@ -553,6 +553,48 @@ class WriteApiTests(unittest.TestCase):
         self.assertEqual(service.calls, [])
         self.assertIsNone(self.store.write_api_request("create-invalid"))
 
+    def test_create_rejects_unpaired_surrogate_before_claim(self) -> None:
+        service = FakeWriteService()
+        with self.server(service) as server:
+            status, _, body = self.request(
+                server,
+                "POST",
+                "/api/write/ads",
+                payload={
+                    "category_path": ["Haus & Garten", "Dekoration"],
+                    "title": "Neue Vase\ud800",
+                    "description": "Beschreibung",
+                    "price_eur": 12,
+                },
+                idempotency_key="create-surrogate",
+            )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_create_request")
+        self.assertEqual(service.calls, [])
+        self.assertIsNone(
+            self.store.write_api_request("create-surrogate")
+        )
+
+    def test_fingerprint_rejects_unpaired_surrogate_without_claim(self) -> None:
+        service = FakeWriteService()
+        with self.server(service) as server:
+            status, _, body = self.request(
+                server,
+                "PATCH",
+                "/api/write/ads/1234567890",
+                payload={"title": "Neue Vase\ud800"},
+                idempotency_key="patch-surrogate",
+            )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_unicode_text")
+        self.assertFalse(body["platform_retry_authorized"])
+        self.assertEqual(service.calls, [])
+        self.assertIsNone(
+            self.store.write_api_request("patch-surrogate")
+        )
+
     def test_create_outcomes_map_without_retry_authority(self) -> None:
         for outcome, expected_status in (
             (OperationOutcome.AMBIGUOUS, 202),
