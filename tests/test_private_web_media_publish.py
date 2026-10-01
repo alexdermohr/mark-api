@@ -410,11 +410,16 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
             page.close()
         self.tmp.cleanup()
 
-    def page(self, handler) -> tuple[CdpPrivateWebMediaPage, FakeClient]:
+    def page(
+        self,
+        handler,
+        **page_kwargs,
+    ) -> tuple[CdpPrivateWebMediaPage, FakeClient]:
         client = FakeClient(handler)
         page = CdpPrivateWebMediaPage(
             "http://127.0.0.1:19610",
             client_factory=lambda: client,
+            **page_kwargs,
         )
         prepared = _prepare_local_media(
             (PrivateWebMediaSource(path=str(self.image)),)
@@ -456,6 +461,13 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
                 }
             if method == "Input.dispatchMouseEvent":
                 return {}
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "string",
+                        "value": "confirmed",
+                    }
+                }
             if method == "Runtime.releaseObject":
                 return {}
             raise AssertionError(method)
@@ -467,6 +479,7 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
         methods = [method for method, _params in client.calls]
         self.assertEqual(methods.count("Runtime.callFunctionOn"), 2)
         self.assertEqual(methods.count("Input.dispatchMouseEvent"), 2)
+        self.assertEqual(methods.count("Runtime.evaluate"), 1)
         activation = str(
             [
                 params["functionDeclaration"]
@@ -479,6 +492,17 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
         self.assertIn('"size_bytes":6', activation)
         self.assertIn("files[0] !== input", activation)
         self.assertNotIn(".click(", activation)
+        settlement_expression = str(
+            next(
+                params["expression"]
+                for method, params in client.calls
+                if method == "Runtime.evaluate"
+            )
+        )
+        self.assertIn("/m-meine-anzeigen.html", settlement_expression)
+        self.assertIn("/p-anzeige-aufgeben-schritt2.html", settlement_expression)
+        self.assertIn('"confirmed"', settlement_expression)
+        self.assertNotIn(".click(", settlement_expression)
 
         with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
             page.submit_create_media(self.expected_media)
@@ -487,6 +511,238 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
                 "Input.dispatchMouseEvent"
             ),
             2,
+        )
+
+    def test_submit_waits_for_delayed_post_submit_settlement(self) -> None:
+        call_function_count = 0
+        settlement_values = ["pending", "confirmed"]
+        sleeps: list[float] = []
+
+        def handler(method, params):
+            nonlocal call_function_count
+            if method == "Runtime.callFunctionOn":
+                call_function_count += 1
+                if call_function_count == 1:
+                    return {
+                        "result": {
+                            "type": "object",
+                            "value": {
+                                "state": "ready",
+                                "files": [
+                                    {"name": "photo.jpg", "size_bytes": 6}
+                                ],
+                            },
+                        }
+                    }
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"state": "ready", "x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "string",
+                        "value": settlement_values.pop(0),
+                    }
+                }
+            if method == "Runtime.releaseObject":
+                return {}
+            raise AssertionError(method)
+
+        page, client = self.page(handler, sleep=sleeps.append)
+
+        page.submit_create_media(self.expected_media)
+
+        self.assertEqual(sleeps, [0.05])
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Input.dispatchMouseEvent"
+            ),
+            2,
+        )
+        self.assertEqual(
+            [method for method, _params in client.calls].count(
+                "Runtime.evaluate"
+            ),
+            2,
+        )
+        self.assertIsNotNone(page._media_prepared)
+
+    def test_submit_settlement_timeout_is_unknown_and_never_retried(
+        self,
+    ) -> None:
+        call_function_count = 0
+        input_calls = 0
+        monotonic_values = iter((0.0, 1.0))
+
+        def handler(method, params):
+            nonlocal call_function_count, input_calls
+            if method == "Runtime.callFunctionOn":
+                call_function_count += 1
+                if call_function_count == 1:
+                    return {
+                        "result": {
+                            "type": "object",
+                            "value": {
+                                "state": "ready",
+                                "files": [
+                                    {"name": "photo.jpg", "size_bytes": 6}
+                                ],
+                            },
+                        }
+                    }
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"state": "ready", "x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                input_calls += 1
+                return {}
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "string",
+                        "value": "pending",
+                    }
+                }
+            if method == "Runtime.releaseObject":
+                return {}
+            raise AssertionError(method)
+
+        page, _client = self.page(
+            handler,
+            timeout_seconds=0.5,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(monotonic_values),
+        )
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            page.submit_create_media(self.expected_media)
+
+        self.assertEqual(
+            caught.exception.stage,
+            "create_media_submit_settle",
+        )
+        self.assertEqual(input_calls, 2)
+        prepared = page._media_prepared
+        self.assertIsNotNone(prepared)
+        assert prepared is not None
+        self.assertTrue(all(Path(path).exists() for path in prepared.paths))
+
+        with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
+            page.submit_create_media(self.expected_media)
+        self.assertEqual(input_calls, 2)
+
+    def test_unconfirmed_post_click_state_is_unknown_and_single_shot(
+        self,
+    ) -> None:
+        call_function_count = 0
+        input_calls = 0
+
+        def handler(method, params):
+            nonlocal call_function_count, input_calls
+            if method == "Runtime.callFunctionOn":
+                call_function_count += 1
+                if call_function_count == 1:
+                    return {
+                        "result": {
+                            "type": "object",
+                            "value": {
+                                "state": "ready",
+                                "files": [
+                                    {"name": "photo.jpg", "size_bytes": 6}
+                                ],
+                            },
+                        }
+                    }
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"state": "ready", "x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                input_calls += 1
+                return {}
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "string",
+                        "value": "unconfirmed",
+                    }
+                }
+            if method == "Runtime.releaseObject":
+                return {}
+            raise AssertionError(method)
+
+        page, _client = self.page(handler)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            page.submit_create_media(self.expected_media)
+
+        self.assertEqual(
+            caught.exception.stage,
+            "create_media_submit_settle",
+        )
+        self.assertEqual(input_calls, 2)
+        with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
+            page.submit_create_media(self.expected_media)
+        self.assertEqual(input_calls, 2)
+
+    def test_malformed_post_click_state_is_sanitized_as_unknown(
+        self,
+    ) -> None:
+        call_function_count = 0
+
+        def handler(method, params):
+            nonlocal call_function_count
+            if method == "Runtime.callFunctionOn":
+                call_function_count += 1
+                if call_function_count == 1:
+                    return {
+                        "result": {
+                            "type": "object",
+                            "value": {
+                                "state": "ready",
+                                "files": [
+                                    {"name": "photo.jpg", "size_bytes": 6}
+                                ],
+                            },
+                        }
+                    }
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"state": "ready", "x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"unexpected": "shape"},
+                    }
+                }
+            if method == "Runtime.releaseObject":
+                return {}
+            raise AssertionError(method)
+
+        page, _client = self.page(handler)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            page.submit_create_media(self.expected_media)
+
+        self.assertEqual(
+            caught.exception.stage,
+            "create_media_submit_settle",
         )
 
     def test_writer_and_cdp_media_lifetimes_span_submit_and_page_close(
@@ -498,6 +754,17 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
         def handler(method, params):
             nonlocal call_function_count, browser_paths
             if method == "Runtime.evaluate":
+                expression = str(params.get("expression", ""))
+                if (
+                    "/m-meine-anzeigen.html" in expression
+                    and '"confirmed"' in expression
+                ):
+                    return {
+                        "result": {
+                            "type": "string",
+                            "value": "confirmed",
+                        }
+                    }
                 return {
                     "result": {
                         "type": "object",
