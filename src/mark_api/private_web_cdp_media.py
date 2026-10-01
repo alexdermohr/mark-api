@@ -40,6 +40,7 @@ class CdpPrivateWebMediaPage(CdpPrivateWebPage):
         self._media_expected_create_snapshot: PrivateWebCreateSnapshot | None = None
         self._media_file_object_id: str | None = None
         self._media_prepared: _PreparedPrivateWebMedia | None = None
+        self._media_submit_unsettled = False
 
     def _release_media_handle(self) -> None:
         object_id = self._media_file_object_id
@@ -66,9 +67,17 @@ class CdpPrivateWebMediaPage(CdpPrivateWebPage):
         self._release_media_handle()
         self._release_media_files()
         self._media_expected_create_snapshot = None
+        self._media_submit_unsettled = False
         super().open_create_form(category_path)
 
     def close(self) -> None:
+        if self._media_submit_unsettled:
+            # A one-shot publish may still be consuming the page-owned files.
+            # Refuse destructive cleanup until observation-only reconciliation
+            # reaches the same canonical post-submit state as the success path.
+            raise PrivateWebSubmitUnknownError(
+                "create_media_submit_unsettled"
+            )
         self._release_media_handle()
         self._release_media_files()
         self._media_expected_create_snapshot = None
@@ -79,7 +88,10 @@ class CdpPrivateWebMediaPage(CdpPrivateWebPage):
         if not isinstance(files, tuple):
             raise TypeError("media files must be a tuple")
         sources = tuple(PrivateWebMediaSource(path=path) for path in files)
-        return _prepare_local_media(sources)
+        # Once browser file selection may be effective, GC must not silently
+        # delete the private copies behind an unresolved one-shot submit.
+        # Explicit settled close() remains the cleanup owner.
+        return _prepare_local_media(sources, delete_on_gc=False)
 
     def _file_input_handle_expression(
         self,
@@ -483,6 +495,16 @@ function() {{
                     "create_media_submit_settle"
                 ) from None
 
+    def reconcile_create_media_submit(self) -> None:
+        """Observe an unresolved one-shot media submit without retrying input."""
+        if not self._media_submit_unsettled:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "create_media_submit_reconcile"
+            )
+        client = self._client()
+        self._wait_for_media_submit_settlement(client)
+        self._media_submit_unsettled = False
+
     def submit_create_media(
         self,
         expected: PrivateWebCreateMediaSnapshot,
@@ -564,6 +586,10 @@ function() {{
         # close() remains the owner of page-local cleanup.
         self._last_create_snapshot = None
         self._media_expected_create_snapshot = None
+        # From the first browser-input dispatch onward, cleanup is unsafe until
+        # the existing post-submit state is observed. Keep this armed for every
+        # UNKNOWN outcome; reconciliation below never repeats browser input.
+        self._media_submit_unsettled = True
         try:
             self._dispatch_browser_click(
                 client,
@@ -575,6 +601,7 @@ function() {{
                 "create_media_submit"
             ) from None
 
-        # A caller may close the page immediately after this returns. Wait for
-        # the existing canonical post-submit page before allowing that cleanup.
-        self._wait_for_media_submit_settlement(client)
+        # A caller may close the page immediately after this returns. Use the
+        # same observation-only path for the initial wait and later UNKNOWN
+        # recovery; only confirmed settlement disarms destructive cleanup.
+        self.reconcile_create_media_submit()

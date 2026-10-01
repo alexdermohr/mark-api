@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import shutil
 import tempfile
 import unittest
 from dataclasses import replace
@@ -26,7 +28,6 @@ from mark_api.private_web_media import (
     PrivateWebMediaSource,
     PrivateWebMediaUnknownError,
     _PreparedPrivateWebMedia,
-    _prepare_local_media,
 )
 
 
@@ -407,6 +408,10 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         for page in reversed(self.pages):
+            if page._media_submit_unsettled:
+                # Test-only forced cleanup after UNKNOWN assertions. Production
+                # deliberately has no force-close path for unresolved submits.
+                page._media_submit_unsettled = False
             page.close()
         self.tmp.cleanup()
 
@@ -421,9 +426,7 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
             client_factory=lambda: client,
             **page_kwargs,
         )
-        prepared = _prepare_local_media(
-            (PrivateWebMediaSource(path=str(self.image)),)
-        )
+        prepared = page._prepare_media_paths((str(self.image),))
         page._create_bound = True
         page._last_create_snapshot = None
         page._media_selection_attempted = True
@@ -577,10 +580,11 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
     ) -> None:
         call_function_count = 0
         input_calls = 0
+        settlement_value = "pending"
         monotonic_values = iter((0.0, 1.0))
 
         def handler(method, params):
-            nonlocal call_function_count, input_calls
+            nonlocal call_function_count, input_calls, settlement_value
             if method == "Runtime.callFunctionOn":
                 call_function_count += 1
                 if call_function_count == 1:
@@ -608,7 +612,7 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
                 return {
                     "result": {
                         "type": "string",
-                        "value": "pending",
+                        "value": settlement_value,
                     }
                 }
             if method == "Runtime.releaseObject":
@@ -635,9 +639,35 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
         assert prepared is not None
         self.assertTrue(all(Path(path).exists() for path in prepared.paths))
 
+        with self.assertRaises(PrivateWebSubmitUnknownError) as close_caught:
+            page.close()
+        self.assertEqual(
+            close_caught.exception.stage,
+            "create_media_submit_unsettled",
+        )
+        self.assertTrue(all(Path(path).exists() for path in prepared.paths))
+
         with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
             page.submit_create_media(self.expected_media)
         self.assertEqual(input_calls, 2)
+
+        settlement_value = "confirmed"
+        page._monotonic = lambda: 2.0
+        evaluate_calls_before = [
+            method for method, _params in _client.calls
+        ].count("Runtime.evaluate")
+
+        page.reconcile_create_media_submit()
+
+        self.assertEqual(input_calls, 2)
+        self.assertEqual(
+            [
+                method for method, _params in _client.calls
+            ].count("Runtime.evaluate"),
+            evaluate_calls_before + 1,
+        )
+        page.close()
+        self.assertTrue(all(not Path(path).exists() for path in prepared.paths))
 
     def test_unconfirmed_post_click_state_is_unknown_and_single_shot(
         self,
@@ -901,6 +931,60 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
         with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
             page.submit_create_media(self.expected_media)
         self.assertEqual(input_calls, 1)
+
+    def test_unsettled_page_gc_preserves_browser_media(self) -> None:
+        call_function_count = 0
+
+        def handler(method, params):
+            nonlocal call_function_count
+            if method == "Runtime.callFunctionOn":
+                call_function_count += 1
+                if call_function_count == 1:
+                    return {
+                        "result": {
+                            "type": "object",
+                            "value": {
+                                "state": "ready",
+                                "files": [
+                                    {"name": "photo.jpg", "size_bytes": 6}
+                                ],
+                            },
+                        }
+                    }
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"state": "ready", "x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                raise PrivateWebCdpError("call")
+            if method == "Runtime.releaseObject":
+                return {}
+            raise AssertionError(method)
+
+        page, _client = self.page(handler)
+        self.pages.remove(page)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            page.submit_create_media(self.expected_media)
+
+        prepared = page._media_prepared
+        self.assertIsNotNone(prepared)
+        assert prepared is not None
+        browser_paths = prepared.paths
+        media_directory = Path(browser_paths[0]).parent
+        self.assertTrue(all(Path(path).exists() for path in browser_paths))
+
+        del prepared
+        del page
+        gc.collect()
+        try:
+            self.assertTrue(
+                all(Path(path).exists() for path in browser_paths)
+            )
+        finally:
+            shutil.rmtree(media_directory, ignore_errors=True)
 
 
 if __name__ == "__main__":
