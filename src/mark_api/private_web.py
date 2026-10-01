@@ -279,7 +279,11 @@ class PrivateWebCreateWriter:
                 raise PrivateWebSubmitUnknownError(stage) from None
             raise PrivateWebWriteNotAttemptedError(stage) from None
 
-    def create_ad(self, request: AdCreateRequest) -> None:
+    def prepare_create(
+        self,
+        request: AdCreateRequest,
+    ) -> PrivateWebCreateSnapshot:
+        """Fill and revalidate one create form without publishing it."""
         if not isinstance(request, AdCreateRequest):
             raise TypeError("request must be AdCreateRequest")
 
@@ -327,7 +331,10 @@ class PrivateWebCreateWriter:
             raise PrivateWebPreconditionError(
                 "before_submit:create_values_drift"
             )
+        return before_submit
 
+    def create_ad(self, request: AdCreateRequest) -> None:
+        self.prepare_create(request)
         self._call(
             "submit_create",
             self._page.submit_create,

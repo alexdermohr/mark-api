@@ -10,9 +10,11 @@ from .domain import AdCreateRequest
 from .ports import WriteNotAttemptedError
 from .private_web import (
     PrivateWebCreateSnapshot,
+    PrivateWebCreateWriter,
     PrivateWebEditorState,
     PrivateWebError,
     PrivateWebPreconditionError,
+    PrivateWebSubmitUnknownError,
     PrivateWebWriteNotAttemptedError,
 )
 
@@ -107,6 +109,28 @@ class PrivateWebCreateMediaPage(Protocol):
         ...
 
     def read_create_media(self) -> PrivateWebCreateMediaSnapshot:
+        ...
+
+
+class PrivateWebCreateMediaPublishPage(PrivateWebCreateMediaPage, Protocol):
+    """Create-form boundary for one separately gated media-filled publish."""
+
+    def open_create_form(self, category_path: tuple[str, ...]) -> None:
+        ...
+
+    def replace_create_title(self, value: str) -> None:
+        ...
+
+    def replace_create_description(self, value: str) -> None:
+        ...
+
+    def replace_create_price(self, value: str) -> None:
+        ...
+
+    def submit_create_media(
+        self,
+        expected: PrivateWebCreateMediaSnapshot,
+    ) -> None:
         ...
 
 
@@ -377,5 +401,58 @@ class PrivateWebCreateMediaStager:
             ):
                 raise PrivateWebMediaUnknownError("media_readback")
             return after
+        finally:
+            prepared.close()
+
+
+class PrivateWebCreateMediaWriter:
+    """Publish one create request with explicit media through a separate gate.
+
+    Local sources are stabilized before any browser access. The ordinary
+    media-free create writer is reused only to prepare and revalidate the form;
+    publication remains a distinct media-aware page action.
+    """
+
+    def __init__(self, page: PrivateWebCreateMediaPublishPage) -> None:
+        self._page = page
+
+    def create_ad(
+        self,
+        request: AdCreateRequest,
+        sources: tuple[PrivateWebMediaSource, ...],
+    ) -> None:
+        if not isinstance(request, AdCreateRequest):
+            raise TypeError("request must be AdCreateRequest")
+
+        # Stabilize the caller-owned bytes before the first browser read/write.
+        prepared = _prepare_local_media(sources)
+        try:
+            PrivateWebCreateWriter(self._page).prepare_create(request)
+
+            # The stager gets only private copies, not caller-owned paths. It
+            # performs its own descriptor validation/copy and exact FileList
+            # readback before any publish action is considered.
+            stable_sources = tuple(
+                PrivateWebMediaSource(path=path) for path in prepared.paths
+            )
+            staged = PrivateWebCreateMediaStager(self._page).stage_create_media(
+                request,
+                stable_sources,
+            )
+            if staged.files != prepared.files:
+                raise PrivateWebMediaUnknownError("media_readback")
+
+            try:
+                self._page.submit_create_media(staged)
+            except PrivateWebSubmitUnknownError:
+                raise
+            except WriteNotAttemptedError:
+                raise PrivateWebWriteNotAttemptedError(
+                    "submit_create_media"
+                ) from None
+            except Exception:  # noqa: BLE001 - submit may already have reached UI.
+                raise PrivateWebSubmitUnknownError(
+                    "submit_create_media"
+                ) from None
         finally:
             prepared.close()

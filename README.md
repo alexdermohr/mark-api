@@ -16,11 +16,12 @@ Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkreti
 - `BrowserBotAdapter` bleibt als historisch belegter Fremdprozess-PoC für Sync und in-place Inhaltsupdate im Repository; er wird nicht automatisch zum Produkt-Backend.
 - `PrivateWebContentWriter` bildet den davon getrennten privaten Writer-Contract für die normale Kleinanzeigen-Weboberfläche. `CdpPrivateWebPage`, `CdpCookieProvider` und `CdpPrivateWebOwnerReader` implementieren den gehärteten loopback-only Driver; der gegatete Real-Smoke auf genau einer eigenen Anzeige hat einen Content-Write mit unabhängigem Owner/Web-Post-Read bestätigt.
 - `PrivateWebCreateWriter` bildet den ersten engen Create-Vertrag für private Konten: expliziter Kategoriepfad, `OFFER + FIXED`, Titel/Beschreibung/Festpreis, keine Medien, kein Draft, kein Buy-Now, keine Marketing- oder Adressfreigabe. Der aktuelle Create-Flow wurde ausschließlich read-only kartiert; ein Live-Publish wurde in diesem Slice nicht ausgeführt.
+- `PrivateWebCreateMediaWriter` ergänzt davon getrennt einen lokalen Media-Publish-Contract: stabile private Kopien aus validierten Datei-Deskriptoren, exakter `FileList`-Readback, erneute Bindung desselben CDP-File-Input-Handles und höchstens ein browser-level Publish-Versuch. Der Pfad ist weder an `MarkService` noch an `/api/write` angeschlossen; ohne media-aware autoritativen Post-Read wird keine serverseitige Medienpersistenz oder `CONFIRMED`-Media-Semantik behauptet. Dieser Slice führt keinen realen Kleinanzeigen-Publish aus.
 - `MarkService` als Application-Layer über den Capability-Adaptern.
 - Read-only Dashboard/API auf Loopback sowie Analytics-Rankings auf explizit gespeicherten Klassifikationslabels.
 - Der Ein-Anzeigen-Realtest vom 24.09.2026 belegt Sync, stabiles in-place Update, Pause/Aktivierung, Verkäufermetriken, positiven Inbox/adId-Fall und Delete mit unabhängigen Besitzerlisten-Readbacks.
 - Am 25.09.2026 wurde der aktuell eingeloggte eigene Account read-only durch `ManagementReadAdapter -> EnrichedOwnerReader -> MarkService -> SnapshotStore` geführt: erfolgreicher leerer Besitzerbestand (`success_empty`), keine Plattformmutation.
-- Plattformwrites sind im Core standardmäßig deaktiviert. Der Create/Publish-Vertrag ist lokal implementiert und regressionsgetestet; ein Live-Publish und damit die Betriebsfreigabe bleiben weiterhin offen.
+- Plattformwrites sind im Core standardmäßig deaktiviert. Der mediafreie Create/Publish-Vertrag und der getrennte media-aware Browser-Publish-Primitive sind lokal implementiert und regressionsgetestet; ein Live-Publish, eine autoritative Media-Reconciliation und damit die Betriebsfreigabe bleiben weiterhin offen.
 
 ## Lokale Klassifikationspflege
 

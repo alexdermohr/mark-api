@@ -720,6 +720,10 @@ class CdpPrivateWebMediaPageTests(unittest.TestCase):
         sources = (
             page._file_input_handle_expression(self.expected_create),
             f"({page._media_readback_function(self.expected_create)})",
+            f"({page._media_create_activation_function(
+                self.expected_create,
+                media_snapshot("photo.jpg", self.image.stat().st_size),
+            )})",
         )
         for source in sources:
             check = subprocess.run(
