@@ -19,6 +19,7 @@ from mark_api.private_web_cdp import (
 )
 from mark_api.private_web_cdp_media import CdpPrivateWebMediaPage
 from mark_api.private_web_media import (
+    PrivateWebCreateMediaPublishPage,
     PrivateWebCreateMediaSnapshot,
     PrivateWebCreateMediaWriter,
     PrivateWebMediaFileSnapshot,
@@ -206,6 +207,10 @@ class WriterCdpPublishPage(CdpPrivateWebMediaPage):
 
 
 class PrivateWebCreateMediaWriterTests(unittest.TestCase):
+    def test_publish_page_protocol_keeps_media_free_submit_contract(self) -> None:
+        self.assertIn("submit_create", PrivateWebCreateMediaPublishPage.__dict__)
+        self.assertIn("submit_create_media", PrivateWebCreateMediaPublishPage.__dict__)
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)

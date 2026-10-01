@@ -127,6 +127,10 @@ class PrivateWebCreateMediaPublishPage(PrivateWebCreateMediaPage, Protocol):
     def replace_create_price(self, value: str) -> None:
         ...
 
+    def submit_create(self) -> None:
+        """Required by PrivateWebCreateWriter; MediaWriter never invokes it."""
+        ...
+
     def submit_create_media(
         self,
         expected: PrivateWebCreateMediaSnapshot,
