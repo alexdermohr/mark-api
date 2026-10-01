@@ -20,12 +20,14 @@ from mark_api.private_web import (
 )
 from mark_api.private_web_runtime import (
     PrivateWebContentRuntime,
+    PrivateWebInventoryRuntime,
     PrivateWebRuntimeClosedError,
     PrivateWebRuntimeDependencyError,
     PrivateWebRuntimeSetupError,
     _NoRedirectManagementTransport,
     _RejectManagementRedirectHandler,
     build_private_web_content_runtime,
+    build_private_web_inventory_runtime,
     require_private_web_runtime_dependency,
 )
 from mark_api.results import ReadResult, ReadStatus
@@ -340,6 +342,30 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
             runtime.create_writer.create_ad(request)
 
         self.assertIsInstance(caught.exception, WriteNotAttemptedError)
+
+    def test_inventory_read_uses_owner_reader_without_page_creation(self) -> None:
+        owner = OwnerReader(
+            ReadResult.success_nonempty((owner_snapshot(),))
+        )
+        page_calls = 0
+
+        def page_factory():
+            nonlocal page_calls
+            page_calls += 1
+            raise AssertionError("inventory read must not create a page")
+
+        runtime = PrivateWebContentRuntime(
+            owner_reader=owner,
+            page_factory=page_factory,
+            close_runtime=lambda: None,
+        )
+
+        result = runtime.read_inventory()
+
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        self.assertEqual(result.value, (owner_snapshot(),))
+        self.assertEqual(owner.calls, 1)
+        self.assertEqual(page_calls, 0)
 
     def test_target_reader_enriches_only_exact_owner_target_and_closes_page(self) -> None:
         owner = OwnerReader(
@@ -661,6 +687,8 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
         runtime.close()
 
         with self.assertRaises(PrivateWebRuntimeClosedError):
+            runtime.read_inventory()
+        with self.assertRaises(PrivateWebRuntimeClosedError):
             runtime.content_reader_for(AD_ID)
         with self.assertRaises(PrivateWebRuntimeClosedError):
             runtime.content_writer.update_content(AD_ID, title="new")
@@ -774,6 +802,67 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
             redirect_handler,
             _RejectManagementRedirectHandler,
         )
+
+    def test_inventory_builder_has_no_writer_surface_or_page_factory(self) -> None:
+        class CookieDelegate:
+            def __init__(self) -> None:
+                self.closed = 0
+
+            def __call__(self):
+                return "session=opaque"
+
+            def close(self) -> None:
+                self.closed += 1
+
+        delegate = CookieDelegate()
+        owner_reader = OwnerReader(
+            ReadResult.success_nonempty((owner_snapshot(),))
+        )
+
+        with (
+            patch(
+                "mark_api.private_web_runtime.require_private_web_runtime_dependency"
+            ) as dependency,
+            patch(
+                "mark_api.private_web_runtime.CdpCookieProvider.from_port",
+                return_value=delegate,
+            ) as cookies,
+            patch(
+                "mark_api.private_web_runtime.ManagementReadAdapter",
+                return_value=owner_reader,
+            ) as management,
+            patch(
+                "mark_api.private_web_runtime.CdpPrivateWebPage.from_port",
+                side_effect=AssertionError("inventory runtime must not create a page"),
+            ) as pages,
+        ):
+            runtime = build_private_web_inventory_runtime(
+                cdp_port=19610,
+                timeout_seconds=4.0,
+            )
+
+        self.assertIsInstance(runtime, PrivateWebInventoryRuntime)
+        dependency.assert_called_once_with()
+        cookies.assert_called_once_with(19610, timeout_seconds=4.0)
+        self.assertEqual(management.call_count, 1)
+        self.assertEqual(management.call_args.kwargs["endpoint"], MANAGEMENT_URL)
+        pages.assert_not_called()
+        for name in (
+            "content_writer",
+            "create_writer",
+            "state_writer",
+            "delete_writer",
+            "content_reader_for",
+        ):
+            self.assertFalse(hasattr(runtime, name), name)
+
+        result = runtime.read_inventory()
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        self.assertEqual(owner_reader.calls, 1)
+
+        runtime.close()
+        runtime.close()
+        self.assertEqual(delegate.closed, 1)
 
     def test_builder_consumes_existing_cdp_port_without_opening_page_eagerly(self) -> None:
         class CookieDelegate:

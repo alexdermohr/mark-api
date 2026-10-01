@@ -262,6 +262,20 @@ Darauf basiert der neue enge `PrivateWebCreateWriter`:
 
 Create benötigt wegen der erst nach dem Write bekannten Anzeigen-ID einen eigenen `CreateOperationReceipt`. `SafeWriteOrchestrator.create()` liest vor dem Write Primär- und unabhängiges Bestätigungsinventar. Nach dem einzigen Publish-Versuch müssen beide gegenüber ihrem jeweiligen Pre-State exakt dieselbe einzelne neue ID sehen und den angeforderten Titel tragen; anschließend muss der target-bound Private-Web-Reader für genau diese ID Titel und Beschreibung exakt bestätigen. Nur dann ist der Create `CONFIRMED`. Andernfalls bleibt er `AMBIGUOUS`; eine erkannte `WriteNotAttemptedError` bleibt ohne Post-Read `PRECONDITION_FAILED`.
 
+### Fortschreibung 30.09.2026 — read-only PrivateWeb Runtime-Smoke
+
+Nach dem Merge des isolierten Media-Staging-Slices ist der nächste Issue-#5-Härtungsschritt bewusst **kein** weiterer Plattform-Write. Neben dem bestehenden D-010-Content-Runtime-Bundle existiert jetzt ein eigener **Inventory-only Runtime-Builder** ohne Page-/Writer-Surfaces; damit kann der freigegebene Owner-Read lokal end-to-end geprüft werden:
+
+- Quelle ist ausschließlich der autoritative Owner-/Management-Read der bereits nutzer-authentifizierten PrivateWeb-Runtime,
+- der Smoke startet und authentifiziert keinen Browser und ruft keinen Create-/Content-/Lifecycle-/Delete-Writer auf,
+- nur erfolgreiche Inventar-Reads werden in eine **ephemere** SQLite-Datenbank geschrieben; Read-Fehler und doppelte IDs stoppen fail-closed vor dem Dashboard,
+- das Dashboard bindet ausschließlich an `127.0.0.1` auf einem ephemeren Port,
+- Health, Summary, Anzeigenprojektion und Analytics werden gegen genau dieses Inventar rückgelesen,
+- HTTP-Write-Methoden bleiben `405 Method Not Allowed`, eine Mark-Write-Route ist im Smoke nicht vorhanden,
+- der Report führt `platform_writes_enabled=false` fest; die Runtime wird auch bei Fehlern geschlossen.
+
+Dieser Slice ist lokal regressionsgetestet und führt **keinen** Kleinanzeigen-Plattformwrite aus. Ein späterer Lauf gegen eine vorhandene nutzer-authentifizierte CDP-Sitzung bleibt read-only und ersetzt keine separate Freigabe für Create/Media-Publish oder andere Plattformmutationen.
+
 ## Geplante Mark-HTTP-API
 
 Das Ziel ist eine eigene schreibfähige Oberfläche, z. B.:
@@ -322,7 +336,9 @@ Erst nach diesem Beleg wird der Browser-Content-Updatepfad zum Fallback degradie
 ### Slice C — Create/Media/Reply
 
 - privater Create-Vertrag lokal implementiert und gegen die aktuelle UI read-only gebunden; ein kontrollierter Live-Publish-Smoke bleibt separat offen,
-- als nächstes Bilderpfad vollständig kartieren und testen,
+- Media-Staging ist als separater fail-closed Vertrag implementiert und gemergt: stabile private Kopie aus validiertem Descriptor, genau ein browser-level File-Input, FileList-Readback, kein Publish und kein Blind-Retry,
+- der read-only PrivateWeb Runtime-Smoke schließt zunächst die verbleibende Issue-#5-E2E-Härtung über SQLite + Dashboard/Analytics bei deaktivierten Writes,
+- ein späterer Media-Publish bleibt ein eigener Write-Slice mit eigener Freigabe und Reconciliation,
 - Reply nur in einer bestehenden natürlichen Conversation testen; keine künstliche Testnachricht erzeugen.
 
 ### Slice D — Mark Write API
@@ -345,4 +361,4 @@ Erst nach diesem Beleg wird der Browser-Content-Updatepfad zum Fallback degradie
 
 Die Frage, **ob** eine schreibfähige Mark-API technisch möglich ist, ist mit **ja** beantwortet.
 
-Die aktive technische Arbeit folgt D-010: `PrivateWebWriter`, persistenter CDP-Driver und der ownergebundene in-place Content-Smoke sind belegt; die Runtime-Komposition verbindet diese Flächen ohne Browser-Lifecycle im Core mit `MarkService`. Lifecycle (`ACTIVE`/`PAUSED`) und Delete sind über denselben fail-closed Web-UI-Pfad implementiert. Create ist jetzt ebenfalls als enger lokaler Contract samt eigener Reconciliation-Semantik implementiert und gegen die aktuelle UI read-only gebunden; ein Live-Publish wurde ausdrücklich nicht ausgeführt. Media bleibt der nächste separate Writer-Slice. ProSellers bleibt das optionale offizielle zweite Backend; die privaten/mobile Reverse-Engineering-Pfade bleiben historische PoC-Evidenz.
+Die aktive technische Arbeit folgt D-010: `PrivateWebWriter`, persistenter CDP-Driver und der ownergebundene in-place Content-Smoke sind belegt; die Runtime-Komposition verbindet diese Flächen ohne Browser-Lifecycle im Core mit `MarkService`. Lifecycle (`ACTIVE`/`PAUSED`) und Delete sind über denselben fail-closed Web-UI-Pfad implementiert. Create ist als enger lokaler Contract samt eigener Reconciliation-Semantik implementiert und gegen die aktuelle UI read-only gebunden; ein Live-Publish wurde ausdrücklich nicht ausgeführt. Media-Staging ist ebenfalls separat fail-closed implementiert und gemergt, ohne Upload-/Persistenz-/Publish-Behauptung. Zusätzlich verbindet der neue read-only PrivateWeb Runtime-Smoke den autoritativen Owner-Read mit ephemerer SQLite-Persistenz und dem loopback-only Dashboard/Analytics, ohne einen Writer aufzurufen. ProSellers bleibt das optionale offizielle zweite Backend; die privaten/mobile Reverse-Engineering-Pfade bleiben historische PoC-Evidenz.

@@ -14,7 +14,7 @@ from .adapters.management import (
     ManagementReadAdapter,
     TransportFailure,
 )
-from .domain import AdCreateRequest, LifecycleState
+from .domain import AdCreateRequest, AdSnapshot, LifecycleState
 from .ports import (
     AdContentUpdater,
     AdCreateWriter,
@@ -33,6 +33,7 @@ from .private_web import (
     PrivateWebStatePage,
     PrivateWebStateWriter,
 )
+from .results import ReadResult
 from .private_web_cdp import (
     CdpCookieProvider,
     CdpPrivateWebOwnerReader,
@@ -241,6 +242,41 @@ class _PerCallPrivateWebDeleteWriter:
                 pass
 
 
+class PrivateWebInventoryRuntime:
+    """Read-only owner-inventory runtime for an existing authenticated CDP worker."""
+
+    def __init__(
+        self,
+        *,
+        owner_reader: AdsReader,
+        close_runtime: Callable[[], None],
+    ) -> None:
+        self._owner_reader = owner_reader
+        self._close_runtime = close_runtime
+        self._closed = False
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise PrivateWebRuntimeClosedError("private Web runtime is closed")
+
+    def read_inventory(self) -> ReadResult[tuple[AdSnapshot, ...]]:
+        self._ensure_open()
+        return self._owner_reader.read_ads()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._close_runtime()
+
+    def __enter__(self) -> "PrivateWebInventoryRuntime":
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
 class PrivateWebContentRuntime:
     """Compose target-bound private-Web create/content/state/delete reads and writes.
 
@@ -281,6 +317,12 @@ class PrivateWebContentRuntime:
     def _ensure_open(self) -> None:
         if self._closed:
             raise PrivateWebRuntimeClosedError("private Web runtime is closed")
+
+    def read_inventory(self) -> ReadResult[tuple[AdSnapshot, ...]]:
+        """Read the authoritative private-Web owner inventory without a write path."""
+
+        self._ensure_open()
+        return self._owner_reader.read_ads()
 
     def content_reader_for(self, ad_id: str) -> AdsReader:
         self._ensure_open()
@@ -327,22 +369,13 @@ def require_private_web_runtime_dependency() -> None:
         )
 
 
-def build_private_web_content_runtime(
+def _build_private_web_owner_reader(
     *,
     cdp_port: int,
-    timeout_seconds: float = 5.0,
-    management_source: str = MANAGEMENT_SOURCE,
-    clock: Callable[[], datetime] | None = None,
-) -> PrivateWebContentRuntime:
-    """Build the private-account Web runtime for an existing CDP worker.
-
-    This function never starts, stops, authenticates or reauthenticates a
-    browser. Login/MFA/CAPTCHA/security-challenge handling remains in the
-    already-authenticated user browser session and the fail-closed page driver.
-    """
-
-    require_private_web_runtime_dependency()
-
+    timeout_seconds: float,
+    management_source: str,
+    clock: Callable[[], datetime] | None,
+) -> tuple[AdsReader, _RuntimeCookieProvider]:
     cookie_delegate = CdpCookieProvider.from_port(
         cdp_port,
         timeout_seconds=timeout_seconds,
@@ -361,7 +394,57 @@ def build_private_web_content_runtime(
     if clock is not None:
         management_kwargs["clock"] = clock
 
-    management_reader = ManagementReadAdapter(**management_kwargs)
+    try:
+        management_reader = ManagementReadAdapter(**management_kwargs)
+    except Exception:
+        cookie_provider.close()
+        raise
+    return management_reader, cookie_provider
+
+
+def build_private_web_inventory_runtime(
+    *,
+    cdp_port: int,
+    timeout_seconds: float = 5.0,
+    management_source: str = MANAGEMENT_SOURCE,
+    clock: Callable[[], datetime] | None = None,
+) -> PrivateWebInventoryRuntime:
+    """Build only the owner-inventory read surface for an existing CDP worker."""
+
+    require_private_web_runtime_dependency()
+    owner_reader, cookie_provider = _build_private_web_owner_reader(
+        cdp_port=cdp_port,
+        timeout_seconds=timeout_seconds,
+        management_source=management_source,
+        clock=clock,
+    )
+    return PrivateWebInventoryRuntime(
+        owner_reader=owner_reader,
+        close_runtime=cookie_provider.close,
+    )
+
+
+def build_private_web_content_runtime(
+    *,
+    cdp_port: int,
+    timeout_seconds: float = 5.0,
+    management_source: str = MANAGEMENT_SOURCE,
+    clock: Callable[[], datetime] | None = None,
+) -> PrivateWebContentRuntime:
+    """Build the private-account Web runtime for an existing CDP worker.
+
+    This function never starts, stops, authenticates or reauthenticates a
+    browser. Login/MFA/CAPTCHA/security-challenge handling remains in the
+    already-authenticated user browser session and the fail-closed page driver.
+    """
+
+    require_private_web_runtime_dependency()
+    management_reader, cookie_provider = _build_private_web_owner_reader(
+        cdp_port=cdp_port,
+        timeout_seconds=timeout_seconds,
+        management_source=management_source,
+        clock=clock,
+    )
 
     def page_factory() -> CdpPrivateWebPage:
         return CdpPrivateWebPage.from_port(
