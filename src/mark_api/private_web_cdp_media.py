@@ -12,6 +12,8 @@ from .private_web_cdp import (
     CdpPrivateWebPage,
     PrivateWebCdpError,
     PrivateWebCdpWriteNotAttemptedError,
+    _CREATE_FORM_PATH,
+    _POST_SUBMIT_PATH,
 )
 from .private_web_media import (
     PrivateWebCreateMediaSnapshot,
@@ -405,6 +407,82 @@ function() {{
 }}
 """
 
+    def _media_submit_settlement_expression(self) -> str:
+        origin = json.dumps(self._expected_origin)
+        create_path = json.dumps(_CREATE_FORM_PATH)
+        post_submit_path = json.dumps(_POST_SUBMIT_PATH)
+        return f"""
+(() => {{
+  const currentOrigin = location.origin;
+  const currentPath = location.pathname;
+  const challengeText = Array.from(
+    document.querySelectorAll(
+      '[role="dialog"], [role="alert"], [aria-modal="true"], [id*="challenge" i], [class*="challenge" i]'
+    )
+  )
+    .map((element) => (element.innerText || "").toLowerCase())
+    .join("\\n");
+  const hasCaptcha = Boolean(
+    document.querySelector(
+      'iframe[src*="captcha" i], [data-sitekey], [id*="captcha" i], [class*="captcha" i]'
+    )
+  ) ||
+    challengeText.includes("captcha") ||
+    challengeText.includes("ich bin kein roboter");
+  const hasMfa = Boolean(
+    document.querySelector(
+      'input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="mfa" i]'
+    )
+  ) ||
+    challengeText.includes("bestätigungscode") ||
+    challengeText.includes("sicherheitscode");
+  const hasSecurityChallenge =
+    challengeText.includes("sicherheitsprüfung") ||
+    challengeText.includes("sicherheitscheck") ||
+    challengeText.includes("ungewöhnliche aktivität") ||
+    challengeText.includes("bestätige, dass du ein mensch bist");
+  const hasLogin =
+    currentPath.startsWith("/u/login/") ||
+    Boolean(document.querySelector('input[type="password"]'));
+
+  if (currentOrigin !== {origin}) return "unconfirmed";
+  if (hasCaptcha || hasMfa || hasSecurityChallenge || hasLogin) {{
+    return "unconfirmed";
+  }}
+  if (currentPath === {post_submit_path}) return "confirmed";
+  if (currentPath === {create_path}) return "pending";
+  return "unconfirmed";
+}})()
+"""
+
+    def _wait_for_media_submit_settlement(self, client) -> None:
+        deadline = self._monotonic() + self._timeout_seconds
+        expression = self._media_submit_settlement_expression()
+        while True:
+            try:
+                settlement = self._runtime_value(client, expression)
+            except Exception:
+                # Navigation may transiently invalidate the execution context
+                # after a successful click. Keep the one-shot submit fenced and
+                # allow only bounded observation; never retry browser input.
+                settlement = None
+            if settlement == "confirmed":
+                return
+            if settlement not in ("pending", None):
+                raise PrivateWebSubmitUnknownError(
+                    "create_media_submit_settle"
+                )
+            if self._monotonic() >= deadline:
+                raise PrivateWebSubmitUnknownError(
+                    "create_media_submit_settle"
+                )
+            try:
+                self._sleep(0.05)
+            except Exception:
+                raise PrivateWebSubmitUnknownError(
+                    "create_media_submit_settle"
+                ) from None
+
     def submit_create_media(
         self,
         expected: PrivateWebCreateMediaSnapshot,
@@ -481,8 +559,9 @@ function() {{
                 "create_media_submit"
             ) from None
 
-        # Do not release the file handle or private copies here: the browser may
-        # still consume them asynchronously after the click. close() owns cleanup.
+        # Do not release the file handle or private copies before settlement:
+        # the browser may still consume them asynchronously after the click.
+        # close() remains the owner of page-local cleanup.
         self._last_create_snapshot = None
         self._media_expected_create_snapshot = None
         try:
@@ -495,3 +574,7 @@ function() {{
             raise PrivateWebSubmitUnknownError(
                 "create_media_submit"
             ) from None
+
+        # A caller may close the page immediately after this returns. Wait for
+        # the existing canonical post-submit page before allowing that cleanup.
+        self._wait_for_media_submit_settlement(client)
