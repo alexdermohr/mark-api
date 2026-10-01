@@ -233,20 +233,36 @@ class MarkService:
             content_reader_factory=self._content_reader_factory,
         )
 
-    def pause(self, ad_id: str) -> OperationReceipt:
+    def pause(
+        self,
+        ad_id: str,
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> OperationReceipt:
         return self._writes.set_state(
             ad_id=ad_id,
             target_state=LifecycleState.PAUSED,
             reader=self._management_reader,
             writer=self._state_writer,
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
         )
 
-    def activate(self, ad_id: str) -> OperationReceipt:
+    def activate(
+        self,
+        ad_id: str,
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> OperationReceipt:
         return self._writes.set_state(
             ad_id=ad_id,
             target_state=LifecycleState.ACTIVE,
             reader=self._management_reader,
             writer=self._state_writer,
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
         )
 
     def delete(
@@ -269,6 +285,8 @@ class MarkService:
         *,
         title: str | None = None,
         description: str | None = None,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
     ) -> OperationReceipt:
         reader = (
             self._owner_reader
@@ -283,4 +301,6 @@ class MarkService:
             writer=self._content_writer,
             title=title,
             description=description,
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
         )

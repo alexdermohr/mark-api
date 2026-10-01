@@ -343,10 +343,15 @@ Erst nach diesem Beleg wird der Browser-Content-Updatepfad zum Fallback degradie
 
 ### Slice D — Mark Write API
 
-- REST-Schicht gegen den bestehenden `SafeWriteOrchestrator`,
-- Authentisierung/Autorisierung für die Mark-API,
-- Idempotency-/Operation-Receipt-Exposition,
-- Writes weiterhin standardmäßig aus und capability-gated.
+Der erste lokale Write-API-Contract ist implementiert, ohne Plattformzugriff:
+
+- separate loopback-only REST-Schicht; das bestehende Dashboard bleibt read-only,
+- zunächst ausschließlich ID-gebundene Content-/Pause-/Activate-/Delete-Routen gegen `MarkService`,
+- Bearer-Authentisierung + explizite Capabilities + eigener default-off Write-Gate vor dem Service-Aufruf,
+- persistente SQLite-Idempotency-Ledger: Claim vor dem Service-Aufruf, exakter Response-Replay nach Abschluss, Konflikt bei anderem Request und harter Retry-Block bei verbliebenem `in_progress`,
+- sanitizierte `OperationReceipt`-Exposition mit `platform_retry_authorized=false`,
+- Delete verlangt zusätzlich explizite ID-Bestätigung + Approval-Referenz,
+- Create, Media-Publish und Reply bleiben außerhalb dieses ersten HTTP-Slices.
 
 ## Nicht-Ziele
 

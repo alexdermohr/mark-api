@@ -413,6 +413,8 @@ class SafeWriteOrchestrator:
         target_state: LifecycleState,
         reader: AdsReader,
         writer: AdStateWriter,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
     ) -> OperationReceipt:
         if target_state not in {LifecycleState.ACTIVE, LifecycleState.PAUSED}:
             raise ValueError("target_state must be ACTIVE or PAUSED")
@@ -428,6 +430,8 @@ class SafeWriteOrchestrator:
             reader=reader,
             writer_call=lambda: writer.set_state(ad_id, target_state),
             allowed_pre_states=allowed_pre_states,
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
             postcondition=lambda _result, snapshot: (
                 snapshot is not None
                 and snapshot.lifecycle_state is target_state
@@ -442,6 +446,8 @@ class SafeWriteOrchestrator:
         writer: AdContentUpdater,
         title: str | None = None,
         description: str | None = None,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
     ) -> OperationReceipt:
         if title is None and description is None:
             raise ValueError("at least one content field must be provided")
@@ -470,6 +476,8 @@ class SafeWriteOrchestrator:
             allowed_pre_states=frozenset(
                 {LifecycleState.ACTIVE, LifecycleState.PAUSED}
             ),
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
             postcondition=content_matches,
         )
 

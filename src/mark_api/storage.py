@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -25,6 +25,23 @@ _CLASSIFICATION_FIELDS = (
     "text_type",
     "title_type",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class WriteApiRequestRecord:
+    idempotency_key: str
+    request_sha256: str
+    state: str
+    requested_at: datetime
+    completed_at: datetime | None
+    response_status: int | None
+    response_json: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WriteApiRequestClaim:
+    created: bool
+    record: WriteApiRequestRecord
 
 
 class SnapshotStore:
@@ -134,6 +151,32 @@ class SnapshotStore:
                     post_snapshot_json TEXT,
                     confirmation_post_snapshot_json TEXT,
                     content_post_snapshot_json TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS write_api_requests (
+                    idempotency_key TEXT PRIMARY KEY,
+                    request_sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK (state IN ('in_progress', 'completed')),
+                    requested_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    response_status INTEGER,
+                    response_json TEXT,
+                    CHECK (
+                        (
+                            state = 'in_progress'
+                            AND completed_at IS NULL
+                            AND response_status IS NULL
+                            AND response_json IS NULL
+                        )
+                        OR
+                        (
+                            state = 'completed'
+                            AND completed_at IS NOT NULL
+                            AND response_status IS NOT NULL
+                            AND response_json IS NOT NULL
+                        )
+                    )
                 );
                 """
             )
@@ -479,6 +522,196 @@ class SnapshotStore:
                     self._snapshot_json(receipt.content_post_snapshot),
                 ),
             )
+
+    @staticmethod
+    def _write_api_request_record(
+        row: sqlite3.Row,
+    ) -> WriteApiRequestRecord:
+        return WriteApiRequestRecord(
+            idempotency_key=str(row["idempotency_key"]),
+            request_sha256=str(row["request_sha256"]),
+            state=str(row["state"]),
+            requested_at=datetime.fromisoformat(row["requested_at"]),
+            completed_at=(
+                datetime.fromisoformat(row["completed_at"])
+                if row["completed_at"] is not None
+                else None
+            ),
+            response_status=(
+                int(row["response_status"])
+                if row["response_status"] is not None
+                else None
+            ),
+            response_json=(
+                str(row["response_json"])
+                if row["response_json"] is not None
+                else None
+            ),
+        )
+
+    def write_api_request(
+        self,
+        idempotency_key: str,
+    ) -> WriteApiRequestRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT idempotency_key, request_sha256, state, requested_at,
+                       completed_at, response_status, response_json
+                FROM write_api_requests
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        return (
+            self._write_api_request_record(row)
+            if row is not None
+            else None
+        )
+
+    def claim_write_api_request(
+        self,
+        *,
+        idempotency_key: str,
+        request_sha256: str,
+        requested_at: datetime,
+    ) -> WriteApiRequestClaim:
+        if not idempotency_key:
+            raise ValueError("idempotency_key must not be empty")
+        if (
+            len(request_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in request_sha256
+            )
+        ):
+            raise ValueError("request_sha256 must be a lowercase SHA-256 digest")
+        if (
+            requested_at.tzinfo is None
+            or requested_at.utcoffset() is None
+        ):
+            raise ValueError("requested_at must be timezone-aware")
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT idempotency_key, request_sha256, state, requested_at,
+                       completed_at, response_status, response_json
+                FROM write_api_requests
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if row is not None:
+                return WriteApiRequestClaim(
+                    created=False,
+                    record=self._write_api_request_record(row),
+                )
+
+            connection.execute(
+                """
+                INSERT INTO write_api_requests (
+                    idempotency_key, request_sha256, state, requested_at
+                ) VALUES (?, ?, 'in_progress', ?)
+                """,
+                (
+                    idempotency_key,
+                    request_sha256,
+                    requested_at.isoformat(),
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT idempotency_key, request_sha256, state, requested_at,
+                       completed_at, response_status, response_json
+                FROM write_api_requests
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            assert row is not None
+            return WriteApiRequestClaim(
+                created=True,
+                record=self._write_api_request_record(row),
+            )
+
+    def complete_write_api_request(
+        self,
+        *,
+        idempotency_key: str,
+        request_sha256: str,
+        response_status: int,
+        response_json: str,
+        completed_at: datetime,
+    ) -> WriteApiRequestRecord:
+        if (
+            isinstance(response_status, bool)
+            or not isinstance(response_status, int)
+            or not 100 <= response_status <= 599
+        ):
+            raise ValueError("response_status must be an HTTP status code")
+        if not isinstance(response_json, str) or not response_json:
+            raise ValueError("response_json must not be empty")
+        if (
+            completed_at.tzinfo is None
+            or completed_at.utcoffset() is None
+        ):
+            raise ValueError("completed_at must be timezone-aware")
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT idempotency_key, request_sha256, state, requested_at,
+                       completed_at, response_status, response_json
+                FROM write_api_requests
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("write API request was not claimed")
+            record = self._write_api_request_record(row)
+            if record.request_sha256 != request_sha256:
+                raise ValueError("write API request fingerprint mismatch")
+            if record.state == "completed":
+                if (
+                    record.response_status == response_status
+                    and record.response_json == response_json
+                ):
+                    return record
+                raise ValueError("write API request is already completed")
+            if record.state != "in_progress":
+                raise ValueError("write API request has invalid state")
+
+            connection.execute(
+                """
+                UPDATE write_api_requests
+                SET state = 'completed',
+                    completed_at = ?,
+                    response_status = ?,
+                    response_json = ?
+                WHERE idempotency_key = ?
+                """,
+                (
+                    completed_at.isoformat(),
+                    response_status,
+                    response_json,
+                    idempotency_key,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT idempotency_key, request_sha256, state, requested_at,
+                       completed_at, response_status, response_json
+                FROM write_api_requests
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            assert row is not None
+            return self._write_api_request_record(row)
 
     def append_inventory_result(
         self,
