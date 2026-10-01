@@ -348,6 +348,58 @@ class PrivateWebCreateMediaStager:
                 "media_before:create_values_mismatch"
             )
 
+    def _stage_prepared_media(
+        self,
+        request: AdCreateRequest,
+        prepared: _PreparedPrivateWebMedia,
+    ) -> PrivateWebCreateMediaSnapshot:
+        """Stage caller-owned stable media without taking cleanup ownership."""
+        if not isinstance(request, AdCreateRequest):
+            raise TypeError("request must be AdCreateRequest")
+        if not isinstance(prepared, _PreparedPrivateWebMedia):
+            raise TypeError("prepared must be _PreparedPrivateWebMedia")
+
+        try:
+            before = self._page.read_create_form()
+        except WriteNotAttemptedError:
+            raise PrivateWebWriteNotAttemptedError(
+                "read_create_before_media"
+            ) from None
+        except Exception:
+            raise PrivateWebWriteNotAttemptedError(
+                "read_create_before_media"
+            ) from None
+        self._require_expected_create(before, request)
+
+        try:
+            self._page.stage_create_media(prepared.paths)
+        except WriteNotAttemptedError:
+            raise PrivateWebWriteNotAttemptedError(
+                "stage_create_media"
+            ) from None
+        except PrivateWebMediaUnknownError:
+            # Reconcile by readback only; never retry file selection.
+            pass
+        except Exception:
+            # An unclassified page/provider failure may have happened after
+            # file-input mutation began. Reconcile by readback, never retry.
+            pass
+
+        try:
+            after = self._page.read_create_media()
+        except Exception:
+            # Once file selection may have happened, even readback failure
+            # is ambiguous. Never retry the file-input action.
+            raise PrivateWebMediaUnknownError("media_readback") from None
+
+        if (
+            not isinstance(after, PrivateWebCreateMediaSnapshot)
+            or after.state is not PrivateWebEditorState.READY
+            or after.files != prepared.files
+        ):
+            raise PrivateWebMediaUnknownError("media_readback")
+        return after
+
     def stage_create_media(
         self,
         request: AdCreateRequest,
@@ -356,51 +408,13 @@ class PrivateWebCreateMediaStager:
         if not isinstance(request, AdCreateRequest):
             raise TypeError("request must be AdCreateRequest")
 
-        # All deterministic local validation and the stable-copy handoff happen
-        # before any page/CDP access. The private copies stay alive through the
-        # browser selection and readback.
+        # Public staging owns its preparation and keeps the historical
+        # staging-only lifecycle. The publish writer uses _stage_prepared_media
+        # with its own preparation so those exact stable files remain alive
+        # through the subsequent media-aware submit.
         prepared = _prepare_local_media(sources)
         try:
-            try:
-                before = self._page.read_create_form()
-            except WriteNotAttemptedError:
-                raise PrivateWebWriteNotAttemptedError(
-                    "read_create_before_media"
-                ) from None
-            except Exception:
-                raise PrivateWebWriteNotAttemptedError(
-                    "read_create_before_media"
-                ) from None
-            self._require_expected_create(before, request)
-
-            try:
-                self._page.stage_create_media(prepared.paths)
-            except WriteNotAttemptedError:
-                raise PrivateWebWriteNotAttemptedError(
-                    "stage_create_media"
-                ) from None
-            except PrivateWebMediaUnknownError:
-                # Reconcile by readback only; never retry file selection.
-                pass
-            except Exception:
-                # An unclassified page/provider failure may have happened after
-                # file-input mutation began. Reconcile by readback, never retry.
-                pass
-
-            try:
-                after = self._page.read_create_media()
-            except Exception:
-                # Once file selection may have happened, even readback failure
-                # is ambiguous. Never retry the file-input action.
-                raise PrivateWebMediaUnknownError("media_readback") from None
-
-            if (
-                not isinstance(after, PrivateWebCreateMediaSnapshot)
-                or after.state is not PrivateWebEditorState.READY
-                or after.files != prepared.files
-            ):
-                raise PrivateWebMediaUnknownError("media_readback")
-            return after
+            return self._stage_prepared_media(request, prepared)
         finally:
             prepared.close()
 
@@ -408,13 +422,24 @@ class PrivateWebCreateMediaStager:
 class PrivateWebCreateMediaWriter:
     """Publish one create request with explicit media through a separate gate.
 
-    Local sources are stabilized before any browser access. The ordinary
-    media-free create writer is reused only to prepare and revalidate the form;
-    publication remains a distinct media-aware page action.
+    Local sources are stabilized before any browser access. The writer owns
+    those stable files through the media-aware submit. The ordinary media-free
+    create writer is reused only to prepare and revalidate the form; the CDP
+    page owns its separate browser-facing copies until page.close().
     """
 
     def __init__(self, page: PrivateWebCreateMediaPublishPage) -> None:
         self._page = page
+
+    @staticmethod
+    def _close_after_error(prepared: _PreparedPrivateWebMedia) -> None:
+        # Cleanup is secondary to an already classified writer outcome. Never
+        # let a local cleanup failure replace a pre-submit or submit-unknown
+        # classification and thereby accidentally authorize a retry.
+        try:
+            prepared.close()
+        except Exception:
+            pass
 
     def create_ad(
         self,
@@ -424,20 +449,18 @@ class PrivateWebCreateMediaWriter:
         if not isinstance(request, AdCreateRequest):
             raise TypeError("request must be AdCreateRequest")
 
-        # Stabilize the caller-owned bytes before the first browser read/write.
+        # One writer-owned stable preparation lives through submit. The stager
+        # borrows it without taking cleanup ownership; the CDP page separately
+        # creates browser-facing copies that remain alive until page.close().
         prepared = _prepare_local_media(sources)
         try:
             PrivateWebCreateWriter(self._page).prepare_create(request)
 
-            # The stager gets only private copies, not caller-owned paths. It
-            # performs its own descriptor validation/copy and exact FileList
-            # readback before any publish action is considered.
-            stable_sources = tuple(
-                PrivateWebMediaSource(path=path) for path in prepared.paths
-            )
-            staged = PrivateWebCreateMediaStager(self._page).stage_create_media(
+            staged = PrivateWebCreateMediaStager(
+                self._page
+            )._stage_prepared_media(
                 request,
-                stable_sources,
+                prepared,
             )
             if staged.files != prepared.files:
                 raise PrivateWebMediaUnknownError("media_readback")
@@ -454,5 +477,16 @@ class PrivateWebCreateMediaWriter:
                 raise PrivateWebSubmitUnknownError(
                     "submit_create_media"
                 ) from None
-        finally:
+        except Exception:
+            self._close_after_error(prepared)
+            raise
+
+        try:
             prepared.close()
+        except Exception:
+            # submit_create_media returned after the one-shot browser-input
+            # path. A cleanup failure must therefore remain non-retryable even
+            # though it says nothing authoritative about platform persistence.
+            raise PrivateWebSubmitUnknownError(
+                "submit_create_media"
+            ) from None

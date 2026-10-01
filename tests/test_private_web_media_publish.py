@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 from pathlib import Path
 
 from mark_api.domain import AdCreateRequest
@@ -23,6 +24,7 @@ from mark_api.private_web_media import (
     PrivateWebMediaFileSnapshot,
     PrivateWebMediaSource,
     PrivateWebMediaUnknownError,
+    _PreparedPrivateWebMedia,
     _prepare_local_media,
 )
 
@@ -69,6 +71,9 @@ class FakePublishPage:
         self.media_override = media_override
         self.submit_error = submit_error
         self.staged_bytes: tuple[bytes, ...] = ()
+        self.staged_paths: tuple[str, ...] = ()
+        self.submit_staged_paths_exist: tuple[bool, ...] = ()
+        self.submit_staged_bytes: tuple[bytes, ...] = ()
         self.calls: list[tuple[str, object]] = []
 
     def open_create_form(self, category_path: tuple[str, ...]) -> None:
@@ -95,6 +100,7 @@ class FakePublishPage:
 
     def stage_create_media(self, files: tuple[str, ...]) -> None:
         self.calls.append(("stage_create_media", files))
+        self.staged_paths = files
         self.staged_bytes = tuple(Path(path).read_bytes() for path in files)
         snapshots = tuple(
             PrivateWebMediaFileSnapshot(
@@ -121,6 +127,13 @@ class FakePublishPage:
         expected: PrivateWebCreateMediaSnapshot,
     ) -> None:
         self.calls.append(("submit_create_media", expected))
+        self.submit_staged_paths_exist = tuple(
+            Path(path).exists() for path in self.staged_paths
+        )
+        self.submit_staged_bytes = tuple(
+            Path(path).read_bytes() if Path(path).exists() else b""
+            for path in self.staged_paths
+        )
         if self.submit_error is not None:
             raise self.submit_error
 
@@ -141,6 +154,55 @@ class FakeClient:
 
     def close(self) -> None:
         return None
+
+
+class WriterCdpPublishPage(CdpPrivateWebMediaPage):
+    """Test harness: writer form methods plus the real media CDP path."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.form = create_snapshot()
+        self.writer_stage_paths: tuple[str, ...] = ()
+        self.writer_paths_alive_during_submit: tuple[bool, ...] = ()
+        self.writer_bytes_during_submit: tuple[bytes, ...] = ()
+
+    def open_create_form(self, category_path: tuple[str, ...]) -> None:
+        self._create_bound = True
+        self._create_submit_attempted = False
+        self._last_create_snapshot = self.form
+
+    def read_create_form(self) -> PrivateWebCreateSnapshot:
+        self._last_create_snapshot = self.form
+        return self.form
+
+    def replace_create_title(self, value: str) -> None:
+        self.form = replace(self.form, title=value)
+        self._last_create_snapshot = self.form
+
+    def replace_create_description(self, value: str) -> None:
+        self.form = replace(self.form, description=value)
+        self._last_create_snapshot = self.form
+
+    def replace_create_price(self, value: str) -> None:
+        self.form = replace(self.form, price_amount=value)
+        self._last_create_snapshot = self.form
+
+    def stage_create_media(self, files: tuple[str, ...]) -> None:
+        self.writer_stage_paths = files
+        super().stage_create_media(files)
+
+    def submit_create_media(
+        self,
+        expected: PrivateWebCreateMediaSnapshot,
+    ) -> None:
+        self.writer_paths_alive_during_submit = tuple(
+            Path(path).exists() for path in self.writer_stage_paths
+        )
+        self.writer_bytes_during_submit = tuple(
+            Path(path).read_bytes() if Path(path).exists() else b""
+            for path in self.writer_stage_paths
+        )
+        super().submit_create_media(expected)
 
 
 class PrivateWebCreateMediaWriterTests(unittest.TestCase):
@@ -206,6 +268,90 @@ class PrivateWebCreateMediaWriterTests(unittest.TestCase):
         self.assertEqual(page.staged_bytes, (b"stable-media",))
         # The outer stable copy is cleaned after the writer returns.
         self.assertFalse(staged_path.exists())
+
+    def test_writer_owned_media_lives_through_submit_then_cleans(self) -> None:
+        page = FakePublishPage()
+
+        PrivateWebCreateMediaWriter(page).create_ad(
+            create_request(),
+            (self.source,),
+        )
+
+        self.assertEqual(page.submit_staged_paths_exist, (True,))
+        self.assertEqual(page.submit_staged_bytes, (b"stable-media",))
+        self.assertTrue(page.staged_paths)
+        self.assertTrue(
+            all(not Path(path).exists() for path in page.staged_paths)
+        )
+
+    def test_submit_unknown_survives_cleanup_failure(self) -> None:
+        page = FakePublishPage(
+            submit_error=PrivateWebSubmitUnknownError("create_media_submit")
+        )
+        original_close = _PreparedPrivateWebMedia.close
+
+        def failing_close(prepared: _PreparedPrivateWebMedia) -> None:
+            original_close(prepared)
+            raise OSError("cleanup failed")
+
+        with patch.object(_PreparedPrivateWebMedia, "close", new=failing_close):
+            with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+                PrivateWebCreateMediaWriter(page).create_ad(
+                    create_request(),
+                    (self.source,),
+                )
+
+        self.assertEqual(caught.exception.stage, "create_media_submit")
+        self.assertEqual(
+            [name for name, _value in page.calls].count("submit_create_media"),
+            1,
+        )
+
+    def test_successful_submit_cleanup_failure_becomes_non_retryable_unknown(
+        self,
+    ) -> None:
+        page = FakePublishPage()
+        original_close = _PreparedPrivateWebMedia.close
+
+        def failing_close(prepared: _PreparedPrivateWebMedia) -> None:
+            original_close(prepared)
+            raise OSError("cleanup failed")
+
+        with patch.object(_PreparedPrivateWebMedia, "close", new=failing_close):
+            with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+                PrivateWebCreateMediaWriter(page).create_ad(
+                    create_request(),
+                    (self.source,),
+                )
+
+        self.assertEqual(caught.exception.stage, "submit_create_media")
+        self.assertEqual(
+            [name for name, _value in page.calls].count("submit_create_media"),
+            1,
+        )
+
+    def test_pre_submit_error_survives_cleanup_failure(self) -> None:
+        page = FakePublishPage(
+            media_override=media_snapshot("other.jpg", len(b"stable-media"))
+        )
+        original_close = _PreparedPrivateWebMedia.close
+
+        def failing_close(prepared: _PreparedPrivateWebMedia) -> None:
+            original_close(prepared)
+            raise OSError("cleanup failed")
+
+        with patch.object(_PreparedPrivateWebMedia, "close", new=failing_close):
+            with self.assertRaises(PrivateWebMediaUnknownError) as caught:
+                PrivateWebCreateMediaWriter(page).create_ad(
+                    create_request(),
+                    (self.source,),
+                )
+
+        self.assertEqual(caught.exception.stage, "media_readback")
+        self.assertNotIn(
+            "submit_create_media",
+            [name for name, _value in page.calls],
+        )
 
     def test_media_drift_blocks_publish(self) -> None:
         page = FakePublishPage(
@@ -337,6 +483,80 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
             ),
             2,
         )
+
+    def test_writer_and_cdp_media_lifetimes_span_submit_and_page_close(
+        self,
+    ) -> None:
+        call_function_count = 0
+        browser_paths: tuple[str, ...] = ()
+
+        def handler(method, params):
+            nonlocal call_function_count, browser_paths
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "object",
+                        "objectId": "file-input-1",
+                    }
+                }
+            if method == "DOM.setFileInputFiles":
+                browser_paths = tuple(params["files"])
+                self.assertEqual(
+                    tuple(Path(path).read_bytes() for path in browser_paths),
+                    (b"123456",),
+                )
+                return {}
+            if method == "Runtime.callFunctionOn":
+                call_function_count += 1
+                if call_function_count <= 2:
+                    return {
+                        "result": {
+                            "type": "object",
+                            "value": {
+                                "state": "ready",
+                                "files": [
+                                    {"name": "photo.jpg", "size_bytes": 6}
+                                ],
+                            },
+                        }
+                    }
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"state": "ready", "x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                return {}
+            if method == "Runtime.releaseObject":
+                return {}
+            raise AssertionError(method)
+
+        client = FakeClient(handler)
+        page = WriterCdpPublishPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: client,
+        )
+        self.pages.append(page)
+
+        PrivateWebCreateMediaWriter(page).create_ad(
+            create_request(),
+            (PrivateWebMediaSource(path=str(self.image)),),
+        )
+
+        self.assertEqual(page.writer_paths_alive_during_submit, (True,))
+        self.assertEqual(page.writer_bytes_during_submit, (b"123456",))
+        self.assertTrue(page.writer_stage_paths)
+        self.assertTrue(
+            all(not Path(path).exists() for path in page.writer_stage_paths)
+        )
+        self.assertTrue(browser_paths)
+        self.assertTrue(all(Path(path).exists() for path in browser_paths))
+        self.assertIsNotNone(page._media_prepared)
+
+        page.close()
+
+        self.assertTrue(all(not Path(path).exists() for path in browser_paths))
 
     def test_media_drift_before_click_is_not_attempted(self) -> None:
         def handler(method, params):
