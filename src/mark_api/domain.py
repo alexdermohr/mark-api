@@ -247,6 +247,8 @@ class CreateOperationReceipt:
     post_snapshot: AdSnapshot | None = None
     confirmation_post_snapshot: AdSnapshot | None = None
     content_post_snapshot: AdSnapshot | None = None
+    authorization_by: str | None = None
+    authorization_reference: str | None = None
 
     def __post_init__(self) -> None:
         _require_nonempty(self.operation, "operation")
@@ -265,6 +267,8 @@ class CreateOperationReceipt:
                 _require_nonempty(value, field_name)
         if self.created_ad_id is not None:
             _require_nonempty(self.created_ad_id, "created_ad_id")
+        if self.authorization_by is not None:
+            _require_nonempty(self.authorization_by, "authorization_by")
         _require_aware(self.started_at, "started_at")
         _require_aware(self.completed_at, "completed_at")
         if self.completed_at < self.started_at:

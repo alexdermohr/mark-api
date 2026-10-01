@@ -147,6 +147,8 @@ class SnapshotStore:
                     confirmation_post_read_status TEXT,
                     content_post_read_status TEXT,
                     writer_invoked INTEGER NOT NULL,
+                    authorization_by TEXT,
+                    authorization_reference TEXT,
                     writer_error TEXT,
                     post_snapshot_json TEXT,
                     confirmation_post_snapshot_json TEXT,
@@ -180,6 +182,23 @@ class SnapshotStore:
                 );
                 """
             )
+            connection.execute("BEGIN IMMEDIATE")
+            create_receipt_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(create_operation_receipts)"
+                ).fetchall()
+            }
+            if "authorization_by" not in create_receipt_columns:
+                connection.execute(
+                    "ALTER TABLE create_operation_receipts "
+                    "ADD COLUMN authorization_by TEXT"
+                )
+            if "authorization_reference" not in create_receipt_columns:
+                connection.execute(
+                    "ALTER TABLE create_operation_receipts "
+                    "ADD COLUMN authorization_reference TEXT"
+                )
 
     @staticmethod
     def _insert_ad_snapshot(
@@ -499,10 +518,11 @@ class SnapshotStore:
                     operation, created_ad_id, started_at, completed_at, outcome,
                     pre_read_status, confirmation_pre_read_status,
                     post_read_status, confirmation_post_read_status,
-                    content_post_read_status, writer_invoked, writer_error,
+                    content_post_read_status, writer_invoked,
+                    authorization_by, authorization_reference, writer_error,
                     post_snapshot_json, confirmation_post_snapshot_json,
                     content_post_snapshot_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     receipt.operation,
@@ -516,6 +536,8 @@ class SnapshotStore:
                     receipt.confirmation_post_read_status,
                     receipt.content_post_read_status,
                     1 if receipt.writer_invoked else 0,
+                    receipt.authorization_by,
+                    receipt.authorization_reference,
                     receipt.writer_error,
                     self._snapshot_json(receipt.post_snapshot),
                     self._snapshot_json(receipt.confirmation_post_snapshot),

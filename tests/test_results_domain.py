@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from mark_api.domain import AdCreateRequest, AdSnapshot, LifecycleState
+from mark_api.domain import (
+    AdCreateRequest,
+    AdSnapshot,
+    CreateOperationReceipt,
+    LifecycleState,
+    OperationOutcome,
+)
 from mark_api.results import ReadResult, ReadStatus
 
 
@@ -56,6 +62,29 @@ class ResultAndDomainTests(unittest.TestCase):
                 source="test",
             )
 
+
+    def test_create_receipt_preserves_existing_positional_argument_order(self) -> None:
+        receipt = CreateOperationReceipt(
+            "create",
+            NOW,
+            NOW,
+            OperationOutcome.AMBIGUOUS,
+            "success_empty",
+            "success_empty",
+            "success_nonempty",
+            "success_nonempty",
+            None,
+            True,
+            None,
+            "TimeoutError",
+            None,
+            None,
+            None,
+        )
+
+        self.assertEqual(receipt.writer_error, "TimeoutError")
+        self.assertIsNone(receipt.authorization_by)
+        self.assertIsNone(receipt.authorization_reference)
 
     def test_create_request_normalizes_category_labels(self) -> None:
         request = AdCreateRequest(

@@ -474,10 +474,19 @@ class MarkServiceTests(unittest.TestCase):
             writes_enabled=True,
         )
 
-        receipt = service.create(request)
+        receipt = service.create(
+            request,
+            authorization_by="api-owner",
+            authorization_reference="write-api:create-application",
+        )
 
         self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
         self.assertEqual(receipt.created_ad_id, "200")
+        self.assertEqual(receipt.authorization_by, "api-owner")
+        self.assertEqual(
+            receipt.authorization_reference,
+            "write-api:create-application",
+        )
         self.assertEqual(create_writer.calls, [request])
         self.assertEqual(management.calls, 2)
         self.assertEqual(owner.calls, 2)

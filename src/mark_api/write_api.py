@@ -11,7 +11,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Protocol
 from urllib.parse import unquote, urlsplit
 
-from .domain import DeleteApproval, OperationOutcome, OperationReceipt
+from .domain import (
+    AdCreateRequest,
+    CreateOperationReceipt,
+    DeleteApproval,
+    OperationOutcome,
+    OperationReceipt,
+)
 from .storage import SnapshotStore
 
 
@@ -24,6 +30,7 @@ def _utc_now() -> datetime:
 
 
 class WriteCapability(str, Enum):
+    CREATE = "create"
     UPDATE_CONTENT = "update_content"
     SET_STATE = "set_state"
     DELETE = "delete"
@@ -64,6 +71,15 @@ class WriteApiAccess:
 
 
 class _WriteService(Protocol):
+    def create(
+        self,
+        request: AdCreateRequest,
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> CreateOperationReceipt:
+        ...
+
     def update_content(
         self,
         ad_id: str,
@@ -154,7 +170,73 @@ def _receipt_to_dict(receipt: OperationReceipt) -> dict[str, object]:
     }
 
 
-def _receipt_status(receipt: OperationReceipt) -> int:
+def _create_receipt_to_dict(
+    receipt: CreateOperationReceipt,
+) -> dict[str, object]:
+    return {
+        "operation": receipt.operation,
+        "created_ad_id": receipt.created_ad_id,
+        "started_at": receipt.started_at.isoformat(),
+        "completed_at": receipt.completed_at.isoformat(),
+        "outcome": receipt.outcome.value,
+        "pre_read_status": receipt.pre_read_status,
+        "confirmation_pre_read_status": receipt.confirmation_pre_read_status,
+        "post_read_status": receipt.post_read_status,
+        "confirmation_post_read_status": receipt.confirmation_post_read_status,
+        "content_post_read_status": receipt.content_post_read_status,
+        "writer_invoked": receipt.writer_invoked,
+        "authorization_by": receipt.authorization_by,
+        "authorization_reference": receipt.authorization_reference,
+        "writer_error": receipt.writer_error,
+    }
+
+
+def _create_receipt_matches_request(
+    receipt: CreateOperationReceipt,
+    request: AdCreateRequest,
+    *,
+    principal: str,
+    authorization_reference: str,
+) -> bool:
+    if (
+        receipt.operation != "create"
+        or receipt.authorization_by != principal
+        or receipt.authorization_reference != authorization_reference
+    ):
+        return False
+    if receipt.outcome is not OperationOutcome.CONFIRMED:
+        return receipt.created_ad_id is None
+
+    created_ad_id = receipt.created_ad_id
+    snapshots = (
+        receipt.post_snapshot,
+        receipt.confirmation_post_snapshot,
+        receipt.content_post_snapshot,
+    )
+    if created_ad_id is None or any(
+        snapshot is None for snapshot in snapshots
+    ):
+        return False
+    post_snapshot = receipt.post_snapshot
+    confirmation_snapshot = receipt.confirmation_post_snapshot
+    content_snapshot = receipt.content_post_snapshot
+    assert post_snapshot is not None
+    assert confirmation_snapshot is not None
+    assert content_snapshot is not None
+    return (
+        post_snapshot.ad_id == created_ad_id
+        and confirmation_snapshot.ad_id == created_ad_id
+        and content_snapshot.ad_id == created_ad_id
+        and post_snapshot.title == request.title
+        and confirmation_snapshot.title == request.title
+        and content_snapshot.title == request.title
+        and content_snapshot.description == request.description
+    )
+
+
+def _receipt_status(
+    receipt: OperationReceipt | CreateOperationReceipt,
+) -> int:
     if receipt.outcome is OperationOutcome.CONFIRMED:
         return 200
     if receipt.outcome is OperationOutcome.PRECONDITION_FAILED:
@@ -308,6 +390,11 @@ def _handler_factory(
                 for item in target.path.split("/")
                 if item
             ]
+            if parts == ["api", "write", "ads"]:
+                if method == "POST":
+                    return ("create", None, WriteCapability.CREATE)
+                return ("method_not_allowed", "POST", None)
+
             if len(parts) < 4 or parts[:3] != ["api", "write", "ads"]:
                 return None
 
@@ -386,8 +473,42 @@ def _handler_factory(
                 self._error(400, "invalid_or_missing_idempotency_key")
                 return
 
+            create_request: AdCreateRequest | None = None
             try:
-                if action == "update_content":
+                if action == "create":
+                    payload = self._read_json_object()
+                    if set(payload) != {
+                        "category_path",
+                        "title",
+                        "description",
+                        "price_eur",
+                    }:
+                        raise ValueError("invalid_create_request")
+                    category_path = payload["category_path"]
+                    if (
+                        not isinstance(category_path, list)
+                        or any(
+                            not isinstance(label, str)
+                            for label in category_path
+                        )
+                    ):
+                        raise ValueError("invalid_create_request")
+                    try:
+                        create_request = AdCreateRequest(
+                            category_path=tuple(category_path),
+                            title=payload["title"],
+                            description=payload["description"],
+                            price_eur=payload["price_eur"],
+                        )
+                    except (TypeError, ValueError):
+                        raise ValueError("invalid_create_request") from None
+                    payload = {
+                        "category_path": list(create_request.category_path),
+                        "title": create_request.title,
+                        "description": create_request.description,
+                        "price_eur": create_request.price_eur,
+                    }
+                elif action == "update_content":
                     payload = self._read_json_object()
                     if not payload or set(payload) - {"title", "description"}:
                         raise ValueError("invalid_content_fields")
@@ -426,7 +547,8 @@ def _handler_factory(
                 self._error(400, str(exc))
                 return
 
-            assert isinstance(ad_id, str)
+            if action != "create":
+                assert isinstance(ad_id, str)
             fingerprint = _request_fingerprint(
                 principal=access.principal,
                 method=method,
@@ -482,7 +604,40 @@ def _handler_factory(
                 return
 
             try:
-                if action == "update_content":
+                authorization_reference = f"write-api:{idempotency_key}"
+                if action == "create":
+                    assert create_request is not None
+                    create_receipt = service.create(
+                        create_request,
+                        authorization_by=access.principal,
+                        authorization_reference=authorization_reference,
+                    )
+                    if not isinstance(
+                        create_receipt,
+                        CreateOperationReceipt,
+                    ):
+                        raise TypeError(
+                            "write service returned invalid create receipt"
+                        )
+                    if not _create_receipt_matches_request(
+                        create_receipt,
+                        create_request,
+                        principal=access.principal,
+                        authorization_reference=authorization_reference,
+                    ):
+                        raise TypeError(
+                            "write service returned misbound create receipt"
+                        )
+                    status = _receipt_status(create_receipt)
+                    response = {
+                        "idempotency_key": idempotency_key,
+                        "operation_receipt": _create_receipt_to_dict(
+                            create_receipt
+                        ),
+                        "platform_retry_authorized": False,
+                    }
+                    receipt = None
+                elif action == "update_content":
                     receipt = service.update_content(
                         ad_id,
                         title=(
@@ -526,33 +681,36 @@ def _handler_factory(
                         ),
                     )
 
-                if not isinstance(receipt, OperationReceipt):
-                    raise TypeError("write service returned invalid receipt")
-                expected_operation = {
-                    "update_content": "update_content",
-                    "pause": "set_state:paused",
-                    "activate": "set_state:active",
-                    "delete": "delete",
-                }[action]
-                expected_authorization_reference = (
-                    str(payload["approval_reference"])
-                    if action == "delete"
-                    else f"write-api:{idempotency_key}"
-                )
-                if (
-                    receipt.ad_id != ad_id
-                    or receipt.operation != expected_operation
-                    or receipt.authorization_by != access.principal
-                    or receipt.authorization_reference
-                    != expected_authorization_reference
-                ):
-                    raise TypeError("write service returned misbound receipt")
-                status = _receipt_status(receipt)
-                response = {
-                    "idempotency_key": idempotency_key,
-                    "operation_receipt": _receipt_to_dict(receipt),
-                    "platform_retry_authorized": False,
-                }
+                if action != "create":
+                    if not isinstance(receipt, OperationReceipt):
+                        raise TypeError("write service returned invalid receipt")
+                    expected_operation = {
+                        "update_content": "update_content",
+                        "pause": "set_state:paused",
+                        "activate": "set_state:active",
+                        "delete": "delete",
+                    }[action]
+                    expected_authorization_reference = (
+                        str(payload["approval_reference"])
+                        if action == "delete"
+                        else authorization_reference
+                    )
+                    if (
+                        receipt.ad_id != ad_id
+                        or receipt.operation != expected_operation
+                        or receipt.authorization_by != access.principal
+                        or receipt.authorization_reference
+                        != expected_authorization_reference
+                    ):
+                        raise TypeError(
+                            "write service returned misbound receipt"
+                        )
+                    status = _receipt_status(receipt)
+                    response = {
+                        "idempotency_key": idempotency_key,
+                        "operation_receipt": _receipt_to_dict(receipt),
+                        "platform_retry_authorized": False,
+                    }
             except Exception:
                 status = 500
                 response = {

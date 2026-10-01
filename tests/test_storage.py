@@ -164,6 +164,8 @@ class SnapshotStoreTests(unittest.TestCase):
             content_post_read_status="success_nonempty",
             writer_invoked=True,
             created_ad_id="200",
+            authorization_by="api-owner",
+            authorization_reference="write-api:create-storage",
             post_snapshot=candidate,
             confirmation_post_snapshot=candidate,
             content_post_snapshot=candidate,
@@ -175,7 +177,8 @@ class SnapshotStoreTests(unittest.TestCase):
             row = connection.execute(
                 """
                 SELECT created_ad_id, outcome, confirmation_pre_read_status,
-                       confirmation_post_read_status, content_post_read_status
+                       confirmation_post_read_status, content_post_read_status,
+                       authorization_by, authorization_reference
                 FROM create_operation_receipts
                 """
             ).fetchone()
@@ -188,7 +191,75 @@ class SnapshotStoreTests(unittest.TestCase):
                 "success_empty",
                 "success_nonempty",
                 "success_nonempty",
+                "api-owner",
+                "write-api:create-storage",
             ),
+        )
+
+    def test_create_receipt_schema_migrates_legacy_authorization_columns(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "mark.sqlite"
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE create_operation_receipts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation TEXT NOT NULL,
+                    created_ad_id TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    pre_read_status TEXT NOT NULL,
+                    confirmation_pre_read_status TEXT NOT NULL,
+                    post_read_status TEXT,
+                    confirmation_post_read_status TEXT,
+                    content_post_read_status TEXT,
+                    writer_invoked INTEGER NOT NULL,
+                    writer_error TEXT,
+                    post_snapshot_json TEXT,
+                    confirmation_post_snapshot_json TEXT,
+                    content_post_snapshot_json TEXT
+                )
+                """
+            )
+
+        store = SnapshotStore(db_path)
+        receipt = CreateOperationReceipt(
+            operation="create",
+            started_at=NOW,
+            completed_at=NOW,
+            outcome=OperationOutcome.PRECONDITION_FAILED,
+            pre_read_status="writes_disabled",
+            confirmation_pre_read_status="not_read",
+            post_read_status=None,
+            confirmation_post_read_status=None,
+            content_post_read_status=None,
+            writer_invoked=False,
+            authorization_by="api-owner",
+            authorization_reference="write-api:create-legacy",
+        )
+        store.append_create_operation_receipt(receipt)
+
+        with sqlite3.connect(db_path) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(create_operation_receipts)"
+                ).fetchall()
+            }
+            row = connection.execute(
+                """
+                SELECT authorization_by, authorization_reference
+                FROM create_operation_receipts
+                """
+            ).fetchone()
+
+        self.assertIn("authorization_by", columns)
+        self.assertIn("authorization_reference", columns)
+        self.assertEqual(
+            row,
+            ("api-owner", "write-api:create-legacy"),
         )
 
     def test_reaction_snapshots_are_append_only(self) -> None:

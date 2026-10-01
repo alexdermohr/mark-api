@@ -126,11 +126,18 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
             confirmation_reader=confirmation,
             writer=writer,
             content_reader_factory=lambda _ad_id: SequenceReader(),
+            authorization_by="api-owner",
+            authorization_reference="write-api:create-disabled",
         )
 
         self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
         self.assertEqual(receipt.pre_read_status, "writes_disabled")
         self.assertFalse(receipt.writer_invoked)
+        self.assertEqual(receipt.authorization_by, "api-owner")
+        self.assertEqual(
+            receipt.authorization_reference,
+            "write-api:create-disabled",
+        )
         self.assertEqual(reader.calls, 0)
         self.assertEqual(confirmation.calls, 0)
         self.assertEqual(writer.calls, 0)
@@ -241,10 +248,17 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
             confirmation_reader=confirmation,
             writer=writer,
             content_reader_factory=factory,
+            authorization_by="api-owner",
+            authorization_reference="write-api:create-confirmed",
         )
 
         self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
         self.assertEqual(receipt.created_ad_id, "200")
+        self.assertEqual(receipt.authorization_by, "api-owner")
+        self.assertEqual(
+            receipt.authorization_reference,
+            "write-api:create-confirmed",
+        )
         self.assertEqual(receipt.content_post_snapshot, exact_content)
         self.assertEqual(writer.calls, 1)
         self.assertEqual(factory_calls, ["200"])

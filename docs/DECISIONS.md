@@ -141,3 +141,17 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - Delete benötigt zusätzlich eine explizite, zur Pfad-ID identische `confirm_ad_id` sowie eine Approval-Referenz,
 - Operation-Receipts werden sanitisiert über HTTP exponiert; ein `AMBIGUOUS`-Outcome erteilt ausdrücklich keine Retry-Autorisierung,
 - dieser Slice konstruiert keine Browser-/PrivateWeb-Runtime und führt keinen Kleinanzeigen-Plattformwrite aus.
+## D-012 — Create wird als eigener Mark-Write-API-Contract exponiert
+
+**Entscheidung:** Die lokale loopback-only Mark Write API erweitert D-011 um `POST /api/write/ads`. Exponiert wird ausschließlich der bereits gehärtete enge `AdCreateRequest` mit Kategoriepfad, Titel, Beschreibung und ganzzahligem EUR-Festpreis. Media-Publish und Reply bleiben weiterhin separate Gates.
+
+**Begründung:** Der Core-Createpfad besitzt bereits eine strengere Reconciliation als ID-gebundene Writes: zwei unabhängige Inventar-Pre-/Post-Reads müssen exakt dieselbe einzelne neue Anzeigen-ID erkennen, anschließend muss ein target-bound Content-Read Titel und Beschreibung bestätigen. Diese Semantik kann über dieselbe crash-idempotente HTTP-Ledger exponiert werden, ohne einen Browser zu starten oder einen Plattformwrite im Implementierungs-Slice auszuführen.
+
+**Folgen:**
+- Create benötigt eine eigene `CREATE`-Capability sowie Bearer-Authentisierung und den API-`writes_enabled`-Gate vor jeder Body-/Service-Ausführung,
+- der HTTP-Payload wird strikt auf `category_path`, `title`, `description` und `price_eur` begrenzt und zuerst durch `AdCreateRequest` normalisiert,
+- die normalisierte Create-Semantik fließt in den persistenten Idempotency-Fingerprint; derselbe semantische Request mit demselben Key wird nach Neustart nur replayt,
+- `CreateOperationReceipt` trägt `authorization_by` und `authorization_reference`; beide Felder werden additiv und rückwärtskompatibel in SQLite migriert und persistiert,
+- der HTTP-Layer akzeptiert nur einen exakt an Operation, Principal und Idempotency-Referenz gebundenen Create-Receipt,
+- `AMBIGUOUS` und Ausführungsfehler erteilen weiterhin keine Retry-Autorisierung,
+- Media-Daten sind im Create-HTTP-Vertrag nicht zulässig; ein späterer Media-Publish braucht weiterhin einen eigenen Contract, eigene Freigabe und Reconciliation.
