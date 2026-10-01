@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from .private_web import PrivateWebCreateSnapshot, PrivateWebEditorState
+import json
+
+from .ports import WriteNotAttemptedError
+from .private_web import (
+    PrivateWebCreateSnapshot,
+    PrivateWebEditorState,
+    PrivateWebSubmitUnknownError,
+)
 from .private_web_cdp import (
     CdpPrivateWebPage,
     PrivateWebCdpError,
@@ -304,3 +311,187 @@ function() {{
             raise
         except Exception:
             raise PrivateWebMediaUnknownError("media_readback") from None
+
+    def _media_create_activation_function(
+        self,
+        expected_create: PrivateWebCreateSnapshot,
+        expected_media: PrivateWebCreateMediaSnapshot,
+    ) -> str:
+        baseline = self._create_form_expression(
+            expected=expected_create,
+            allow_media_files=True,
+        )
+        expected_files = json.dumps(
+            [
+                {"name": item.name, "size_bytes": item.size_bytes}
+                for item in expected_media.files
+            ],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        return f"""
+function() {{
+  const stateOnly = (state) => ({{state}});
+  const baseline = {baseline};
+  if (!baseline || baseline.state !== "ready") {{
+    return baseline || stateOnly("unknown");
+  }}
+
+  const input = this;
+  const files = Array.from(document.querySelectorAll('input[type="file"]'));
+  const expectedFiles = {expected_files};
+  if (
+    !(input instanceof HTMLInputElement) ||
+    input.type !== "file" ||
+    input.files === null ||
+    files.length !== 1 ||
+    files[0] !== input ||
+    !input.isConnected ||
+    input.files.length !== expectedFiles.length
+  ) return stateOnly("unknown");
+
+  for (let index = 0; index < expectedFiles.length; index += 1) {{
+    const actual = input.files[index];
+    const expected = expectedFiles[index];
+    if (
+      actual.name !== expected.name ||
+      actual.size !== expected.size_bytes
+    ) return stateOnly("unknown");
+  }}
+
+  const title = document.querySelector("#ad-title");
+  if (!(title instanceof HTMLInputElement) || input.form !== title.form) {{
+    return stateOnly("unknown");
+  }}
+  const form = title.form;
+  if (!form) return stateOnly("unknown");
+  const normalizedButtonText = (element) =>
+    (element.innerText || "").replace(/\\s+/g, " ").trim();
+  const publishButtons = Array.from(form.querySelectorAll("button")).filter(
+    (button) => normalizedButtonText(button) === "Anzeige aufgeben"
+  );
+  if (
+    publishButtons.length !== 1 ||
+    publishButtons[0].type !== "button" ||
+    publishButtons[0].disabled ||
+    publishButtons[0].getAttribute("aria-disabled") === "true"
+  ) return stateOnly("unknown");
+
+  const button = publishButtons[0];
+  const style = getComputedStyle(button);
+  if (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.visibility === "collapse" ||
+    style.pointerEvents === "none" ||
+    Number(style.opacity) === 0
+  ) return stateOnly("unknown");
+  button.scrollIntoView({{block: "center", inline: "center"}});
+  const rect = button.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return stateOnly("unknown");
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const hit = document.elementFromPoint(x, y);
+  if (hit !== button && !button.contains(hit)) return stateOnly("unknown");
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    x < 0 ||
+    y < 0 ||
+    x > window.innerWidth ||
+    y > window.innerHeight
+  ) return stateOnly("unknown");
+  return {{state: "ready", x, y}};
+}}
+"""
+
+    def submit_create_media(
+        self,
+        expected: PrivateWebCreateMediaSnapshot,
+    ) -> None:
+        if not isinstance(expected, PrivateWebCreateMediaSnapshot):
+            raise TypeError("expected must be PrivateWebCreateMediaSnapshot")
+        if expected.state is not PrivateWebEditorState.READY:
+            raise ValueError("expected media snapshot must be ready")
+        if self._create_submit_attempted:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "create_media_submit_already_attempted"
+            )
+
+        expected_create = self._media_expected_create_snapshot
+        object_id = self._media_file_object_id
+        prepared = self._media_prepared
+        if (
+            not self._create_bound
+            or not self._media_selection_attempted
+            or expected_create is None
+            or object_id is None
+            or prepared is None
+            or expected.files != prepared.files
+        ):
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "create_media_submit"
+            )
+
+        try:
+            current = self.read_create_media()
+        except Exception:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "create_media_submit_revalidate"
+            ) from None
+        if current != expected:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "create_media_submit_drift"
+            )
+
+        # The publish action itself is one-shot. Arm the no-retry fence before
+        # the final page-side binding/point calculation, matching submit_create.
+        self._create_submit_attempted = True
+        client = self._client()
+        try:
+            result = client.call(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": self._media_create_activation_function(
+                        expected_create,
+                        expected,
+                    ),
+                    "returnByValue": True,
+                    "awaitPromise": False,
+                },
+            )
+            if "exceptionDetails" in result:
+                raise PrivateWebCdpWriteNotAttemptedError(
+                    "create_media_submit"
+                )
+            remote = result.get("result")
+            if not isinstance(remote, dict) or "value" not in remote:
+                raise PrivateWebCdpWriteNotAttemptedError(
+                    "create_media_submit"
+                )
+            point = self._create_point(
+                remote["value"],
+                stage="create_media_submit",
+            )
+        except WriteNotAttemptedError:
+            raise
+        except Exception:
+            raise PrivateWebCdpWriteNotAttemptedError(
+                "create_media_submit"
+            ) from None
+
+        # Do not release the file handle or private copies here: the browser may
+        # still consume them asynchronously after the click. close() owns cleanup.
+        self._last_create_snapshot = None
+        self._media_expected_create_snapshot = None
+        try:
+            self._dispatch_browser_click(
+                client,
+                x=point[0],
+                y=point[1],
+            )
+        except Exception:
+            raise PrivateWebSubmitUnknownError(
+                "create_media_submit"
+            ) from None

@@ -156,3 +156,18 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - `created_ad_id` ist ausschließlich für `CONFIRMED` zulässig; `AMBIGUOUS` und `PRECONDITION_FAILED` exponieren bewusst keine nur vermutete neue Anzeigen-ID,
 - `AMBIGUOUS` und Ausführungsfehler erteilen weiterhin keine Retry-Autorisierung,
 - Media-Daten sind im Create-HTTP-Vertrag nicht zulässig; ein späterer Media-Publish braucht weiterhin einen eigenen Contract, eigene Freigabe und Reconciliation.
+
+## D-013 — Media-Publish bleibt ein separater, noch nicht domain-bestätigter PrivateWeb-Contract
+
+**Entscheidung:** Für einen Create mit expliziten lokalen Medien wird ein eigener `PrivateWebCreateMediaWriter` oberhalb des bereits gehärteten Media-Stagings eingeführt. Der normale `PrivateWebCreateWriter`, `AdCreateRequest`, `MarkService` und die lokale Mark Write API bleiben mediafrei. Der neue Pfad darf nach exakter Form- und `FileList`-Revalidierung genau einen browser-level Publish-Versuch auf demselben gebundenen File-Input-Handle auslösen.
+
+**Begründung:** Der vorhandene Create-Contract ist absichtlich eng und bereits separat über Inventar- und Content-Readbacks reconciled. Media-Staging besitzt eigene lokale Stabilitäts- und No-Blind-Retry-Invarianten. Eine Vermischung würde den bestätigten mediafreien Contract rückwirkend aufweichen. Gleichzeitig enthält der aktuelle autoritative `AdSnapshot` keine Medienidentität; deshalb kann ein erfolgreicher Listing-Readback derzeit nicht beweisen, dass genau die erwarteten Medien serverseitig hochgeladen und persistiert wurden.
+
+**Folgen:**
+- lokale Media-Dateien werden vor dem ersten Browserzugriff aus validierten Deskriptoren in private stabile Kopien überführt,
+- der bestehende Create-Writer darf die Form für den Media-Pfad nur vorbereiten und unmittelbar revalidieren; sein normaler mediafreier Submit bleibt unverändert,
+- Media-Staging muss die erwartete `FileList` exakt read-backen; der Publish-Pfad bindet danach weiterhin dasselbe CDP-Objekthandle und prüft Dateiname und Größe erneut,
+- der Media-Publish ist one-shot: sobald der browser-level Publish-Input beginnt, ist ein Fehler `AMBIGUOUS`/unknown und autorisiert keinen Blind-Retry,
+- der neue Contract wird noch nicht an `MarkService`, `SafeWriteOrchestrator` oder `/api/write` angeschlossen; insbesondere gibt es kein `CONFIRMED`-Media-Receipt,
+- ein späterer höherer Media-Write-Contract benötigt zuerst einen autoritativen media-aware Post-Read beziehungsweise eine andere belastbare Medien-Reconciliation,
+- dieser Implementierungs-Slice führt keinen realen Kleinanzeigen-Publish oder sonstigen Plattformwrite aus.

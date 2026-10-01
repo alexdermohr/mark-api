@@ -94,7 +94,9 @@ class PrivateWebMediaTargetBindingTests(unittest.TestCase):
 
         self.assertIn("allow_media_files: bool = False", base_source)
         self.assertNotIn("allow_media_files=True", base_source)
-        self.assertEqual(media_source.count("allow_media_files=True"), 1)
+        self.assertEqual(media_source.count("allow_media_files=True"), 2)
+        self.assertIn("_media_readback_function", media_source)
+        self.assertIn("_media_create_activation_function", media_source)
 
 
 if __name__ == "__main__":
