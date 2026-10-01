@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from mark_api.domain import AdCreateRequest, AdSnapshot, LifecycleState
+from mark_api.domain import (
+    AdCreateRequest,
+    AdSnapshot,
+    CreateOperationReceipt,
+    LifecycleState,
+    OperationOutcome,
+)
 from mark_api.results import ReadResult, ReadStatus
 
 
@@ -57,6 +63,48 @@ class ResultAndDomainTests(unittest.TestCase):
             )
 
 
+    def test_create_receipt_preserves_existing_positional_argument_order(self) -> None:
+        receipt = CreateOperationReceipt(
+            "create",
+            NOW,
+            NOW,
+            OperationOutcome.AMBIGUOUS,
+            "success_empty",
+            "success_empty",
+            "success_nonempty",
+            "success_nonempty",
+            None,
+            True,
+            None,
+            "TimeoutError",
+            None,
+            None,
+            None,
+        )
+
+        self.assertEqual(receipt.writer_error, "TimeoutError")
+        self.assertIsNone(receipt.authorization_by)
+        self.assertIsNone(receipt.authorization_reference)
+
+    def test_create_receipt_rejects_unconfirmed_created_ad_id(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "only confirmed create may expose created_ad_id",
+        ):
+            CreateOperationReceipt(
+                operation="create",
+                started_at=NOW,
+                completed_at=NOW,
+                outcome=OperationOutcome.AMBIGUOUS,
+                pre_read_status="success_empty",
+                confirmation_pre_read_status="success_empty",
+                post_read_status="success_nonempty",
+                confirmation_post_read_status="success_nonempty",
+                content_post_read_status="success_empty",
+                writer_invoked=True,
+                created_ad_id="200",
+            )
+
     def test_create_request_normalizes_category_labels(self) -> None:
         request = AdCreateRequest(
             category_path=(" Haus & Garten ", " Dekoration ", " Weitere Dekoration "),
@@ -69,6 +117,36 @@ class ResultAndDomainTests(unittest.TestCase):
             request.category_path,
             ("Haus & Garten", "Dekoration", "Weitere Dekoration"),
         )
+
+    def test_create_request_rejects_unpaired_unicode_surrogates(self) -> None:
+        invalid = "\ud800"
+        cases = (
+            {
+                "category_path": ("Haus & Garten", invalid),
+                "title": "Testanzeige",
+                "description": "Beschreibung",
+            },
+            {
+                "category_path": ("Haus & Garten", "Dekoration"),
+                "title": f"Test{invalid}",
+                "description": "Beschreibung",
+            },
+            {
+                "category_path": ("Haus & Garten", "Dekoration"),
+                "title": "Testanzeige",
+                "description": f"Beschreibung{invalid}",
+            },
+        )
+        for payload in cases:
+            with self.subTest(payload=repr(payload)):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Unicode scalar values",
+                ):
+                    AdCreateRequest(
+                        **payload,
+                        price_eur=12,
+                    )
 
     def test_create_request_rejects_title_outside_current_ui_limit(self) -> None:
         with self.assertRaises(ValueError):

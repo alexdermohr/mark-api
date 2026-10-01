@@ -116,20 +116,21 @@ python -m pip install -e '.[private-web]'
 
 ## Lokale Mark Write API
 
-Slice D führt eine **separate** loopback-only Write-Surface ein; das bestehende Dashboard bleibt vollständig read-only. Der erste Contract exponiert ausschließlich bereits vorhandene, ID-gebundene `MarkService`-Operationen:
+Slice D führt eine **separate** loopback-only Write-Surface ein; das bestehende Dashboard bleibt vollständig read-only. Der Contract exponiert ausschließlich bereits gehärtete `MarkService`-Operationen:
 
+- `POST /api/write/ads` für den engen Create-Vertrag aus `category_path`, `title`, `description` und `price_eur`,
 - `PATCH /api/write/ads/{id}` für Titel/Beschreibung,
 - `POST /api/write/ads/{id}/pause`,
 - `POST /api/write/ads/{id}/activate`,
 - `DELETE /api/write/ads/{id}` mit zusätzlicher expliziter `confirm_ad_id`-Bestätigung.
 
-Create, Media-Publish und Reply sind **keine** Routen dieses Slices.
+Create unterstützt in dieser Surface ausdrücklich **keine Medien**. Media-Publish und Reply bleiben separate, nicht exponierte Gates.
 
 Die Write-Surface bindet ausschließlich an `127.0.0.1` und verlangt vor jedem Service-Aufruf einen Bearer-Token, eine passende Capability und `writes_enabled=true`. Der Core behält seinen eigenen unabhängigen `writes_enabled`-Gate, sodass die HTTP-Surface allein keine Plattformwrites freischaltet. Tokens werden nur zur Laufzeit injiziert und weder persistiert noch in `repr` ausgegeben.
 
 Jede mutierende Anfrage benötigt einen `Idempotency-Key`. Vor dem Aufruf von `MarkService` wird ein Request-Fingerprint atomar in derselben SQLite-Datenbank als `in_progress` gespeichert. Ein identischer bereits abgeschlossener Request replayt ausschließlich die gespeicherte HTTP-Response; ein abweichender Request mit demselben Key wird abgewiesen. Bleibt nach einem Prozessabbruch ein `in_progress`-Eintrag zurück, wird **kein** erneuter Plattformversuch autorisiert. Damit überlebt die No-Blind-Retry-Regel auch einen HTTP-Prozessneustart.
 
-Die HTTP-Antwort exponiert den sanitisierten `OperationReceipt` und setzt `platform_retry_authorized=false`. `CONFIRMED` wird als 200, `PRECONDITION_FAILED` als 409 und `AMBIGUOUS` als 202 zurückgegeben. Dieser Slice startet keinen Browser, baut keine PrivateWeb-Runtime und führt keinen Kleinanzeigen-Plattformwrite aus.
+Die HTTP-Antwort exponiert den sanitisierten `OperationReceipt` beziehungsweise `CreateOperationReceipt` und setzt `platform_retry_authorized=false`. `CONFIRMED` wird als 200, `PRECONDITION_FAILED` als 409 und `AMBIGUOUS` als 202 zurückgegeben. Create-Receipts tragen denselben authentifizierten Principal und dieselbe Idempotency-Referenz bis in Core und SQLite-Audit. Dieser Slice startet keinen Browser, baut keine PrivateWeb-Runtime und führt keinen Kleinanzeigen-Plattformwrite aus.
 
 ## Offene fachliche Punkte
 

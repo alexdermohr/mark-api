@@ -236,6 +236,8 @@ class SafeWriteOrchestrator:
         confirmation_reader: AdsReader,
         writer: AdCreateWriter | None,
         content_reader_factory: Callable[[str], AdsReader] | None,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
     ) -> CreateOperationReceipt:
         started_at = self._clock()
 
@@ -258,6 +260,8 @@ class SafeWriteOrchestrator:
                     confirmation_post_read_status=None,
                     content_post_read_status=None,
                     writer_invoked=writer_invoked,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
                     writer_error=writer_error,
                 )
             )
@@ -399,6 +403,8 @@ class SafeWriteOrchestrator:
                 content_post_read_status=content_post_status,
                 writer_invoked=True,
                 created_ad_id=candidate_id if confirmed else None,
+                authorization_by=authorization_by,
+                authorization_reference=authorization_reference,
                 writer_error=writer_error,
                 post_snapshot=post_snapshot,
                 confirmation_post_snapshot=confirmation_post_snapshot,

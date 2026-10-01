@@ -11,7 +11,11 @@ from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 from mark_api.domain import (
+    AdCreateRequest,
+    AdSnapshot,
+    CreateOperationReceipt,
     DeleteApproval,
+    LifecycleState,
     OperationOutcome,
     OperationReceipt,
 )
@@ -55,6 +59,71 @@ def receipt(
     )
 
 
+def create_receipt(
+    *,
+    request: AdCreateRequest,
+    outcome: OperationOutcome = OperationOutcome.CONFIRMED,
+    authorization_by: str | None = None,
+    authorization_reference: str | None = None,
+    operation: str = "create",
+    include_snapshots: bool = True,
+) -> CreateOperationReceipt:
+    confirmed = outcome is OperationOutcome.CONFIRMED
+    candidate = (
+        AdSnapshot(
+            ad_id="200",
+            observed_at=NOW,
+            source="management",
+            lifecycle_state=LifecycleState.ACTIVE,
+            title=request.title,
+        )
+        if confirmed and include_snapshots
+        else None
+    )
+    content = (
+        AdSnapshot(
+            ad_id="200",
+            observed_at=NOW,
+            source="management+private-web",
+            lifecycle_state=LifecycleState.ACTIVE,
+            title=request.title,
+            description=request.description,
+        )
+        if confirmed and include_snapshots
+        else None
+    )
+    return CreateOperationReceipt(
+        operation=operation,
+        started_at=NOW,
+        completed_at=NOW,
+        outcome=outcome,
+        pre_read_status="success_empty",
+        confirmation_pre_read_status="success_empty",
+        post_read_status=(
+            "success_nonempty"
+            if outcome is not OperationOutcome.PRECONDITION_FAILED
+            else None
+        ),
+        confirmation_post_read_status=(
+            "success_nonempty"
+            if outcome is not OperationOutcome.PRECONDITION_FAILED
+            else None
+        ),
+        content_post_read_status=(
+            "success_nonempty"
+            if confirmed
+            else None
+        ),
+        writer_invoked=outcome is not OperationOutcome.PRECONDITION_FAILED,
+        created_ad_id="200" if confirmed else None,
+        authorization_by=authorization_by,
+        authorization_reference=authorization_reference,
+        post_snapshot=candidate,
+        confirmation_post_snapshot=candidate,
+        content_post_snapshot=content,
+    )
+
+
 class FakeWriteService:
     def __init__(
         self,
@@ -70,6 +139,29 @@ class FakeWriteService:
     def _maybe_fail(self) -> None:
         if self.fail:
             raise RuntimeError("provider details must not escape")
+
+    def create(
+        self,
+        request: AdCreateRequest,
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> CreateOperationReceipt:
+        self.calls.append(
+            (
+                "create",
+                request,
+                authorization_by,
+                authorization_reference,
+            )
+        )
+        self._maybe_fail()
+        return create_receipt(
+            request=request,
+            outcome=self.outcome,
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
+        )
 
     def update_content(
         self,
@@ -184,6 +276,31 @@ class MisboundWriteService(FakeWriteService):
         )
 
 
+class MisboundCreateService(FakeWriteService):
+    def create(
+        self,
+        request: AdCreateRequest,
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> CreateOperationReceipt:
+        self.calls.append(
+            (
+                "create",
+                request,
+                authorization_by,
+                authorization_reference,
+            )
+        )
+        return create_receipt(
+            request=request,
+            outcome=self.outcome,
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
+            include_snapshots=False,
+        )
+
+
 class WriteApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -198,6 +315,7 @@ class WriteApiTests(unittest.TestCase):
         *,
         capabilities: frozenset[WriteCapability] = frozenset(
             {
+                WriteCapability.CREATE,
                 WriteCapability.UPDATE_CONTENT,
                 WriteCapability.SET_STATE,
                 WriteCapability.DELETE,
@@ -319,6 +437,237 @@ class WriteApiTests(unittest.TestCase):
                 self.assertEqual(status, expected_status)
                 self.assertEqual(service.calls, [])
                 self.assertIsNone(self.store.write_api_request(key))
+
+    def test_create_replays_normalized_request_across_server_restart(self) -> None:
+        service = FakeWriteService()
+        first_payload = {
+            "category_path": [" Haus & Garten ", "Dekoration"],
+            "title": "Neue Vase",
+            "description": "Beschreibung",
+            "price_eur": 12,
+        }
+        with self.server(service) as server:
+            first_status, first_headers, first_body = self.request(
+                server,
+                "POST",
+                "/api/write/ads",
+                payload=first_payload,
+                idempotency_key="create-once",
+            )
+
+        self.assertEqual(first_status, 200)
+        self.assertIsNone(first_headers.get("Idempotency-Replayed"))
+        self.assertEqual(len(service.calls), 1)
+        call = service.calls[0]
+        self.assertEqual(call[0], "create")
+        self.assertEqual(
+            call[1],
+            AdCreateRequest(
+                category_path=("Haus & Garten", "Dekoration"),
+                title="Neue Vase",
+                description="Beschreibung",
+                price_eur=12,
+            ),
+        )
+        self.assertEqual(call[2], "api-test-owner")
+        self.assertEqual(call[3], "write-api:create-once")
+        self.assertEqual(
+            first_body["operation_receipt"]["created_ad_id"],
+            "200",
+        )
+        self.assertEqual(
+            first_body["operation_receipt"]["authorization_by"],
+            "api-test-owner",
+        )
+        self.assertEqual(
+            first_body["operation_receipt"]["authorization_reference"],
+            "write-api:create-once",
+        )
+        self.assertFalse(first_body["platform_retry_authorized"])
+
+        fresh_service = FakeWriteService()
+        second_payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase",
+            "description": "Beschreibung",
+            "price_eur": 12,
+        }
+        with self.server(fresh_service) as server:
+            second_status, second_headers, second_body = self.request(
+                server,
+                "POST",
+                "/api/write/ads",
+                payload=second_payload,
+                idempotency_key="create-once",
+            )
+
+        self.assertEqual(second_status, 200)
+        self.assertEqual(
+            second_headers.get("Idempotency-Replayed"),
+            "true",
+        )
+        self.assertEqual(second_body, first_body)
+        self.assertEqual(fresh_service.calls, [])
+
+    def test_create_capability_and_validation_fail_before_claim(self) -> None:
+        valid_payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase",
+            "description": "Beschreibung",
+            "price_eur": 12,
+        }
+        service = FakeWriteService()
+        with self.server(
+            service,
+            capabilities=frozenset({WriteCapability.UPDATE_CONTENT}),
+        ) as server:
+            status, _, body = self.request(
+                server,
+                "POST",
+                "/api/write/ads",
+                payload=valid_payload,
+                idempotency_key="create-capability-denied",
+            )
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "capability_denied")
+        self.assertEqual(service.calls, [])
+        self.assertIsNone(
+            self.store.write_api_request("create-capability-denied")
+        )
+
+        service = FakeWriteService()
+        invalid_payload = {
+            **valid_payload,
+            "media": ["not-supported"],
+        }
+        with self.server(service) as server:
+            status, _, body = self.request(
+                server,
+                "POST",
+                "/api/write/ads",
+                payload=invalid_payload,
+                idempotency_key="create-invalid",
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_create_request")
+        self.assertEqual(service.calls, [])
+        self.assertIsNone(self.store.write_api_request("create-invalid"))
+
+    def test_create_rejects_unpaired_surrogate_before_claim(self) -> None:
+        service = FakeWriteService()
+        with self.server(service) as server:
+            status, _, body = self.request(
+                server,
+                "POST",
+                "/api/write/ads",
+                payload={
+                    "category_path": ["Haus & Garten", "Dekoration"],
+                    "title": "Neue Vase\ud800",
+                    "description": "Beschreibung",
+                    "price_eur": 12,
+                },
+                idempotency_key="create-surrogate",
+            )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_create_request")
+        self.assertEqual(service.calls, [])
+        self.assertIsNone(
+            self.store.write_api_request("create-surrogate")
+        )
+
+    def test_fingerprint_rejects_unpaired_surrogate_without_claim(self) -> None:
+        service = FakeWriteService()
+        with self.server(service) as server:
+            status, _, body = self.request(
+                server,
+                "PATCH",
+                "/api/write/ads/1234567890",
+                payload={"title": "Neue Vase\ud800"},
+                idempotency_key="patch-surrogate",
+            )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_unicode_text")
+        self.assertFalse(body["platform_retry_authorized"])
+        self.assertEqual(service.calls, [])
+        self.assertIsNone(
+            self.store.write_api_request("patch-surrogate")
+        )
+
+    def test_create_outcomes_map_without_retry_authority(self) -> None:
+        for outcome, expected_status in (
+            (OperationOutcome.AMBIGUOUS, 202),
+            (OperationOutcome.PRECONDITION_FAILED, 409),
+        ):
+            with self.subTest(outcome=outcome.value):
+                service = FakeWriteService(outcome=outcome)
+                key = f"create-{outcome.value}"
+                with self.server(service) as server:
+                    status, _, body = self.request(
+                        server,
+                        "POST",
+                        "/api/write/ads",
+                        payload={
+                            "category_path": [
+                                "Haus & Garten",
+                                "Dekoration",
+                            ],
+                            "title": "Neue Vase",
+                            "description": "Beschreibung",
+                            "price_eur": 12,
+                        },
+                        idempotency_key=key,
+                    )
+                self.assertEqual(status, expected_status)
+                self.assertEqual(
+                    body["operation_receipt"]["outcome"],
+                    outcome.value,
+                )
+                self.assertIsNone(
+                    body["operation_receipt"]["created_ad_id"]
+                )
+                self.assertFalse(body["platform_retry_authorized"])
+
+    def test_misbound_create_receipt_fails_closed_and_is_not_reexecuted(self) -> None:
+        payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase",
+            "description": "Beschreibung",
+            "price_eur": 12,
+        }
+        service = MisboundCreateService()
+        with self.server(service) as server:
+            first_status, _, first_body = self.request(
+                server,
+                "POST",
+                "/api/write/ads",
+                payload=payload,
+                idempotency_key="create-misbound",
+            )
+
+        self.assertEqual(first_status, 500)
+        self.assertEqual(first_body["error"], "write_execution_error")
+        self.assertFalse(first_body["platform_retry_authorized"])
+        self.assertEqual(len(service.calls), 1)
+
+        fresh_service = FakeWriteService()
+        with self.server(fresh_service) as server:
+            second_status, second_headers, second_body = self.request(
+                server,
+                "POST",
+                "/api/write/ads",
+                payload=payload,
+                idempotency_key="create-misbound",
+            )
+
+        self.assertEqual(second_status, 500)
+        self.assertEqual(
+            second_headers.get("Idempotency-Replayed"),
+            "true",
+        )
+        self.assertEqual(second_body, first_body)
+        self.assertEqual(fresh_service.calls, [])
 
     def test_patch_replays_persisted_response_across_server_restart(self) -> None:
         service = FakeWriteService()
@@ -604,11 +953,10 @@ class WriteApiTests(unittest.TestCase):
         self.assertEqual(second_body, first_body)
         self.assertEqual(fresh_service.calls, [])
 
-    def test_create_media_reply_and_queries_are_not_routes(self) -> None:
+    def test_media_reply_and_queries_are_not_routes(self) -> None:
         service = FakeWriteService()
         with self.server(service) as server:
             for method, path in (
-                ("POST", "/api/write/ads"),
                 ("POST", "/api/write/ads/1234567890/media"),
                 ("POST", "/api/write/conversations/abc/reply"),
                 ("PATCH", "/api/write/ads/1234567890?force=1"),

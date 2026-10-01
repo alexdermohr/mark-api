@@ -346,12 +346,12 @@ Erst nach diesem Beleg wird der Browser-Content-Updatepfad zum Fallback degradie
 Der erste lokale Write-API-Contract ist implementiert, ohne Plattformzugriff:
 
 - separate loopback-only REST-Schicht; das bestehende Dashboard bleibt read-only,
-- zunächst ausschließlich ID-gebundene Content-/Pause-/Activate-/Delete-Routen gegen `MarkService`,
+- ID-gebundene Content-/Pause-/Activate-/Delete-Routen gegen `MarkService` sowie den engen Create-Contract über `POST /api/write/ads`,
 - Bearer-Authentisierung + explizite Capabilities + eigener default-off Write-Gate vor dem Service-Aufruf,
 - persistente SQLite-Idempotency-Ledger: Claim vor dem Service-Aufruf, exakter Response-Replay nach Abschluss, Konflikt bei anderem Request und harter Retry-Block bei verbliebenem `in_progress`,
-- sanitizierte `OperationReceipt`-Exposition mit `platform_retry_authorized=false`,
+- sanitizierte `OperationReceipt`-/`CreateOperationReceipt`-Exposition mit `platform_retry_authorized=false`; Create-Authorization wird bis in den SQLite-Audit persistiert,
 - Delete verlangt zusätzlich explizite ID-Bestätigung + Approval-Referenz,
-- Create, Media-Publish und Reply bleiben außerhalb dieses ersten HTTP-Slices.
+- Create akzeptiert nur Kategoriepfad, Titel, Beschreibung und ganzzahligen EUR-Festpreis; Media-Publish und Reply bleiben außerhalb der HTTP-Surface.
 
 ## Nicht-Ziele
 

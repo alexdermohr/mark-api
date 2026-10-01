@@ -224,13 +224,21 @@ class MarkService:
             self._store.append_reaction_snapshot(result.value)
         return result
 
-    def create(self, request: AdCreateRequest) -> CreateOperationReceipt:
+    def create(
+        self,
+        request: AdCreateRequest,
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> CreateOperationReceipt:
         return self._writes.create(
             request=request,
             reader=self._management_reader,
             confirmation_reader=self._delete_confirmation_reader,
             writer=self._create_writer,
             content_reader_factory=self._content_reader_factory,
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
         )
 
     def pause(
