@@ -276,6 +276,7 @@ class PrivateWebMediaCreateRuntime:
     ) -> None:
         self._page_factory = page_factory
         self._pending_page: _CloseablePrivateWebMediaPage | None = None
+        self._submit_unknown_fenced = False
         self._closed = False
 
     def _ensure_open(self) -> None:
@@ -284,10 +285,14 @@ class PrivateWebMediaCreateRuntime:
                 "private Web media runtime is closed"
             )
 
-    def _ensure_no_pending_submit(self) -> None:
+    def _ensure_create_available(self) -> None:
         if self._pending_page is not None:
             raise PrivateWebRuntimeSetupError(
                 "private Web media submit requires reconciliation"
+            )
+        if self._submit_unknown_fenced:
+            raise PrivateWebRuntimeSetupError(
+                "private Web media submit outcome forbids retry"
             )
 
     def _close_after_writer_outcome(
@@ -312,7 +317,7 @@ class PrivateWebMediaCreateRuntime:
         sources: tuple[PrivateWebMediaSource, ...],
     ) -> None:
         self._ensure_open()
-        self._ensure_no_pending_submit()
+        self._ensure_create_available()
         try:
             page = self._page_factory()
         except WriteNotAttemptedError:
@@ -324,6 +329,16 @@ class PrivateWebMediaCreateRuntime:
 
         try:
             PrivateWebCreateMediaWriter(page).create_ad(request, sources)
+        except PrivateWebSubmitUnknownError:
+            # Every media-submit UNKNOWN is explicitly non-retryable. Keep a
+            # runtime-level fence even if the page itself is already settled
+            # and can be closed, such as writer-owned local cleanup failure.
+            self._submit_unknown_fenced = True
+            try:
+                self._close_after_writer_outcome(page)
+            except PrivateWebSubmitUnknownError:
+                pass
+            raise
         except Exception:
             try:
                 self._close_after_writer_outcome(page)
@@ -334,7 +349,11 @@ class PrivateWebMediaCreateRuntime:
         # A successful media writer has already observed canonical settlement.
         # If close nevertheless reports an unsettled submit, preserve the page
         # and surface UNKNOWN rather than dropping its media lifetime.
-        self._close_after_writer_outcome(page)
+        try:
+            self._close_after_writer_outcome(page)
+        except PrivateWebSubmitUnknownError:
+            self._submit_unknown_fenced = True
+            raise
 
     def reconcile_media_submit(self) -> None:
         self._ensure_open()
@@ -346,6 +365,7 @@ class PrivateWebMediaCreateRuntime:
 
         page.reconcile_create_media_submit()
         self._pending_page = None
+        self._submit_unknown_fenced = False
         try:
             page.close()
         except Exception:

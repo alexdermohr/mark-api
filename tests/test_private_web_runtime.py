@@ -455,6 +455,39 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         runtime.reconcile_media_submit()
         runtime.close()
 
+    def test_writer_unknown_without_pending_page_blocks_retry(self) -> None:
+        events: list[tuple] = []
+        pages: list[MediaCreatePage] = []
+
+        def page_factory() -> MediaCreatePage:
+            page = MediaCreatePage(events)
+            pages.append(page)
+            return page
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+
+        with patch(
+            "mark_api.private_web_runtime.PrivateWebCreateMediaWriter.create_ad",
+            side_effect=PrivateWebSubmitUnknownError("submit_create_media"),
+        ):
+            with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+                runtime.create_ad(self.request, self.sources)
+
+        self.assertEqual(caught.exception.stage, "submit_create_media")
+        self.assertEqual(len(pages), 1)
+        self.assertTrue(pages[0]._closed)
+        with self.assertRaises(PrivateWebRuntimeSetupError) as duplicate:
+            runtime.create_ad(self.request, self.sources)
+        self.assertIsInstance(duplicate.exception, WriteNotAttemptedError)
+        self.assertEqual(len(pages), 1)
+
+        with self.assertRaises(PrivateWebRuntimeSetupError):
+            runtime.reconcile_media_submit()
+
+        # No unresolved page-owned media remains, so runtime shutdown itself is
+        # safe even though the non-retryable create fence remains armed.
+        runtime.close()
+
     def test_failed_reconciliation_keeps_pending_page_owned(self) -> None:
         events: list[tuple] = []
         page = MediaCreatePage(
