@@ -461,7 +461,14 @@ class PrivateWebCreateMediaWriter:
         # One writer-owned stable preparation lives through submit. The stager
         # borrows it without taking cleanup ownership; the CDP page separately
         # creates browser-facing copies that remain alive until page.close().
-        prepared = _prepare_local_media(sources)
+        # This phase is entirely local and precedes every browser mutation, so
+        # validation/copy failures are provably safe to classify as not attempted.
+        try:
+            prepared = _prepare_local_media(sources)
+        except (TypeError, ValueError):
+            raise PrivateWebWriteNotAttemptedError(
+                "prepare_create_media"
+            ) from None
         try:
             PrivateWebCreateWriter(self._page).prepare_create(request)
 

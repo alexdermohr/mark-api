@@ -14,6 +14,7 @@ from mark_api.private_web import (
     PrivateWebCreateWriter,
     PrivateWebEditorState,
     PrivateWebSubmitUnknownError,
+    PrivateWebWriteNotAttemptedError,
 )
 from mark_api.private_web_cdp import (
     PrivateWebCdpError,
@@ -226,7 +227,7 @@ class PrivateWebCreateMediaWriterTests(unittest.TestCase):
     def test_invalid_media_fails_before_any_browser_access(self) -> None:
         page = FakePublishPage()
 
-        with self.assertRaises(ValueError):
+        with self.assertRaises(PrivateWebWriteNotAttemptedError) as caught:
             PrivateWebCreateMediaWriter(page).create_ad(
                 create_request(),
                 (
@@ -236,6 +237,7 @@ class PrivateWebCreateMediaWriterTests(unittest.TestCase):
                 ),
             )
 
+        self.assertEqual(caught.exception.stage, "prepare_create_media")
         self.assertEqual(page.calls, [])
 
     def test_prepare_create_remains_non_publishing(self) -> None:

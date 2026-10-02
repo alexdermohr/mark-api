@@ -602,6 +602,69 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
 
         runtime.close()
 
+    def test_local_media_preparation_failure_is_precondition_failed(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        page_calls = 0
+
+        def page_factory() -> MediaCreatePage:
+            nonlocal page_calls
+            page_calls += 1
+            return MediaCreatePage(events)
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+        missing_sources = (
+            PrivateWebMediaSource(
+                path=str(Path(self.tmp.name) / "missing.jpg")
+            ),
+        )
+        writer = runtime.bind_create_writer(
+            self.request,
+            missing_sources,
+        )
+        primary = SequenceReader(ReadResult.success_empty(()))
+        confirmation = SequenceReader(ReadResult.success_empty(()))
+        content_calls: list[str] = []
+
+        receipt = SafeWriteOrchestrator(writes_enabled=True).create(
+            request=self.request,
+            reader=primary,
+            confirmation_reader=confirmation,
+            writer=writer,
+            content_reader_factory=lambda ad_id: (
+                content_calls.append(ad_id)
+                or OwnerReader(ReadResult.success_empty(()))
+            ),
+        )
+
+        self.assertEqual(
+            receipt.outcome,
+            OperationOutcome.PRECONDITION_FAILED,
+        )
+        self.assertTrue(receipt.writer_invoked)
+        self.assertEqual(
+            receipt.writer_error,
+            "PrivateWebWriteNotAttemptedError",
+        )
+        self.assertIsNone(receipt.post_read_status)
+        self.assertIsNone(receipt.confirmation_post_read_status)
+        self.assertIsNone(receipt.content_post_read_status)
+        self.assertEqual(primary.calls, 1)
+        self.assertEqual(confirmation.calls, 1)
+        self.assertEqual(content_calls, [])
+        self.assertEqual(page_calls, 1)
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            0,
+        )
+        self.assertNotIn(
+            "media_open_create_form",
+            [event[0] for event in events],
+        )
+
+        runtime.close()
+
     def test_bound_writer_reuses_safe_create_confirmation_and_persistence(
         self,
     ) -> None:
