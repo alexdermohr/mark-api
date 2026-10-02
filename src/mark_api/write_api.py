@@ -23,6 +23,7 @@ from .storage import SnapshotStore
 
 _MAX_BODY_BYTES = 16 * 1024
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_MEDIA_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
 def _utc_now() -> datetime:
@@ -31,6 +32,7 @@ def _utc_now() -> datetime:
 
 class WriteCapability(str, Enum):
     CREATE = "create"
+    CREATE_MEDIA = "create_media"
     UPDATE_CONTENT = "update_content"
     SET_STATE = "set_state"
     DELETE = "delete"
@@ -68,6 +70,18 @@ class WriteApiAccess:
             raise TypeError("writes_enabled must be bool")
         object.__setattr__(self, "principal", self.principal.strip())
         object.__setattr__(self, "capabilities", normalized)
+
+
+class _MediaWriteService(Protocol):
+    def create_with_media(
+        self,
+        request: AdCreateRequest,
+        media_refs: tuple[str, ...],
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> CreateOperationReceipt:
+        ...
 
 
 class _WriteService(Protocol):
@@ -125,6 +139,81 @@ def _valid_ad_id(value: str) -> bool:
         and value.isascii()
         and value.isdigit()
     )
+
+
+def _normalize_create_payload(
+    payload: dict[str, object],
+    *,
+    with_media: bool,
+) -> tuple[
+    AdCreateRequest,
+    tuple[str, ...] | None,
+    dict[str, object],
+]:
+    expected = {
+        "category_path",
+        "title",
+        "description",
+        "price_eur",
+    }
+    if with_media:
+        expected.add("media_refs")
+    if set(payload) != expected:
+        raise ValueError(
+            "invalid_media_create_request"
+            if with_media
+            else "invalid_create_request"
+        )
+
+    category_path = payload["category_path"]
+    if (
+        not isinstance(category_path, list)
+        or any(not isinstance(label, str) for label in category_path)
+    ):
+        raise ValueError(
+            "invalid_media_create_request"
+            if with_media
+            else "invalid_create_request"
+        )
+    try:
+        request = AdCreateRequest(
+            category_path=tuple(category_path),
+            title=payload["title"],
+            description=payload["description"],
+            price_eur=payload["price_eur"],
+        )
+    except (TypeError, ValueError):
+        raise ValueError(
+            "invalid_media_create_request"
+            if with_media
+            else "invalid_create_request"
+        ) from None
+
+    normalized: dict[str, object] = {
+        "category_path": list(request.category_path),
+        "title": request.title,
+        "description": request.description,
+        "price_eur": request.price_eur,
+    }
+    if not with_media:
+        return request, None, normalized
+
+    raw_media_refs = payload["media_refs"]
+    if (
+        not isinstance(raw_media_refs, list)
+        or not raw_media_refs
+        or any(
+            not isinstance(ref, str)
+            or _MEDIA_REF_RE.fullmatch(ref) is None
+            for ref in raw_media_refs
+        )
+    ):
+        raise ValueError("invalid_media_refs")
+    media_refs = tuple(raw_media_refs)
+    if len(set(media_refs)) != len(media_refs):
+        raise ValueError("invalid_media_refs")
+    normalized["media_refs"] = list(media_refs)
+    return request, media_refs, normalized
 
 
 def _canonical_json(value: object) -> str:
@@ -252,6 +341,7 @@ def _receipt_status(
 def _handler_factory(
     *,
     service: _WriteService,
+    media_service: _MediaWriteService | None,
     store: SnapshotStore,
     access: WriteApiAccess,
     clock: Callable[[], datetime],
@@ -400,6 +490,15 @@ def _handler_factory(
                     return ("create", None, WriteCapability.CREATE)
                 return ("method_not_allowed", "POST", None)
 
+            if parts == ["api", "write", "media", "ads"]:
+                if method == "POST":
+                    return (
+                        "create_media",
+                        None,
+                        WriteCapability.CREATE_MEDIA,
+                    )
+                return ("method_not_allowed", "POST", None)
+
             if len(parts) < 4 or parts[:3] != ["api", "write", "ads"]:
                 return None
 
@@ -479,40 +578,16 @@ def _handler_factory(
                 return
 
             create_request: AdCreateRequest | None = None
+            media_refs: tuple[str, ...] | None = None
             try:
-                if action == "create":
-                    payload = self._read_json_object()
-                    if set(payload) != {
-                        "category_path",
-                        "title",
-                        "description",
-                        "price_eur",
-                    }:
-                        raise ValueError("invalid_create_request")
-                    category_path = payload["category_path"]
-                    if (
-                        not isinstance(category_path, list)
-                        or any(
-                            not isinstance(label, str)
-                            for label in category_path
+                if action in {"create", "create_media"}:
+                    raw_payload = self._read_json_object()
+                    create_request, media_refs, payload = (
+                        _normalize_create_payload(
+                            raw_payload,
+                            with_media=action == "create_media",
                         )
-                    ):
-                        raise ValueError("invalid_create_request")
-                    try:
-                        create_request = AdCreateRequest(
-                            category_path=tuple(category_path),
-                            title=payload["title"],
-                            description=payload["description"],
-                            price_eur=payload["price_eur"],
-                        )
-                    except (TypeError, ValueError):
-                        raise ValueError("invalid_create_request") from None
-                    payload = {
-                        "category_path": list(create_request.category_path),
-                        "title": create_request.title,
-                        "description": create_request.description,
-                        "price_eur": create_request.price_eur,
-                    }
+                    )
                 elif action == "update_content":
                     payload = self._read_json_object()
                     if not payload or set(payload) - {"title", "description"}:
@@ -552,7 +627,7 @@ def _handler_factory(
                 self._error(400, str(exc))
                 return
 
-            if action != "create":
+            if action not in {"create", "create_media"}:
                 assert isinstance(ad_id, str)
             try:
                 fingerprint = _request_fingerprint(
@@ -618,13 +693,23 @@ def _handler_factory(
 
             try:
                 authorization_reference = f"write-api:{idempotency_key}"
-                if action == "create":
+                if action in {"create", "create_media"}:
                     assert create_request is not None
-                    create_receipt = service.create(
-                        create_request,
-                        authorization_by=access.principal,
-                        authorization_reference=authorization_reference,
-                    )
+                    if action == "create":
+                        create_receipt = service.create(
+                            create_request,
+                            authorization_by=access.principal,
+                            authorization_reference=authorization_reference,
+                        )
+                    else:
+                        assert media_service is not None
+                        assert media_refs is not None
+                        create_receipt = media_service.create_with_media(
+                            create_request,
+                            media_refs,
+                            authorization_by=access.principal,
+                            authorization_reference=authorization_reference,
+                        )
                     if not isinstance(
                         create_receipt,
                         CreateOperationReceipt,
@@ -649,6 +734,14 @@ def _handler_factory(
                         ),
                         "platform_retry_authorized": False,
                     }
+                    if action == "create_media":
+                        # The existing create receipt confirms only the ad
+                        # identity/content contract, never server-side media
+                        # persistence. Do not turn that narrower confirmation
+                        # into a successful media-operation claim.
+                        if status == 200:
+                            status = 202
+                        response["media_persistence_confirmed"] = False
                     receipt = None
                 elif action == "update_content":
                     receipt = service.update_content(
@@ -694,7 +787,7 @@ def _handler_factory(
                         ),
                     )
 
-                if action != "create":
+                if action not in {"create", "create_media"}:
                     if not isinstance(receipt, OperationReceipt):
                         raise TypeError("write service returned invalid receipt")
                     expected_operation = {
@@ -731,6 +824,8 @@ def _handler_factory(
                     "idempotency_key": idempotency_key,
                     "platform_retry_authorized": False,
                 }
+                if action == "create_media":
+                    response["media_persistence_confirmed"] = False
 
             response_json = _canonical_json(response)
             try:
@@ -803,6 +898,7 @@ def create_write_api_server(
     store: SnapshotStore,
     access: WriteApiAccess,
     *,
+    media_service: _MediaWriteService | None = None,
     host: str = "127.0.0.1",
     port: int = 0,
     clock: Callable[[], datetime] = _utc_now,
@@ -817,11 +913,19 @@ def create_write_api_server(
         raise ValueError("port must be an integer between 0 and 65535")
     if not isinstance(access, WriteApiAccess):
         raise TypeError("access must be WriteApiAccess")
+    if (
+        WriteCapability.CREATE_MEDIA in access.capabilities
+        and media_service is None
+    ):
+        raise ValueError(
+            "create_media capability requires media_service"
+        )
 
     return LoopbackWriteApiServer(
         (host, port),
         _handler_factory(
             service=service,
+            media_service=media_service,
             store=store,
             access=access,
             clock=clock,
