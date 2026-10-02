@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from importlib import metadata
@@ -486,6 +487,185 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
 
         # No unresolved page-owned media remains, so runtime shutdown itself is
         # safe even though the non-retryable create fence remains armed.
+        runtime.close()
+
+    def test_concurrent_create_calls_are_serialized(self) -> None:
+        events: list[tuple] = []
+        pages: list[MediaCreatePage] = []
+        start = threading.Barrier(3)
+        writer_barrier = threading.Barrier(2)
+        counter_lock = threading.Lock()
+        active_writers = 0
+        max_active_writers = 0
+        errors: list[BaseException] = []
+
+        def page_factory() -> MediaCreatePage:
+            page = MediaCreatePage(events)
+            pages.append(page)
+            return page
+
+        def fake_create(writer, request, sources) -> None:
+            nonlocal active_writers, max_active_writers
+            with counter_lock:
+                active_writers += 1
+                max_active_writers = max(max_active_writers, active_writers)
+            try:
+                try:
+                    writer_barrier.wait(timeout=0.2)
+                except threading.BrokenBarrierError:
+                    pass
+            finally:
+                with counter_lock:
+                    active_writers -= 1
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+
+        def invoke() -> None:
+            try:
+                start.wait(timeout=1)
+                runtime.create_ad(self.request, self.sources)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch(
+            "mark_api.private_web_runtime.PrivateWebCreateMediaWriter.create_ad",
+            new=fake_create,
+        ):
+            threads = [threading.Thread(target=invoke) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait(timeout=1)
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(max_active_writers, 1)
+        runtime.close()
+
+    def test_close_waits_for_inflight_create(self) -> None:
+        events: list[tuple] = []
+        writer_entered = threading.Event()
+        release_writer = threading.Event()
+        close_started = threading.Event()
+        close_done = threading.Event()
+        errors: list[BaseException] = []
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: MediaCreatePage(events)
+        )
+
+        def fake_create(writer, request, sources) -> None:
+            writer_entered.set()
+            if not release_writer.wait(timeout=2):
+                raise AssertionError("writer release was not signaled")
+
+        def invoke_create() -> None:
+            try:
+                runtime.create_ad(self.request, self.sources)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def invoke_close() -> None:
+            try:
+                close_started.set()
+                runtime.close()
+                close_done.set()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch(
+            "mark_api.private_web_runtime.PrivateWebCreateMediaWriter.create_ad",
+            new=fake_create,
+        ):
+            create_thread = threading.Thread(target=invoke_create)
+            create_thread.start()
+            self.assertTrue(writer_entered.wait(timeout=1))
+
+            close_thread = threading.Thread(target=invoke_close)
+            close_thread.start()
+            self.assertTrue(close_started.wait(timeout=1))
+            self.assertFalse(close_done.wait(timeout=0.1))
+
+            release_writer.set()
+            create_thread.join(timeout=2)
+            close_thread.join(timeout=2)
+
+        self.assertFalse(create_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(close_done.is_set())
+        with self.assertRaises(PrivateWebRuntimeClosedError):
+            runtime.create_ad(self.request, self.sources)
+
+    def test_reconcile_cleanup_blocks_next_create_until_complete(self) -> None:
+        events: list[tuple] = []
+        settled_close_entered = threading.Event()
+        release_settled_close = threading.Event()
+        second_page_created = threading.Event()
+        pages: list[MediaCreatePage] = []
+        errors: list[BaseException] = []
+
+        class BlockingReconcilePage(MediaCreatePage):
+            def __init__(self) -> None:
+                super().__init__(events, submit_unknown=True)
+                self._reconciled = False
+
+            def reconcile_create_media_submit(self) -> None:
+                super().reconcile_create_media_submit()
+                self._reconciled = True
+
+            def close(self) -> None:
+                if self._reconciled and not self._unsettled:
+                    settled_close_entered.set()
+                    if not release_settled_close.wait(timeout=2):
+                        raise AssertionError("reconcile close release was not signaled")
+                super().close()
+
+        first_page = BlockingReconcilePage()
+
+        def page_factory() -> MediaCreatePage:
+            if not pages:
+                pages.append(first_page)
+                return first_page
+            page = MediaCreatePage(events)
+            pages.append(page)
+            second_page_created.set()
+            return page
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            runtime.create_ad(self.request, self.sources)
+
+        def invoke_reconcile() -> None:
+            try:
+                runtime.reconcile_media_submit()
+            except BaseException as exc:
+                errors.append(exc)
+
+        def invoke_second_create() -> None:
+            try:
+                runtime.create_ad(self.request, self.sources)
+            except BaseException as exc:
+                errors.append(exc)
+
+        reconcile_thread = threading.Thread(target=invoke_reconcile)
+        reconcile_thread.start()
+        self.assertTrue(settled_close_entered.wait(timeout=1))
+
+        create_thread = threading.Thread(target=invoke_second_create)
+        create_thread.start()
+        self.assertFalse(second_page_created.wait(timeout=0.1))
+
+        release_settled_close.set()
+        reconcile_thread.join(timeout=2)
+        create_thread.join(timeout=2)
+
+        self.assertFalse(reconcile_thread.is_alive())
+        self.assertFalse(create_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_page_created.is_set())
+        self.assertEqual(len(pages), 2)
         runtime.close()
 
     def test_failed_reconciliation_keeps_pending_page_owned(self) -> None:

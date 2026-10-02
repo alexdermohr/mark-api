@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 from importlib import import_module, metadata
+from threading import Lock
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -261,12 +262,13 @@ class _PerCallPrivateWebDeleteWriter:
 
 
 class PrivateWebMediaCreateRuntime:
-    """Own one safe media-create page at a time for an existing CDP worker.
+    """Own one serialized media-create state machine for an existing CDP worker.
 
     A submit that remains UNKNOWN is retained as a live page instead of being
-    dropped by per-call cleanup. While that page is unresolved, no second media
-    create and no runtime close is allowed. Reconciliation observes only the
-    existing submit state and never repeats browser input.
+    dropped by per-call cleanup. All create, reconciliation, and close
+    transitions are serialized so at most one page/writer operation can own
+    this runtime at a time. Reconciliation observes only the existing submit
+    state and never repeats browser input.
     """
 
     def __init__(
@@ -278,6 +280,7 @@ class PrivateWebMediaCreateRuntime:
         self._pending_page: _CloseablePrivateWebMediaPage | None = None
         self._submit_unknown_fenced = False
         self._closed = False
+        self._operation_lock = Lock()
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -311,7 +314,7 @@ class PrivateWebMediaCreateRuntime:
             # Local cleanup failure must not replace the writer outcome.
             pass
 
-    def create_ad(
+    def _create_ad_locked(
         self,
         request: AdCreateRequest,
         sources: tuple[PrivateWebMediaSource, ...],
@@ -355,7 +358,15 @@ class PrivateWebMediaCreateRuntime:
             self._submit_unknown_fenced = True
             raise
 
-    def reconcile_media_submit(self) -> None:
+    def create_ad(
+        self,
+        request: AdCreateRequest,
+        sources: tuple[PrivateWebMediaSource, ...],
+    ) -> None:
+        with self._operation_lock:
+            self._create_ad_locked(request, sources)
+
+    def _reconcile_media_submit_locked(self) -> None:
         self._ensure_open()
         page = self._pending_page
         if page is None:
@@ -373,7 +384,11 @@ class PrivateWebMediaCreateRuntime:
             # manufacture platform retry authority.
             pass
 
-    def close(self) -> None:
+    def reconcile_media_submit(self) -> None:
+        with self._operation_lock:
+            self._reconcile_media_submit_locked()
+
+    def _close_locked(self) -> None:
         if self._closed:
             return
         if self._pending_page is not None:
@@ -382,17 +397,23 @@ class PrivateWebMediaCreateRuntime:
             )
         self._closed = True
 
+    def close(self) -> None:
+        with self._operation_lock:
+            self._close_locked()
+
     def __enter__(self) -> "PrivateWebMediaCreateRuntime":
-        self._ensure_open()
+        with self._operation_lock:
+            self._ensure_open()
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        if exc_type is not None and self._pending_page is not None:
-            # Preserve the original submit/reconciliation classification. A
-            # second close error would mask it while the runtime must keep
-            # owning the unresolved page for explicit reconciliation.
-            return
-        self.close()
+        with self._operation_lock:
+            if exc_type is not None and self._pending_page is not None:
+                # Preserve the original submit/reconciliation classification.
+                # A second close error would mask it while the runtime must keep
+                # owning the unresolved page for explicit reconciliation.
+                return
+            self._close_locked()
 
 
 class PrivateWebInventoryRuntime:
