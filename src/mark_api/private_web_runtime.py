@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib import import_module, metadata
 from threading import Lock
 from typing import Protocol
@@ -15,7 +15,14 @@ from .adapters.management import (
     ManagementReadAdapter,
     TransportFailure,
 )
-from .domain import AdCreateRequest, AdSnapshot, LifecycleState
+from .domain import (
+    AdCreateRequest,
+    AdSnapshot,
+    CreateOperationReceipt,
+    LifecycleState,
+    OperationOutcome,
+)
+from .orchestrator import SafeWriteOrchestrator
 from .ports import (
     AdContentUpdater,
     AdCreateWriter,
@@ -34,6 +41,7 @@ from .private_web import (
     PrivateWebStatePage,
     PrivateWebStateWriter,
     PrivateWebSubmitUnknownError,
+    PrivateWebWriteNotAttemptedError,
 )
 from .results import ReadResult
 from .private_web_cdp import (
@@ -45,8 +53,14 @@ from .private_web_cdp_media import CdpPrivateWebMediaPage
 from .private_web_media import (
     PrivateWebCreateMediaPublishPage,
     PrivateWebCreateMediaWriter,
+    PrivateWebMediaRefRegistry,
     PrivateWebMediaSource,
 )
+from .storage import SnapshotStore
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class PrivateWebRuntimeDependencyError(RuntimeError):
@@ -480,6 +494,116 @@ class _BoundPrivateWebMediaCreateWriter:
             # Never manufacture retry authority from a later runtime outcome.
             self._used = True
         self._runtime.create_ad(request, self._sources)
+
+
+class PrivateWebMediaCreateService:
+    """Bind opaque media refs to one serialized safe media-create attempt."""
+
+    def __init__(
+        self,
+        *,
+        runtime: PrivateWebMediaCreateRuntime,
+        registry: PrivateWebMediaRefRegistry,
+        reader: AdsReader,
+        confirmation_reader: AdsReader,
+        content_reader_factory: Callable[[str], AdsReader],
+        store: SnapshotStore | None = None,
+        writes_enabled: bool = False,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not isinstance(runtime, PrivateWebMediaCreateRuntime):
+            raise TypeError("runtime must be PrivateWebMediaCreateRuntime")
+        if not isinstance(registry, PrivateWebMediaRefRegistry):
+            raise TypeError("registry must be PrivateWebMediaRefRegistry")
+        if not isinstance(writes_enabled, bool):
+            raise TypeError("writes_enabled must be bool")
+        self._runtime = runtime
+        self._registry = registry
+        self._reader = reader
+        self._confirmation_reader = confirmation_reader
+        self._content_reader_factory = content_reader_factory
+        self._store = store
+        self._clock = _utc_now if clock is None else clock
+        self._writes_enabled = writes_enabled
+        self._operation_lock = Lock()
+        self._writes = SafeWriteOrchestrator(
+            store=store,
+            writes_enabled=writes_enabled,
+            clock=self._clock,
+        )
+
+    def _media_ref_precondition(
+        self,
+        *,
+        started_at: datetime,
+        authorization_by: str | None,
+        authorization_reference: str | None,
+    ) -> CreateOperationReceipt:
+        receipt = CreateOperationReceipt(
+            operation="create",
+            started_at=started_at,
+            completed_at=self._clock(),
+            outcome=OperationOutcome.PRECONDITION_FAILED,
+            pre_read_status="media_refs_unavailable",
+            confirmation_pre_read_status="not_read",
+            post_read_status=None,
+            confirmation_post_read_status=None,
+            content_post_read_status=None,
+            writer_invoked=False,
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
+        )
+        if self._store is not None:
+            self._store.append_create_operation_receipt(receipt)
+        return receipt
+
+    def create_with_media(
+        self,
+        request: AdCreateRequest,
+        media_refs: tuple[str, ...],
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> CreateOperationReceipt:
+        # The loopback HTTP server is threaded. Serialize resolution plus the
+        # complete pre/write/post state machine so concurrent creates cannot
+        # contaminate each other's inventory delta.
+        with self._operation_lock:
+            if not self._writes_enabled:
+                return self._writes.create(
+                    request=request,
+                    reader=self._reader,
+                    confirmation_reader=self._confirmation_reader,
+                    writer=None,
+                    content_reader_factory=self._content_reader_factory,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+
+            started_at = self._clock()
+            try:
+                # Registry sources are immutable private copies. Hold their
+                # lease across both pre-reads, the one-shot runtime writer, and
+                # all confirmation reads for this exact logical attempt.
+                with self._registry.acquire(media_refs) as sources:
+                    writer = self._runtime.bind_create_writer(request, sources)
+                    return self._writes.create(
+                        request=request,
+                        reader=self._reader,
+                        confirmation_reader=self._confirmation_reader,
+                        writer=writer,
+                        content_reader_factory=self._content_reader_factory,
+                        authorization_by=authorization_by,
+                        authorization_reference=authorization_reference,
+                    )
+            except PrivateWebWriteNotAttemptedError:
+                # Unknown/invalid/closed refs are a local precondition failure.
+                # No owner/browser read or platform write was attempted.
+                return self._media_ref_precondition(
+                    started_at=started_at,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
 
 
 class PrivateWebInventoryRuntime:
