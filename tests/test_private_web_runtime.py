@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from importlib import metadata
+from pathlib import Path
 from unittest.mock import patch
 from urllib.request import ProxyHandler
 
@@ -21,6 +24,7 @@ from mark_api.private_web import (
 from mark_api.private_web_runtime import (
     PrivateWebContentRuntime,
     PrivateWebInventoryRuntime,
+    PrivateWebMediaCreateRuntime,
     PrivateWebRuntimeClosedError,
     PrivateWebRuntimeDependencyError,
     PrivateWebRuntimeSetupError,
@@ -28,7 +32,13 @@ from mark_api.private_web_runtime import (
     _RejectManagementRedirectHandler,
     build_private_web_content_runtime,
     build_private_web_inventory_runtime,
+    build_private_web_media_create_runtime,
     require_private_web_runtime_dependency,
+)
+from mark_api.private_web_media import (
+    PrivateWebCreateMediaSnapshot,
+    PrivateWebMediaFileSnapshot,
+    PrivateWebMediaSource,
 )
 from mark_api.results import ReadResult, ReadStatus
 
@@ -159,6 +169,98 @@ class CreatePage:
             raise self._close_error
 
 
+class MediaCreatePage:
+    def __init__(
+        self,
+        events: list[tuple],
+        *,
+        submit_unknown: bool = False,
+        reconcile_unknown: bool = False,
+    ) -> None:
+        self._events = events
+        self._category_path: tuple[str, ...] | None = None
+        self._title = ""
+        self._description = ""
+        self._price = ""
+        self._media: PrivateWebCreateMediaSnapshot | None = None
+        self._submit_unknown = submit_unknown
+        self._reconcile_unknown = reconcile_unknown
+        self._unsettled = False
+        self._closed = False
+
+    def open_create_form(self, category_path: tuple[str, ...]) -> None:
+        self._category_path = category_path
+        self._events.append(("media_open_create_form", category_path))
+
+    def read_create_form(self) -> PrivateWebCreateSnapshot:
+        self._events.append(("media_read_create_form", self._category_path))
+        return PrivateWebCreateSnapshot(
+            state=PrivateWebEditorState.READY,
+            title=self._title,
+            description=self._description,
+            price_amount=self._price,
+        )
+
+    def replace_create_title(self, value: str) -> None:
+        self._title = value
+        self._events.append(("media_replace_title", value))
+
+    def replace_create_description(self, value: str) -> None:
+        self._description = value
+        self._events.append(("media_replace_description", value))
+
+    def replace_create_price(self, value: str) -> None:
+        self._price = value
+        self._events.append(("media_replace_price", value))
+
+    def submit_create(self) -> None:
+        raise AssertionError("media runtime must not use ordinary create submit")
+
+    def stage_create_media(self, files: tuple[str, ...]) -> None:
+        snapshots = tuple(
+            PrivateWebMediaFileSnapshot(
+                name=Path(item).name,
+                size_bytes=Path(item).stat().st_size,
+            )
+            for item in files
+        )
+        self._media = PrivateWebCreateMediaSnapshot(
+            state=PrivateWebEditorState.READY,
+            files=snapshots,
+        )
+        self._events.append(("media_stage", snapshots))
+
+    def read_create_media(self) -> PrivateWebCreateMediaSnapshot:
+        self._events.append(("media_readback", None))
+        assert self._media is not None
+        return self._media
+
+    def submit_create_media(
+        self,
+        expected: PrivateWebCreateMediaSnapshot,
+    ) -> None:
+        self._events.append(("media_submit", expected.files))
+        if self._submit_unknown:
+            self._unsettled = True
+            raise PrivateWebSubmitUnknownError("create_media_submit_settle")
+
+    def reconcile_create_media_submit(self) -> None:
+        self._events.append(("media_reconcile", None))
+        if not self._unsettled:
+            raise AssertionError("only unsettled media submits are reconcilable")
+        if self._reconcile_unknown:
+            raise PrivateWebSubmitUnknownError("create_media_submit_settle")
+        self._unsettled = False
+
+    def close(self) -> None:
+        self._events.append(("media_close", self._unsettled))
+        if self._unsettled:
+            raise PrivateWebSubmitUnknownError(
+                "create_media_submit_unsettled"
+            )
+        self._closed = True
+
+
 class LifecyclePage:
     def __init__(
         self,
@@ -249,6 +351,451 @@ class DeletePage:
         self._events.append(("close_delete", self._ad_id))
         if self._close_error is not None:
             raise self._close_error
+
+
+class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.image = Path(self.tmp.name) / "photo.jpg"
+        self.image.write_bytes(b"123456")
+        self.request = AdCreateRequest(
+            category_path=(
+                "Haus & Garten",
+                "Dekoration",
+                "Weitere Dekoration",
+            ),
+            title="Neue Vase",
+            description="Beschreibung",
+            price_eur=12,
+        )
+        self.sources = (PrivateWebMediaSource(path=str(self.image)),)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_success_closes_page_without_pending_submit(self) -> None:
+        events: list[tuple] = []
+        pages: list[MediaCreatePage] = []
+
+        def page_factory() -> MediaCreatePage:
+            page = MediaCreatePage(events)
+            pages.append(page)
+            return page
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+
+        runtime.create_ad(self.request, self.sources)
+
+        self.assertEqual(len(pages), 1)
+        self.assertTrue(pages[0]._closed)
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            1,
+        )
+        runtime.close()
+
+    def test_unknown_submit_is_retained_and_blocks_duplicate_and_close(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        page_calls = 0
+        page = MediaCreatePage(events, submit_unknown=True)
+
+        def page_factory() -> MediaCreatePage:
+            nonlocal page_calls
+            page_calls += 1
+            return page
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            runtime.create_ad(self.request, self.sources)
+
+        self.assertEqual(page_calls, 1)
+        self.assertFalse(page._closed)
+        self.assertTrue(page._unsettled)
+
+        with self.assertRaises(PrivateWebRuntimeSetupError) as duplicate:
+            runtime.create_ad(self.request, self.sources)
+        self.assertIsInstance(duplicate.exception, WriteNotAttemptedError)
+        self.assertEqual(page_calls, 1)
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            1,
+        )
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as close_caught:
+            runtime.close()
+        self.assertEqual(
+            close_caught.exception.stage,
+            "media_runtime_close_unsettled",
+        )
+        self.assertFalse(page._closed)
+
+        runtime.reconcile_media_submit()
+        self.assertFalse(page._unsettled)
+        self.assertTrue(page._closed)
+        runtime.close()
+
+    def test_context_manager_preserves_submit_unknown_stage(self) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events, submit_unknown=True)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            with runtime:
+                runtime.create_ad(self.request, self.sources)
+
+        self.assertEqual(
+            caught.exception.stage,
+            "create_media_submit_settle",
+        )
+        self.assertTrue(page._unsettled)
+        self.assertFalse(page._closed)
+
+        runtime.reconcile_media_submit()
+        runtime.close()
+
+    def test_writer_unknown_without_pending_page_blocks_retry(self) -> None:
+        events: list[tuple] = []
+        pages: list[MediaCreatePage] = []
+
+        def page_factory() -> MediaCreatePage:
+            page = MediaCreatePage(events)
+            pages.append(page)
+            return page
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+
+        with patch(
+            "mark_api.private_web_runtime.PrivateWebCreateMediaWriter.create_ad",
+            side_effect=PrivateWebSubmitUnknownError("submit_create_media"),
+        ):
+            with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+                runtime.create_ad(self.request, self.sources)
+
+        self.assertEqual(caught.exception.stage, "submit_create_media")
+        self.assertEqual(len(pages), 1)
+        self.assertTrue(pages[0]._closed)
+        with self.assertRaises(PrivateWebRuntimeSetupError) as duplicate:
+            runtime.create_ad(self.request, self.sources)
+        self.assertIsInstance(duplicate.exception, WriteNotAttemptedError)
+        self.assertEqual(len(pages), 1)
+
+        with self.assertRaises(PrivateWebRuntimeSetupError):
+            runtime.reconcile_media_submit()
+
+        # No unresolved page-owned media remains, so runtime shutdown itself is
+        # safe even though the non-retryable create fence remains armed.
+        runtime.close()
+
+    def test_cancellation_after_possible_submit_retains_page_and_fence(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+
+        def cancel_after_possible_submit(writer, request, sources) -> None:
+            page._unsettled = True
+            raise KeyboardInterrupt("cancelled after possible submit")
+
+        with patch(
+            "mark_api.private_web_runtime.PrivateWebCreateMediaWriter.create_ad",
+            new=cancel_after_possible_submit,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                runtime.create_ad(self.request, self.sources)
+
+        self.assertEqual(
+            caught.exception.args,
+            ("cancelled after possible submit",),
+        )
+        self.assertTrue(page._unsettled)
+        self.assertFalse(page._closed)
+
+        with self.assertRaises(PrivateWebRuntimeSetupError):
+            runtime.create_ad(self.request, self.sources)
+        with self.assertRaises(PrivateWebSubmitUnknownError) as close_caught:
+            runtime.close()
+        self.assertEqual(
+            close_caught.exception.stage,
+            "media_runtime_close_unsettled",
+        )
+
+        runtime.reconcile_media_submit()
+        self.assertFalse(page._unsettled)
+        self.assertTrue(page._closed)
+        runtime.close()
+
+    def test_concurrent_create_calls_are_serialized(self) -> None:
+        events: list[tuple] = []
+        pages: list[MediaCreatePage] = []
+        start = threading.Barrier(3)
+        writer_barrier = threading.Barrier(2)
+        counter_lock = threading.Lock()
+        active_writers = 0
+        max_active_writers = 0
+        errors: list[BaseException] = []
+
+        def page_factory() -> MediaCreatePage:
+            page = MediaCreatePage(events)
+            pages.append(page)
+            return page
+
+        def fake_create(writer, request, sources) -> None:
+            nonlocal active_writers, max_active_writers
+            with counter_lock:
+                active_writers += 1
+                max_active_writers = max(max_active_writers, active_writers)
+            try:
+                try:
+                    writer_barrier.wait(timeout=0.2)
+                except threading.BrokenBarrierError:
+                    pass
+            finally:
+                with counter_lock:
+                    active_writers -= 1
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+
+        def invoke() -> None:
+            try:
+                start.wait(timeout=1)
+                runtime.create_ad(self.request, self.sources)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch(
+            "mark_api.private_web_runtime.PrivateWebCreateMediaWriter.create_ad",
+            new=fake_create,
+        ):
+            threads = [threading.Thread(target=invoke) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait(timeout=1)
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(max_active_writers, 1)
+        runtime.close()
+
+    def test_close_waits_for_inflight_create(self) -> None:
+        events: list[tuple] = []
+        writer_entered = threading.Event()
+        release_writer = threading.Event()
+        close_started = threading.Event()
+        close_done = threading.Event()
+        errors: list[BaseException] = []
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: MediaCreatePage(events)
+        )
+
+        def fake_create(writer, request, sources) -> None:
+            writer_entered.set()
+            if not release_writer.wait(timeout=2):
+                raise AssertionError("writer release was not signaled")
+
+        def invoke_create() -> None:
+            try:
+                runtime.create_ad(self.request, self.sources)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def invoke_close() -> None:
+            try:
+                close_started.set()
+                runtime.close()
+                close_done.set()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch(
+            "mark_api.private_web_runtime.PrivateWebCreateMediaWriter.create_ad",
+            new=fake_create,
+        ):
+            create_thread = threading.Thread(target=invoke_create)
+            create_thread.start()
+            self.assertTrue(writer_entered.wait(timeout=1))
+
+            close_thread = threading.Thread(target=invoke_close)
+            close_thread.start()
+            self.assertTrue(close_started.wait(timeout=1))
+            self.assertFalse(close_done.wait(timeout=0.1))
+
+            release_writer.set()
+            create_thread.join(timeout=2)
+            close_thread.join(timeout=2)
+
+        self.assertFalse(create_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(close_done.is_set())
+        with self.assertRaises(PrivateWebRuntimeClosedError):
+            runtime.create_ad(self.request, self.sources)
+
+    def test_reconcile_cleanup_blocks_next_create_until_complete(self) -> None:
+        events: list[tuple] = []
+        settled_close_entered = threading.Event()
+        release_settled_close = threading.Event()
+        second_page_created = threading.Event()
+        pages: list[MediaCreatePage] = []
+        errors: list[BaseException] = []
+
+        class BlockingReconcilePage(MediaCreatePage):
+            def __init__(self) -> None:
+                super().__init__(events, submit_unknown=True)
+                self._reconciled = False
+
+            def reconcile_create_media_submit(self) -> None:
+                super().reconcile_create_media_submit()
+                self._reconciled = True
+
+            def close(self) -> None:
+                if self._reconciled and not self._unsettled:
+                    settled_close_entered.set()
+                    if not release_settled_close.wait(timeout=2):
+                        raise AssertionError("reconcile close release was not signaled")
+                super().close()
+
+        first_page = BlockingReconcilePage()
+
+        def page_factory() -> MediaCreatePage:
+            if not pages:
+                pages.append(first_page)
+                return first_page
+            page = MediaCreatePage(events)
+            pages.append(page)
+            second_page_created.set()
+            return page
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            runtime.create_ad(self.request, self.sources)
+
+        def invoke_reconcile() -> None:
+            try:
+                runtime.reconcile_media_submit()
+            except BaseException as exc:
+                errors.append(exc)
+
+        def invoke_second_create() -> None:
+            try:
+                runtime.create_ad(self.request, self.sources)
+            except BaseException as exc:
+                errors.append(exc)
+
+        reconcile_thread = threading.Thread(target=invoke_reconcile)
+        reconcile_thread.start()
+        self.assertTrue(settled_close_entered.wait(timeout=1))
+
+        create_thread = threading.Thread(target=invoke_second_create)
+        create_thread.start()
+        self.assertFalse(second_page_created.wait(timeout=0.1))
+
+        release_settled_close.set()
+        reconcile_thread.join(timeout=2)
+        create_thread.join(timeout=2)
+
+        self.assertFalse(reconcile_thread.is_alive())
+        self.assertFalse(create_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_page_created.is_set())
+        self.assertEqual(len(pages), 2)
+        runtime.close()
+
+    def test_failed_reconciliation_keeps_pending_page_owned(self) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(
+            events,
+            submit_unknown=True,
+            reconcile_unknown=True,
+        )
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            runtime.create_ad(self.request, self.sources)
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            runtime.reconcile_media_submit()
+
+        self.assertTrue(page._unsettled)
+        self.assertFalse(page._closed)
+        with self.assertRaises(PrivateWebRuntimeSetupError):
+            runtime.create_ad(self.request, self.sources)
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            runtime.close()
+
+        page._reconcile_unknown = False
+        runtime.reconcile_media_submit()
+        self.assertTrue(page._closed)
+        runtime.close()
+
+    def test_reconcile_without_pending_is_write_not_attempted(self) -> None:
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: MediaCreatePage([])
+        )
+
+        with self.assertRaises(PrivateWebRuntimeSetupError) as caught:
+            runtime.reconcile_media_submit()
+
+        self.assertIsInstance(caught.exception, WriteNotAttemptedError)
+
+    def test_page_setup_failure_is_write_not_attempted(self) -> None:
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: (_ for _ in ()).throw(
+                OSError("page setup failed")
+            )
+        )
+
+        with self.assertRaises(PrivateWebRuntimeSetupError) as caught:
+            runtime.create_ad(self.request, self.sources)
+
+        self.assertIsInstance(caught.exception, WriteNotAttemptedError)
+
+    def test_closed_runtime_rejects_create_and_reconcile(self) -> None:
+        page_calls = 0
+
+        def page_factory() -> MediaCreatePage:
+            nonlocal page_calls
+            page_calls += 1
+            return MediaCreatePage([])
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+        runtime.close()
+
+        with self.assertRaises(PrivateWebRuntimeClosedError):
+            runtime.create_ad(self.request, self.sources)
+        with self.assertRaises(PrivateWebRuntimeClosedError):
+            runtime.reconcile_media_submit()
+        self.assertEqual(page_calls, 0)
+
+    def test_builder_uses_media_page_factory_only(self) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events)
+
+        with (
+            patch(
+                "mark_api.private_web_runtime."
+                "require_private_web_runtime_dependency"
+            ) as dependency,
+            patch(
+                "mark_api.private_web_runtime."
+                "CdpPrivateWebMediaPage.from_port",
+                return_value=page,
+            ) as from_port,
+        ):
+            runtime = build_private_web_media_create_runtime(
+                cdp_port=19610,
+                timeout_seconds=7.0,
+            )
+            runtime.create_ad(self.request, self.sources)
+
+        dependency.assert_called_once_with()
+        from_port.assert_called_once_with(19610, timeout_seconds=7.0)
+        runtime.close()
 
 
 class PrivateWebContentRuntimeTests(unittest.TestCase):
