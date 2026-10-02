@@ -367,6 +367,11 @@ class PrivateWebMediaCreateRuntime:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is not None and self._pending_page is not None:
+            # Preserve the original submit/reconciliation classification. A
+            # second close error would mask it while the runtime must keep
+            # owning the unresolved page for explicit reconciliation.
+            return
         self.close()
 
 

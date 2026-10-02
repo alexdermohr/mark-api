@@ -436,6 +436,25 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertTrue(page._closed)
         runtime.close()
 
+    def test_context_manager_preserves_submit_unknown_stage(self) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events, submit_unknown=True)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            with runtime:
+                runtime.create_ad(self.request, self.sources)
+
+        self.assertEqual(
+            caught.exception.stage,
+            "create_media_submit_settle",
+        )
+        self.assertTrue(page._unsettled)
+        self.assertFalse(page._closed)
+
+        runtime.reconcile_media_submit()
+        runtime.close()
+
     def test_failed_reconciliation_keeps_pending_page_owned(self) -> None:
         events: list[tuple] = []
         page = MediaCreatePage(
