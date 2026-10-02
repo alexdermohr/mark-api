@@ -648,6 +648,16 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
         )
         self.assertTrue(all(Path(path).exists() for path in prepared.paths))
 
+        with self.assertRaises(
+            PrivateWebCdpWriteNotAttemptedError
+        ) as reopen_caught:
+            page.open_create_form(create_request().category_path)
+        self.assertEqual(
+            reopen_caught.exception.stage,
+            "create_media_already_attempted",
+        )
+        self.assertTrue(all(Path(path).exists() for path in prepared.paths))
+
         with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
             page.submit_create_media(self.expected_media)
         self.assertEqual(input_calls, 2)
