@@ -489,6 +489,45 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         # safe even though the non-retryable create fence remains armed.
         runtime.close()
 
+    def test_cancellation_after_possible_submit_retains_page_and_fence(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+
+        def cancel_after_possible_submit(writer, request, sources) -> None:
+            page._unsettled = True
+            raise KeyboardInterrupt("cancelled after possible submit")
+
+        with patch(
+            "mark_api.private_web_runtime.PrivateWebCreateMediaWriter.create_ad",
+            new=cancel_after_possible_submit,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                runtime.create_ad(self.request, self.sources)
+
+        self.assertEqual(
+            caught.exception.args,
+            ("cancelled after possible submit",),
+        )
+        self.assertTrue(page._unsettled)
+        self.assertFalse(page._closed)
+
+        with self.assertRaises(PrivateWebRuntimeSetupError):
+            runtime.create_ad(self.request, self.sources)
+        with self.assertRaises(PrivateWebSubmitUnknownError) as close_caught:
+            runtime.close()
+        self.assertEqual(
+            close_caught.exception.stage,
+            "media_runtime_close_unsettled",
+        )
+
+        runtime.reconcile_media_submit()
+        self.assertFalse(page._unsettled)
+        self.assertTrue(page._closed)
+        runtime.close()
+
     def test_concurrent_create_calls_are_serialized(self) -> None:
         events: list[tuple] = []
         pages: list[MediaCreatePage] = []

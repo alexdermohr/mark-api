@@ -348,6 +348,17 @@ class PrivateWebMediaCreateRuntime:
             except PrivateWebSubmitUnknownError:
                 pass
             raise
+        except BaseException:
+            # Cancellation-style exits can arrive after browser input without
+            # passing through an Exception subclass. Conservatively fence all
+            # retries and let page.close() retain an unsettled submit page, but
+            # never replace the original cancellation with cleanup outcome.
+            self._submit_unknown_fenced = True
+            try:
+                self._close_after_writer_outcome(page)
+            except PrivateWebSubmitUnknownError:
+                pass
+            raise
 
         # A successful media writer has already observed canonical settlement.
         # If close nevertheless reports an unsettled submit, preserve the page
