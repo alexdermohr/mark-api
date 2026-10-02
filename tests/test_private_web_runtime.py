@@ -935,6 +935,63 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertEqual(calls, ["first", "second"])
         self.assertEqual(errors, [])
 
+    def test_media_create_service_preserves_runtime_submit_unknown_fence(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events, submit_unknown=True)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+        primary = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_empty(()),
+            ReadResult.success_empty(()),
+        )
+        confirmation = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_empty(()),
+            ReadResult.success_empty(()),
+        )
+        content_calls: list[str] = []
+        service = PrivateWebMediaCreateService(
+            runtime=runtime,
+            resolver=PrivateWebMediaRefResolver({"cover_01": self.sources[0]}),
+            reader=primary,
+            confirmation_reader=confirmation,
+            content_reader_factory=lambda ad_id: (
+                content_calls.append(ad_id)
+                or OwnerReader(ReadResult.success_empty(()))
+            ),
+            writes_enabled=True,
+        )
+
+        first = service.create_with_media(self.request, ("cover_01",))
+        second = service.create_with_media(self.request, ("cover_01",))
+
+        self.assertEqual(first.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertEqual(
+            first.writer_error,
+            "PrivateWebSubmitUnknownError",
+        )
+        self.assertEqual(
+            second.outcome,
+            OperationOutcome.PRECONDITION_FAILED,
+        )
+        self.assertEqual(
+            second.writer_error,
+            "PrivateWebRuntimeSetupError",
+        )
+        self.assertEqual(primary.calls, 3)
+        self.assertEqual(confirmation.calls, 3)
+        self.assertEqual(content_calls, [])
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            1,
+        )
+
+        runtime.reconcile_media_submit()
+        self.assertTrue(page._closed)
+        runtime.close()
+
     def test_submit_unknown_can_confirm_without_releasing_runtime_fence(
         self,
     ) -> None:
