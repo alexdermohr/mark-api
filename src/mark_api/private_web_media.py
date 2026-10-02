@@ -4,10 +4,8 @@ import os
 import re
 import stat
 import tempfile
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from threading import Lock
 from typing import Protocol
 
 from .domain import AdCreateRequest
@@ -331,13 +329,13 @@ def _prepare_local_media(
 _MEDIA_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
-class PrivateWebMediaRefRegistry:
-    """Own immutable private copies for pre-authorized opaque media refs.
+class PrivateWebMediaRefResolver:
+    """Resolve pre-authorized opaque refs through one immutable binding map.
 
-    Construction is the only point at which local paths enter this contract.
-    Every source is validated and copied into registry-owned private storage
-    before the registry can resolve any ref. HTTP callers therefore never gain
-    filesystem read authority from a ref value.
+    Bindings are copied at construction time and have no mutation surface.
+    Resolution itself grants no filesystem authority from ref text; the media
+    service immediately stabilizes the selected sources before its first
+    owner/browser read.
     """
 
     def __init__(
@@ -346,11 +344,8 @@ class PrivateWebMediaRefRegistry:
     ) -> None:
         if not isinstance(bindings, Mapping):
             raise TypeError("media ref bindings must be a mapping")
-
-        items = tuple(bindings.items())
-        refs: list[str] = []
-        sources: list[PrivateWebMediaSource] = []
-        for ref, source in items:
+        copied: dict[str, PrivateWebMediaSource] = {}
+        for ref, source in bindings.items():
             if (
                 not isinstance(ref, str)
                 or _MEDIA_REF_RE.fullmatch(ref) is None
@@ -360,42 +355,16 @@ class PrivateWebMediaRefRegistry:
                 raise TypeError(
                     "media ref bindings must contain PrivateWebMediaSource"
                 )
-            refs.append(ref)
-            sources.append(source)
-
-        prepared: _PreparedPrivateWebMedia | None = None
-        stable_sources: dict[str, PrivateWebMediaSource] = {}
-        if sources:
-            prepared = _prepare_local_media(tuple(sources))
-            stable_sources = {
-                ref: PrivateWebMediaSource(path=stable_path)
-                for ref, stable_path in zip(
-                    refs,
-                    prepared.paths,
-                    strict=True,
-                )
-            }
-
-        self._prepared = prepared
-        self._sources = stable_sources
-        self._closed = False
-        self._active_leases = 0
-        self._lock = Lock()
+            copied[ref] = source
+        self._sources = copied
 
     def __repr__(self) -> str:
-        with self._lock:
-            return (
-                "PrivateWebMediaRefRegistry("
-                f"refs={len(self._sources)}, "
-                f"active_leases={self._active_leases}, "
-                f"closed={self._closed})"
-            )
+        return f"PrivateWebMediaRefResolver(refs={len(self._sources)})"
 
-    @contextmanager
-    def acquire(
+    def resolve(
         self,
         media_refs: tuple[str, ...],
-    ) -> Iterator[tuple[PrivateWebMediaSource, ...]]:
+    ) -> tuple[PrivateWebMediaSource, ...]:
         if (
             not isinstance(media_refs, tuple)
             or not media_refs
@@ -406,61 +375,13 @@ class PrivateWebMediaRefRegistry:
             )
             or len(set(media_refs)) != len(media_refs)
         ):
+            raise PrivateWebWriteNotAttemptedError("resolve_media_refs")
+        try:
+            return tuple(self._sources[ref] for ref in media_refs)
+        except KeyError:
             raise PrivateWebWriteNotAttemptedError(
                 "resolve_media_refs"
-            )
-
-        with self._lock:
-            if self._closed:
-                raise PrivateWebWriteNotAttemptedError(
-                    "resolve_media_refs"
-                )
-            try:
-                sources = tuple(
-                    self._sources[ref]
-                    for ref in media_refs
-                )
-            except KeyError:
-                raise PrivateWebWriteNotAttemptedError(
-                    "resolve_media_refs"
-                ) from None
-            self._active_leases += 1
-
-        try:
-            yield sources
-        finally:
-            with self._lock:
-                self._active_leases -= 1
-
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            if self._active_leases:
-                raise RuntimeError(
-                    "media ref registry has active leases"
-                )
-            self._closed = True
-            prepared = self._prepared
-            self._prepared = None
-            self._sources = {}
-
-        if prepared is not None:
-            try:
-                prepared.close()
-            except Exception:
-                # Registry cleanup is local-only. It must never replace an
-                # already classified create outcome or imply retry authority.
-                pass
-
-    def __enter__(self) -> "PrivateWebMediaRefRegistry":
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("media ref registry is closed")
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
+            ) from None
 
 
 class PrivateWebCreateMediaStager:

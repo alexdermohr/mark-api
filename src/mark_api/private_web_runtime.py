@@ -53,8 +53,9 @@ from .private_web_cdp_media import CdpPrivateWebMediaPage
 from .private_web_media import (
     PrivateWebCreateMediaPublishPage,
     PrivateWebCreateMediaWriter,
-    PrivateWebMediaRefRegistry,
+    PrivateWebMediaRefResolver,
     PrivateWebMediaSource,
+    _prepare_local_media,
 )
 from .storage import SnapshotStore
 
@@ -503,7 +504,7 @@ class PrivateWebMediaCreateService:
         self,
         *,
         runtime: PrivateWebMediaCreateRuntime,
-        registry: PrivateWebMediaRefRegistry,
+        resolver: PrivateWebMediaRefResolver,
         reader: AdsReader,
         confirmation_reader: AdsReader,
         content_reader_factory: Callable[[str], AdsReader],
@@ -513,12 +514,12 @@ class PrivateWebMediaCreateService:
     ) -> None:
         if not isinstance(runtime, PrivateWebMediaCreateRuntime):
             raise TypeError("runtime must be PrivateWebMediaCreateRuntime")
-        if not isinstance(registry, PrivateWebMediaRefRegistry):
-            raise TypeError("registry must be PrivateWebMediaRefRegistry")
+        if not isinstance(resolver, PrivateWebMediaRefResolver):
+            raise TypeError("resolver must be PrivateWebMediaRefResolver")
         if not isinstance(writes_enabled, bool):
             raise TypeError("writes_enabled must be bool")
         self._runtime = runtime
-        self._registry = registry
+        self._resolver = resolver
         self._reader = reader
         self._confirmation_reader = confirmation_reader
         self._content_reader_factory = content_reader_factory
@@ -581,29 +582,49 @@ class PrivateWebMediaCreateService:
                 )
 
             started_at = self._clock()
+            prepared = None
             try:
-                # Registry sources are immutable private copies. Hold their
-                # lease across both pre-reads, the one-shot runtime writer, and
-                # all confirmation reads for this exact logical attempt.
-                with self._registry.acquire(media_refs) as sources:
-                    writer = self._runtime.bind_create_writer(request, sources)
-                    return self._writes.create(
-                        request=request,
-                        reader=self._reader,
-                        confirmation_reader=self._confirmation_reader,
-                        writer=writer,
-                        content_reader_factory=self._content_reader_factory,
-                        authorization_by=authorization_by,
-                        authorization_reference=authorization_reference,
-                    )
-            except PrivateWebWriteNotAttemptedError:
-                # Unknown/invalid/closed refs are a local precondition failure.
-                # No owner/browser read or platform write was attempted.
+                resolved = self._resolver.resolve(media_refs)
+                prepared = _prepare_local_media(resolved)
+                stable_sources = tuple(
+                    PrivateWebMediaSource(path=path)
+                    for path in prepared.paths
+                )
+            except (PrivateWebWriteNotAttemptedError, TypeError, ValueError):
+                if prepared is not None:
+                    try:
+                        prepared.close()
+                    except Exception:
+                        pass
+                # Resolution and stabilization happened entirely locally,
+                # before owner/browser reads or any platform write.
                 return self._media_ref_precondition(
                     started_at=started_at,
                     authorization_by=authorization_by,
                     authorization_reference=authorization_reference,
                 )
+
+            try:
+                writer = self._runtime.bind_create_writer(
+                    request,
+                    stable_sources,
+                )
+                return self._writes.create(
+                    request=request,
+                    reader=self._reader,
+                    confirmation_reader=self._confirmation_reader,
+                    writer=writer,
+                    content_reader_factory=self._content_reader_factory,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+            finally:
+                try:
+                    prepared.close()
+                except Exception:
+                    # Cleanup is local-only and must not replace the classified
+                    # create outcome or manufacture platform retry authority.
+                    pass
 
 
 class PrivateWebInventoryRuntime:

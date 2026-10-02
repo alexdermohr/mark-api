@@ -24,7 +24,7 @@ from mark_api.private_web_media import (
     PrivateWebCreateMediaStager,
     PrivateWebCreateMediaWriter,
     PrivateWebMediaFileSnapshot,
-    PrivateWebMediaRefRegistry,
+    PrivateWebMediaRefResolver,
     PrivateWebMediaSource,
     PrivateWebMediaUnknownError,
     _prepare_local_media,
@@ -125,74 +125,35 @@ class PrivateWebMediaContractTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_media_ref_registry_stabilizes_sources_and_preserves_order(
+    def test_media_ref_resolver_copies_binding_map_and_preserves_order(
         self,
     ) -> None:
         detail = self.root / "detail.jpg"
         detail.write_bytes(b"detail-image")
-        registry = PrivateWebMediaRefRegistry(
-            {
-                "cover_01": self.source,
-                "detail_02": PrivateWebMediaSource(path=str(detail)),
-            }
+        detail_source = PrivateWebMediaSource(path=str(detail))
+        bindings = {"cover_01": self.source, "detail_02": detail_source}
+        resolver = PrivateWebMediaRefResolver(bindings)
+
+        bindings["cover_01"] = detail_source
+
+        self.assertEqual(
+            resolver.resolve(("detail_02", "cover_01")),
+            (detail_source, self.source),
         )
+        self.assertNotIn(str(self.root), repr(resolver))
 
-        self.image.write_bytes(b"changed-after-registration")
-        detail.unlink()
-
-        with registry.acquire(("detail_02", "cover_01")) as sources:
-            stable_paths = tuple(Path(source.path) for source in sources)
-            self.assertEqual(
-                tuple(path.read_bytes() for path in stable_paths),
-                (b"detail-image", b"local-test-image"),
-            )
-            self.assertNotIn(str(self.root), repr(registry))
-
-        registry.close()
-        self.assertTrue(all(not path.exists() for path in stable_paths))
-
-    def test_media_ref_registry_holds_sources_for_active_lease(self) -> None:
-        registry = PrivateWebMediaRefRegistry({"cover_01": self.source})
-
-        with registry.acquire(("cover_01",)) as sources:
-            stable_path = Path(sources[0].path)
-            self.assertTrue(stable_path.exists())
-            with self.assertRaisesRegex(RuntimeError, "active leases"):
-                registry.close()
-            self.assertTrue(stable_path.exists())
-
-        registry.close()
-        self.assertFalse(stable_path.exists())
-
-    def test_media_ref_registry_rejects_unknown_or_invalid_refs(self) -> None:
-        registry = PrivateWebMediaRefRegistry({"cover_01": self.source})
-
-        for refs in (
-            ("missing",),
-            ("../photo",),
-            ("cover_01", "cover_01"),
-            (),
-        ):
-            with self.subTest(refs=refs):
-                with self.assertRaises(PrivateWebWriteNotAttemptedError):
-                    with registry.acquire(refs):
-                        self.fail("invalid media refs must not resolve")
-
-        registry.close()
-
-    def test_media_ref_registry_stabilizes_before_original_disappears(
+    def test_media_ref_resolver_rejects_invalid_or_unknown_handles(
         self,
     ) -> None:
-        registry = PrivateWebMediaRefRegistry({"cover_01": self.source})
-        self.image.unlink()
+        resolver = PrivateWebMediaRefResolver({"cover_01": self.source})
 
-        with registry.acquire(("cover_01",)) as sources:
-            self.assertEqual(
-                Path(sources[0].path).read_bytes(),
-                b"local-test-image",
-            )
+        for refs in (("missing",), ("../photo",), ("cover_01", "cover_01"), ()):
+            with self.subTest(refs=refs):
+                with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                    resolver.resolve(refs)
 
-        registry.close()
+        with self.assertRaises(ValueError):
+            PrivateWebMediaRefResolver({"../photo": self.source})
 
     def test_invalid_local_input_never_accesses_browser_page(self) -> None:
         page = FakeMediaPage()

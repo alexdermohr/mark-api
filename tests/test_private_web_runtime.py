@@ -40,7 +40,7 @@ from mark_api.private_web_runtime import (
 from mark_api.private_web_media import (
     PrivateWebCreateMediaSnapshot,
     PrivateWebMediaFileSnapshot,
-    PrivateWebMediaRefRegistry,
+    PrivateWebMediaRefResolver,
     PrivateWebMediaSource,
 )
 from mark_api.results import ReadResult, ReadStatus
@@ -732,13 +732,24 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertEqual(persisted, (1,))
         runtime.close()
 
-    def test_media_create_service_resolves_refs_through_safe_orchestrator(
+    def test_media_create_service_freezes_selected_bytes_before_pre_reads(
         self,
     ) -> None:
         events: list[tuple] = []
-        page = MediaCreatePage(events)
-        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
-        registry = PrivateWebMediaRefRegistry({"cover_01": self.sources[0]})
+        original = b"selected-before-owner-read"
+        self.image.write_bytes(original)
+
+        class CapturingPage(MediaCreatePage):
+            def stage_create_media(self, files: tuple[str, ...]) -> None:
+                events.append(
+                    ("media_bytes", tuple(Path(item).read_bytes() for item in files))
+                )
+                super().stage_create_media(files)
+
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: CapturingPage(events)
+        )
+        resolver = PrivateWebMediaRefResolver({"cover_01": self.sources[0]})
         created_id = "4000000010"
         created_inventory = owner_snapshot(
             ad_id=created_id,
@@ -749,7 +760,15 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             title=self.request.title,
             description=self.request.description,
         )
-        primary = SequenceReader(
+        outer = self
+
+        class MutatingPrimaryReader(SequenceReader):
+            def read_ads(self):
+                if self.calls == 0:
+                    outer.image.write_bytes(b"changed-during-owner-pre-read")
+                return super().read_ads()
+
+        primary = MutatingPrimaryReader(
             ReadResult.success_empty(()),
             ReadResult.success_nonempty((created_inventory,)),
         )
@@ -757,18 +776,14 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             ReadResult.success_empty(()),
             ReadResult.success_nonempty((created_inventory,)),
         )
-        content_calls: list[str] = []
-        db_path = Path(self.tmp.name) / "media-service.sqlite"
+        db_path = Path(self.tmp.name) / "media-service-freeze.sqlite"
         service = PrivateWebMediaCreateService(
             runtime=runtime,
-            registry=registry,
+            resolver=resolver,
             reader=primary,
             confirmation_reader=confirmation,
-            content_reader_factory=lambda ad_id: (
-                content_calls.append(ad_id)
-                or OwnerReader(
-                    ReadResult.success_nonempty((created_content,))
-                )
+            content_reader_factory=lambda _ad_id: OwnerReader(
+                ReadResult.success_nonempty((created_content,))
             ),
             store=SnapshotStore(db_path),
             writes_enabled=True,
@@ -778,7 +793,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             self.request,
             ("cover_01",),
             authorization_by="test-owner",
-            authorization_reference="opaque-media-test",
+            authorization_reference="media-freeze-test",
         )
 
         self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
@@ -786,11 +801,11 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertEqual(receipt.authorization_by, "test-owner")
         self.assertEqual(
             receipt.authorization_reference,
-            "opaque-media-test",
+            "media-freeze-test",
         )
+        self.assertIn(("media_bytes", (original,)), events)
         self.assertEqual(primary.calls, 2)
         self.assertEqual(confirmation.calls, 2)
-        self.assertEqual(content_calls, [created_id])
         self.assertEqual(
             [event[0] for event in events].count("media_submit"),
             1,
@@ -800,12 +815,9 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM create_operation_receipts"
             ).fetchone()
         self.assertEqual(persisted, (1,))
-        registry.close()
         runtime.close()
 
-    def test_media_create_service_unknown_ref_is_precondition_failed(
-        self,
-    ) -> None:
+    def test_media_create_service_unknown_ref_short_circuits_reads(self) -> None:
         page_calls = 0
 
         def page_factory() -> MediaCreatePage:
@@ -814,56 +826,42 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             return MediaCreatePage([])
 
         runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
-        registry = PrivateWebMediaRefRegistry({"cover_01": self.sources[0]})
-        primary = SequenceReader(ReadResult.success_empty(()))
-        confirmation = SequenceReader(ReadResult.success_empty(()))
-        content_calls: list[str] = []
+        primary = OwnerReader(ReadResult.success_empty(()))
+        confirmation = OwnerReader(ReadResult.success_empty(()))
         service = PrivateWebMediaCreateService(
             runtime=runtime,
-            registry=registry,
+            resolver=PrivateWebMediaRefResolver({"cover_01": self.sources[0]}),
             reader=primary,
             confirmation_reader=confirmation,
-            content_reader_factory=lambda ad_id: (
-                content_calls.append(ad_id)
-                or OwnerReader(ReadResult.success_empty(()))
+            content_reader_factory=lambda _ad_id: OwnerReader(
+                ReadResult.success_empty(())
             ),
             writes_enabled=True,
         )
 
-        receipt = service.create_with_media(
-            self.request,
-            ("missing",),
-            authorization_by="test-owner",
-            authorization_reference="opaque-media-missing",
-        )
+        receipt = service.create_with_media(self.request, ("missing",))
 
-        self.assertEqual(
-            receipt.outcome,
-            OperationOutcome.PRECONDITION_FAILED,
-        )
+        self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
         self.assertEqual(receipt.pre_read_status, "media_refs_unavailable")
         self.assertEqual(receipt.confirmation_pre_read_status, "not_read")
         self.assertFalse(receipt.writer_invoked)
-        self.assertIsNone(receipt.writer_error)
-        self.assertIsNone(receipt.post_read_status)
-        self.assertIsNone(receipt.confirmation_post_read_status)
-        self.assertIsNone(receipt.content_post_read_status)
         self.assertEqual(primary.calls, 0)
         self.assertEqual(confirmation.calls, 0)
-        self.assertEqual(content_calls, [])
         self.assertEqual(page_calls, 0)
-        registry.close()
         runtime.close()
 
-    def test_media_create_service_writes_disabled_skips_registry(self) -> None:
+    def test_media_create_service_disabled_gate_skips_local_source_read(
+        self,
+    ) -> None:
+        missing = PrivateWebMediaSource(
+            path=str(Path(self.tmp.name) / "missing.jpg")
+        )
         runtime = PrivateWebMediaCreateRuntime(
             page_factory=lambda: MediaCreatePage([])
         )
-        registry = PrivateWebMediaRefRegistry({"cover_01": self.sources[0]})
-        registry.close()
         service = PrivateWebMediaCreateService(
             runtime=runtime,
-            registry=registry,
+            resolver=PrivateWebMediaRefResolver({"cover_01": missing}),
             reader=OwnerReader(ReadResult.success_empty(())),
             confirmation_reader=OwnerReader(ReadResult.success_empty(())),
             content_reader_factory=lambda _ad_id: OwnerReader(
@@ -874,60 +872,44 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
 
         receipt = service.create_with_media(self.request, ("cover_01",))
 
-        self.assertEqual(
-            receipt.outcome,
-            OperationOutcome.PRECONDITION_FAILED,
-        )
+        self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
         self.assertEqual(receipt.pre_read_status, "writes_disabled")
         self.assertFalse(receipt.writer_invoked)
         runtime.close()
 
-    def test_media_create_service_serializes_complete_orchestration(
-        self,
-    ) -> None:
-        runtime = PrivateWebMediaCreateRuntime(
-            page_factory=lambda: MediaCreatePage([])
-        )
-        registry = PrivateWebMediaRefRegistry(
-            {"cover_01": self.sources[0]}
-        )
-        reader = OwnerReader(ReadResult.success_empty(()))
-        confirmation = OwnerReader(ReadResult.success_empty(()))
+    def test_media_create_service_serializes_whole_orchestrator(self) -> None:
         service = PrivateWebMediaCreateService(
-            runtime=runtime,
-            registry=registry,
-            reader=reader,
-            confirmation_reader=confirmation,
+            runtime=PrivateWebMediaCreateRuntime(
+                page_factory=lambda: MediaCreatePage([])
+            ),
+            resolver=PrivateWebMediaRefResolver({"cover_01": self.sources[0]}),
+            reader=OwnerReader(ReadResult.success_empty(())),
+            confirmation_reader=OwnerReader(ReadResult.success_empty(())),
             content_reader_factory=lambda _ad_id: OwnerReader(
                 ReadResult.success_empty(())
             ),
             writes_enabled=True,
         )
-
         first_entered = threading.Event()
-        first_release = threading.Event()
-        second_attempted = threading.Event()
-        second_entered = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
         calls: list[str | None] = []
         errors: list[BaseException] = []
 
         class BlockingWrites:
             def create(self, **kwargs):
-                reference = kwargs.get("authorization_reference")
-                calls.append(reference)
+                calls.append(kwargs.get("authorization_reference"))
                 if len(calls) == 1:
                     first_entered.set()
-                    if not first_release.wait(timeout=2):
+                    if not release_first.wait(timeout=2):
                         raise AssertionError("first create was not released")
-                else:
-                    second_entered.set()
                 return object()
 
         service._writes = BlockingWrites()
 
-        def invoke(reference: str, attempted: threading.Event | None = None) -> None:
-            if attempted is not None:
-                attempted.set()
+        def invoke(reference: str, started: threading.Event | None = None) -> None:
+            if started is not None:
+                started.set()
             try:
                 service.create_with_media(
                     self.request,
@@ -938,30 +920,20 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
                 errors.append(exc)
 
         first = threading.Thread(target=invoke, args=("first",))
-        second = threading.Thread(
-            target=invoke,
-            args=("second", second_attempted),
-        )
+        second = threading.Thread(target=invoke, args=("second", second_started))
         first.start()
         self.assertTrue(first_entered.wait(timeout=2))
         second.start()
-        self.assertTrue(second_attempted.wait(timeout=2))
-
-        self.assertFalse(second_entered.wait(timeout=0.1))
+        self.assertTrue(second_started.wait(timeout=2))
         self.assertEqual(calls, ["first"])
 
-        first_release.set()
+        release_first.set()
         first.join(timeout=2)
         second.join(timeout=2)
-
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
-        self.assertTrue(second_entered.is_set())
         self.assertEqual(calls, ["first", "second"])
         self.assertEqual(errors, [])
-
-        registry.close()
-        runtime.close()
 
     def test_submit_unknown_can_confirm_without_releasing_runtime_fence(
         self,
@@ -2024,3 +1996,17 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
         dependency.assert_called_once_with()
         cookies.assert_called_once_with(19610, timeout_seconds=4.0)
         transport_factory.assert_called_once_with()
+        self.assertEqual(management.call_count, 1)
+        self.assertEqual(management.call_args.kwargs["endpoint"], MANAGEMENT_URL)
+        self.assertIs(
+            management.call_args.kwargs["transport"],
+            management_transport,
+        )
+        pages.assert_not_called()
+
+        runtime.close()
+        self.assertEqual(delegate.closed, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

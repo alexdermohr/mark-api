@@ -189,20 +189,19 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - ein späterer Resolver muss Refs an vorher explizit zugelassene und stabilisierte Media-Artefakte binden; beliebiges Server-Filesystem-Lesen bleibt außerhalb des HTTP-Contracts,
 - dieser Slice führt keinen realen Kleinanzeigen-Plattformwrite aus.
 
-## D-015 — Opaque Media-Refs werden statisch stabilisiert und an die bestehende Media-Runtime gebunden
+## D-015 — Opaque Media-Refs werden pro Create-Versuch stabilisiert und an die bestehende Media-Runtime gebunden
 
 **Fortschreibung:** Diese Entscheidung ersetzt ausschließlich die D-014-Aussage, dass noch kein Resolver und keine konkrete PrivateWeb-Media-Service-Komposition existieren. Die D-013/D-014-Grenze bleibt unverändert: `CreateOperationReceipt.CONFIRMED` bestätigt weiterhin keine serverseitige Medienpersistenz.
 
-**Entscheidung:** `PrivateWebMediaRefRegistry` bildet einen kleinen, statischen internen Resolver für bereits explizit zugelassene `media_refs`. Beim Aufbau kopiert die Registry jede gebundene `PrivateWebMediaSource` nach der bestehenden Deskriptor-/TOCTOU-Prüfung in registry-eigenen privaten Speicher. Danach besitzt sie keine Mutations-API für Ref-Bindings. `PrivateWebMediaCreateService` erwirbt die aufgelösten stabilen Quellen vor jedem Owner-Pre-Read und hält ihren Lease über den gesamten serialisierten `SafeWriteOrchestrator.create()`-Versuch einschließlich one-shot Runtime-Writer und Post-Reads. Der Writer selbst bleibt ausschließlich `PrivateWebMediaCreateRuntime.bind_create_writer()`.
+**Entscheidung:** `PrivateWebMediaRefResolver` ist eine kleine immutable Kopie explizit zugelassener `media_ref -> PrivateWebMediaSource`-Bindings ohne CRUD- oder Dateipfadauflösung aus HTTP-Input. `PrivateWebMediaCreateService` löst die angeforderten Refs genau einmal innerhalb seines serialisierten Create-Versuchs auf und kopiert die ausgewählten Quellen mit der bestehenden Deskriptor-/TOCTOU-Prüfung in private, service-eigene Dateien **vor dem ersten Owner-Pre-Read**. Diese Kopien bleiben bis zum Abschluss aller Post-Reads am Leben; der Browserwriter bleibt ausschließlich `PrivateWebMediaCreateRuntime.bind_create_writer()`.
 
-**Begründung:** Eine bloße späte Übersetzung `ref -> Pfad` würde die opake HTTP-Grenze zwar formal einhalten, aber die Byte-Identität zwischen Autorisierung und Browsermutation nicht ausreichend festhalten. Die eager private Kopie bindet die Ref-Semantik stattdessen an konkrete validierte Bytes; spätere Änderungen oder das Verschwinden des Originalpfads verändern den registrierten Inhalt nicht. Gleichzeitig bleibt die Registry absichtlich klein: kein Upload-Store, kein dynamisches CRUD und keine allgemeine Dateisystem-Leseautorität aus HTTP-Inputs.
+**Begründung:** Eine späte Übersetzung `ref -> Pfad` würde erlauben, dass sich die Bytes während der Pre-Read-Phase ändern. Die per-Attempt-Stabilisierung bindet den autorisierten/idempotenten Versuch stattdessen vor jeder Browsermutation an konkrete validierte Bytes, ohne eine langlebige allgemeine Registry einzuführen.
 
 **Folgen:**
-- Registry-Keys verwenden dieselbe ASCII-Grammatik wie die Write API; unbekannte, ungültige, leere oder doppelte Ref-Tupel werden bereits vor Owner-/Browser-Reads lokal als `PrivateWebWriteNotAttemptedError` klassifiziert und vom Media-Service in einen `PRECONDITION_FAILED`-Receipt ohne Writer-Aufruf überführt,
-- `acquire()` erhält die Ref-Reihenfolge, hält die stabilen Dateien vom ersten Owner-Pre-Read bis zum Abschluss aller Post-Reads am Leben und verhindert ein Schließen der Registry bei aktiven Leases,
-- `PrivateWebMediaCreateService` serialisiert den **vollständigen** Create-Orchestrator-Versuch über konkurrierende HTTP-Threads; dadurch kann der Pre/Post-Read-Zyklus eines Requests nicht den Media-Create-Write eines zweiten Requests überlappen,
-- die bestehende `PrivateWebMediaCreateRuntime` behält ihre one-shot-, UNKNOWN- und Reconciliation-Fences unverändert; der neue Service erzeugt keine zusätzliche Retry-Autorität,
-- `write_api.py` bleibt path-frei und kennt weiterhin weder `PrivateWebMediaSource` noch lokale Dateipfade; der Media-Service muss explizit beim Serveraufbau bereitgestellt werden,
-- die persistente HTTP-Idempotenz bleibt vorgelagert: ein identischer abgeschlossener Request replayt nur die gespeicherte Antwort, ein zurückgebliebener `in_progress`-Claim autorisiert keinen neuen Plattformversuch,
-- eine media-aware autoritative Post-Read-Semantik fehlt weiterhin; daher bleibt `media_persistence_confirmed=false`,
+- dieselbe ASCII-Grammatik wie in der Write API; unbekannte, ungültige, leere oder doppelte Ref-Tupel werden vor Owner-/Browser-Reads als lokales `PRECONDITION_FAILED` ohne Writer-Aufruf klassifiziert,
+- Ref-Reihenfolge bleibt erhalten; Änderungen an Originaldateien nach Service-Eintritt können die für diesen Versuch gewählten Bytes nicht mehr verändern,
+- `PrivateWebMediaCreateService` serialisiert den vollständigen Pre-/Write-/Post-Read-Zyklus über konkurrierende HTTP-Threads,
+- die bestehende Runtime behält ihre one-shot-, UNKNOWN- und Reconciliation-Fences; der Service erzeugt keine zusätzliche Retry-Autorität,
+- `write_api.py` bleibt path-frei; persistente HTTP-Idempotenz bleibt vorgelagert und ein abgeschlossener Replay ruft den Media-Service nicht erneut auf,
+- ohne media-aware autoritativen Post-Read bleibt `media_persistence_confirmed=false`,
 - dieser Slice führt keinen realen Kleinanzeigen-Plattformwrite aus.
