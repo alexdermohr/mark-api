@@ -287,12 +287,17 @@ def _copy_validated_descriptor(
 
 def _prepare_local_media(
     sources: tuple[PrivateWebMediaSource, ...],
+    *,
+    delete_on_gc: bool = True,
 ) -> _PreparedPrivateWebMedia:
+    if not isinstance(delete_on_gc, bool):
+        raise TypeError("delete_on_gc must be a bool")
     names = _validated_source_names(sources)
     try:
         directory = tempfile.TemporaryDirectory(
             prefix="mark-private-web-media-",
             ignore_cleanup_errors=True,
+            delete=delete_on_gc,
         )
         os.chmod(directory.name, 0o700)
     except OSError:
