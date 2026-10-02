@@ -157,7 +157,9 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - `AMBIGUOUS` und Ausführungsfehler erteilen weiterhin keine Retry-Autorisierung,
 - Media-Daten sind im Create-HTTP-Vertrag nicht zulässig; ein späterer Media-Publish braucht weiterhin einen eigenen Contract, eigene Freigabe und Reconciliation.
 
-## D-013 — Media-Publish bleibt ein separater, noch nicht domain-bestätigter PrivateWeb-Contract
+## D-013 — Media-Publish bleibt ein separater, noch nicht domain-bestätigter PrivateWeb-Contract (historischer Zwischenstand)
+
+**Fortschreibung:** D-014 ersetzt ausschließlich die damalige Aussage, dass die lokale Write API mediafrei bleibt. Die hier festgehaltene Einschränkung bleibt bestehen: Der vorhandene `CreateOperationReceipt` bestätigt keine serverseitige Medienpersistenz.
 
 **Entscheidung:** Für einen Create mit expliziten lokalen Medien wird ein eigener `PrivateWebCreateMediaWriter` oberhalb des bereits gehärteten Media-Stagings eingeführt. Der normale `PrivateWebCreateWriter`, `AdCreateRequest`, `MarkService` und die lokale Mark Write API bleiben mediafrei. Der neue Pfad darf nach exakter Form- und `FileList`-Revalidierung genau einen browser-level Publish-Versuch auf demselben gebundenen File-Input-Handle auslösen.
 
@@ -171,3 +173,18 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - der neue Contract wird noch nicht an `MarkService`, `SafeWriteOrchestrator` oder `/api/write` angeschlossen; insbesondere gibt es kein `CONFIRMED`-Media-Receipt,
 - ein späterer höherer Media-Write-Contract benötigt zuerst einen autoritativen media-aware Post-Read beziehungsweise eine andere belastbare Medien-Reconciliation,
 - dieser Implementierungs-Slice führt keinen realen Kleinanzeigen-Publish oder sonstigen Plattformwrite aus.
+
+## D-014 — Media-Create erhält eine eigene opake Write-API-Surface ohne Dateipfadautorität
+
+**Entscheidung:** Die lokale loopback-only Mark Write API exponiert zusätzlich `POST /api/write/media/ads` als getrennten Media-Create-Vertrag. Dieser Pfad benötigt die eigene Capability `CREATE_MEDIA`; die bestehende `CREATE`-Capability autorisiert ihn nicht. Der HTTP-Payload verwendet die normalen `AdCreateRequest`-Felder plus eine nicht leere, reihenfolgeerhaltende Liste eindeutiger opaker `media_refs` mit der ASCII-Grammatik `[A-Za-z0-9][A-Za-z0-9_-]{0,127}`.
+
+**Begründung:** Die HTTP-Schicht soll weder absolute oder relative Dateipfade noch Bytes annehmen und damit keine allgemeine lokale Datei-Leseautorität erhalten. Die Referenzauflösung bleibt deshalb hinter einem separaten Media-Service-Port. `write_api.py` kennt weder `PrivateWebMediaSource` noch eine Dateisystemauflösung. Wenn `CREATE_MEDIA` konfiguriert ist, aber kein Media-Service bereitsteht, schlägt der Serveraufbau fail-closed fehl.
+
+**Folgen:**
+- der normale `POST /api/write/ads`-Create bleibt unverändert mediafrei,
+- die normalisierten `media_refs` sind Bestandteil des persistenten Idempotency-Fingerprints; derselbe Key mit anderen Refs ergibt einen Konflikt statt einer erneuten Ausführung,
+- die Write API gibt `media_refs` nicht zurück und setzt weiterhin `platform_retry_authorized=false`,
+- `CreateOperationReceipt.CONFIRMED` bestätigt auch auf dem Media-Pfad nur die bestehende Anzeigen-/Content-Semantik und **nicht** die Medienpersistenz; deshalb liefert der Media-Pfad für `CONFIRMED` wie für `AMBIGUOUS` HTTP 202 und zusätzlich `media_persistence_confirmed=false`, während `PRECONDITION_FAILED` HTTP 409 bleibt,
+- dieser Slice stellt noch keinen Resolver von `media_refs` zu lokalen `PrivateWebMediaSource`-Objekten und keine konkrete PrivateWeb-Media-Service-Komposition bereit,
+- ein späterer Resolver muss Refs an vorher explizit zugelassene und stabilisierte Media-Artefakte binden; beliebiges Server-Filesystem-Lesen bleibt außerhalb des HTTP-Contracts,
+- dieser Slice führt keinen realen Kleinanzeigen-Plattformwrite aus.

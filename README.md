@@ -117,21 +117,22 @@ python -m pip install -e '.[private-web]'
 
 ## Lokale Mark Write API
 
-Slice D führt eine **separate** loopback-only Write-Surface ein; das bestehende Dashboard bleibt vollständig read-only. Der Contract exponiert ausschließlich bereits gehärtete `MarkService`-Operationen:
+Slice D führt eine **separate** loopback-only Write-Surface ein; das bestehende Dashboard bleibt vollständig read-only. Der normale Create-Vertrag bleibt mediafrei, zusätzlich ist ein getrennt gegateter Media-Create-Vertrag exponiert:
 
-- `POST /api/write/ads` für den engen Create-Vertrag aus `category_path`, `title`, `description` und `price_eur`,
+- `POST /api/write/ads` für den engen mediafreien Create-Vertrag aus `category_path`, `title`, `description` und `price_eur`,
+- `POST /api/write/media/ads` für dieselben Create-Felder plus `media_refs`,
 - `PATCH /api/write/ads/{id}` für Titel/Beschreibung,
 - `POST /api/write/ads/{id}/pause`,
 - `POST /api/write/ads/{id}/activate`,
 - `DELETE /api/write/ads/{id}` mit zusätzlicher expliziter `confirm_ad_id`-Bestätigung.
 
-Create unterstützt in dieser Surface ausdrücklich **keine Medien**. Media-Publish und Reply bleiben separate, nicht exponierte Gates.
+Der Media-Create-Pfad benötigt die eigene Capability `CREATE_MEDIA`; `CREATE` allein autorisiert ihn nicht. `media_refs` sind ausschließlich opake, eindeutige ASCII-Handles der Form `[A-Za-z0-9][A-Za-z0-9_-]{0,127}`. Die HTTP-Schicht akzeptiert dafür weder Dateipfade noch Bytes und löst die Handles nicht in lokale Dateien auf. Wird `CREATE_MEDIA` aktiviert, ohne einen separaten Media-Service bereitzustellen, schlägt der Serveraufbau fail-closed fehl. Reply bleibt ein separates, nicht exponiertes Gate.
 
 Die Write-Surface bindet ausschließlich an `127.0.0.1` und verlangt vor jedem Service-Aufruf einen Bearer-Token, eine passende Capability und `writes_enabled=true`. Der Core behält seinen eigenen unabhängigen `writes_enabled`-Gate, sodass die HTTP-Surface allein keine Plattformwrites freischaltet. Tokens werden nur zur Laufzeit injiziert und weder persistiert noch in `repr` ausgegeben.
 
-Jede mutierende Anfrage benötigt einen `Idempotency-Key`. Vor dem Aufruf von `MarkService` wird ein Request-Fingerprint atomar in derselben SQLite-Datenbank als `in_progress` gespeichert. Ein identischer bereits abgeschlossener Request replayt ausschließlich die gespeicherte HTTP-Response; ein abweichender Request mit demselben Key wird abgewiesen. Bleibt nach einem Prozessabbruch ein `in_progress`-Eintrag zurück, wird **kein** erneuter Plattformversuch autorisiert. Damit überlebt die No-Blind-Retry-Regel auch einen HTTP-Prozessneustart.
+Jede mutierende Anfrage benötigt einen `Idempotency-Key`. Vor dem Service-Aufruf wird ein Request-Fingerprint atomar in derselben SQLite-Datenbank als `in_progress` gespeichert; beim Media-Create gehören die normalisierten `media_refs` zum Fingerprint. Ein identischer bereits abgeschlossener Request replayt ausschließlich die gespeicherte HTTP-Response; ein abweichender Request mit demselben Key wird abgewiesen. Bleibt nach einem Prozessabbruch ein `in_progress`-Eintrag zurück, wird **kein** erneuter Plattformversuch autorisiert. Damit überlebt die No-Blind-Retry-Regel auch einen HTTP-Prozessneustart.
 
-Die HTTP-Antwort exponiert den sanitisierten `OperationReceipt` beziehungsweise `CreateOperationReceipt` und setzt `platform_retry_authorized=false`. `CONFIRMED` wird als 200, `PRECONDITION_FAILED` als 409 und `AMBIGUOUS` als 202 zurückgegeben. Create-Receipts tragen denselben authentifizierten Principal und dieselbe Idempotency-Referenz bis in Core und SQLite-Audit. Dieser Slice startet keinen Browser, baut keine PrivateWeb-Runtime und führt keinen Kleinanzeigen-Plattformwrite aus.
+Die HTTP-Antwort exponiert den sanitisierten `OperationReceipt` beziehungsweise `CreateOperationReceipt` und setzt immer `platform_retry_authorized=false`. Für den mediafreien Create sowie die ID-gebundenen Writes bleibt `CONFIRMED` = 200, `PRECONDITION_FAILED` = 409 und `AMBIGUOUS` = 202. Beim Media-Create bestätigt ein `CreateOperationReceipt.CONFIRMED` dagegen nur die bisherige Anzeigen-/Content-Semantik, nicht die Persistenz der Medien: deshalb werden `CONFIRMED` und `AMBIGUOUS` als 202 zurückgegeben, `PRECONDITION_FAILED` als 409, und die Response trägt zusätzlich `media_persistence_confirmed=false`. Die `media_refs` werden nicht zurückgegeben. Dieser Slice liefert selbst noch keinen Resolver von `media_refs` zu `PrivateWebMediaSource`, baut keine konkrete PrivateWeb-Media-Service-Komposition und führt in Implementierung oder Tests keinen realen Kleinanzeigen-Plattformwrite aus.
 
 ## Offene fachliche Punkte
 
