@@ -467,16 +467,30 @@ function() {{
 }})()
 """
 
-    def _wait_for_media_submit_settlement(self, client) -> None:
+    def _discard_media_submit_client(self) -> None:
+        client = self._client_instance
+        self._client_instance = None
+        # The retained object handle belongs to that CDP session. Once the
+        # session failed it is unusable, but the page-owned files must remain.
+        self._media_file_object_id = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _wait_for_media_submit_settlement(self) -> None:
         deadline = self._monotonic() + self._timeout_seconds
         expression = self._media_submit_settlement_expression()
         while True:
             try:
-                settlement = self._runtime_value(client, expression)
+                settlement = self._runtime_value(self._client(), expression)
             except Exception:
-                # Navigation may transiently invalidate the execution context
-                # after a successful click. Keep the one-shot submit fenced and
-                # allow only bounded observation; never retry browser input.
+                # Navigation may transiently invalidate the execution context,
+                # or the cached CDP socket itself may have failed. Drop only
+                # that local client so the next observation reconnects to the
+                # same exactly-one page target. Browser input stays fenced.
+                self._discard_media_submit_client()
                 settlement = None
             if settlement == "confirmed":
                 return
@@ -501,8 +515,7 @@ function() {{
             raise PrivateWebCdpWriteNotAttemptedError(
                 "create_media_submit_reconcile"
             )
-        client = self._client()
-        self._wait_for_media_submit_settlement(client)
+        self._wait_for_media_submit_settlement()
         self._media_submit_unsettled = False
 
     def submit_create_media(
@@ -597,6 +610,10 @@ function() {{
                 y=point[1],
             )
         except Exception:
+            # The input outcome is already UNKNOWN. Discard only the failed
+            # local CDP connection so later reconciliation can reconnect and
+            # observe state; never repeat browser input.
+            self._discard_media_submit_client()
             raise PrivateWebSubmitUnknownError(
                 "create_media_submit"
             ) from None

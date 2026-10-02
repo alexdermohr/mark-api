@@ -144,6 +144,7 @@ class FakeClient:
     def __init__(self, handler) -> None:
         self.handler = handler
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.close_calls = 0
 
     def call(
         self,
@@ -155,7 +156,7 @@ class FakeClient:
         return self.handler(method, actual)
 
     def close(self) -> None:
-        return None
+        self.close_calls += 1
 
 
 class WriterCdpPublishPage(CdpPrivateWebMediaPage):
@@ -931,6 +932,93 @@ class CdpPrivateWebMediaPublishTests(unittest.TestCase):
         with self.assertRaises(PrivateWebCdpWriteNotAttemptedError):
             page.submit_create_media(self.expected_media)
         self.assertEqual(input_calls, 1)
+
+    def test_input_failure_reconcile_uses_fresh_client_without_retry(self) -> None:
+        first_call_function_count = 0
+        first_input_calls = 0
+
+        def first_handler(method, params):
+            nonlocal first_call_function_count, first_input_calls
+            if method == "Runtime.callFunctionOn":
+                first_call_function_count += 1
+                if first_call_function_count == 1:
+                    return {
+                        "result": {
+                            "type": "object",
+                            "value": {
+                                "state": "ready",
+                                "files": [
+                                    {"name": "photo.jpg", "size_bytes": 6}
+                                ],
+                            },
+                        }
+                    }
+                return {
+                    "result": {
+                        "type": "object",
+                        "value": {"state": "ready", "x": 10.0, "y": 20.0},
+                    }
+                }
+            if method == "Input.dispatchMouseEvent":
+                first_input_calls += 1
+                raise PrivateWebCdpError("call")
+            if method == "Runtime.releaseObject":
+                return {}
+            raise AssertionError(method)
+
+        def second_handler(method, params):
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "type": "string",
+                        "value": "confirmed",
+                    }
+                }
+            if method == "Runtime.releaseObject":
+                return {}
+            raise AssertionError(method)
+
+        first_client = FakeClient(first_handler)
+        second_client = FakeClient(second_handler)
+        clients = iter((first_client, second_client))
+        page = CdpPrivateWebMediaPage(
+            "http://127.0.0.1:19610",
+            client_factory=lambda: next(clients),
+        )
+        prepared = page._prepare_media_paths((str(self.image),))
+        page._create_bound = True
+        page._last_create_snapshot = None
+        page._media_selection_attempted = True
+        page._media_expected_create_snapshot = self.expected_create
+        page._media_file_object_id = "file-input-1"
+        page._media_prepared = prepared
+        self.pages.append(page)
+
+        with self.assertRaises(PrivateWebSubmitUnknownError) as caught:
+            page.submit_create_media(self.expected_media)
+
+        self.assertEqual(caught.exception.stage, "create_media_submit")
+        self.assertEqual(first_input_calls, 1)
+        self.assertEqual(first_client.close_calls, 1)
+        self.assertIsNone(page._client_instance)
+        self.assertIsNone(page._media_file_object_id)
+        self.assertTrue(all(Path(path).exists() for path in prepared.paths))
+
+        page.reconcile_create_media_submit()
+
+        self.assertIs(page._client_instance, second_client)
+        self.assertFalse(page._media_submit_unsettled)
+        self.assertEqual(first_input_calls, 1)
+        self.assertNotIn(
+            "Input.dispatchMouseEvent",
+            [method for method, _params in second_client.calls],
+        )
+        self.assertEqual(
+            [method for method, _params in second_client.calls].count(
+                "Runtime.evaluate"
+            ),
+            1,
+        )
 
     def test_unsettled_page_gc_preserves_browser_media(self) -> None:
         call_function_count = 0
