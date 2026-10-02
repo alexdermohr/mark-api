@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -322,6 +324,64 @@ def _prepare_local_media(
     except Exception:
         directory.cleanup()
         raise
+
+
+_MEDIA_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+class PrivateWebMediaRefResolver:
+    """Resolve pre-authorized opaque refs through one immutable binding map.
+
+    Bindings are copied at construction time and have no mutation surface.
+    Resolution itself grants no filesystem authority from ref text; the media
+    service immediately stabilizes the selected sources before its first
+    owner/browser read.
+    """
+
+    def __init__(
+        self,
+        bindings: Mapping[str, PrivateWebMediaSource],
+    ) -> None:
+        if not isinstance(bindings, Mapping):
+            raise TypeError("media ref bindings must be a mapping")
+        copied: dict[str, PrivateWebMediaSource] = {}
+        for ref, source in bindings.items():
+            if (
+                not isinstance(ref, str)
+                or _MEDIA_REF_RE.fullmatch(ref) is None
+            ):
+                raise ValueError("media ref is invalid")
+            if not isinstance(source, PrivateWebMediaSource):
+                raise TypeError(
+                    "media ref bindings must contain PrivateWebMediaSource"
+                )
+            copied[ref] = source
+        self._sources = copied
+
+    def __repr__(self) -> str:
+        return f"PrivateWebMediaRefResolver(refs={len(self._sources)})"
+
+    def resolve(
+        self,
+        media_refs: tuple[str, ...],
+    ) -> tuple[PrivateWebMediaSource, ...]:
+        if (
+            not isinstance(media_refs, tuple)
+            or not media_refs
+            or any(
+                not isinstance(ref, str)
+                or _MEDIA_REF_RE.fullmatch(ref) is None
+                for ref in media_refs
+            )
+            or len(set(media_refs)) != len(media_refs)
+        ):
+            raise PrivateWebWriteNotAttemptedError("resolve_media_refs")
+        try:
+            return tuple(self._sources[ref] for ref in media_refs)
+        except KeyError:
+            raise PrivateWebWriteNotAttemptedError(
+                "resolve_media_refs"
+            ) from None
 
 
 class PrivateWebCreateMediaStager:

@@ -24,6 +24,7 @@ from mark_api.private_web_media import (
     PrivateWebCreateMediaStager,
     PrivateWebCreateMediaWriter,
     PrivateWebMediaFileSnapshot,
+    PrivateWebMediaRefResolver,
     PrivateWebMediaSource,
     PrivateWebMediaUnknownError,
     _prepare_local_media,
@@ -123,6 +124,36 @@ class PrivateWebMediaContractTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_media_ref_resolver_copies_binding_map_and_preserves_order(
+        self,
+    ) -> None:
+        detail = self.root / "detail.jpg"
+        detail.write_bytes(b"detail-image")
+        detail_source = PrivateWebMediaSource(path=str(detail))
+        bindings = {"cover_01": self.source, "detail_02": detail_source}
+        resolver = PrivateWebMediaRefResolver(bindings)
+
+        bindings["cover_01"] = detail_source
+
+        self.assertEqual(
+            resolver.resolve(("detail_02", "cover_01")),
+            (detail_source, self.source),
+        )
+        self.assertNotIn(str(self.root), repr(resolver))
+
+    def test_media_ref_resolver_rejects_invalid_or_unknown_handles(
+        self,
+    ) -> None:
+        resolver = PrivateWebMediaRefResolver({"cover_01": self.source})
+
+        for refs in (("missing",), ("../photo",), ("cover_01", "cover_01"), ()):
+            with self.subTest(refs=refs):
+                with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                    resolver.resolve(refs)
+
+        with self.assertRaises(ValueError):
+            PrivateWebMediaRefResolver({"../photo": self.source})
 
     def test_invalid_local_input_never_accesses_browser_page(self) -> None:
         page = FakeMediaPage()
