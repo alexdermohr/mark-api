@@ -377,6 +377,18 @@ class PrivateWebMediaCreateRuntime:
         with self._operation_lock:
             self._create_ad_locked(request, sources)
 
+    def bind_create_writer(
+        self,
+        request: AdCreateRequest,
+        sources: tuple[PrivateWebMediaSource, ...],
+    ) -> AdCreateWriter:
+        """Bind one explicit create request and media tuple to a one-shot writer."""
+        return _BoundPrivateWebMediaCreateWriter(
+            runtime=self,
+            request=request,
+            sources=sources,
+        )
+
     def _reconcile_media_submit_locked(self) -> None:
         self._ensure_open()
         page = self._pending_page
@@ -425,6 +437,49 @@ class PrivateWebMediaCreateRuntime:
                 # owning the unresolved page for explicit reconciliation.
                 return
             self._close_locked()
+
+
+class _BoundPrivateWebMediaCreateWriter:
+    """Adapt one exact media-create attempt to the existing AdCreateWriter port."""
+
+    def __init__(
+        self,
+        *,
+        runtime: PrivateWebMediaCreateRuntime,
+        request: AdCreateRequest,
+        sources: tuple[PrivateWebMediaSource, ...],
+    ) -> None:
+        if not isinstance(request, AdCreateRequest):
+            raise TypeError("media create writer request must be AdCreateRequest")
+        if not isinstance(sources, tuple):
+            raise TypeError("media sources must be a tuple")
+        if not sources:
+            raise ValueError("media create writer requires at least one source")
+        if any(
+            not isinstance(source, PrivateWebMediaSource)
+            for source in sources
+        ):
+            raise TypeError("media sources must contain PrivateWebMediaSource")
+        self._runtime = runtime
+        self._request = request
+        self._sources = sources
+        self._call_lock = Lock()
+        self._used = False
+
+    def create_ad(self, request: AdCreateRequest) -> None:
+        with self._call_lock:
+            if self._used:
+                raise PrivateWebRuntimeSetupError(
+                    "private Web media create writer is already used"
+                )
+            if not isinstance(request, AdCreateRequest) or request != self._request:
+                raise PrivateWebRuntimeSetupError(
+                    "private Web media create writer request mismatch"
+                )
+            # This adapter represents one explicit logical create attempt.
+            # Never manufacture retry authority from a later runtime outcome.
+            self._used = True
+        self._runtime.create_ad(request, self._sources)
 
 
 class PrivateWebInventoryRuntime:

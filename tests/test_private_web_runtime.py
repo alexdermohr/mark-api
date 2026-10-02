@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -41,6 +42,7 @@ from mark_api.private_web_media import (
     PrivateWebMediaSource,
 )
 from mark_api.results import ReadResult, ReadStatus
+from mark_api.storage import SnapshotStore
 
 
 AD_ID = "3524046688"
@@ -74,6 +76,21 @@ class OwnerReader:
     def read_ads(self):
         self.calls += 1
         return self.result
+
+
+class SequenceReader:
+    def __init__(self, *results) -> None:
+        if not results:
+            raise ValueError("at least one read result is required")
+        self._results = results
+        self.calls = 0
+
+    def read_ads(self):
+        if self.calls >= len(self._results):
+            raise AssertionError("unexpected extra read")
+        result = self._results[self.calls]
+        self.calls += 1
+        return result
 
 
 class SharedPage:
@@ -525,6 +542,262 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
 
         runtime.reconcile_media_submit()
         self.assertFalse(page._unsettled)
+        self.assertTrue(page._closed)
+        runtime.close()
+
+    def test_bind_create_writer_requires_explicit_media_sources(self) -> None:
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: MediaCreatePage([])
+        )
+
+        with self.assertRaises(TypeError):
+            runtime.bind_create_writer(object(), self.sources)
+        with self.assertRaises(TypeError):
+            runtime.bind_create_writer(self.request, list(self.sources))
+        with self.assertRaises(ValueError):
+            runtime.bind_create_writer(self.request, ())
+        with self.assertRaises(TypeError):
+            runtime.bind_create_writer(self.request, (object(),))
+
+        runtime.close()
+
+    def test_bound_create_writer_is_request_bound_and_one_shot(self) -> None:
+        events: list[tuple] = []
+        pages: list[MediaCreatePage] = []
+
+        def page_factory() -> MediaCreatePage:
+            page = MediaCreatePage(events)
+            pages.append(page)
+            return page
+
+        runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
+        writer = runtime.bind_create_writer(self.request, self.sources)
+        mismatched = AdCreateRequest(
+            category_path=self.request.category_path,
+            title="Andere Vase",
+            description=self.request.description,
+            price_eur=self.request.price_eur,
+        )
+
+        with self.assertRaises(PrivateWebRuntimeSetupError) as mismatch:
+            writer.create_ad(mismatched)
+        self.assertIsInstance(mismatch.exception, WriteNotAttemptedError)
+        self.assertEqual(len(pages), 0)
+
+        writer.create_ad(self.request)
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            1,
+        )
+
+        with self.assertRaises(PrivateWebRuntimeSetupError) as duplicate:
+            writer.create_ad(self.request)
+        self.assertIsInstance(duplicate.exception, WriteNotAttemptedError)
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            1,
+        )
+
+        runtime.close()
+
+    def test_bound_writer_reuses_safe_create_confirmation_and_persistence(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+        writer = runtime.bind_create_writer(self.request, self.sources)
+        created_id = "4000000001"
+        created_inventory = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+        )
+        created_content = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+            description=self.request.description,
+        )
+        primary = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((created_inventory,)),
+        )
+        confirmation = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((created_inventory,)),
+        )
+        content_calls: list[str] = []
+
+        def content_reader_factory(ad_id: str) -> OwnerReader:
+            content_calls.append(ad_id)
+            return OwnerReader(
+                ReadResult.success_nonempty((created_content,))
+            )
+
+        db_path = Path(self.tmp.name) / "media-orchestration.sqlite"
+        store = SnapshotStore(db_path)
+        receipt = SafeWriteOrchestrator(
+            store=store,
+            writes_enabled=True,
+        ).create(
+            request=self.request,
+            reader=primary,
+            confirmation_reader=confirmation,
+            writer=writer,
+            content_reader_factory=content_reader_factory,
+            authorization_by="test-owner",
+            authorization_reference="media-create-test",
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(receipt.created_ad_id, created_id)
+        self.assertIsNone(receipt.writer_error)
+        self.assertEqual(primary.calls, 2)
+        self.assertEqual(confirmation.calls, 2)
+        self.assertEqual(content_calls, [created_id])
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            1,
+        )
+        with sqlite3.connect(db_path) as connection:
+            persisted = connection.execute(
+                "SELECT COUNT(*) FROM create_operation_receipts"
+            ).fetchone()
+        self.assertEqual(persisted, (1,))
+        runtime.close()
+
+    def test_submit_unknown_can_confirm_without_releasing_runtime_fence(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events, submit_unknown=True)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+        writer = runtime.bind_create_writer(self.request, self.sources)
+        created_id = "4000000002"
+        created_inventory = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+        )
+        created_content = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+            description=self.request.description,
+        )
+        primary = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((created_inventory,)),
+        )
+        confirmation = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((created_inventory,)),
+        )
+
+        receipt = SafeWriteOrchestrator(writes_enabled=True).create(
+            request=self.request,
+            reader=primary,
+            confirmation_reader=confirmation,
+            writer=writer,
+            content_reader_factory=lambda ad_id: OwnerReader(
+                ReadResult.success_nonempty((created_content,))
+            ),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(receipt.created_ad_id, created_id)
+        self.assertEqual(
+            receipt.writer_error,
+            "PrivateWebSubmitUnknownError",
+        )
+        self.assertTrue(page._unsettled)
+        self.assertFalse(page._closed)
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            1,
+        )
+
+        second_primary = SequenceReader(
+            ReadResult.success_nonempty((created_inventory,))
+        )
+        second_confirmation = SequenceReader(
+            ReadResult.success_nonempty((created_inventory,))
+        )
+        second_writer = runtime.bind_create_writer(
+            self.request,
+            self.sources,
+        )
+        second = SafeWriteOrchestrator(writes_enabled=True).create(
+            request=self.request,
+            reader=second_primary,
+            confirmation_reader=second_confirmation,
+            writer=second_writer,
+            content_reader_factory=lambda ad_id: OwnerReader(
+                ReadResult.success_empty(())
+            ),
+        )
+
+        self.assertEqual(
+            second.outcome,
+            OperationOutcome.PRECONDITION_FAILED,
+        )
+        self.assertEqual(
+            second.writer_error,
+            "PrivateWebRuntimeSetupError",
+        )
+        self.assertEqual(second_primary.calls, 1)
+        self.assertEqual(second_confirmation.calls, 1)
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            1,
+        )
+
+        runtime.reconcile_media_submit()
+        self.assertTrue(page._closed)
+        runtime.close()
+
+    def test_submit_unknown_stays_ambiguous_when_readbacks_do_not_confirm(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events, submit_unknown=True)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+        writer = runtime.bind_create_writer(self.request, self.sources)
+        primary = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_empty(()),
+        )
+        confirmation = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_empty(()),
+        )
+        content_calls: list[str] = []
+
+        receipt = SafeWriteOrchestrator(writes_enabled=True).create(
+            request=self.request,
+            reader=primary,
+            confirmation_reader=confirmation,
+            writer=writer,
+            content_reader_factory=lambda ad_id: (
+                content_calls.append(ad_id)
+                or OwnerReader(ReadResult.success_empty(()))
+            ),
+        )
+
+        self.assertEqual(receipt.outcome, OperationOutcome.AMBIGUOUS)
+        self.assertIsNone(receipt.created_ad_id)
+        self.assertEqual(
+            receipt.writer_error,
+            "PrivateWebSubmitUnknownError",
+        )
+        self.assertEqual(content_calls, [])
+        self.assertTrue(page._unsettled)
+        self.assertFalse(page._closed)
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            1,
+        )
+
+        runtime.reconcile_media_submit()
         self.assertTrue(page._closed)
         runtime.close()
 
