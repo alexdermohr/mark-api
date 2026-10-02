@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -735,6 +736,142 @@ class WriteApiTests(unittest.TestCase):
         self.assertEqual(second_body, first_body)
         self.assertEqual(fresh_standard.calls, [])
         self.assertEqual(fresh_media.calls, [])
+
+    def test_media_and_standard_create_share_server_serialization(self) -> None:
+        standard_entered = threading.Event()
+        release_standard = threading.Event()
+        media_entered = threading.Event()
+        errors: list[BaseException] = []
+        results: dict[str, tuple] = {}
+
+        class BlockingStandardService(FakeWriteService):
+            def create(
+                self,
+                request: AdCreateRequest,
+                *,
+                authorization_by: str | None = None,
+                authorization_reference: str | None = None,
+            ) -> CreateOperationReceipt:
+                standard_entered.set()
+                if not release_standard.wait(timeout=2):
+                    raise AssertionError("standard create was not released")
+                return super().create(
+                    request,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+
+        class ObservedMediaService(FakeMediaWriteService):
+            def create_with_media(
+                self,
+                request: AdCreateRequest,
+                media_refs: tuple[str, ...],
+                *,
+                authorization_by: str | None = None,
+                authorization_reference: str | None = None,
+            ) -> CreateOperationReceipt:
+                media_entered.set()
+                return super().create_with_media(
+                    request,
+                    media_refs,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+
+        standard_service = BlockingStandardService()
+        media_service = ObservedMediaService()
+        standard_payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Standard Vase",
+            "description": "Beschreibung",
+            "price_eur": 12,
+        }
+        media_payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Media Vase",
+            "description": "Beschreibung",
+            "price_eur": 13,
+            "media_refs": ["cover_01"],
+        }
+
+        def invoke(name: str, server, path: str, payload: dict, key: str) -> None:
+            try:
+                results[name] = self.request(
+                    server,
+                    "POST",
+                    path,
+                    payload=payload,
+                    idempotency_key=key,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with self.server(
+            standard_service,
+            media_service=media_service,
+            capabilities=frozenset(
+                {WriteCapability.CREATE, WriteCapability.CREATE_MEDIA}
+            ),
+        ) as server:
+            standard = threading.Thread(
+                target=invoke,
+                args=(
+                    "standard",
+                    server,
+                    "/api/write/ads",
+                    standard_payload,
+                    "cross-route-standard",
+                ),
+            )
+            media = threading.Thread(
+                target=invoke,
+                args=(
+                    "media",
+                    server,
+                    "/api/write/media/ads",
+                    media_payload,
+                    "cross-route-media",
+                ),
+            )
+
+            media_started = False
+            standard.start()
+            try:
+                self.assertTrue(standard_entered.wait(timeout=2))
+                media.start()
+                media_started = True
+
+                deadline = time.monotonic() + 2
+                media_claim = None
+                while time.monotonic() < deadline:
+                    media_claim = self.store.write_api_request(
+                        "cross-route-media"
+                    )
+                    if (
+                        media_claim is not None
+                        and media_claim.state == "in_progress"
+                    ):
+                        break
+                    time.sleep(0.01)
+
+                self.assertIsNotNone(media_claim)
+                assert media_claim is not None
+                self.assertEqual(media_claim.state, "in_progress")
+                self.assertFalse(media_entered.wait(timeout=0.1))
+            finally:
+                release_standard.set()
+                standard.join(timeout=2)
+                if media_started:
+                    media.join(timeout=2)
+
+        self.assertFalse(standard.is_alive())
+        self.assertFalse(media.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(media_entered.is_set())
+        self.assertEqual(results["standard"][0], 200)
+        self.assertEqual(results["media"][0], 202)
+        self.assertEqual(len(standard_service.calls), 1)
+        self.assertEqual(len(media_service.calls), 1)
 
     def test_media_refs_are_opaque_unique_ascii_handles(self) -> None:
         invalid_refs = (

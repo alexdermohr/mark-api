@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Lock
 from typing import Callable, Protocol
 from urllib.parse import unquote, urlsplit
 
@@ -346,6 +347,12 @@ def _handler_factory(
     access: WriteApiAccess,
     clock: Callable[[], datetime],
 ):
+    # Both create routes infer their result from owner-inventory deltas.
+    # Serialize the complete service calls across this threaded server so a
+    # media and media-free create cannot share/contaminate the same delta
+    # window. Other write routes remain independent.
+    create_lock = Lock()
+
     class WriteApiHandler(BaseHTTPRequestHandler):
         server_version = "mark-api-write/0.1"
         sys_version = ""
@@ -695,21 +702,22 @@ def _handler_factory(
                 authorization_reference = f"write-api:{idempotency_key}"
                 if action in {"create", "create_media"}:
                     assert create_request is not None
-                    if action == "create":
-                        create_receipt = service.create(
-                            create_request,
-                            authorization_by=access.principal,
-                            authorization_reference=authorization_reference,
-                        )
-                    else:
-                        assert media_service is not None
-                        assert media_refs is not None
-                        create_receipt = media_service.create_with_media(
-                            create_request,
-                            media_refs,
-                            authorization_by=access.principal,
-                            authorization_reference=authorization_reference,
-                        )
+                    with create_lock:
+                        if action == "create":
+                            create_receipt = service.create(
+                                create_request,
+                                authorization_by=access.principal,
+                                authorization_reference=authorization_reference,
+                            )
+                        else:
+                            assert media_service is not None
+                            assert media_refs is not None
+                            create_receipt = media_service.create_with_media(
+                                create_request,
+                                media_refs,
+                                authorization_by=access.principal,
+                                authorization_reference=authorization_reference,
+                            )
                     if not isinstance(
                         create_receipt,
                         CreateOperationReceipt,

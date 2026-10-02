@@ -200,7 +200,7 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 **Folgen:**
 - dieselbe ASCII-Grammatik wie in der Write API; unbekannte, ungültige, leere oder doppelte Ref-Tupel werden vor Owner-/Browser-Reads als lokales `PRECONDITION_FAILED` ohne Writer-Aufruf klassifiziert,
 - Ref-Reihenfolge bleibt erhalten; Änderungen an Originaldateien nach Service-Eintritt können die für diesen Versuch gewählten Bytes nicht mehr verändern,
-- `PrivateWebMediaCreateService` serialisiert den vollständigen Pre-/Write-/Post-Read-Zyklus über konkurrierende HTTP-Threads,
+- `PrivateWebMediaCreateService` serialisiert seinen vollständigen Pre-/Write-/Post-Read-Zyklus; für Requests derselben `LoopbackWriteApiServer`-Instanz serialisiert zusätzlich ein gemeinsamer Create-Lock mediafreien und media-aware Create nach dem persistenten Idempotency-Claim, während Update, Pause, Activate und Delete unabhängig bleiben,
 - die bestehende Runtime behält ihre one-shot-, UNKNOWN- und Reconciliation-Fences; der Service erzeugt keine zusätzliche Retry-Autorität,
 - `write_api.py` bleibt path-frei; persistente HTTP-Idempotenz bleibt vorgelagert und ein abgeschlossener Replay ruft den Media-Service nicht erneut auf,
 - ohne media-aware autoritativen Post-Read bleibt `media_persistence_confirmed=false`,
