@@ -22,6 +22,7 @@ from mark_api.private_web_cdp_media import CdpPrivateWebMediaPage
 from mark_api.private_web_media import (
     PrivateWebCreateMediaSnapshot,
     PrivateWebCreateMediaStager,
+    PrivateWebCreateMediaWriter,
     PrivateWebMediaFileSnapshot,
     PrivateWebMediaSource,
     PrivateWebMediaUnknownError,
@@ -175,6 +176,59 @@ class PrivateWebMediaContractTests(unittest.TestCase):
             )
 
         self.assertEqual(page.calls, [])
+
+    def test_publish_writer_local_preparation_failures_are_not_attempted(
+        self,
+    ) -> None:
+        missing = PrivateWebMediaSource(
+            path=str(self.root / "missing.jpg")
+        )
+        left = self.root / "left"
+        right = self.root / "right"
+        left.mkdir()
+        right.mkdir()
+        first = left / "same.jpg"
+        second = right / "same.jpg"
+        first.write_bytes(b"a")
+        second.write_bytes(b"b")
+
+        for sources in (
+            (missing,),
+            (PrivateWebMediaSource(path=str(self.root)),),
+            (
+                PrivateWebMediaSource(path=str(first)),
+                PrivateWebMediaSource(path=str(second)),
+            ),
+        ):
+            with self.subTest(sources=sources):
+                # The page deliberately exposes no browser methods. Reaching
+                # it would fail the test instead of being mistaken for a local
+                # source-validation outcome.
+                writer = PrivateWebCreateMediaWriter(object())
+                with self.assertRaises(
+                    PrivateWebWriteNotAttemptedError
+                ) as caught:
+                    writer.create_ad(create_request(), sources)
+                self.assertEqual(
+                    caught.exception.stage,
+                    "prepare_create_media",
+                )
+
+    def test_publish_writer_symlink_preparation_is_not_attempted(self) -> None:
+        link = self.root / "writer-link.jpg"
+        try:
+            link.symlink_to(self.image)
+        except OSError as exc:
+            self.skipTest(type(exc).__name__)
+
+        writer = PrivateWebCreateMediaWriter(object())
+        with self.assertRaises(PrivateWebWriteNotAttemptedError) as caught:
+            writer.create_ad(
+                create_request(),
+                (PrivateWebMediaSource(path=str(link)),),
+            )
+
+        self.assertEqual(caught.exception.stage, "prepare_create_media")
 
     def test_no_unproven_format_or_nonzero_size_limit_is_invented(self) -> None:
         arbitrary = self.root / "arbitrary.bin"
