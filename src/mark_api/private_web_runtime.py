@@ -32,12 +32,19 @@ from .private_web import (
     PrivateWebPage,
     PrivateWebStatePage,
     PrivateWebStateWriter,
+    PrivateWebSubmitUnknownError,
 )
 from .results import ReadResult
 from .private_web_cdp import (
     CdpCookieProvider,
     CdpPrivateWebOwnerReader,
     CdpPrivateWebPage,
+)
+from .private_web_cdp_media import CdpPrivateWebMediaPage
+from .private_web_media import (
+    PrivateWebCreateMediaPublishPage,
+    PrivateWebCreateMediaWriter,
+    PrivateWebMediaSource,
 )
 
 
@@ -89,6 +96,17 @@ class _CloseablePrivateWebPage(
     PrivateWebDeletePage,
     Protocol,
 ):
+    def close(self) -> None:
+        ...
+
+
+class _CloseablePrivateWebMediaPage(
+    PrivateWebCreateMediaPublishPage,
+    Protocol,
+):
+    def reconcile_create_media_submit(self) -> None:
+        ...
+
     def close(self) -> None:
         ...
 
@@ -240,6 +258,116 @@ class _PerCallPrivateWebDeleteWriter:
             except Exception:
                 # Cleanup must not replace a classified writer outcome.
                 pass
+
+
+class PrivateWebMediaCreateRuntime:
+    """Own one safe media-create page at a time for an existing CDP worker.
+
+    A submit that remains UNKNOWN is retained as a live page instead of being
+    dropped by per-call cleanup. While that page is unresolved, no second media
+    create and no runtime close is allowed. Reconciliation observes only the
+    existing submit state and never repeats browser input.
+    """
+
+    def __init__(
+        self,
+        *,
+        page_factory: Callable[[], _CloseablePrivateWebMediaPage],
+    ) -> None:
+        self._page_factory = page_factory
+        self._pending_page: _CloseablePrivateWebMediaPage | None = None
+        self._closed = False
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise PrivateWebRuntimeClosedError(
+                "private Web media runtime is closed"
+            )
+
+    def _ensure_no_pending_submit(self) -> None:
+        if self._pending_page is not None:
+            raise PrivateWebRuntimeSetupError(
+                "private Web media submit requires reconciliation"
+            )
+
+    def _close_after_writer_outcome(
+        self,
+        page: _CloseablePrivateWebMediaPage,
+    ) -> None:
+        try:
+            page.close()
+        except PrivateWebSubmitUnknownError as exc:
+            if exc.stage == "create_media_submit_unsettled":
+                self._pending_page = page
+                raise
+            # Any other cleanup classification must not replace the already
+            # classified writer outcome.
+        except Exception:
+            # Local cleanup failure must not replace the writer outcome.
+            pass
+
+    def create_ad(
+        self,
+        request: AdCreateRequest,
+        sources: tuple[PrivateWebMediaSource, ...],
+    ) -> None:
+        self._ensure_open()
+        self._ensure_no_pending_submit()
+        try:
+            page = self._page_factory()
+        except WriteNotAttemptedError:
+            raise
+        except Exception:
+            raise PrivateWebRuntimeSetupError(
+                "private Web media page setup failed"
+            ) from None
+
+        try:
+            PrivateWebCreateMediaWriter(page).create_ad(request, sources)
+        except Exception:
+            try:
+                self._close_after_writer_outcome(page)
+            except PrivateWebSubmitUnknownError:
+                pass
+            raise
+
+        # A successful media writer has already observed canonical settlement.
+        # If close nevertheless reports an unsettled submit, preserve the page
+        # and surface UNKNOWN rather than dropping its media lifetime.
+        self._close_after_writer_outcome(page)
+
+    def reconcile_media_submit(self) -> None:
+        self._ensure_open()
+        page = self._pending_page
+        if page is None:
+            raise PrivateWebRuntimeSetupError(
+                "private Web media submit has no pending reconciliation"
+            )
+
+        page.reconcile_create_media_submit()
+        self._pending_page = None
+        try:
+            page.close()
+        except Exception:
+            # Settlement is already confirmed. Local cleanup failure must not
+            # manufacture platform retry authority.
+            pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self._pending_page is not None:
+            raise PrivateWebSubmitUnknownError(
+                "media_runtime_close_unsettled"
+            )
+        self._closed = True
+
+    def __enter__(self) -> "PrivateWebMediaCreateRuntime":
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
 
 
 class PrivateWebInventoryRuntime:
@@ -400,6 +528,28 @@ def _build_private_web_owner_reader(
         cookie_provider.close()
         raise
     return management_reader, cookie_provider
+
+
+def build_private_web_media_create_runtime(
+    *,
+    cdp_port: int,
+    timeout_seconds: float = 5.0,
+) -> PrivateWebMediaCreateRuntime:
+    """Build only the media-create lifecycle for an existing CDP worker.
+
+    This surface is deliberately internal to the runtime layer. It does not
+    change the media-free AdCreateRequest, MarkService, or loopback Write API.
+    """
+
+    require_private_web_runtime_dependency()
+
+    def page_factory() -> CdpPrivateWebMediaPage:
+        return CdpPrivateWebMediaPage.from_port(
+            cdp_port,
+            timeout_seconds=timeout_seconds,
+        )
+
+    return PrivateWebMediaCreateRuntime(page_factory=page_factory)
 
 
 def build_private_web_inventory_runtime(
