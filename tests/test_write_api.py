@@ -247,6 +247,44 @@ class FakeWriteService:
         )
 
 
+class FakeMediaWriteService:
+    def __init__(
+        self,
+        *,
+        outcome: OperationOutcome = OperationOutcome.CONFIRMED,
+        fail: bool = False,
+    ) -> None:
+        self.outcome = outcome
+        self.fail = fail
+        self.calls: list[tuple[object, ...]] = []
+
+    def create_with_media(
+        self,
+        request: AdCreateRequest,
+        media_refs: tuple[str, ...],
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> CreateOperationReceipt:
+        self.calls.append(
+            (
+                "create_with_media",
+                request,
+                media_refs,
+                authorization_by,
+                authorization_reference,
+            )
+        )
+        if self.fail:
+            raise RuntimeError("media provider details must not escape")
+        return create_receipt(
+            request=request,
+            outcome=self.outcome,
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
+        )
+
+
 class MisboundWriteService(FakeWriteService):
     def update_content(
         self,
@@ -313,6 +351,7 @@ class WriteApiTests(unittest.TestCase):
         self,
         service: FakeWriteService,
         *,
+        media_service: FakeMediaWriteService | None = None,
         capabilities: frozenset[WriteCapability] = frozenset(
             {
                 WriteCapability.CREATE,
@@ -333,6 +372,7 @@ class WriteApiTests(unittest.TestCase):
             service,
             self.store,
             access,
+            media_service=media_service,
             port=0,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -552,6 +592,268 @@ class WriteApiTests(unittest.TestCase):
         self.assertEqual(body["error"], "invalid_create_request")
         self.assertEqual(service.calls, [])
         self.assertIsNone(self.store.write_api_request("create-invalid"))
+
+    def test_media_create_requires_distinct_capability_and_service(
+        self,
+    ) -> None:
+        payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase",
+            "description": "Beschreibung",
+            "price_eur": 12,
+            "media_refs": ["media_ref_1"],
+        }
+
+        standard_service = FakeWriteService()
+        with self.server(standard_service) as server:
+            status, _, body = self.request(
+                server,
+                "POST",
+                "/api/write/media/ads",
+                payload=payload,
+                idempotency_key="media-capability-denied",
+            )
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "capability_denied")
+        self.assertEqual(standard_service.calls, [])
+        self.assertIsNone(
+            self.store.write_api_request("media-capability-denied")
+        )
+
+        access = WriteApiAccess(
+            principal="api-test-owner",
+            bearer_token=TOKEN,
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+            writes_enabled=True,
+        )
+        with self.assertRaises(ValueError):
+            create_write_api_server(
+                FakeWriteService(),
+                self.store,
+                access,
+                port=0,
+            )
+
+        media_service = FakeMediaWriteService()
+        with self.server(
+            FakeWriteService(),
+            media_service=media_service,
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+        ) as server:
+            standard_status, _, standard_body = self.request(
+                server,
+                "POST",
+                "/api/write/ads",
+                payload={
+                    "category_path": ["Haus & Garten", "Dekoration"],
+                    "title": "Neue Vase",
+                    "description": "Beschreibung",
+                    "price_eur": 12,
+                },
+                idempotency_key="standard-capability-denied",
+            )
+        self.assertEqual(standard_status, 403)
+        self.assertEqual(standard_body["error"], "capability_denied")
+        self.assertEqual(media_service.calls, [])
+        self.assertIsNone(
+            self.store.write_api_request("standard-capability-denied")
+        )
+
+    def test_media_create_replays_normalized_opaque_refs(self) -> None:
+        service = FakeWriteService()
+        media_service = FakeMediaWriteService()
+        payload = {
+            "category_path": [" Haus & Garten ", "Dekoration"],
+            "title": "Neue Vase",
+            "description": "Beschreibung",
+            "price_eur": 12,
+            "media_refs": ["cover_01", "detail-02"],
+        }
+        capabilities = frozenset({WriteCapability.CREATE_MEDIA})
+        with self.server(
+            service,
+            media_service=media_service,
+            capabilities=capabilities,
+        ) as server:
+            first_status, first_headers, first_body = self.request(
+                server,
+                "POST",
+                "/api/write/media/ads",
+                payload=payload,
+                idempotency_key="media-create-once",
+            )
+
+        self.assertEqual(first_status, 202)
+        self.assertIsNone(first_headers.get("Idempotency-Replayed"))
+        self.assertEqual(service.calls, [])
+        self.assertEqual(
+            media_service.calls,
+            [
+                (
+                    "create_with_media",
+                    AdCreateRequest(
+                        category_path=("Haus & Garten", "Dekoration"),
+                        title="Neue Vase",
+                        description="Beschreibung",
+                        price_eur=12,
+                    ),
+                    ("cover_01", "detail-02"),
+                    "api-test-owner",
+                    "write-api:media-create-once",
+                )
+            ],
+        )
+        self.assertFalse(first_body["platform_retry_authorized"])
+        self.assertFalse(first_body["media_persistence_confirmed"])
+
+        fresh_standard = FakeWriteService()
+        fresh_media = FakeMediaWriteService()
+        with self.server(
+            fresh_standard,
+            media_service=fresh_media,
+            capabilities=capabilities,
+        ) as server:
+            second_status, second_headers, second_body = self.request(
+                server,
+                "POST",
+                "/api/write/media/ads",
+                payload={
+                    "category_path": ["Haus & Garten", "Dekoration"],
+                    "title": "Neue Vase",
+                    "description": "Beschreibung",
+                    "price_eur": 12,
+                    "media_refs": ["cover_01", "detail-02"],
+                },
+                idempotency_key="media-create-once",
+            )
+
+        self.assertEqual(second_status, 202)
+        self.assertEqual(
+            second_headers.get("Idempotency-Replayed"),
+            "true",
+        )
+        self.assertEqual(second_body, first_body)
+        self.assertEqual(fresh_standard.calls, [])
+        self.assertEqual(fresh_media.calls, [])
+
+    def test_media_refs_are_opaque_unique_ascii_handles(self) -> None:
+        invalid_refs = (
+            [],
+            ["/tmp/photo.jpg"],
+            ["../photo"],
+            ["photo.jpg"],
+            ["C:\\photo.jpg"],
+            ["ümlaut"],
+            ["duplicate", "duplicate"],
+            "not-a-list",
+            [1],
+        )
+        for index, media_refs in enumerate(invalid_refs):
+            with self.subTest(media_refs=media_refs):
+                key = f"invalid-media-ref-{index}"
+                media_service = FakeMediaWriteService()
+                with self.server(
+                    FakeWriteService(),
+                    media_service=media_service,
+                    capabilities=frozenset(
+                        {WriteCapability.CREATE_MEDIA}
+                    ),
+                ) as server:
+                    status, _, body = self.request(
+                        server,
+                        "POST",
+                        "/api/write/media/ads",
+                        payload={
+                            "category_path": [
+                                "Haus & Garten",
+                                "Dekoration",
+                            ],
+                            "title": "Neue Vase",
+                            "description": "Beschreibung",
+                            "price_eur": 12,
+                            "media_refs": media_refs,
+                        },
+                        idempotency_key=key,
+                    )
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"], "invalid_media_refs")
+                self.assertEqual(media_service.calls, [])
+                self.assertIsNone(self.store.write_api_request(key))
+
+    def test_media_refs_participate_in_idempotency_fingerprint(self) -> None:
+        media_service = FakeMediaWriteService()
+        capabilities = frozenset({WriteCapability.CREATE_MEDIA})
+        base_payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase",
+            "description": "Beschreibung",
+            "price_eur": 12,
+        }
+        with self.server(
+            FakeWriteService(),
+            media_service=media_service,
+            capabilities=capabilities,
+        ) as server:
+            first_status, _, _ = self.request(
+                server,
+                "POST",
+                "/api/write/media/ads",
+                payload={**base_payload, "media_refs": ["media_a"]},
+                idempotency_key="media-ref-conflict",
+            )
+            second_status, _, second_body = self.request(
+                server,
+                "POST",
+                "/api/write/media/ads",
+                payload={**base_payload, "media_refs": ["media_b"]},
+                idempotency_key="media-ref-conflict",
+            )
+
+        self.assertEqual(first_status, 202)
+        self.assertEqual(second_status, 409)
+        self.assertEqual(second_body["error"], "idempotency_conflict")
+        self.assertFalse(second_body["platform_retry_authorized"])
+        self.assertEqual(len(media_service.calls), 1)
+
+    def test_media_create_outcomes_map_without_retry_authority(self) -> None:
+        payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase",
+            "description": "Beschreibung",
+            "price_eur": 12,
+            "media_refs": ["media_ref_1"],
+        }
+        for outcome, expected_status in (
+            (OperationOutcome.AMBIGUOUS, 202),
+            (OperationOutcome.PRECONDITION_FAILED, 409),
+        ):
+            with self.subTest(outcome=outcome.value):
+                media_service = FakeMediaWriteService(outcome=outcome)
+                key = f"media-create-{outcome.value}"
+                with self.server(
+                    FakeWriteService(),
+                    media_service=media_service,
+                    capabilities=frozenset(
+                        {WriteCapability.CREATE_MEDIA}
+                    ),
+                ) as server:
+                    status, _, body = self.request(
+                        server,
+                        "POST",
+                        "/api/write/media/ads",
+                        payload=payload,
+                        idempotency_key=key,
+                    )
+                self.assertEqual(status, expected_status)
+                self.assertEqual(
+                    body["operation_receipt"]["outcome"],
+                    outcome.value,
+                )
+                self.assertIsNone(
+                    body["operation_receipt"]["created_ad_id"]
+                )
+                self.assertFalse(body["platform_retry_authorized"])
+                self.assertFalse(body["media_persistence_confirmed"])
 
     def test_create_rejects_unpaired_surrogate_before_claim(self) -> None:
         service = FakeWriteService()
