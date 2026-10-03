@@ -8,6 +8,7 @@ from mark_api.domain import (
     AdSnapshot,
     CreateOperationReceipt,
     LifecycleState,
+    MediaPostReadStatus,
     OperationOutcome,
 )
 from mark_api.results import ReadResult, ReadStatus
@@ -85,6 +86,48 @@ class ResultAndDomainTests(unittest.TestCase):
         self.assertEqual(receipt.writer_error, "TimeoutError")
         self.assertIsNone(receipt.authorization_by)
         self.assertIsNone(receipt.authorization_reference)
+        self.assertIsNone(receipt.media_post_read_status)
+        self.assertFalse(receipt.media_persistence_confirmed)
+
+    def test_create_receipt_media_confirmation_requires_confirmed_create(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "media persistence confirmation requires confirmed create",
+        ):
+            CreateOperationReceipt(
+                operation="create",
+                started_at=NOW,
+                completed_at=NOW,
+                outcome=OperationOutcome.AMBIGUOUS,
+                pre_read_status="success_empty",
+                confirmation_pre_read_status="success_empty",
+                post_read_status="success_nonempty",
+                confirmation_post_read_status="success_nonempty",
+                content_post_read_status="success_nonempty",
+                writer_invoked=True,
+                media_post_read_status=MediaPostReadStatus.CONFIRMED,
+                media_persistence_confirmed=True,
+            )
+
+    def test_create_receipt_confirmed_media_status_requires_positive_flag(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "confirmed media post-read requires media persistence confirmation",
+        ):
+            CreateOperationReceipt(
+                operation="create",
+                started_at=NOW,
+                completed_at=NOW,
+                outcome=OperationOutcome.CONFIRMED,
+                pre_read_status="success_empty",
+                confirmation_pre_read_status="success_empty",
+                post_read_status="success_nonempty",
+                confirmation_post_read_status="success_nonempty",
+                content_post_read_status="success_nonempty",
+                writer_invoked=True,
+                created_ad_id="200",
+                media_post_read_status=MediaPostReadStatus.CONFIRMED,
+            )
 
     def test_create_receipt_rejects_unconfirmed_created_ad_id(self) -> None:
         with self.assertRaisesRegex(

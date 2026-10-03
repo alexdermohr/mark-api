@@ -19,6 +19,14 @@ class OperationOutcome(StrEnum):
     PRECONDITION_FAILED = "precondition_failed"
 
 
+class MediaPostReadStatus(StrEnum):
+    NOT_READ = "not_read"
+    VERIFIER_UNAVAILABLE = "verifier_unavailable"
+    CONFIRMED = "confirmed"
+    MISMATCH = "mismatch"
+    UNKNOWN = "unknown"
+
+
 def _require_nonempty(value: str, field_name: str) -> None:
     if not value.strip():
         raise ValueError(f"{field_name} must not be blank")
@@ -265,6 +273,8 @@ class CreateOperationReceipt:
     content_post_snapshot: AdSnapshot | None = None
     authorization_by: str | None = None
     authorization_reference: str | None = None
+    media_post_read_status: MediaPostReadStatus | None = None
+    media_persistence_confirmed: bool = False
 
     def __post_init__(self) -> None:
         _require_nonempty(self.operation, "operation")
@@ -285,6 +295,31 @@ class CreateOperationReceipt:
             _require_nonempty(self.created_ad_id, "created_ad_id")
         if self.authorization_by is not None:
             _require_nonempty(self.authorization_by, "authorization_by")
+        if (
+            self.media_post_read_status is not None
+            and not isinstance(self.media_post_read_status, MediaPostReadStatus)
+        ):
+            raise TypeError(
+                "media_post_read_status must be MediaPostReadStatus or None"
+            )
+        if not isinstance(self.media_persistence_confirmed, bool):
+            raise TypeError("media_persistence_confirmed must be bool")
+        if self.media_persistence_confirmed:
+            if self.outcome is not OperationOutcome.CONFIRMED:
+                raise ValueError(
+                    "media persistence confirmation requires confirmed create"
+                )
+            if self.media_post_read_status is not MediaPostReadStatus.CONFIRMED:
+                raise ValueError(
+                    "media persistence confirmation requires confirmed post-read"
+                )
+        if (
+            self.media_post_read_status is MediaPostReadStatus.CONFIRMED
+            and not self.media_persistence_confirmed
+        ):
+            raise ValueError(
+                "confirmed media post-read requires media persistence confirmation"
+            )
         _require_aware(self.started_at, "started_at")
         _require_aware(self.completed_at, "completed_at")
         if self.completed_at < self.started_at:

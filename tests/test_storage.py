@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from threading import Barrier
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from mark_api.domain import (
     AdSnapshot,
     CreateOperationReceipt,
     LifecycleState,
+    MediaPostReadStatus,
     OperationOutcome,
     OperationReceipt,
     ReactionSnapshot,
@@ -169,6 +171,8 @@ class SnapshotStoreTests(unittest.TestCase):
             post_snapshot=candidate,
             confirmation_post_snapshot=candidate,
             content_post_snapshot=candidate,
+            media_post_read_status=MediaPostReadStatus.CONFIRMED,
+            media_persistence_confirmed=True,
         )
 
         store.append_create_operation_receipt(receipt)
@@ -178,7 +182,8 @@ class SnapshotStoreTests(unittest.TestCase):
                 """
                 SELECT created_ad_id, outcome, confirmation_pre_read_status,
                        confirmation_post_read_status, content_post_read_status,
-                       authorization_by, authorization_reference
+                       authorization_by, authorization_reference,
+                       media_post_read_status, media_persistence_confirmed
                 FROM create_operation_receipts
                 """
             ).fetchone()
@@ -193,8 +198,71 @@ class SnapshotStoreTests(unittest.TestCase):
                 "success_nonempty",
                 "api-owner",
                 "write-api:create-storage",
+                "confirmed",
+                1,
             ),
         )
+
+    def test_create_receipt_checkpoint_is_append_only_content_evidence(self) -> None:
+        store = self.make_store()
+        candidate = AdSnapshot(
+            ad_id="201",
+            observed_at=NOW,
+            source="management",
+            lifecycle_state=LifecycleState.ACTIVE,
+            title="Checkpoint Vase",
+            description="Beschreibung",
+        )
+        receipt = CreateOperationReceipt(
+            operation="create",
+            started_at=NOW,
+            completed_at=NOW,
+            outcome=OperationOutcome.CONFIRMED,
+            pre_read_status="success_empty",
+            confirmation_pre_read_status="success_empty",
+            post_read_status="success_nonempty",
+            confirmation_post_read_status="success_nonempty",
+            content_post_read_status="success_nonempty",
+            writer_invoked=True,
+            created_ad_id="201",
+            authorization_by="api-owner",
+            authorization_reference="write-api:create-checkpoint",
+            post_snapshot=candidate,
+            confirmation_post_snapshot=candidate,
+            content_post_snapshot=candidate,
+        )
+
+        checkpoint_id = store.append_create_operation_checkpoint(receipt)
+
+        self.assertGreater(checkpoint_id, 0)
+        with sqlite3.connect(store.path) as connection:
+            row = connection.execute(
+                """
+                SELECT checkpoint_kind, created_ad_id, outcome,
+                       content_post_read_status, writer_invoked
+                FROM create_operation_checkpoints
+                WHERE id = ?
+                """,
+                (checkpoint_id,),
+            ).fetchone()
+        self.assertEqual(
+            row,
+            (
+                "before_media_post_read",
+                "201",
+                "confirmed",
+                "success_nonempty",
+                1,
+            ),
+        )
+        with self.assertRaises(ValueError):
+            store.append_create_operation_checkpoint(
+                replace(
+                    receipt,
+                    media_post_read_status=MediaPostReadStatus.CONFIRMED,
+                    media_persistence_confirmed=True,
+                )
+            )
 
     def test_create_receipt_schema_migrates_legacy_authorization_columns(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -238,6 +306,7 @@ class SnapshotStoreTests(unittest.TestCase):
             writer_invoked=False,
             authorization_by="api-owner",
             authorization_reference="write-api:create-legacy",
+            media_post_read_status=MediaPostReadStatus.NOT_READ,
         )
         store.append_create_operation_receipt(receipt)
 
@@ -250,16 +319,19 @@ class SnapshotStoreTests(unittest.TestCase):
             }
             row = connection.execute(
                 """
-                SELECT authorization_by, authorization_reference
+                SELECT authorization_by, authorization_reference,
+                       media_post_read_status, media_persistence_confirmed
                 FROM create_operation_receipts
                 """
             ).fetchone()
 
         self.assertIn("authorization_by", columns)
         self.assertIn("authorization_reference", columns)
+        self.assertIn("media_post_read_status", columns)
+        self.assertIn("media_persistence_confirmed", columns)
         self.assertEqual(
             row,
-            ("api-owner", "write-api:create-legacy"),
+            ("api-owner", "write-api:create-legacy", "not_read", 0),
         )
 
     def test_reaction_snapshots_are_append_only(self) -> None:

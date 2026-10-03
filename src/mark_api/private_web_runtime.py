@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
 from importlib import import_module, metadata
 from threading import Lock, Thread, current_thread
@@ -22,6 +23,7 @@ from .domain import (
     CreateOperationReceipt,
     DeleteApproval,
     LifecycleState,
+    MediaPostReadStatus,
     OperationOutcome,
     OperationReceipt,
 )
@@ -56,6 +58,8 @@ from .private_web_cdp_media import CdpPrivateWebMediaPage
 from .private_web_media import (
     PrivateWebCreateMediaPublishPage,
     PrivateWebCreateMediaWriter,
+    PrivateWebMediaPersistenceSnapshot,
+    PrivateWebMediaPersistenceVerifier,
     PrivateWebMediaRefResolver,
     PrivateWebMediaSource,
     _prepare_local_media,
@@ -71,6 +75,9 @@ from .write_api import (
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_MEDIA_PERSISTENCE_VERIFY_TIMEOUT_SECONDS = 10.0
 
 
 class PrivateWebRuntimeDependencyError(RuntimeError):
@@ -439,6 +446,8 @@ class PrivateWebMediaCreateRuntime:
             pass
 
     def reconcile_media_submit(self) -> None:
+        """Observe unresolved browser submit state without repeating browser input."""
+
         with self._operation_lock:
             self._reconcile_media_submit_locked()
 
@@ -524,6 +533,7 @@ class PrivateWebMediaCreateService:
         reader: AdsReader,
         confirmation_reader: AdsReader,
         content_reader_factory: Callable[[str], AdsReader],
+        media_persistence_verifier: PrivateWebMediaPersistenceVerifier | None = None,
         store: SnapshotStore | None = None,
         writes_enabled: bool = False,
         clock: Callable[[], datetime] | None = None,
@@ -534,19 +544,88 @@ class PrivateWebMediaCreateService:
             raise TypeError("resolver must be PrivateWebMediaRefResolver")
         if not isinstance(writes_enabled, bool):
             raise TypeError("writes_enabled must be bool")
+        if (
+            media_persistence_verifier is not None
+            and not callable(
+                getattr(media_persistence_verifier, "verify_media", None)
+            )
+        ):
+            raise TypeError(
+                "media_persistence_verifier must provide verify_media"
+            )
         self._runtime = runtime
         self._resolver = resolver
         self._reader = reader
         self._confirmation_reader = confirmation_reader
         self._content_reader_factory = content_reader_factory
+        self._media_persistence_verifier = media_persistence_verifier
         self._store = store
         self._clock = _utc_now if clock is None else clock
         self._writes_enabled = writes_enabled
         self._operation_lock = Lock()
+        # Media receipts are persisted only after the media-aware post-read has
+        # been classified. Persisting inside the generic orchestrator would
+        # otherwise record a narrower content-only receipt first.
         self._writes = SafeWriteOrchestrator(
-            store=store,
+            store=None,
             writes_enabled=writes_enabled,
             clock=self._clock,
+        )
+
+    def _persist_create_receipt(
+        self,
+        receipt: CreateOperationReceipt,
+    ) -> CreateOperationReceipt:
+        if self._store is not None:
+            self._store.append_create_operation_receipt(receipt)
+        return receipt
+
+    def _with_media_post_read(
+        self,
+        receipt: CreateOperationReceipt,
+        stable_sources: tuple[PrivateWebMediaSource, ...] | None = None,
+    ) -> CreateOperationReceipt:
+        if (
+            receipt.outcome is not OperationOutcome.CONFIRMED
+            or receipt.created_ad_id is None
+        ):
+            status = MediaPostReadStatus.NOT_READ
+        elif self._media_persistence_verifier is None:
+            status = MediaPostReadStatus.VERIFIER_UNAVAILABLE
+        elif stable_sources is None:
+            status = MediaPostReadStatus.UNKNOWN
+        else:
+            try:
+                result = self._media_persistence_verifier.verify_media(
+                    receipt.created_ad_id,
+                    stable_sources,
+                    timeout_seconds=_MEDIA_PERSISTENCE_VERIFY_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                status = MediaPostReadStatus.UNKNOWN
+            else:
+                if (
+                    not isinstance(result, ReadResult)
+                    or result.status is not ReadStatus.SUCCESS_NONEMPTY
+                    or not isinstance(
+                        result.value,
+                        PrivateWebMediaPersistenceSnapshot,
+                    )
+                    or result.value.ad_id != receipt.created_ad_id
+                ):
+                    status = MediaPostReadStatus.UNKNOWN
+                elif result.value.exact_match:
+                    status = MediaPostReadStatus.CONFIRMED
+                else:
+                    status = MediaPostReadStatus.MISMATCH
+
+        return replace(
+            receipt,
+            completed_at=max(receipt.completed_at, self._clock()),
+            media_post_read_status=status,
+            media_persistence_confirmed=(
+                status is MediaPostReadStatus.CONFIRMED
+            ),
         )
 
     def _media_ref_precondition(
@@ -569,10 +648,9 @@ class PrivateWebMediaCreateService:
             writer_invoked=False,
             authorization_by=authorization_by,
             authorization_reference=authorization_reference,
+            media_post_read_status=MediaPostReadStatus.NOT_READ,
         )
-        if self._store is not None:
-            self._store.append_create_operation_receipt(receipt)
-        return receipt
+        return self._persist_create_receipt(receipt)
 
     def create_with_media(
         self,
@@ -587,7 +665,7 @@ class PrivateWebMediaCreateService:
         # contaminate each other's inventory delta.
         with self._operation_lock:
             if not self._writes_enabled:
-                return self._writes.create(
+                receipt = self._writes.create(
                     request=request,
                     reader=self._reader,
                     confirmation_reader=self._confirmation_reader,
@@ -595,6 +673,9 @@ class PrivateWebMediaCreateService:
                     content_reader_factory=self._content_reader_factory,
                     authorization_by=authorization_by,
                     authorization_reference=authorization_reference,
+                )
+                return self._persist_create_receipt(
+                    self._with_media_post_read(receipt)
                 )
 
             started_at = self._clock()
@@ -625,7 +706,7 @@ class PrivateWebMediaCreateService:
                     request,
                     stable_sources,
                 )
-                return self._writes.create(
+                receipt = self._writes.create(
                     request=request,
                     reader=self._reader,
                     confirmation_reader=self._confirmation_reader,
@@ -634,6 +715,23 @@ class PrivateWebMediaCreateService:
                     authorization_by=authorization_by,
                     authorization_reference=authorization_reference,
                 )
+                if (
+                    self._store is not None
+                    and self._media_persistence_verifier is not None
+                    and receipt.outcome is OperationOutcome.CONFIRMED
+                    and receipt.created_ad_id is not None
+                    and receipt.writer_invoked
+                ):
+                    # Commit content/create evidence before the injected
+                    # authoritative verifier performs another external read.
+                    # A process abort or BaseException during that read must
+                    # not erase the audit trail of the platform write.
+                    self._store.append_create_operation_checkpoint(receipt)
+                receipt = self._with_media_post_read(
+                    receipt,
+                    stable_sources,
+                )
+                return self._persist_create_receipt(receipt)
             finally:
                 try:
                     prepared.close()
@@ -1095,6 +1193,7 @@ def _validate_write_runtime_config(
     media_writes_enabled: bool,
     media_runtime: PrivateWebMediaCreateRuntime | None,
     media_resolver: PrivateWebMediaRefResolver | None,
+    media_persistence_verifier: PrivateWebMediaPersistenceVerifier | None,
 ) -> None:
     if not isinstance(access, WriteApiAccess):
         raise TypeError("access must be WriteApiAccess")
@@ -1105,6 +1204,15 @@ def _validate_write_runtime_config(
     if (media_runtime is None) != (media_resolver is None):
         raise ValueError(
             "media runtime and media resolver must be configured together"
+        )
+    if (
+        media_persistence_verifier is not None
+        and not callable(
+            getattr(media_persistence_verifier, "verify_media", None)
+        )
+    ):
+        raise TypeError(
+            "media_persistence_verifier must provide verify_media"
         )
 
     media_capability = WriteCapability.CREATE_MEDIA in access.capabilities
@@ -1121,6 +1229,10 @@ def _validate_write_runtime_config(
         raise ValueError(
             "media_writes_enabled requires private Web media composition"
         )
+    if media_persistence_verifier is not None and not media_composed:
+        raise ValueError(
+            "media persistence verifier requires private Web media composition"
+        )
 
 
 def compose_private_web_write_api_runtime(
@@ -1131,6 +1243,7 @@ def compose_private_web_write_api_runtime(
     confirmation_runtime: PrivateWebInventoryRuntime | None = None,
     media_runtime: PrivateWebMediaCreateRuntime | None = None,
     media_resolver: PrivateWebMediaRefResolver | None = None,
+    media_persistence_verifier: PrivateWebMediaPersistenceVerifier | None = None,
     core_writes_enabled: bool = False,
     media_writes_enabled: bool = False,
     port: int = 0,
@@ -1159,6 +1272,7 @@ def compose_private_web_write_api_runtime(
         media_writes_enabled=media_writes_enabled,
         media_runtime=media_runtime,
         media_resolver=media_resolver,
+        media_persistence_verifier=media_persistence_verifier,
     )
     runtime_clock = _utc_now if clock is None else clock
     if not callable(runtime_clock):
@@ -1198,6 +1312,7 @@ def compose_private_web_write_api_runtime(
             reader=owner_reader,
             confirmation_reader=confirmation_reader,
             content_reader_factory=content_runtime.content_reader_for,
+            media_persistence_verifier=media_persistence_verifier,
             store=store,
             writes_enabled=media_writes_enabled,
             clock=runtime_clock,
@@ -1257,6 +1372,7 @@ def build_private_web_write_api_runtime(
     access: WriteApiAccess,
     confirmation_runtime: PrivateWebInventoryRuntime | None = None,
     media_bindings: Mapping[str, PrivateWebMediaSource] | None = None,
+    media_persistence_verifier: PrivateWebMediaPersistenceVerifier | None = None,
     core_writes_enabled: bool = False,
     media_writes_enabled: bool = False,
     port: int = 0,
@@ -1318,6 +1434,19 @@ def build_private_web_write_api_runtime(
         raise ValueError(
             "media_writes_enabled requires create_media capability"
         )
+    if media_persistence_verifier is not None and not media_capability:
+        raise ValueError(
+            "media persistence verifier requires create_media capability"
+        )
+    if (
+        media_persistence_verifier is not None
+        and not callable(
+            getattr(media_persistence_verifier, "verify_media", None)
+        )
+    ):
+        raise TypeError(
+            "media_persistence_verifier must provide verify_media"
+        )
 
     content_runtime: PrivateWebContentRuntime | None = None
     media_runtime: PrivateWebMediaCreateRuntime | None = None
@@ -1340,6 +1469,7 @@ def build_private_web_write_api_runtime(
             confirmation_runtime=confirmation_runtime,
             media_runtime=media_runtime,
             media_resolver=media_resolver,
+            media_persistence_verifier=media_persistence_verifier,
             store=store,
             access=access,
             core_writes_enabled=core_writes_enabled,

@@ -184,7 +184,7 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - der normale `POST /api/write/ads`-Create bleibt unverändert mediafrei,
 - die normalisierten `media_refs` sind Bestandteil des persistenten Idempotency-Fingerprints; derselbe Key mit anderen Refs ergibt einen Konflikt statt einer erneuten Ausführung,
 - die Write API gibt `media_refs` nicht zurück und setzt weiterhin `platform_retry_authorized=false`,
-- `CreateOperationReceipt.CONFIRMED` bestätigt auch auf dem Media-Pfad nur die bestehende Anzeigen-/Content-Semantik und **nicht** die Medienpersistenz; deshalb liefert der Media-Pfad für `CONFIRMED` wie für `AMBIGUOUS` HTTP 202 und zusätzlich `media_persistence_confirmed=false`, während `PRECONDITION_FAILED` HTTP 409 bleibt,
+- D-014 lieferte für `CONFIRMED` wie für `AMBIGUOUS` zunächst HTTP 202 mit `media_persistence_confirmed=false`; diese Response-Aussage wird durch D-018 fortgeschrieben: nur ein zusätzlicher exakter autoritativer Media-Post-Read hebt einen content-bestätigten Media-Create auf HTTP 200/`media_persistence_confirmed=true`, sonst bleibt er HTTP 202; `PRECONDITION_FAILED` bleibt HTTP 409,
 - dieser Slice stellt noch keinen Resolver von `media_refs` zu lokalen `PrivateWebMediaSource`-Objekten und keine konkrete PrivateWeb-Media-Service-Komposition bereit,
 - ein späterer Resolver muss Refs an vorher explizit zugelassene und stabilisierte Media-Artefakte binden; beliebiges Server-Filesystem-Lesen bleibt außerhalb des HTTP-Contracts,
 - dieser Slice führt keinen realen Kleinanzeigen-Plattformwrite aus.
@@ -240,3 +240,23 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - `mark-api-dashboard` kann die beiden Entscheidungen zur Laufzeit mit `--reaction-metric` beziehungsweise `--objective-metric` erhalten; das Repository speichert oder setzt dafür keinen Produktdefault,
 - Rankings bleiben deskriptiv. Aus ihnen wird weder Kausalität noch Qualität abgeleitet,
 - Issue #1 bleibt offen, bis ein Mensch die fachliche Reaktionsmetrik und das Optimierungsziel tatsächlich festlegt.
+
+## D-018 — Autoritativer Media-Post-Read bestätigt exakte serverseitige Medienpersistenz
+
+**Fortschreibung:** D-018 erweitert D-013 bis D-016 ausschließlich um eine zusätzliche serverseitige Media-Evidenzschicht. Die bestehenden one-shot-/UNKNOWN-/No-Blind-Retry-Regeln bleiben unverändert; insbesondere ersetzt ein bestätigter Media-Post-Read keinen weiterhin unresolved Browser-Submit-Fence.
+
+**Entscheidung:** `PrivateWebMediaCreateService` darf optional einen vom Caller bereitgestellten `PrivateWebMediaPersistenceVerifier` verwenden. Der Verifier erhält nur die bestätigte Anzeigen-ID und genau die privaten, vor dem ersten Owner-Pre-Read stabilisierten `PrivateWebMediaSource`-Kopien des laufenden Create-Versuchs. Der Verifier besitzt die plattformspezifische Identitätslogik und liefert eine path-freie `PrivateWebMediaPersistenceSnapshot` mit einem expliziten `exact_match`. Der synchrone Port erhält ein explizites `timeout_seconds`-Budget; die plattformspezifische Implementierung muss ihre Transport-/Read-I/O innerhalb dieses Budgets terminieren und Ablauf als Read-Fehler zurückgeben. Lokale Browser-`FileList`- oder Dateistaging-Evidenz zählt nicht als serverseitige Persistenzbestätigung.
+
+**Folgen:**
+- `CreateOperationReceipt` erhält additive Media-Evidenz: `media_post_read_status` und `media_persistence_confirmed`; bestehende Positionsargumente bleiben unverändert,
+- `media_persistence_confirmed=true` ist nur zulässig, wenn der Create-/Content-Receipt `CONFIRMED` ist und der autoritative Media-Post-Read für dieselbe Anzeigen-ID `CONFIRMED`/`exact_match=true` liefert,
+- fehlt der Verifier, meldet der Media-Post-Read Mismatch oder ist das Read-Ergebnis ungültig/unsicher, bleibt `media_persistence_confirmed=false`; daraus entsteht weder ein Plattform-Retry noch ein zweiter Reconciliation-Fence,
+- ein unresolved Browser-Submit behält unabhängig von serverseitiger Content-/Media-Bestätigung den bestehenden Submit-UNKNOWN-Fence; `reconcile_media_submit()` bleibt observation-only und wiederholt keinen Browser-Input,
+- bevor bei einem bereits bestätigten und tatsächlich ausgeführten Create der externe Media-Verifier aufgerufen wird, persistiert SQLite einen append-only `before_media_post_read`-Checkpoint mit der bereits bekannten Anzeigen-/Content-Evidenz; ein Prozessabbruch oder propagierender `BaseException` während des Verifiers kann damit den Nachweis des Plattformwrites nicht mehr verlieren,
+- bei normalem Abschluss bleibt weiterhin genau ein finales angereichertes `create_operation_receipts`-Receipt; der separate Checkpoint ist ausschließlich Crash-/Audit-Evidenz und erzeugt keine Retry-Autorität,
+- die finale `completed_at`-Zeit eines Media-Create-Receipts wird erst nach der Media-Post-Read-Klassifikation gesetzt, damit persistierte Audit-Reihenfolge und Operationsdauer den zusätzlichen autoritativen Read einschließen,
+- SQLite persistiert die beiden Media-Evidenzfelder additiv; bestehende Datenbanken migrieren `media_persistence_confirmed` mit Default 0,
+- die Write API liefert für einen content-bestätigten Media-Create nur dann HTTP 200, wenn zusätzlich `media_persistence_confirmed=true` ist; ansonsten bleibt der Media-Pfad HTTP 202, `PRECONDITION_FAILED` bleibt HTTP 409 und `platform_retry_authorized` bleibt immer false,
+- persistente Idempotency-Replays geben die zuvor gespeicherte Media-Response unverändert zurück und führen weder Service noch Verifier erneut aus,
+- HTTP-Antwort und persistente Media-Evidenz enthalten keine `media_refs`, lokalen Pfade, Bytes, Browser-`FileList`-Zustände oder provider-spezifischen Media-IDs,
+- dieser Slice führt keinen realen Kleinanzeigen-Plattformwrite aus.
