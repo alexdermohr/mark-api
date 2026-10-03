@@ -77,6 +77,9 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_MEDIA_PERSISTENCE_VERIFY_TIMEOUT_SECONDS = 10.0
+
+
 class PrivateWebRuntimeDependencyError(RuntimeError):
     """The optional private-Web runtime dependency set is unavailable."""
 
@@ -596,6 +599,7 @@ class PrivateWebMediaCreateService:
                 result = self._media_persistence_verifier.verify_media(
                     receipt.created_ad_id,
                     stable_sources,
+                    timeout_seconds=_MEDIA_PERSISTENCE_VERIFY_TIMEOUT_SECONDS,
                 )
             except Exception:
                 status = MediaPostReadStatus.UNKNOWN
@@ -711,6 +715,18 @@ class PrivateWebMediaCreateService:
                     authorization_by=authorization_by,
                     authorization_reference=authorization_reference,
                 )
+                if (
+                    self._store is not None
+                    and self._media_persistence_verifier is not None
+                    and receipt.outcome is OperationOutcome.CONFIRMED
+                    and receipt.created_ad_id is not None
+                    and receipt.writer_invoked
+                ):
+                    # Commit content/create evidence before the injected
+                    # authoritative verifier performs another external read.
+                    # A process abort or BaseException during that read must
+                    # not erase the audit trail of the platform write.
+                    self._store.append_create_operation_checkpoint(receipt)
                 receipt = self._with_media_post_read(
                     receipt,
                     stable_sources,

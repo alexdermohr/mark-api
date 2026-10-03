@@ -13,6 +13,7 @@ from .domain import (
     CreateOperationReceipt,
     InboundMessageEvent,
     LifecycleState,
+    OperationOutcome,
     OperationReceipt,
     ReactionSnapshot,
 )
@@ -151,6 +152,29 @@ class SnapshotStore:
                     authorization_reference TEXT,
                     media_post_read_status TEXT,
                     media_persistence_confirmed INTEGER NOT NULL DEFAULT 0,
+                    writer_error TEXT,
+                    post_snapshot_json TEXT,
+                    confirmation_post_snapshot_json TEXT,
+                    content_post_snapshot_json TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS create_operation_checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    checkpoint_kind TEXT NOT NULL
+                        CHECK (checkpoint_kind = 'before_media_post_read'),
+                    operation TEXT NOT NULL,
+                    created_ad_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    pre_read_status TEXT NOT NULL,
+                    confirmation_pre_read_status TEXT NOT NULL,
+                    post_read_status TEXT,
+                    confirmation_post_read_status TEXT,
+                    content_post_read_status TEXT,
+                    writer_invoked INTEGER NOT NULL,
+                    authorization_by TEXT,
+                    authorization_reference TEXT,
                     writer_error TEXT,
                     post_snapshot_json TEXT,
                     confirmation_post_snapshot_json TEXT,
@@ -519,6 +543,68 @@ class SnapshotStore:
                     self._snapshot_json(receipt.post_snapshot),
                 ),
             )
+
+    def append_create_operation_checkpoint(
+        self,
+        receipt: CreateOperationReceipt,
+    ) -> int:
+        """Durably checkpoint a confirmed write before external media reads."""
+
+        if (
+            receipt.outcome is not OperationOutcome.CONFIRMED
+            or receipt.created_ad_id is None
+            or not receipt.writer_invoked
+        ):
+            raise ValueError(
+                "media post-read checkpoint requires a confirmed invoked create"
+            )
+        if (
+            receipt.media_post_read_status is not None
+            or receipt.media_persistence_confirmed
+        ):
+            raise ValueError(
+                "media post-read checkpoint requires unclassified media evidence"
+            )
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO create_operation_checkpoints (
+                    checkpoint_kind, operation, created_ad_id,
+                    started_at, completed_at, outcome,
+                    pre_read_status, confirmation_pre_read_status,
+                    post_read_status, confirmation_post_read_status,
+                    content_post_read_status, writer_invoked,
+                    authorization_by, authorization_reference, writer_error,
+                    post_snapshot_json, confirmation_post_snapshot_json,
+                    content_post_snapshot_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "before_media_post_read",
+                    receipt.operation,
+                    receipt.created_ad_id,
+                    receipt.started_at.isoformat(),
+                    receipt.completed_at.isoformat(),
+                    receipt.outcome.value,
+                    receipt.pre_read_status,
+                    receipt.confirmation_pre_read_status,
+                    receipt.post_read_status,
+                    receipt.confirmation_post_read_status,
+                    receipt.content_post_read_status,
+                    1,
+                    receipt.authorization_by,
+                    receipt.authorization_reference,
+                    receipt.writer_error,
+                    self._snapshot_json(receipt.post_snapshot),
+                    self._snapshot_json(receipt.confirmation_post_snapshot),
+                    self._snapshot_json(receipt.content_post_snapshot),
+                ),
+            )
+            checkpoint_id = cursor.lastrowid
+        if checkpoint_id is None:
+            raise RuntimeError("create operation checkpoint did not return an id")
+        return int(checkpoint_id)
 
     def append_create_operation_receipt(
         self,

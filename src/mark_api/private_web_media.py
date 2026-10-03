@@ -73,13 +73,16 @@ class PrivateWebMediaPersistenceSnapshot:
 
 
 class PrivateWebMediaPersistenceVerifier(Protocol):
-    """Verify stable expected local media against an authoritative server read."""
+    """Verify stable expected media with caller-bounded authoritative I/O."""
 
     def verify_media(
         self,
         ad_id: str,
         expected_sources: tuple[PrivateWebMediaSource, ...],
+        *,
+        timeout_seconds: float,
     ) -> ReadResult[PrivateWebMediaPersistenceSnapshot]:
+        """Return within timeout_seconds; transport expiry is a read failure."""
         ...
 
 

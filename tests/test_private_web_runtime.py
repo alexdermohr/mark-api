@@ -119,7 +119,11 @@ class MediaPersistenceVerifier:
         self,
         ad_id: str,
         expected_sources: tuple[PrivateWebMediaSource, ...],
+        *,
+        timeout_seconds: float,
     ):
+        if timeout_seconds <= 0:
+            raise AssertionError("media verifier timeout must be positive")
         self.calls.append(
             (
                 ad_id,
@@ -877,7 +881,94 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             persisted = connection.execute(
                 "SELECT COUNT(*) FROM create_operation_receipts"
             ).fetchone()
+            checkpoints = connection.execute(
+                "SELECT COUNT(*) FROM create_operation_checkpoints"
+            ).fetchone()
         self.assertEqual(persisted, (1,))
+        self.assertEqual(checkpoints, (1,))
+        runtime.close()
+
+    def test_media_create_service_checkpoint_survives_verifier_baseexception(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: MediaCreatePage(events)
+        )
+        created_id = "4000000025"
+        created_inventory = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+        )
+        created_content = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+            description=self.request.description,
+        )
+        calls: list[tuple[str, float]] = []
+
+        class InterruptingVerifier:
+            def verify_media(
+                self,
+                ad_id: str,
+                expected_sources: tuple[PrivateWebMediaSource, ...],
+                *,
+                timeout_seconds: float,
+            ):
+                calls.append((ad_id, timeout_seconds))
+                raise KeyboardInterrupt("simulated process-level interruption")
+
+        db_path = Path(self.tmp.name) / "media-checkpoint-interrupt.sqlite"
+        service = PrivateWebMediaCreateService(
+            runtime=runtime,
+            resolver=PrivateWebMediaRefResolver(
+                {"cover_01": self.sources[0]}
+            ),
+            reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            confirmation_reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            content_reader_factory=lambda _ad_id: OwnerReader(
+                ReadResult.success_nonempty((created_content,))
+            ),
+            media_persistence_verifier=InterruptingVerifier(),
+            store=SnapshotStore(db_path),
+            writes_enabled=True,
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            service.create_with_media(self.request, ("cover_01",))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], created_id)
+        self.assertGreater(calls[0][1], 0)
+        with sqlite3.connect(db_path) as connection:
+            checkpoint = connection.execute(
+                """
+                SELECT checkpoint_kind, created_ad_id, outcome,
+                       content_post_read_status, writer_invoked
+                FROM create_operation_checkpoints
+                """
+            ).fetchone()
+            final_count = connection.execute(
+                "SELECT COUNT(*) FROM create_operation_receipts"
+            ).fetchone()
+        self.assertEqual(
+            checkpoint,
+            (
+                "before_media_post_read",
+                created_id,
+                "confirmed",
+                "success_nonempty",
+                1,
+            ),
+        )
+        self.assertEqual(final_count, (0,))
+        self.assertFalse(runtime.reconciliation_required)
         runtime.close()
 
     def test_media_create_service_completion_time_includes_media_post_read(

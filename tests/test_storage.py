@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from threading import Barrier
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -201,6 +202,67 @@ class SnapshotStoreTests(unittest.TestCase):
                 1,
             ),
         )
+
+    def test_create_receipt_checkpoint_is_append_only_content_evidence(self) -> None:
+        store = self.make_store()
+        candidate = AdSnapshot(
+            ad_id="201",
+            observed_at=NOW,
+            source="management",
+            lifecycle_state=LifecycleState.ACTIVE,
+            title="Checkpoint Vase",
+            description="Beschreibung",
+        )
+        receipt = CreateOperationReceipt(
+            operation="create",
+            started_at=NOW,
+            completed_at=NOW,
+            outcome=OperationOutcome.CONFIRMED,
+            pre_read_status="success_empty",
+            confirmation_pre_read_status="success_empty",
+            post_read_status="success_nonempty",
+            confirmation_post_read_status="success_nonempty",
+            content_post_read_status="success_nonempty",
+            writer_invoked=True,
+            created_ad_id="201",
+            authorization_by="api-owner",
+            authorization_reference="write-api:create-checkpoint",
+            post_snapshot=candidate,
+            confirmation_post_snapshot=candidate,
+            content_post_snapshot=candidate,
+        )
+
+        checkpoint_id = store.append_create_operation_checkpoint(receipt)
+
+        self.assertGreater(checkpoint_id, 0)
+        with sqlite3.connect(store.path) as connection:
+            row = connection.execute(
+                """
+                SELECT checkpoint_kind, created_ad_id, outcome,
+                       content_post_read_status, writer_invoked
+                FROM create_operation_checkpoints
+                WHERE id = ?
+                """,
+                (checkpoint_id,),
+            ).fetchone()
+        self.assertEqual(
+            row,
+            (
+                "before_media_post_read",
+                "201",
+                "confirmed",
+                "success_nonempty",
+                1,
+            ),
+        )
+        with self.assertRaises(ValueError):
+            store.append_create_operation_checkpoint(
+                replace(
+                    receipt,
+                    media_post_read_status=MediaPostReadStatus.CONFIRMED,
+                    media_persistence_confirmed=True,
+                )
+            )
 
     def test_create_receipt_schema_migrates_legacy_authorization_columns(self) -> None:
         tmp = tempfile.TemporaryDirectory()
