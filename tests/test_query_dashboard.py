@@ -494,6 +494,9 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertIn('src="/dashboard.js"', html)
         self.assertIn('id="metric-select"', html)
         self.assertIn('id="groups-body"', html)
+        self.assertIn('id="groups-chart"', html)
+        self.assertIn('id="ranking-chart"', html)
+        self.assertIn('role="list"', html)
         self.assertNotIn("https://", html)
         self.assertNotIn("http://", html)
 
@@ -502,6 +505,18 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertIn("summary.views_total_known", javascript)
         self.assertIn("/api/analytics/groups", javascript)
         self.assertIn('item.present === null ? "—"', javascript)
+        self.assertIn("renderBarChart(", javascript)
+        self.assertIn('"groups-chart",', javascript)
+        self.assertIn('"ranking-chart",', javascript)
+        self.assertIn("label.textContent = String(labelOf(entry.item));", javascript)
+        self.assertIn('row.setAttribute("role", "listitem");', javascript)
+        self.assertIn("container.replaceChildren();", javascript)
+        self.assertIn("rawValue === null || rawValue === undefined", javascript)
+        self.assertIn('document.createElement("progress")', javascript)
+        self.assertIn("progress.max = max === 0 ? 1 : max;", javascript)
+        self.assertIn("progress.value = entry.value;", javascript)
+        self.assertNotIn(".style.width", javascript)
+        self.assertNotIn("innerHTML", javascript)
         self.assertIn("let analyticsRequestGeneration = 0;", javascript)
         self.assertIn(
             "const generation = ++analyticsRequestGeneration;",
@@ -516,7 +531,10 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertNotIn(chr(92) + chr(96), javascript)
 
         _, _, css_body = self.get("/dashboard.css")
-        self.assertIn(".cards", css_body.decode("utf-8"))
+        css = css_body.decode("utf-8")
+        self.assertIn(".cards", css)
+        self.assertIn(".chart-row", css)
+        self.assertIn(".chart-progress", css)
 
     def test_non_get_methods_are_405_and_no_write_route_exists(self) -> None:
         for path in (
