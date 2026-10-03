@@ -2095,6 +2095,16 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             close_runtime=lambda: close_events.append("content"),
         )
 
+    @staticmethod
+    def _confirmation_runtime(
+        reader,
+        close_events: list[str],
+    ) -> PrivateWebInventoryRuntime:
+        return PrivateWebInventoryRuntime(
+            owner_reader=reader,
+            close_runtime=lambda: close_events.append("confirmation"),
+        )
+
     def _request(
         self,
         runtime: PrivateWebWriteApiRuntime,
@@ -2232,6 +2242,94 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
 
             self.assertEqual(close_events, ["content"])
 
+    def test_create_fails_closed_without_independent_confirmation_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            reader = OwnerReader(ReadResult.success_empty(()))
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(reader, close_events)
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=content_runtime,
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.CREATE}),
+                    writes_enabled=True,
+                ),
+                core_writes_enabled=True,
+            )
+            try:
+                status, body = self._request(
+                    runtime,
+                    "POST",
+                    "/api/write/ads",
+                    payload=self._create_payload(),
+                    idempotency_key="missing-independent-confirmation",
+                )
+                self.assertEqual(status, 409)
+                receipt = body["operation_receipt"]
+                self.assertEqual(receipt["pre_read_status"], "not_read")
+                self.assertEqual(
+                    receipt["confirmation_pre_read_status"],
+                    "confirmation_reader_not_independent",
+                )
+                self.assertFalse(receipt["writer_invoked"])
+                self.assertEqual(reader.calls, 0)
+            finally:
+                runtime.close()
+            self.assertEqual(close_events, ["content"])
+
+    def test_delete_stays_ambiguous_without_independent_confirmation_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            reader = SequenceReader(
+                ReadResult.success_nonempty((owner_snapshot(),)),
+                ReadResult.success_empty(()),
+            )
+            close_events: list[str] = []
+            events: list[tuple] = []
+            content_runtime = PrivateWebContentRuntime(
+                owner_reader=reader,
+                page_factory=lambda: DeletePage(events),
+                close_runtime=lambda: close_events.append("content"),
+            )
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=content_runtime,
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.DELETE}),
+                    writes_enabled=True,
+                ),
+                core_writes_enabled=True,
+            )
+            try:
+                status, body = self._request(
+                    runtime,
+                    "DELETE",
+                    f"/api/write/ads/{AD_ID}",
+                    payload={
+                        "confirm_ad_id": AD_ID,
+                        "approval_reference": "ticket-independent-confirmation",
+                    },
+                    idempotency_key="missing-delete-confirmation",
+                )
+                self.assertEqual(status, 202)
+                receipt = body["operation_receipt"]
+                self.assertEqual(receipt["outcome"], "ambiguous")
+                self.assertTrue(receipt["writer_invoked"])
+                self.assertFalse(body["platform_retry_authorized"])
+                self.assertEqual(reader.calls, 2)
+                self.assertEqual(
+                    [event[0] for event in events].count("submit_delete"),
+                    1,
+                )
+            finally:
+                runtime.close()
+            self.assertEqual(close_events, ["content"])
+
     def test_bundle_does_not_expose_internal_write_surfaces(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SnapshotStore(Path(tmp) / "runtime.sqlite")
@@ -2326,21 +2424,26 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
     def test_builder_accepts_empty_media_bindings_without_media_capability(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            reader = OwnerReader(ReadResult.success_empty(()))
             close_events: list[str] = []
-            content_runtime = self._content_runtime(
-                OwnerReader(ReadResult.success_empty(())),
-                close_events,
-            )
+            content_runtime = self._content_runtime(reader, close_events)
             access = WriteApiAccess(
                 principal="runtime-test",
                 bearer_token=self.TOKEN,
                 capabilities=frozenset({WriteCapability.CREATE}),
+                writes_enabled=True,
             )
             with (
                 patch(
                     "mark_api.private_web_runtime.build_private_web_content_runtime",
                     return_value=content_runtime,
                 ),
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_inventory_runtime",
+                    side_effect=AssertionError(
+                        "same-source confirmation runtime must not build"
+                    ),
+                ) as confirmation_builder,
                 patch(
                     "mark_api.private_web_runtime.build_private_web_media_create_runtime",
                     side_effect=AssertionError("media runtime must not build"),
@@ -2351,10 +2454,28 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                     store=store,
                     access=access,
                     media_bindings={},
+                    core_writes_enabled=True,
                 )
             try:
                 self.assertEqual(runtime.server_address[0], "127.0.0.1")
                 media_builder.assert_not_called()
+                confirmation_builder.assert_not_called()
+                status, body = self._request(
+                    runtime,
+                    "POST",
+                    "/api/write/ads",
+                    payload=self._create_payload(),
+                    idempotency_key="builder-no-independent-confirmation",
+                )
+                self.assertEqual(status, 409)
+                receipt = body["operation_receipt"]
+                self.assertEqual(receipt["pre_read_status"], "not_read")
+                self.assertEqual(
+                    receipt["confirmation_pre_read_status"],
+                    "confirmation_reader_not_independent",
+                )
+                self.assertFalse(receipt["writer_invoked"])
+                self.assertEqual(reader.calls, 0)
             finally:
                 runtime.close()
             self.assertEqual(close_events, ["content"])
@@ -2381,6 +2502,12 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                     return_value=content_runtime,
                 ),
                 patch(
+                    "mark_api.private_web_runtime.build_private_web_inventory_runtime",
+                    side_effect=AssertionError(
+                        "same-source confirmation runtime must not build"
+                    ),
+                ) as confirmation_builder,
+                patch(
                     "mark_api.private_web_runtime.build_private_web_media_create_runtime",
                     side_effect=RuntimeError("media setup failed"),
                 ),
@@ -2392,6 +2519,7 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                         access=access,
                         media_bindings={"cover": source},
                     )
+                confirmation_builder.assert_not_called()
             self.assertEqual(close_events, ["content"])
 
     def test_media_route_is_wired_but_closed_core_gate_skips_resolution(self) -> None:
@@ -2804,9 +2932,11 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             )
             reader = SequenceReader(
                 ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created,)),
+                ReadResult.success_nonempty((created,)),
+            )
+            confirmation_reader = SequenceReader(
                 ReadResult.success_empty(()),
-                ReadResult.success_nonempty((created,)),
-                ReadResult.success_nonempty((created,)),
                 ReadResult.success_nonempty((created,)),
             )
             close_events: list[str] = []
@@ -2832,6 +2962,10 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 page_factory=page_factory,
                 close_runtime=lambda: close_events.append("content"),
             )
+            confirmation_runtime = self._confirmation_runtime(
+                confirmation_reader,
+                close_events,
+            )
             access = WriteApiAccess(
                 principal="runtime-test",
                 bearer_token=self.TOKEN,
@@ -2840,6 +2974,7 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             )
             runtime = compose_private_web_write_api_runtime(
                 content_runtime=content_runtime,
+                confirmation_runtime=confirmation_runtime,
                 store=store,
                 access=access,
                 core_writes_enabled=True,
@@ -2859,7 +2994,8 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 )
                 self.assertTrue(body["operation_receipt"]["writer_invoked"])
                 self.assertFalse(body["platform_retry_authorized"])
-                self.assertEqual(reader.calls, 5)
+                self.assertEqual(reader.calls, 3)
+                self.assertEqual(confirmation_reader.calls, 2)
                 self.assertEqual(
                     [event[0] for event in events].count("submit_create"),
                     1,
@@ -2868,7 +3004,7 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 self.assertEqual(pages, [])
             finally:
                 runtime.close()
-            self.assertEqual(close_events, ["content"])
+            self.assertEqual(close_events, ["confirmation", "content"])
 
     def test_media_service_gate_is_independent_from_core_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2930,11 +3066,17 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             reader = SequenceReader(
                 ReadResult.success_empty(()),
                 ReadResult.success_empty(()),
+            )
+            confirmation_reader = SequenceReader(
                 ReadResult.success_empty(()),
                 ReadResult.success_empty(()),
             )
             close_events: list[str] = []
             content_runtime = self._content_runtime(reader, close_events)
+            confirmation_runtime = self._confirmation_runtime(
+                confirmation_reader,
+                close_events,
+            )
             events: list[tuple] = []
             media_runtime = PrivateWebMediaCreateRuntime(
                 page_factory=lambda: MediaCreatePage(events)
@@ -2947,6 +3089,7 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             )
             runtime = compose_private_web_write_api_runtime(
                 content_runtime=content_runtime,
+                confirmation_runtime=confirmation_runtime,
                 media_runtime=media_runtime,
                 media_resolver=PrivateWebMediaRefResolver({"cover_01": source}),
                 store=store,
@@ -3003,7 +3146,7 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 )
             finally:
                 runtime.close()
-            self.assertEqual(close_events, ["content"])
+            self.assertEqual(close_events, ["confirmation", "content"])
 
     def test_builder_preserves_setup_error_when_cleanup_also_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

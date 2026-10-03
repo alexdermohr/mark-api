@@ -748,9 +748,12 @@ class PrivateWebContentRuntime:
 
 
 class _PrivateWebRuntimeAdsReader:
-    """Adapt one owned PrivateWebContentRuntime to the AdsReader port."""
+    """Adapt one owned PrivateWeb inventory runtime to the AdsReader port."""
 
-    def __init__(self, runtime: PrivateWebContentRuntime) -> None:
+    def __init__(
+        self,
+        runtime: PrivateWebContentRuntime | PrivateWebInventoryRuntime,
+    ) -> None:
         self._runtime = runtime
 
     def read_ads(self) -> ReadResult[tuple[AdSnapshot, ...]]:
@@ -887,6 +890,7 @@ class PrivateWebWriteApiRuntime:
         *,
         server: LoopbackWriteApiServer,
         content_runtime: PrivateWebContentRuntime,
+        confirmation_runtime: PrivateWebInventoryRuntime | None,
         media_runtime: PrivateWebMediaCreateRuntime | None,
         mark_service: MarkService,
         media_service: PrivateWebMediaCreateService | None,
@@ -894,6 +898,7 @@ class PrivateWebWriteApiRuntime:
     ) -> None:
         self._server = server
         self._content_runtime = content_runtime
+        self._confirmation_runtime = confirmation_runtime
         self._media_runtime = media_runtime
         self._mark_service = mark_service
         self._media_service = media_service
@@ -1026,6 +1031,13 @@ class PrivateWebWriteApiRuntime:
                 if media_unknown is not None:
                     raise media_unknown
 
+                if self._confirmation_runtime is not None:
+                    try:
+                        self._confirmation_runtime.close()
+                    except Exception:
+                        self._runtime_cleanup_failed = True
+                        cleanup_failed = True
+
                 try:
                     self._content_runtime.close()
                 except Exception:
@@ -1088,6 +1100,7 @@ def compose_private_web_write_api_runtime(
     content_runtime: PrivateWebContentRuntime,
     store: SnapshotStore,
     access: WriteApiAccess,
+    confirmation_runtime: PrivateWebInventoryRuntime | None = None,
     media_runtime: PrivateWebMediaCreateRuntime | None = None,
     media_resolver: PrivateWebMediaRefResolver | None = None,
     core_writes_enabled: bool = False,
@@ -1103,6 +1116,13 @@ def compose_private_web_write_api_runtime(
 
     if not isinstance(content_runtime, PrivateWebContentRuntime):
         raise TypeError("content_runtime must be PrivateWebContentRuntime")
+    if (
+        confirmation_runtime is not None
+        and not isinstance(confirmation_runtime, PrivateWebInventoryRuntime)
+    ):
+        raise TypeError(
+            "confirmation_runtime must be PrivateWebInventoryRuntime or None"
+        )
     if not isinstance(store, SnapshotStore):
         raise TypeError("store must be SnapshotStore")
     _validate_write_runtime_config(
@@ -1117,7 +1137,15 @@ def compose_private_web_write_api_runtime(
         raise TypeError("clock must be callable")
 
     owner_reader = _PrivateWebRuntimeAdsReader(content_runtime)
-    confirmation_reader = _PrivateWebRuntimeAdsReader(content_runtime)
+    # Reuse the exact primary reader as a fail-closed sentinel when no
+    # independently established confirmation runtime was supplied. The
+    # SafeWriteOrchestrator then rejects Create before any read/write and
+    # refuses to CONFIRM Delete from a single inventory source.
+    confirmation_reader = (
+        owner_reader
+        if confirmation_runtime is None
+        else _PrivateWebRuntimeAdsReader(confirmation_runtime)
+    )
     mark_service = MarkService(
         owner_reader=owner_reader,
         management_reader=owner_reader,
@@ -1175,6 +1203,7 @@ def compose_private_web_write_api_runtime(
         return PrivateWebWriteApiRuntime(
             server=server,
             content_runtime=content_runtime,
+            confirmation_runtime=confirmation_runtime,
             media_runtime=media_runtime,
             mark_service=mark_service,
             media_service=media_service,
