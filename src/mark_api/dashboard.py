@@ -288,7 +288,13 @@ td.title {
 .note { margin: 10px 0 22px; font-size: 0.88rem; }
 @media (max-width: 640px) {
   header { align-items: flex-start; flex-direction: column; }
-  .chart-row { grid-template-columns: minmax(70px, 110px) minmax(90px, 1fr) auto; }
+  .chart-row { grid-template-columns: minmax(70px, 110px) minmax(0, 1fr); }
+  .chart-value {
+    grid-column: 2;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
 }
 """
 

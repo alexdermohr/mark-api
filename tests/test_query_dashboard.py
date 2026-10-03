@@ -542,6 +542,12 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertIn(".chart-progress::-webkit-progress-bar", css)
         self.assertIn(".chart-progress::-webkit-progress-value", css)
         self.assertIn(".chart-progress::-moz-progress-bar", css)
+        self.assertIn(
+            ".chart-row { grid-template-columns: minmax(70px, 110px) minmax(0, 1fr); }",
+            css,
+        )
+        self.assertIn("grid-column: 2;", css)
+        self.assertIn("overflow-wrap: anywhere;", css)
 
     def test_bar_chart_runtime_filters_values_and_preserves_semantics(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
