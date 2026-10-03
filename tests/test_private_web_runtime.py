@@ -2295,6 +2295,42 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                             )
                         builder.assert_not_called()
 
+    def test_builder_accepts_empty_media_bindings_without_media_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(
+                OwnerReader(ReadResult.success_empty(())),
+                close_events,
+            )
+            access = WriteApiAccess(
+                principal="runtime-test",
+                bearer_token=self.TOKEN,
+                capabilities=frozenset({WriteCapability.CREATE}),
+            )
+            with (
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_content_runtime",
+                    return_value=content_runtime,
+                ),
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_media_create_runtime",
+                    side_effect=AssertionError("media runtime must not build"),
+                ) as media_builder,
+            ):
+                runtime = build_private_web_write_api_runtime(
+                    cdp_port=19610,
+                    store=store,
+                    access=access,
+                    media_bindings={},
+                )
+            try:
+                self.assertEqual(runtime.server_address[0], "127.0.0.1")
+                media_builder.assert_not_called()
+            finally:
+                runtime.close()
+            self.assertEqual(close_events, ["content"])
+
     def test_builder_closes_content_runtime_if_media_builder_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SnapshotStore(Path(tmp) / "runtime.sqlite")

@@ -1101,9 +1101,10 @@ def build_private_web_write_api_runtime(
                 "create_media capability requires non-empty media_bindings"
             )
     elif media_bindings is not None:
-        raise ValueError(
-            "media_bindings require create_media capability"
-        )
+        if not isinstance(media_bindings, Mapping) or media_bindings:
+            raise ValueError(
+                "media_bindings require create_media capability"
+            )
     if media_writes_enabled and not media_capability:
         raise ValueError(
             "media_writes_enabled requires create_media capability"
