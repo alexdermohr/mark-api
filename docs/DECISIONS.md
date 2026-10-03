@@ -205,3 +205,22 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - `write_api.py` bleibt path-frei; persistente HTTP-Idempotenz bleibt vorgelagert und ein abgeschlossener Replay ruft den Media-Service nicht erneut auf,
 - ohne media-aware autoritativen Post-Read bleibt `media_persistence_confirmed=false`,
 - dieser Slice führt keinen realen Kleinanzeigen-Plattformwrite aus.
+## D-016 — PrivateWeb Write API wird als explizites loopback-only Runtime-Bundle komponiert
+
+**Fortschreibung:** D-016 ändert keine Write-Semantik aus D-010 bis D-015. Insbesondere bleibt media_persistence_confirmed=false, solange kein media-aware autoritativer Post-Read existiert, und ein Browser-/Media-UNKNOWN erteilt keine Retry-Autorisierung.
+
+**Entscheidung:** build_private_web_write_api_runtime(...) ist die konkrete Produktionskomposition für einen bereits laufenden, vom Nutzer selbst authentifizierten CDP-Worker. Das resultierende PrivateWebWriteApiRuntime besitzt den PrivateWebContentRuntime, optional den PrivateWebMediaCreateRuntime, den daraus komponierten MarkService, optional PrivateWebMediaCreateService und genau einen LoopbackWriteApiServer. Eine unabhängige Create/Delete-Confirmation-Runtime wird nicht aus einer zweiten Instanz derselben Management-Quelle konstruiert. Sowohl der High-Level-Builder über `confirmation_runtime=` als auch die Low-Level-Komposition dürfen eine vom Caller bereits separat etablierte `PrivateWebInventoryRuntime` nur dann explizit übernehmen, wenn deren tatsächliche Unabhängigkeit außerhalb dieser Builder begründet ist; kein Builder erzeugt eine solche zweite Quelle automatisch. Der Browserprozess selbst bleibt außerhalb des Bundles und wird weder gestartet noch authentifiziert oder beendet.
+
+**Begründung:** Die zuvor einzeln gehärteten Contracts waren nur testweise zusammensteckbar. Eine zentrale Komposition macht Ownership, Gate-Trennung und Shutdown-Semantik explizit, ohne einen CLI-Konfigurationskanal für Tokens/Dateipfade einzuführen oder Plattformwrites automatisch zu aktivieren.
+
+**Folgen:**
+- der HTTP-Server bindet weiterhin ausschließlich an 127.0.0.1; start() startet nur seinen lokalen Serverthread,
+- WriteApiAccess.writes_enabled, core_writes_enabled und media_writes_enabled bleiben unabhängige Freigabegates und sind standardmäßig false; ein geöffnetes HTTP-Gate öffnet weder Core- noch Media-Writes,
+- CREATE_MEDIA darf nur mit gemeinsam vorhandener PrivateWebMediaCreateRuntime und PrivateWebMediaRefResolver komponiert werden; der High-Level-Builder verlangt dafür nicht leere explizite media_ref -> PrivateWebMediaSource-Bindings und kopiert sie über den bestehenden Resolver immutable,
+- Media-Bindings ohne CREATE_MEDIA, CREATE_MEDIA ohne vollständige Media-Komposition sowie media_writes_enabled=true ohne Media-Komposition scheitern vor Browserzugriff,
+- der High-Level-Builder fabriziert keine unabhängige Bestätigung aus einer zweiten Instanz derselben Management-Quelle: eine vom Caller separat etablierte `PrivateWebInventoryRuntime` kann explizit über `confirmation_runtime=` injiziert werden; ohne diese explizite Runtime stoppt Create vor dem Writer mit `confirmation_reader_not_independent`, und Delete kann ohne zweite Abwesenheitsquelle nicht `CONFIRMED` werden,
+- der Builder bereinigt von ihm bereits erzeugte Runtimes bei partieller Konstruktion; eine fehlgeschlagene Low-Level-Komposition übernimmt dagegen keine caller-owned Runtimes,
+- bleibt nach einem Media-Submit `PrivateWebMediaCreateRuntime.reconciliation_required` wahr, blockiert die gemeinsame PrivateWeb-Komposition sämtliche weiteren Core- und Media-Writes unter demselben Operations-Lock noch vor ihrem Service-Delegate; nur erfolgreiche `reconcile_media_submit()`-Beobachtung hebt diesen Fence wieder auf,
+- Shutdown quiesziert zuerst HTTP. Meldet PrivateWebMediaCreateRuntime.close() einen unresolved Submit, wird PrivateWebSubmitUnknownError unverändert weitergereicht; Content- und Media-Runtime bleiben für die explizite observation-only reconcile_media_submit() erhalten, während der HTTP-Server nicht neu gestartet werden darf,
+- erst nach erfolgreicher Reconciliation kann ein erneutes close() die restlichen lokalen Ressourcen deterministisch schließen,
+- dieser Slice führt keinen realen Kleinanzeigen-Plattformwrite aus und fügt keinen Auth-, MFA-, CAPTCHA- oder Security-Challenge-Bypass hinzu.
