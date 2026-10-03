@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from mark_api.analytics import ANALYTICS_METRICS, REACTION_METRICS, AnalyticsContract
 from mark_api.dashboard import create_server
 from mark_api.domain import (
     AdClassification,
@@ -245,6 +246,51 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertEqual(len(reactions), 1)
         self.assertEqual(reactions[0]["conversation_count"], 1)
         self.assertNotIn("text", reactions[0])
+
+    def test_analytics_contract_is_neutral_and_ui_has_no_metric_default(self) -> None:
+        _, _, contract_body = self.get("/api/analytics/contract")
+        contract = json.loads(contract_body)
+
+        self.assertIsNone(contract["reaction_metric"])
+        self.assertIsNone(contract["objective_metric"])
+        self.assertEqual(
+            contract["allowed_reaction_metrics"],
+            list(REACTION_METRICS),
+        )
+        self.assertEqual(
+            contract["allowed_objective_metrics"],
+            list(ANALYTICS_METRICS),
+        )
+
+        _, _, js_body = self.get("/dashboard.js")
+        script = js_body.decode("utf-8")
+        self.assertIn('setOptions(metricSelect, metricsPayload.metrics, "Metrik auswählen …")', script)
+        self.assertIn('getJson("/api/analytics/contract")', script)
+
+    def test_dashboard_exposes_explicit_configured_contract(self) -> None:
+        server = create_server(
+            self.store,
+            port=0,
+            analytics_contract=AnalyticsContract(
+                reaction_metric="unique_buyer_count",
+                objective_metric="inbound_message_count",
+            ),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        host, port = server.server_address
+
+        with urlopen(
+            f"http://{host}:{port}/api/analytics/contract",
+            timeout=2,
+        ) as response:
+            contract = json.loads(response.read())
+
+        self.assertEqual(contract["reaction_metric"], "unique_buyer_count")
+        self.assertEqual(contract["objective_metric"], "inbound_message_count")
 
     def test_analytics_contract_and_rankings_endpoints(self) -> None:
         _, _, metrics_body = self.get("/api/analytics/metrics")

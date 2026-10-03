@@ -136,9 +136,11 @@ Die HTTP-Antwort exponiert den sanitisierten `OperationReceipt` beziehungsweise 
 
 ## Offene fachliche Punkte
 
-Die Reaktionsdaten werden absichtlich getrennt als `conversation_count`, `unique_buyer_count` und `inbound_message_count` gespeichert. Welche dieser Größen fachlich „wie viele geschrieben haben“ meint, ist noch nicht festgelegt.
+Die Reaktionsdaten werden absichtlich getrennt als `conversation_count`, `unique_buyer_count` und `inbound_message_count` gespeichert. `AnalyticsContract.reaction_metric` kann explizit genau eine dieser Größen auswählen, ist aber standardmäßig `None`. Damit wird keine davon stillschweigend zur Bedeutung von „wie viele geschrieben haben“ erklärt.
 
-Ebenso ist noch keine fachlich bestätigte Zielfunktion für „beste Lösung“ definiert. Die Analytics-Schicht zeigt deshalb Rohmetriken und Rankings, ohne daraus Kausalität oder Qualität abzuleiten.
+Ebenso ist noch keine fachlich bestätigte Zielfunktion für „beste Lösung“ definiert. `AnalyticsContract.objective_metric` kann explizit eine vorhandene Analytics-Rohmetrik binden und ist standardmäßig ebenfalls `None`. Objective-gebundene Rankings brechen ohne diese Konfiguration fail-closed ab; die bestehenden deskriptiven Ranking-Endpunkte verlangen weiterhin einen expliziten `metric`-Parameter. Fehlende Werte werden ausgelassen, beobachtete Nullwerte bleiben erhalten. Keine Rangfolge begründet Kausalität oder Qualität.
+
+Das read-only Dashboard exponiert den aktuellen Contract unter `GET /api/analytics/contract`. Ohne explizite Zielmetrik zeigt die Metrikauswahl zunächst „Metrik auswählen …“ und lädt kein Ranking. Für eine bewusst gesetzte Laufzeitkonfiguration akzeptiert `mark-api-dashboard` optional `--reaction-metric` und `--objective-metric`; das Repository definiert dafür keinen fachlichen Default.
 
 ## Zulässige Betriebswege
 

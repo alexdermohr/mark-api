@@ -9,8 +9,11 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .analytics import (
     ANALYTICS_DIMENSIONS,
     ANALYTICS_METRICS,
+    REACTION_METRICS,
+    AnalyticsContract,
     AnalyticsService,
     ad_metric_ranking_to_dict,
+    analytics_contract_to_dict,
     group_metric_ranking_to_dict,
 )
 from .query import (
@@ -56,6 +59,7 @@ _DASHBOARD_HTML = """<!doctype html>
     <section class="panel">
       <h2>Analytics-Rankings</h2>
       <p class="muted">Rohmetriken nach explizit gespeicherten Labels. Keine Qualitäts- oder Kausalaussage.</p>
+      <p id="analytics-contract" class="note"></p>
       <div class="controls">
         <label>
           Metrik
@@ -283,8 +287,14 @@ function renderAds(ads) {
   }
 }
 
-function setOptions(select, values) {
+function setOptions(select, values, placeholder = null) {
   select.replaceChildren();
+  if (placeholder !== null) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = placeholder;
+    select.append(option);
+  }
   for (const value of values) {
     const option = document.createElement("option");
     option.value = value;
@@ -308,6 +318,13 @@ function renderGroups(groups) {
 }
 
 let analyticsRequestGeneration = 0;
+
+function renderAnalyticsContract(contract) {
+  const reaction = contract.reaction_metric ?? "nicht festgelegt";
+  const objective = contract.objective_metric ?? "nicht festgelegt";
+  byId("analytics-contract").textContent =
+    `Reaktionsmetrik: ${reaction}; Optimierungsziel: ${objective}. Rankings werden nur nach explizit ausgewählter Metrik geladen.`;
+}
 
 function renderRanking(items) {
   const body = byId("ranking-body");
@@ -347,11 +364,12 @@ async function load() {
   const status = byId("status");
   status.textContent = "Lade lokale Daten …";
   try {
-    const [summary, ads, metricsPayload, dimensionsPayload] = await Promise.all([
+    const [summary, ads, metricsPayload, dimensionsPayload, contract] = await Promise.all([
       getJson("/api/summary"),
       getJson("/api/ads"),
       getJson("/api/analytics/metrics"),
       getJson("/api/analytics/dimensions"),
+      getJson("/api/analytics/contract"),
     ]);
     byId("tracked").textContent = summary.tracked_ads;
     byId("current").textContent = summary.current_ads;
@@ -363,14 +381,22 @@ async function load() {
     byId("replies").textContent =
       `${summary.replies_total_known} / ${summary.replies_observed_ads} Ads`;
     renderAds(ads);
+    renderAnalyticsContract(contract);
 
     const metricSelect = byId("metric-select");
     const dimensionSelect = byId("dimension-select");
     const previousMetric = metricSelect.value;
     const previousDimension = dimensionSelect.value;
-    setOptions(metricSelect, metricsPayload.metrics);
+    setOptions(metricSelect, metricsPayload.metrics, "Metrik auswählen …");
     setOptions(dimensionSelect, dimensionsPayload.dimensions);
-    if (metricsPayload.metrics.includes(previousMetric)) metricSelect.value = previousMetric;
+    if (metricsPayload.metrics.includes(previousMetric)) {
+      metricSelect.value = previousMetric;
+    } else if (
+      contract.objective_metric !== null
+      && metricsPayload.metrics.includes(contract.objective_metric)
+    ) {
+      metricSelect.value = contract.objective_metric;
+    }
     if (dimensionsPayload.dimensions.includes(previousDimension)) dimensionSelect.value = previousDimension;
 
     await loadAnalytics();
@@ -528,6 +554,12 @@ def _handler_factory(query: MarkQueryService, analytics: AnalyticsService):
             if path == "/api/analytics/metrics":
                 self._send_json(200, {"metrics": list(ANALYTICS_METRICS)})
                 return
+            if path == "/api/analytics/contract":
+                self._send_json(
+                    200,
+                    analytics_contract_to_dict(analytics.contract),
+                )
+                return
             if path == "/api/analytics/dimensions":
                 self._send_json(
                     200,
@@ -645,6 +677,7 @@ def create_server(
     *,
     host: str = "127.0.0.1",
     port: int = 8765,
+    analytics_contract: AnalyticsContract | None = None,
 ) -> LoopbackDashboardServer:
     if host != "127.0.0.1":
         raise ValueError("dashboard must bind to 127.0.0.1")
@@ -656,7 +689,7 @@ def create_server(
         raise ValueError("port must be an integer between 0 and 65535")
 
     query = MarkQueryService(store)
-    analytics = AnalyticsService(store)
+    analytics = AnalyticsService(store, contract=analytics_contract)
     return LoopbackDashboardServer(
         (host, port),
         _handler_factory(query, analytics),
@@ -679,10 +712,36 @@ def main(argv: list[str] | None = None) -> int:
         default=8765,
         help="Loopback port (default: 8765).",
     )
+    parser.add_argument(
+        "--reaction-metric",
+        choices=REACTION_METRICS,
+        default=None,
+        help=(
+            "Explicit interpretation of 'wie viele geschrieben haben'; "
+            "unset by default."
+        ),
+    )
+    parser.add_argument(
+        "--objective-metric",
+        choices=ANALYTICS_METRICS,
+        default=None,
+        help=(
+            "Explicit analytics objective used to preselect rankings; "
+            "unset by default."
+        ),
+    )
     args = parser.parse_args(argv)
 
     store = SnapshotStore(args.db)
-    server = create_server(store, port=args.port)
+    contract = AnalyticsContract(
+        reaction_metric=args.reaction_metric,
+        objective_metric=args.objective_metric,
+    )
+    server = create_server(
+        store,
+        port=args.port,
+        analytics_contract=contract,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
