@@ -236,12 +236,26 @@ button:hover { background: #2a313b; }
   border: 0;
   border-radius: 999px;
   overflow: hidden;
-  accent-color: #8ca6cf;
+  appearance: none;
+  -webkit-appearance: none;
   background: #252b34;
 }
+.chart-progress::-webkit-progress-bar {
+  background: #252b34;
+  border-radius: 999px;
+}
+.chart-progress::-webkit-progress-value {
+  background: #8ca6cf;
+  border-radius: 999px;
+}
+.chart-progress::-moz-progress-bar {
+  background: #8ca6cf;
+  border-radius: 999px;
+}
 .chart-value {
-  min-width: 4.5em;
+  min-width: 7.5em;
   text-align: right;
+  white-space: nowrap;
   font-variant-numeric: tabular-nums;
   color: #b7bec8;
 }
@@ -371,7 +385,7 @@ function renderBarChart(containerId, items, valueOf, labelOf, formatValue) {
 
     const value = document.createElement("span");
     value.className = "chart-value";
-    value.textContent = formatValue(entry.value);
+    value.textContent = formatValue(entry.value, entry.item);
 
     row.append(label, progress, value);
     container.append(row);
@@ -395,7 +409,7 @@ function renderGroups(groups) {
     groups,
     (group) => group.metric_mean,
     (group) => group.label,
-    (value) => value.toFixed(2),
+    (value, group) => `${value.toFixed(2)} (n=${group.sample_size})`,
   );
 }
 
