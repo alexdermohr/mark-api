@@ -18,6 +18,7 @@ from mark_api.domain import (
     AdSnapshot,
     DeleteApproval,
     LifecycleState,
+    MediaPostReadStatus,
     OperationOutcome,
     OperationReceipt,
 )
@@ -52,6 +53,7 @@ from mark_api.private_web_runtime import (
 from mark_api.private_web_media import (
     PrivateWebCreateMediaSnapshot,
     PrivateWebMediaFileSnapshot,
+    PrivateWebMediaPersistenceSnapshot,
     PrivateWebMediaRefResolver,
     PrivateWebMediaSource,
 )
@@ -106,6 +108,42 @@ class SequenceReader:
         result = self._results[self.calls]
         self.calls += 1
         return result
+
+
+class MediaPersistenceVerifier:
+    def __init__(self, *results) -> None:
+        self._results = list(results)
+        self.calls: list[tuple[str, tuple[tuple[str, bytes], ...]]] = []
+
+    def verify_media(
+        self,
+        ad_id: str,
+        expected_sources: tuple[PrivateWebMediaSource, ...],
+    ):
+        self.calls.append(
+            (
+                ad_id,
+                tuple(
+                    (Path(source.path).name, Path(source.path).read_bytes())
+                    for source in expected_sources
+                ),
+            )
+        )
+        if self._results:
+            result = self._results.pop(0)
+            if isinstance(result, ReadResult):
+                return result
+            exact_match = bool(result)
+        else:
+            exact_match = True
+        return ReadResult.success_nonempty(
+            PrivateWebMediaPersistenceSnapshot(
+                ad_id=ad_id,
+                observed_at=NOW,
+                source="authoritative-media-test",
+                exact_match=exact_match,
+            )
+        )
 
 
 class SharedPage:
@@ -790,6 +828,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             ReadResult.success_nonempty((created_inventory,)),
         )
         db_path = Path(self.tmp.name) / "media-service-freeze.sqlite"
+        media_verifier = MediaPersistenceVerifier()
         service = PrivateWebMediaCreateService(
             runtime=runtime,
             resolver=resolver,
@@ -798,6 +837,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             content_reader_factory=lambda _ad_id: OwnerReader(
                 ReadResult.success_nonempty((created_content,))
             ),
+            media_persistence_verifier=media_verifier,
             store=SnapshotStore(db_path),
             writes_enabled=True,
         )
@@ -816,6 +856,16 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             receipt.authorization_reference,
             "media-freeze-test",
         )
+        self.assertTrue(receipt.media_persistence_confirmed)
+        self.assertEqual(
+            receipt.media_post_read_status,
+            MediaPostReadStatus.CONFIRMED,
+        )
+        self.assertEqual(
+            media_verifier.calls,
+            [(created_id, (("photo.jpg", original),))],
+        )
+        self.assertFalse(runtime.reconciliation_required)
         self.assertIn(("media_bytes", (original,)), events)
         self.assertEqual(primary.calls, 2)
         self.assertEqual(confirmation.calls, 2)
@@ -841,6 +891,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         runtime = PrivateWebMediaCreateRuntime(page_factory=page_factory)
         primary = OwnerReader(ReadResult.success_empty(()))
         confirmation = OwnerReader(ReadResult.success_empty(()))
+        media_verifier = MediaPersistenceVerifier()
         service = PrivateWebMediaCreateService(
             runtime=runtime,
             resolver=PrivateWebMediaRefResolver({"cover_01": self.sources[0]}),
@@ -849,6 +900,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             content_reader_factory=lambda _ad_id: OwnerReader(
                 ReadResult.success_empty(())
             ),
+            media_persistence_verifier=media_verifier,
             writes_enabled=True,
         )
 
@@ -860,6 +912,12 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertFalse(receipt.writer_invoked)
         self.assertEqual(primary.calls, 0)
         self.assertEqual(confirmation.calls, 0)
+        self.assertEqual(media_verifier.calls, [])
+        self.assertEqual(
+            receipt.media_post_read_status,
+            MediaPostReadStatus.NOT_READ,
+        )
+        self.assertFalse(receipt.media_persistence_confirmed)
         self.assertEqual(page_calls, 0)
         runtime.close()
 
@@ -872,6 +930,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         runtime = PrivateWebMediaCreateRuntime(
             page_factory=lambda: MediaCreatePage([])
         )
+        media_verifier = MediaPersistenceVerifier()
         service = PrivateWebMediaCreateService(
             runtime=runtime,
             resolver=PrivateWebMediaRefResolver({"cover_01": missing}),
@@ -880,6 +939,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             content_reader_factory=lambda _ad_id: OwnerReader(
                 ReadResult.success_empty(())
             ),
+            media_persistence_verifier=media_verifier,
             writes_enabled=False,
         )
 
@@ -888,6 +948,12 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
         self.assertEqual(receipt.pre_read_status, "writes_disabled")
         self.assertFalse(receipt.writer_invoked)
+        self.assertEqual(
+            receipt.media_post_read_status,
+            MediaPostReadStatus.NOT_READ,
+        )
+        self.assertFalse(receipt.media_persistence_confirmed)
+        self.assertEqual(media_verifier.calls, [])
         runtime.close()
 
     def test_media_create_service_serializes_whole_orchestrator(self) -> None:
@@ -901,6 +967,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             content_reader_factory=lambda _ad_id: OwnerReader(
                 ReadResult.success_empty(())
             ),
+            media_persistence_verifier=MediaPersistenceVerifier(),
             writes_enabled=True,
         )
         first_entered = threading.Event()
@@ -909,6 +976,8 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         calls: list[str | None] = []
         errors: list[BaseException] = []
 
+        original_writes = service._writes
+
         class BlockingWrites:
             def create(self, **kwargs):
                 calls.append(kwargs.get("authorization_reference"))
@@ -916,7 +985,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
                     first_entered.set()
                     if not release_first.wait(timeout=2):
                         raise AssertionError("first create was not released")
-                return object()
+                return original_writes.create(**kwargs)
 
         service._writes = BlockingWrites()
 
@@ -948,6 +1017,157 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertEqual(calls, ["first", "second"])
         self.assertEqual(errors, [])
 
+    def test_media_create_service_mismatch_is_fail_closed_without_runtime_fence(
+        self,
+    ) -> None:
+        original = b"stable-media-for-verification"
+        self.image.write_bytes(original)
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: MediaCreatePage([])
+        )
+        created_id = "4000000020"
+        created_inventory = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+        )
+        created_content = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+            description=self.request.description,
+        )
+        verifier = MediaPersistenceVerifier(False)
+        service = PrivateWebMediaCreateService(
+            runtime=runtime,
+            resolver=PrivateWebMediaRefResolver(
+                {"cover_01": self.sources[0]}
+            ),
+            reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            confirmation_reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            content_reader_factory=lambda _ad_id: OwnerReader(
+                ReadResult.success_nonempty((created_content,))
+            ),
+            media_persistence_verifier=verifier,
+            writes_enabled=True,
+        )
+
+        receipt = service.create_with_media(self.request, ("cover_01",))
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(receipt.created_ad_id, created_id)
+        self.assertFalse(receipt.media_persistence_confirmed)
+        self.assertEqual(
+            receipt.media_post_read_status,
+            MediaPostReadStatus.MISMATCH,
+        )
+        self.assertFalse(runtime.reconciliation_required)
+        self.assertEqual(
+            verifier.calls,
+            [(created_id, (("photo.jpg", original),))],
+        )
+        runtime.close()
+
+    def test_media_create_service_read_failure_is_unknown_without_runtime_fence(
+        self,
+    ) -> None:
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: MediaCreatePage([])
+        )
+        created_id = "4000000021"
+        created_inventory = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+        )
+        created_content = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+            description=self.request.description,
+        )
+        verifier = MediaPersistenceVerifier(
+            ReadResult.failure(ReadStatus.TRANSPORT_ERROR),
+        )
+        service = PrivateWebMediaCreateService(
+            runtime=runtime,
+            resolver=PrivateWebMediaRefResolver(
+                {"cover_01": self.sources[0]}
+            ),
+            reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            confirmation_reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            content_reader_factory=lambda _ad_id: OwnerReader(
+                ReadResult.success_nonempty((created_content,))
+            ),
+            media_persistence_verifier=verifier,
+            writes_enabled=True,
+        )
+
+        receipt = service.create_with_media(self.request, ("cover_01",))
+
+        self.assertFalse(receipt.media_persistence_confirmed)
+        self.assertEqual(
+            receipt.media_post_read_status,
+            MediaPostReadStatus.UNKNOWN,
+        )
+        self.assertFalse(runtime.reconciliation_required)
+        self.assertEqual(len(verifier.calls), 1)
+        runtime.close()
+
+    def test_media_create_service_without_verifier_stays_unconfirmed(
+        self,
+    ) -> None:
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: MediaCreatePage([])
+        )
+        created_id = "4000000022"
+        created_inventory = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+        )
+        created_content = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+            description=self.request.description,
+        )
+        service = PrivateWebMediaCreateService(
+            runtime=runtime,
+            resolver=PrivateWebMediaRefResolver(
+                {"cover_01": self.sources[0]}
+            ),
+            reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            confirmation_reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            content_reader_factory=lambda _ad_id: OwnerReader(
+                ReadResult.success_nonempty((created_content,))
+            ),
+            writes_enabled=True,
+        )
+
+        receipt = service.create_with_media(self.request, ("cover_01",))
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertFalse(receipt.media_persistence_confirmed)
+        self.assertEqual(
+            receipt.media_post_read_status,
+            MediaPostReadStatus.VERIFIER_UNAVAILABLE,
+        )
+        self.assertFalse(runtime.reconciliation_required)
+        runtime.close()
+
     def test_media_create_service_preserves_runtime_submit_unknown_fence(
         self,
     ) -> None:
@@ -965,6 +1185,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             ReadResult.success_empty(()),
         )
         content_calls: list[str] = []
+        media_verifier = MediaPersistenceVerifier()
         service = PrivateWebMediaCreateService(
             runtime=runtime,
             resolver=PrivateWebMediaRefResolver({"cover_01": self.sources[0]}),
@@ -974,6 +1195,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
                 content_calls.append(ad_id)
                 or OwnerReader(ReadResult.success_empty(()))
             ),
+            media_persistence_verifier=media_verifier,
             writes_enabled=True,
         )
 
@@ -996,6 +1218,17 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertEqual(primary.calls, 3)
         self.assertEqual(confirmation.calls, 3)
         self.assertEqual(content_calls, [])
+        self.assertEqual(media_verifier.calls, [])
+        self.assertEqual(
+            first.media_post_read_status,
+            MediaPostReadStatus.NOT_READ,
+        )
+        self.assertEqual(
+            second.media_post_read_status,
+            MediaPostReadStatus.NOT_READ,
+        )
+        self.assertFalse(first.media_persistence_confirmed)
+        self.assertFalse(second.media_persistence_confirmed)
         self.assertEqual(
             [event[0] for event in events].count("media_submit"),
             1,
@@ -1003,6 +1236,72 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
 
         runtime.reconcile_media_submit()
         self.assertTrue(page._closed)
+        runtime.close()
+
+    def test_service_server_confirmation_does_not_release_submit_unknown_fence(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        original = b"stable-media-submit-unknown"
+        self.image.write_bytes(original)
+        page = MediaCreatePage(events, submit_unknown=True)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+        created_id = "4000000023"
+        created_inventory = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+        )
+        created_content = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+            description=self.request.description,
+        )
+        verifier = MediaPersistenceVerifier()
+        service = PrivateWebMediaCreateService(
+            runtime=runtime,
+            resolver=PrivateWebMediaRefResolver(
+                {"cover_01": self.sources[0]}
+            ),
+            reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            confirmation_reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            content_reader_factory=lambda _ad_id: OwnerReader(
+                ReadResult.success_nonempty((created_content,))
+            ),
+            media_persistence_verifier=verifier,
+            writes_enabled=True,
+        )
+
+        receipt = service.create_with_media(self.request, ("cover_01",))
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(receipt.created_ad_id, created_id)
+        self.assertEqual(
+            receipt.writer_error,
+            "PrivateWebSubmitUnknownError",
+        )
+        self.assertTrue(receipt.media_persistence_confirmed)
+        self.assertEqual(
+            receipt.media_post_read_status,
+            MediaPostReadStatus.CONFIRMED,
+        )
+        self.assertEqual(
+            verifier.calls,
+            [(created_id, (("photo.jpg", original),))],
+        )
+        self.assertTrue(runtime.reconciliation_required)
+        self.assertEqual(
+            [event[0] for event in events].count("media_submit"),
+            1,
+        )
+
+        runtime.reconcile_media_submit()
+        self.assertFalse(runtime.reconciliation_required)
         runtime.close()
 
     def test_submit_unknown_can_confirm_without_releasing_runtime_fence(
@@ -3092,6 +3391,7 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 confirmation_runtime=confirmation_runtime,
                 media_runtime=media_runtime,
                 media_resolver=PrivateWebMediaRefResolver({"cover_01": source}),
+                media_persistence_verifier=MediaPersistenceVerifier(),
                 store=store,
                 access=access,
                 media_writes_enabled=True,

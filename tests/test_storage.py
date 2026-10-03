@@ -12,6 +12,7 @@ from mark_api.domain import (
     AdSnapshot,
     CreateOperationReceipt,
     LifecycleState,
+    MediaPostReadStatus,
     OperationOutcome,
     OperationReceipt,
     ReactionSnapshot,
@@ -169,6 +170,8 @@ class SnapshotStoreTests(unittest.TestCase):
             post_snapshot=candidate,
             confirmation_post_snapshot=candidate,
             content_post_snapshot=candidate,
+            media_post_read_status=MediaPostReadStatus.CONFIRMED,
+            media_persistence_confirmed=True,
         )
 
         store.append_create_operation_receipt(receipt)
@@ -178,7 +181,8 @@ class SnapshotStoreTests(unittest.TestCase):
                 """
                 SELECT created_ad_id, outcome, confirmation_pre_read_status,
                        confirmation_post_read_status, content_post_read_status,
-                       authorization_by, authorization_reference
+                       authorization_by, authorization_reference,
+                       media_post_read_status, media_persistence_confirmed
                 FROM create_operation_receipts
                 """
             ).fetchone()
@@ -193,6 +197,8 @@ class SnapshotStoreTests(unittest.TestCase):
                 "success_nonempty",
                 "api-owner",
                 "write-api:create-storage",
+                "confirmed",
+                1,
             ),
         )
 
@@ -238,6 +244,7 @@ class SnapshotStoreTests(unittest.TestCase):
             writer_invoked=False,
             authorization_by="api-owner",
             authorization_reference="write-api:create-legacy",
+            media_post_read_status=MediaPostReadStatus.NOT_READ,
         )
         store.append_create_operation_receipt(receipt)
 
@@ -250,16 +257,19 @@ class SnapshotStoreTests(unittest.TestCase):
             }
             row = connection.execute(
                 """
-                SELECT authorization_by, authorization_reference
+                SELECT authorization_by, authorization_reference,
+                       media_post_read_status, media_persistence_confirmed
                 FROM create_operation_receipts
                 """
             ).fetchone()
 
         self.assertIn("authorization_by", columns)
         self.assertIn("authorization_reference", columns)
+        self.assertIn("media_post_read_status", columns)
+        self.assertIn("media_persistence_confirmed", columns)
         self.assertEqual(
             row,
-            ("api-owner", "write-api:create-legacy"),
+            ("api-owner", "write-api:create-legacy", "not_read", 0),
         )
 
     def test_reaction_snapshots_are_append_only(self) -> None:

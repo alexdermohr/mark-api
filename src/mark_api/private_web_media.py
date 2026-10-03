@@ -6,9 +6,11 @@ import stat
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Protocol
 
 from .domain import AdCreateRequest
+from .results import ReadResult
 from .ports import WriteNotAttemptedError
 from .private_web import (
     PrivateWebCreateSnapshot,
@@ -37,6 +39,48 @@ class PrivateWebMediaSource:
             raise TypeError("media source path must be a string")
         if not self.path or "\x00" in self.path or not os.path.isabs(self.path):
             raise ValueError("media source path must be an absolute path")
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateWebMediaPersistenceSnapshot:
+    """Authoritative server-side media verification result for one owner ad.
+
+    The verifier owns the platform-specific identity algorithm. This snapshot
+    deliberately carries no local path, browser FileList state, CDN URL, or
+    provider-specific media identifier.
+    """
+
+    ad_id: str
+    observed_at: datetime
+    source: str
+    exact_match: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ad_id, str) or not self.ad_id.strip():
+            raise ValueError("media persistence snapshot requires ad_id")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("media persistence snapshot requires source")
+        if (
+            not isinstance(self.observed_at, datetime)
+            or self.observed_at.tzinfo is None
+            or self.observed_at.utcoffset() is None
+        ):
+            raise ValueError(
+                "media persistence observed_at must be timezone-aware"
+            )
+        if not isinstance(self.exact_match, bool):
+            raise TypeError("media persistence exact_match must be bool")
+
+
+class PrivateWebMediaPersistenceVerifier(Protocol):
+    """Verify stable expected local media against an authoritative server read."""
+
+    def verify_media(
+        self,
+        ad_id: str,
+        expected_sources: tuple[PrivateWebMediaSource, ...],
+    ) -> ReadResult[PrivateWebMediaPersistenceSnapshot]:
+        ...
 
 
 @dataclass(frozen=True, slots=True)

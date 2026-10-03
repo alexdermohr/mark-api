@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError
@@ -17,6 +18,7 @@ from mark_api.domain import (
     CreateOperationReceipt,
     DeleteApproval,
     LifecycleState,
+    MediaPostReadStatus,
     OperationOutcome,
     OperationReceipt,
 )
@@ -254,9 +256,13 @@ class FakeMediaWriteService:
         *,
         outcome: OperationOutcome = OperationOutcome.CONFIRMED,
         fail: bool = False,
+        media_post_read_status: MediaPostReadStatus | None = None,
+        media_persistence_confirmed: bool = False,
     ) -> None:
         self.outcome = outcome
         self.fail = fail
+        self.media_post_read_status = media_post_read_status
+        self.media_persistence_confirmed = media_persistence_confirmed
         self.calls: list[tuple[object, ...]] = []
 
     def create_with_media(
@@ -278,11 +284,16 @@ class FakeMediaWriteService:
         )
         if self.fail:
             raise RuntimeError("media provider details must not escape")
-        return create_receipt(
+        receipt = create_receipt(
             request=request,
             outcome=self.outcome,
             authorization_by=authorization_by,
             authorization_reference=authorization_reference,
+        )
+        return replace(
+            receipt,
+            media_post_read_status=self.media_post_read_status,
+            media_persistence_confirmed=self.media_persistence_confirmed,
         )
 
 
@@ -706,6 +717,11 @@ class WriteApiTests(unittest.TestCase):
         )
         self.assertFalse(first_body["platform_retry_authorized"])
         self.assertFalse(first_body["media_persistence_confirmed"])
+        self.assertIsNone(first_body["media_post_read_status"])
+        self.assertNotIn(
+            "media_post_read_status",
+            first_body["operation_receipt"],
+        )
 
         fresh_standard = FakeWriteService()
         fresh_media = FakeMediaWriteService()
@@ -729,6 +745,76 @@ class WriteApiTests(unittest.TestCase):
             )
 
         self.assertEqual(second_status, 202)
+        self.assertEqual(
+            second_headers.get("Idempotency-Replayed"),
+            "true",
+        )
+        self.assertEqual(second_body, first_body)
+        self.assertEqual(fresh_standard.calls, [])
+        self.assertEqual(fresh_media.calls, [])
+
+    def test_media_create_confirmed_persistence_returns_200_and_replays(
+        self,
+    ) -> None:
+        service = FakeWriteService()
+        media_service = FakeMediaWriteService(
+            media_post_read_status=MediaPostReadStatus.CONFIRMED,
+            media_persistence_confirmed=True,
+        )
+        payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase",
+            "description": "Beschreibung",
+            "price_eur": 12,
+            "media_refs": ["cover_01"],
+        }
+        capabilities = frozenset({WriteCapability.CREATE_MEDIA})
+
+        with self.server(
+            service,
+            media_service=media_service,
+            capabilities=capabilities,
+        ) as server:
+            first_status, first_headers, first_body = self.request(
+                server,
+                "POST",
+                "/api/write/media/ads",
+                payload=payload,
+                idempotency_key="media-create-confirmed",
+            )
+
+        self.assertEqual(first_status, 200)
+        self.assertIsNone(first_headers.get("Idempotency-Replayed"))
+        self.assertTrue(first_body["media_persistence_confirmed"])
+        self.assertEqual(first_body["media_post_read_status"], "confirmed")
+        self.assertEqual(
+            first_body["operation_receipt"]["media_post_read_status"],
+            "confirmed",
+        )
+        self.assertTrue(
+            first_body["operation_receipt"]["media_persistence_confirmed"]
+        )
+        self.assertFalse(first_body["platform_retry_authorized"])
+        serialized = json.dumps(first_body, sort_keys=True)
+        self.assertNotIn("media_refs", serialized)
+        self.assertNotIn("cover_01", serialized)
+
+        fresh_standard = FakeWriteService()
+        fresh_media = FakeMediaWriteService()
+        with self.server(
+            fresh_standard,
+            media_service=fresh_media,
+            capabilities=capabilities,
+        ) as server:
+            second_status, second_headers, second_body = self.request(
+                server,
+                "POST",
+                "/api/write/media/ads",
+                payload=payload,
+                idempotency_key="media-create-confirmed",
+            )
+
+        self.assertEqual(second_status, 200)
         self.assertEqual(
             second_headers.get("Idempotency-Replayed"),
             "true",

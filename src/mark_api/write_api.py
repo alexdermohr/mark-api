@@ -268,7 +268,7 @@ def _receipt_to_dict(receipt: OperationReceipt) -> dict[str, object]:
 def _create_receipt_to_dict(
     receipt: CreateOperationReceipt,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "operation": receipt.operation,
         "created_ad_id": receipt.created_ad_id,
         "started_at": receipt.started_at.isoformat(),
@@ -284,6 +284,12 @@ def _create_receipt_to_dict(
         "authorization_reference": receipt.authorization_reference,
         "writer_error": receipt.writer_error,
     }
+    if receipt.media_post_read_status is not None:
+        payload["media_post_read_status"] = receipt.media_post_read_status.value
+        payload["media_persistence_confirmed"] = (
+            receipt.media_persistence_confirmed
+        )
+    return payload
 
 
 def _create_receipt_matches_request(
@@ -743,13 +749,23 @@ def _handler_factory(
                         "platform_retry_authorized": False,
                     }
                     if action == "create_media":
-                        # The existing create receipt confirms only the ad
-                        # identity/content contract, never server-side media
-                        # persistence. Do not turn that narrower confirmation
-                        # into a successful media-operation claim.
-                        if status == 200:
+                        # Content confirmation remains distinct from exact
+                        # server-side media persistence. A media create is HTTP
+                        # 200 only when both are confirmed; otherwise a
+                        # content-confirmed/media-unconfirmed result remains 202.
+                        if (
+                            status == 200
+                            and not create_receipt.media_persistence_confirmed
+                        ):
                             status = 202
-                        response["media_persistence_confirmed"] = False
+                        response["media_persistence_confirmed"] = (
+                            create_receipt.media_persistence_confirmed
+                        )
+                        response["media_post_read_status"] = (
+                            create_receipt.media_post_read_status.value
+                            if create_receipt.media_post_read_status is not None
+                            else None
+                        )
                     receipt = None
                 elif action == "update_content":
                     receipt = service.update_content(
