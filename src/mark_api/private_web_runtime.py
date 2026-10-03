@@ -760,12 +760,32 @@ class _PrivateWebRuntimeAdsReader:
         return self._runtime.read_inventory()
 
 
+def _ensure_no_pending_media_reconciliation(
+    media_runtime: PrivateWebMediaCreateRuntime | None,
+) -> None:
+    """Fence every composed write while one media submit still needs observation."""
+
+    if media_runtime is not None and media_runtime.reconciliation_required:
+        raise PrivateWebRuntimeSetupError(
+            "private Web media submit requires reconciliation"
+        )
+
+
 class _SerializedPrivateWebWriteService:
     """Serialize whole MarkService operations over one shared browser worker."""
 
-    def __init__(self, delegate: MarkService, operation_lock: Lock) -> None:
+    def __init__(
+        self,
+        delegate: MarkService,
+        operation_lock: Lock,
+        media_runtime: PrivateWebMediaCreateRuntime | None,
+    ) -> None:
         self._delegate = delegate
         self._operation_lock = operation_lock
+        self._media_runtime = media_runtime
+
+    def _ensure_write_available(self) -> None:
+        _ensure_no_pending_media_reconciliation(self._media_runtime)
 
     def create(
         self,
@@ -775,6 +795,7 @@ class _SerializedPrivateWebWriteService:
         authorization_reference: str | None = None,
     ) -> CreateOperationReceipt:
         with self._operation_lock:
+            self._ensure_write_available()
             return self._delegate.create(
                 request,
                 authorization_by=authorization_by,
@@ -789,6 +810,7 @@ class _SerializedPrivateWebWriteService:
         authorization_reference: str | None = None,
     ) -> OperationReceipt:
         with self._operation_lock:
+            self._ensure_write_available()
             return self._delegate.pause(
                 ad_id,
                 authorization_by=authorization_by,
@@ -803,6 +825,7 @@ class _SerializedPrivateWebWriteService:
         authorization_reference: str | None = None,
     ) -> OperationReceipt:
         with self._operation_lock:
+            self._ensure_write_available()
             return self._delegate.activate(
                 ad_id,
                 authorization_by=authorization_by,
@@ -816,6 +839,7 @@ class _SerializedPrivateWebWriteService:
         approval: DeleteApproval,
     ) -> OperationReceipt:
         with self._operation_lock:
+            self._ensure_write_available()
             return self._delegate.delete(ad_id, approval=approval)
 
     def update_content(
@@ -828,6 +852,7 @@ class _SerializedPrivateWebWriteService:
         authorization_reference: str | None = None,
     ) -> OperationReceipt:
         with self._operation_lock:
+            self._ensure_write_available()
             return self._delegate.update_content(
                 ad_id,
                 title=title,
@@ -844,9 +869,11 @@ class _SerializedPrivateWebMediaService:
         self,
         delegate: PrivateWebMediaCreateService,
         operation_lock: Lock,
+        media_runtime: PrivateWebMediaCreateRuntime,
     ) -> None:
         self._delegate = delegate
         self._operation_lock = operation_lock
+        self._media_runtime = media_runtime
 
     def create_with_media(
         self,
@@ -857,6 +884,7 @@ class _SerializedPrivateWebMediaService:
         authorization_reference: str | None = None,
     ) -> CreateOperationReceipt:
         with self._operation_lock:
+            _ensure_no_pending_media_reconciliation(self._media_runtime)
             return self._delegate.create_with_media(
                 request,
                 media_refs,
@@ -1179,11 +1207,16 @@ def compose_private_web_write_api_runtime(
     serialized_mark_service = _SerializedPrivateWebWriteService(
         mark_service,
         operation_lock,
+        media_runtime,
     )
     serialized_media_service = (
         None
         if media_service is None
-        else _SerializedPrivateWebMediaService(media_service, operation_lock)
+        else _SerializedPrivateWebMediaService(
+            media_service,
+            operation_lock,
+            media_runtime,
+        )
     )
     server = create_write_api_server(
         serialized_mark_service,
