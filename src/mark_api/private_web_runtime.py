@@ -796,6 +796,7 @@ class PrivateWebWriteApiRuntime:
         self._server_closed = False
         self._stopping = False
         self._closed = False
+        self._runtime_cleanup_failed = False
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -858,7 +859,7 @@ class PrivateWebWriteApiRuntime:
                     )
                 self._stopping = True
 
-            cleanup_failed = False
+            cleanup_failed = self._runtime_cleanup_failed
 
             if not self._server_shutdown:
                 if thread is None:
@@ -896,6 +897,7 @@ class PrivateWebWriteApiRuntime:
                 except PrivateWebSubmitUnknownError as exc:
                     media_unknown = exc
                 except Exception:
+                    self._runtime_cleanup_failed = True
                     cleanup_failed = True
 
             # UNKNOWN is the only close outcome that must preserve the owned
@@ -908,6 +910,7 @@ class PrivateWebWriteApiRuntime:
             try:
                 self._content_runtime.close()
             except Exception:
+                self._runtime_cleanup_failed = True
                 cleanup_failed = True
 
             if cleanup_failed:

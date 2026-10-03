@@ -2435,6 +2435,47 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 runtime.close()
             self.assertEqual(close_events, ["content"])
 
+    def test_runtime_cleanup_failure_stays_fail_closed_across_repeated_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            close_calls = 0
+
+            def close_runtime() -> None:
+                nonlocal close_calls
+                close_calls += 1
+                raise RuntimeError("content cleanup failed")
+
+            content_runtime = PrivateWebContentRuntime(
+                owner_reader=OwnerReader(ReadResult.success_empty(())),
+                page_factory=lambda: (_ for _ in ()).throw(
+                    AssertionError("browser page must stay lazy")
+                ),
+                close_runtime=close_runtime,
+            )
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=content_runtime,
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset(),
+                ),
+            )
+
+            for _ in range(2):
+                with self.assertRaisesRegex(
+                    PrivateWebRuntimeSetupError,
+                    "cleanup failed",
+                ):
+                    runtime.close()
+
+            self.assertEqual(close_calls, 1)
+            with self.assertRaisesRegex(
+                PrivateWebRuntimeSetupError,
+                "shutdown is pending",
+            ):
+                runtime.start()
+
     def test_unresolved_media_submit_quiesces_http_and_blocks_shutdown(self) -> None:
         class PendingMediaPage:
             def __init__(self) -> None:
