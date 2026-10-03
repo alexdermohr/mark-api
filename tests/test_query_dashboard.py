@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -494,6 +495,9 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertIn('src="/dashboard.js"', html)
         self.assertIn('id="metric-select"', html)
         self.assertIn('id="groups-body"', html)
+        self.assertIn('id="groups-chart"', html)
+        self.assertIn('id="ranking-chart"', html)
+        self.assertIn('role="list"', html)
         self.assertNotIn("https://", html)
         self.assertNotIn("http://", html)
 
@@ -502,6 +506,20 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertIn("summary.views_total_known", javascript)
         self.assertIn("/api/analytics/groups", javascript)
         self.assertIn('item.present === null ? "—"', javascript)
+        self.assertIn("renderBarChart(", javascript)
+        self.assertIn('"groups-chart",', javascript)
+        self.assertIn('"ranking-chart",', javascript)
+        self.assertIn("label.textContent = String(labelOf(entry.item));", javascript)
+        self.assertIn('row.setAttribute("role", "listitem");', javascript)
+        self.assertIn("container.replaceChildren();", javascript)
+        self.assertIn("rawValue === null || rawValue === undefined", javascript)
+        self.assertIn('document.createElement("progress")', javascript)
+        self.assertIn("progress.max = max === 0 ? 1 : max;", javascript)
+        self.assertIn("progress.value = entry.value;", javascript)
+        self.assertIn("formatValue(entry.value, entry.item)", javascript)
+        self.assertIn("(n=${group.sample_size})", javascript)
+        self.assertNotIn(".style.width", javascript)
+        self.assertNotIn("innerHTML", javascript)
         self.assertIn("let analyticsRequestGeneration = 0;", javascript)
         self.assertIn(
             "const generation = ++analyticsRequestGeneration;",
@@ -516,7 +534,140 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertNotIn(chr(92) + chr(96), javascript)
 
         _, _, css_body = self.get("/dashboard.css")
-        self.assertIn(".cards", css_body.decode("utf-8"))
+        css = css_body.decode("utf-8")
+        self.assertIn(".cards", css)
+        self.assertIn(".chart-row", css)
+        self.assertIn(".chart-progress", css)
+        self.assertIn("appearance: none;", css)
+        self.assertIn(".chart-progress::-webkit-progress-bar", css)
+        self.assertIn(".chart-progress::-webkit-progress-value", css)
+        self.assertIn(".chart-progress::-moz-progress-bar", css)
+        self.assertIn(
+            ".chart-row { grid-template-columns: minmax(70px, 110px) minmax(0, 1fr); }",
+            css,
+        )
+        self.assertIn("grid-column: 2;", css)
+        self.assertIn("overflow-wrap: anywhere;", css)
+
+    def test_bar_chart_runtime_filters_values_and_preserves_semantics(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+
+class Element {
+  constructor(tagName) {
+    this.tagName = tagName;
+    this.children = [];
+    this.attributes = {};
+    this.hidden = false;
+    this.textContent = "";
+    this.className = "";
+    this.max = undefined;
+    this.value = undefined;
+  }
+
+  replaceChildren(...children) {
+    this.children = children;
+  }
+
+  append(...children) {
+    this.children.push(...children);
+  }
+
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+  }
+}
+
+const elements = new Map();
+const chart = new Element("div");
+elements.set("chart", chart);
+elements.set("groups-chart", new Element("div"));
+elements.set("groups-body", new Element("tbody"));
+elements.set("groups-empty", new Element("p"));
+
+globalThis.document = {
+  getElementById(id) {
+    return elements.get(id);
+  },
+  createElement(tagName) {
+    return new Element(tagName);
+  },
+};
+
+renderBarChart(
+  "chart",
+  [
+    {label: "null", value: null},
+    {label: "negative", value: -1},
+    {label: "zero", value: 0},
+    {label: "four", value: 4},
+    {label: "invalid", value: "not-a-number"},
+  ],
+  (item) => item.value,
+  (item) => item.label,
+  (value, item) => `${value}:${item.label}`,
+);
+assert.equal(chart.hidden, false);
+assert.deepEqual(
+  chart.children.map((row) => row.children[0].textContent),
+  ["zero", "four"],
+);
+assert.deepEqual(
+  chart.children.map((row) => row.children[2].textContent),
+  ["0:zero", "4:four"],
+);
+assert.equal(chart.children[0].children[1].max, 4);
+assert.equal(chart.children[0].children[1].value, 0);
+assert.equal(chart.children[1].children[1].value, 4);
+
+renderBarChart(
+  "chart",
+  [{label: "a", value: 0}, {label: "b", value: 0}],
+  (item) => item.value,
+  (item) => item.label,
+  (value) => String(value),
+);
+assert.equal(chart.children[0].children[1].max, 1);
+assert.equal(chart.children[1].children[1].max, 1);
+
+renderBarChart(
+  "chart",
+  [{label: "missing", value: undefined}, {label: "bad", value: -2}],
+  (item) => item.value,
+  (item) => item.label,
+  (value) => String(value),
+);
+assert.equal(chart.hidden, true);
+assert.equal(chart.children.length, 0);
+
+renderGroups([
+  {label: "tiny", sample_size: 1, metric_sum: 12, metric_mean: 12},
+]);
+const groupChart = elements.get("groups-chart");
+assert.equal(groupChart.children.length, 1);
+assert.equal(groupChart.children[0].attributes.role, "listitem");
+assert.equal(groupChart.children[0].children[0].textContent, "tiny");
+assert.equal(groupChart.children[0].children[2].textContent, "12.00 (n=1)");
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
 
     def test_non_get_methods_are_405_and_no_write_route_exists(self) -> None:
         for path in (

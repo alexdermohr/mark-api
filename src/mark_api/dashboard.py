@@ -72,6 +72,7 @@ _DASHBOARD_HTML = """<!doctype html>
       </div>
 
       <h3>Gruppen</h3>
+      <div id="groups-chart" class="chart" role="list" aria-label="Gruppenvergleich nach Mittelwert" hidden></div>
       <div class="table-wrap">
         <table>
           <thead>
@@ -89,6 +90,7 @@ _DASHBOARD_HTML = """<!doctype html>
       <p class="note">Stichprobengröße 1 ist nur ein Datenwert, keine Qualitätsaussage.</p>
 
       <h3>Anzeigenranking</h3>
+      <div id="ranking-chart" class="chart" role="list" aria-label="Anzeigenvergleich nach ausgewählter Metrik" hidden></div>
       <div class="table-wrap">
         <table>
           <thead>
@@ -210,6 +212,53 @@ button:hover { background: #2a313b; }
   color: #b7bec8;
   font-size: 0.9rem;
 }
+.chart {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0 16px;
+}
+.chart[hidden] { display: none; }
+.chart-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 180px) minmax(120px, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+.chart-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #c8ced7;
+}
+.chart-progress {
+  width: 100%;
+  height: 12px;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  appearance: none;
+  -webkit-appearance: none;
+  background: #252b34;
+}
+.chart-progress::-webkit-progress-bar {
+  background: #252b34;
+  border-radius: 999px;
+}
+.chart-progress::-webkit-progress-value {
+  background: #8ca6cf;
+  border-radius: 999px;
+}
+.chart-progress::-moz-progress-bar {
+  background: #8ca6cf;
+  border-radius: 999px;
+}
+.chart-value {
+  min-width: 7.5em;
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  color: #b7bec8;
+}
 .table-wrap { overflow-x: auto; }
 table {
   width: 100%;
@@ -239,6 +288,13 @@ td.title {
 .note { margin: 10px 0 22px; font-size: 0.88rem; }
 @media (max-width: 640px) {
   header { align-items: flex-start; flex-direction: column; }
+  .chart-row { grid-template-columns: minmax(70px, 110px) minmax(0, 1fr); }
+  .chart-value {
+    grid-column: 2;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
 }
 """
 
@@ -303,6 +359,45 @@ function setOptions(select, values, placeholder = null) {
   }
 }
 
+function renderBarChart(containerId, items, valueOf, labelOf, formatValue) {
+  const container = byId(containerId);
+  container.replaceChildren();
+  const rows = [];
+  for (const item of items) {
+    const rawValue = valueOf(item);
+    if (rawValue === null || rawValue === undefined) continue;
+    const value = Number(rawValue);
+    if (!Number.isFinite(value) || value < 0) continue;
+    rows.push({item, value});
+  }
+  container.hidden = rows.length === 0;
+  if (rows.length === 0) return;
+
+  const max = Math.max(...rows.map((entry) => entry.value), 0);
+  for (const entry of rows) {
+    const row = document.createElement("div");
+    row.className = "chart-row";
+    row.setAttribute("role", "listitem");
+
+    const label = document.createElement("span");
+    label.className = "chart-label";
+    label.textContent = String(labelOf(entry.item));
+
+    const progress = document.createElement("progress");
+    progress.className = "chart-progress";
+    progress.max = max === 0 ? 1 : max;
+    progress.value = entry.value;
+    progress.setAttribute("aria-hidden", "true");
+
+    const value = document.createElement("span");
+    value.className = "chart-value";
+    value.textContent = formatValue(entry.value, entry.item);
+
+    row.append(label, progress, value);
+    container.append(row);
+  }
+}
+
 function renderGroups(groups) {
   const body = byId("groups-body");
   body.replaceChildren();
@@ -315,6 +410,13 @@ function renderGroups(groups) {
     row.append(td(Number(group.metric_mean).toFixed(2)));
     body.append(row);
   }
+  renderBarChart(
+    "groups-chart",
+    groups,
+    (group) => group.metric_mean,
+    (group) => group.label,
+    (value, group) => `${value.toFixed(2)} (n=${group.sample_size})`,
+  );
 }
 
 let analyticsRequestGeneration = 0;
@@ -339,6 +441,13 @@ function renderRanking(items) {
     row.append(td(item.lifecycle_state));
     body.append(row);
   }
+  renderBarChart(
+    "ranking-chart",
+    items,
+    (item) => item.value,
+    (item) => item.ad_id,
+    (value) => String(value),
+  );
 }
 
 async function loadAnalytics() {
