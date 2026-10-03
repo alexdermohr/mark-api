@@ -1,27 +1,35 @@
 # Produktspezifikation
 
-Stand: 03.10.2026
+Stand: 04.10.2026
 
-Status: **funktionaler Scope konkretisiert; technischer MVP-Integrationsweg nach Realtest gewählt; Detail-Akzeptanz und Produktionsfreigabe noch offen**
+Status: **funktionaler MVP-Scope technisch umgesetzt; Detail-Akzeptanz auf zwei Analytics-Produktentscheidungen reduziert; produktive Plattformwrites bleiben separat gegated**
 
-Quelle: docs/requirements-source-2026-09-23.md
+Quelle: `docs/requirements-source-2026-09-23.md`
 
 ## 1. Ziel
 
 Für Marks Kleinanzeigen-Account soll eine Lösung entstehen, die Anzeigen verwaltet und Leistungsdaten in einem Dashboard auswertet. Aus den gesammelten Daten sollen Vergleiche, Ranglisten und Optimierungsvorschläge entstehen.
 
-Die ursprünglich genannten Wünsche nach externer Titel-/Beschreibungsgenerierung und Bildgenerierung bleiben dokumentiert, sind nach Projektentscheidung vom 24.09.2026 jedoch **nicht MVP-priorisiert**. Der MVP konzentriert sich auf Anzeigen-CRUD, Synchronisation, Messaging und messbare Leistungsdaten.
+Die ursprünglich genannten Wünsche nach externer Titel-/Beschreibungsgenerierung und Bildgenerierung bleiben dokumentiert, sind nach Projektentscheidung vom 24.09.2026 jedoch **nicht MVP-priorisiert**. Der MVP konzentriert sich auf Anzeigenverwaltung, Synchronisation, Messaging und messbare Leistungsdaten.
 
 ## 2. Belegter Funktionsumfang
 
 ### 2.1 Anzeigen
-- Anzeigen erstellen.
-- Anzeigen löschen.
-- Anzeigen verwalten.
 
-„Verwalten“ ist als gewünschter Oberbegriff belegt; die darunter fallenden Einzeloperationen müssen noch präzisiert werden.
+Der gewünschte Oberbegriff „Anzeigen verwalten“ ist für den vorhandenen MVP-Core inzwischen technisch präzisiert als:
+
+- bestehende eigene Anzeigen synchronisieren,
+- Titel und Beschreibung einer bestehenden Anzeige in-place aktualisieren,
+- pausieren beziehungsweise reservieren,
+- aktivieren,
+- löschen,
+- Besitzerstatus sowie Views, Merker und Replies lesen,
+- Inbox/Conversation einer Anzeigen-ID zuordnen.
+
+Create/Publish ist zusätzlich als eigener, stärker gegateter Write-Pfad implementiert. Daraus folgt keine automatische Produktionsfreigabe.
 
 ### 2.2 Textgenerierung — bestätigt, aber depriorisiert
+
 - Titel aus Prompts generieren.
 - Beschreibungstexte aus Prompts generieren.
 - Generierte Inhalte für Anzeigen verwenden.
@@ -29,102 +37,112 @@ Die ursprünglich genannten Wünsche nach externer Titel-/Beschreibungsgenerieru
 Diese ursprünglich bestätigte Anforderung ist **kein MVP-Schwerpunkt**.
 
 ### 2.3 Bildgenerierung — bestätigt, aber depriorisiert
+
 - Bilder aus Prompts generieren.
 - Generierte Bilder automatisch für Anzeigen verwenden.
 
-Diese ursprünglich bestätigte Anforderung ist **kein MVP-Schwerpunkt**.
+Diese ursprünglich bestätigte Anforderung ist **kein MVP-Schwerpunkt**. Der vorhandene Media-Create-Pfad betrifft dagegen die sichere Verwendung explizit zugelassener lokaler Medien und ersetzt keine generative Bildfunktion.
 
 ### 2.4 Dashboard
-Ein Dashboard soll die relevanten Anzeigen- und Leistungsdaten sichtbar machen.
+
+Ein read-only Dashboard samt lokaler API stellt Anzeigen-, Reaktions- und Analytics-Daten dar. Grafiken und Ranglisten verwenden ausschließlich explizit angeforderte Rohmetriken.
 
 ### 2.5 Datensammlung und Auswertung
-Gewünscht sind mindestens:
+
+Gewünscht und technisch abgebildet sind mindestens:
+
 - Aufrufe,
-- die Kennzahl „wie viele geschrieben haben“; ob damit Konversationen, eindeutige Interessenten oder eingehende Nachrichten gemeint sind, ist weiterhin eine menschliche Produktentscheidung,
-- daraus berechnete Kennzahlen,
+- getrennte Rohmetriken für Konversationen, eindeutige Interessenten und eingehende Nachrichten,
+- daraus berechnete deskriptive Kennzahlen,
 - Grafiken,
 - Top-Listen.
 
-Der Datenvertrag hält dafür `conversation_count`, `unique_buyer_count` und `inbound_message_count` getrennt. `reaction_metric` ist standardmäßig nicht gesetzt und darf nur explizit auf eine dieser drei Rohmetriken gebunden werden. Keine davon ist technisch oder fachlich als Default bevorzugt.
+Der Datenvertrag hält `conversation_count`, `unique_buyer_count` und `inbound_message_count` getrennt. `reaction_metric` ist standardmäßig nicht gesetzt und darf nur explizit auf eine dieser drei Rohmetriken gebunden werden. Keine davon ist technisch oder fachlich als Default bevorzugt.
+
+Zusätzlich bleiben E-Mail-basierte Projektionen als eigene, source-explizite Metriken getrennt und werden nicht mit den ReactionSnapshot-Werten vermischt.
 
 ### 2.6 Vergleichsdimensionen
-Top-Listen bzw. Vergleiche sollen insbesondere nach folgenden Merkmalen möglich sein:
+
+Top-Listen beziehungsweise Vergleiche sind insbesondere nach folgenden expliziten Merkmalen möglich:
+
 - Bild-Typ,
 - Stadt,
 - Text-Typ,
 - Titel-Typ.
 
 ### 2.7 Empfehlungen
-Aus den Daten sollen Vorschläge für die besten bzw. erfolgversprechendsten Lösungen abgeleitet werden.
 
-Dafür ist eine explizite `objective_metric` erforderlich. Der Contract setzt keine Zielmetrik als Default; ohne konfigurierte Zielgröße bleibt die Optimierungssemantik neutral/fail-closed. Rohmetriken und explizit angeforderte deskriptive Rankings bleiben davon getrennt und begründen weder Kausalität noch eine Qualitätsaussage.
+Aus den Daten sollen Vorschläge für die besten beziehungsweise erfolgversprechendsten Lösungen abgeleitet werden.
+
+Dafür ist eine explizite `objective_metric` erforderlich. Der Contract setzt keine Zielmetrik als Default; ohne konfigurierte Zielgröße bleibt die Optimierungssemantik neutral und fail-closed. Rohmetriken und explizit angeforderte deskriptive Rankings bleiben davon getrennt und begründen weder Kausalität noch automatisch eine Qualitätsaussage.
 
 ## 3. Funktionale Anforderungen
 
-- **FR-01:** Anzeigen erstellen.
-- **FR-02:** Anzeigen löschen.
-- **FR-03:** Anzeigen verwalten.
+- **FR-01:** Anzeigen erstellen, jedoch nur über den separat gegateten Create-Pfad.
+- **FR-02:** Anzeigen löschen; Delete bleibt zusätzlich ID-gebunden freigabepflichtig.
+- **FR-03:** Anzeigen gemäß Abschnitt 2.1 verwalten.
 - **FR-04 (depriorisiert):** Titel anhand eines Prompts generieren.
 - **FR-05 (depriorisiert):** Beschreibungstexte anhand eines Prompts generieren.
 - **FR-06 (depriorisiert):** Bilder anhand eines Prompts generieren.
 - **FR-07 (depriorisiert):** Generierte Bilder einer Anzeige automatisch zur Verwendung zuführen.
-- **FR-08:** Aufrufzahlen erfassen, soweit der Integrationsweg diese Daten bereitstellt.
+- **FR-08:** Aufrufzahlen erfassen, soweit der gewählte Datenpfad diese bereitstellt.
 - **FR-09:** `conversation_count`, `unique_buyer_count` und `inbound_message_count` getrennt erfassen; die fachliche Bedeutung von „wie viele geschrieben haben“ nur über eine explizite `reaction_metric` festlegen.
 - **FR-10:** Kennzahlen und Grafiken im Dashboard visualisieren.
 - **FR-11:** Top-Listen nach Bild-Typ, Stadt, Text-Typ und Titel-Typ nur gegen eine explizit ausgewählte Rohmetrik erzeugen.
 - **FR-12:** Optimierungsvorschläge nur gegen eine explizit konfigurierte `objective_metric` ableiten; ohne Zielmetrik keine „beste Lösung“ behaupten.
 
-## 4. Noch nicht belegte Detailanforderungen
+## 4. Verbleibende fachliche Detailentscheidungen
 
-Folgende Punkte dürfen nicht als bereits entschieden behandelt werden:
+Issue #1 enthält nur noch zwei fachliche Restentscheidungen:
 
-1. Welche Einzelaktionen umfasst „Anzeigen verwalten“ genau?
-2. Welche Pflichtfelder muss eine Anzeige enthalten?
-3. Welche Aktionen laufen automatisch und welche benötigen Freigabe?
-4. Welche der getrennten Rohmetriken `conversation_count`, `unique_buyer_count` oder `inbound_message_count` soll fachlich „wie viele geschrieben haben“ bedeuten?
-5. Wie werden Bild-, Text- und Titel-Typen klassifiziert?
-6. Welche Zeiträume und Vergleichsgruppen gelten im Dashboard?
-7. Wo soll die Anwendung laufen?
-8. Welche Kosten- und Betriebsgrenzen gelten?
-9. Welche Daten dürfen wie lange gespeichert werden?
-10. Welche explizite Zielmetrik bzw. Zielfunktion und welche Mindestqualität definieren „beste Lösung“?
+1. Welche der getrennten Rohmetriken `conversation_count`, `unique_buyer_count` oder `inbound_message_count` soll fachlich „wie viele geschrieben haben“ bedeuten?
+2. Welche explizite `objective_metric` oder später ausdrücklich definierte Zielfunktion bestimmt objektiv, wann eine Variante als „beste Lösung“ gilt?
 
-## 5. Technische Gates
+Diese beiden Entscheidungen bleiben bewusst menschliche Produktentscheidungen. Das Repository setzt dafür keinen Default.
 
-Der Ein-Anzeigen-Realtest vom 24.09.2026 hat technisch belegt:
+Frühere offene Punkte zu Verwaltungsscope, Integrationsarchitektur, technischen Freigaberegeln, Runtime-Komposition und Fehler-/Retry-Semantik sind inzwischen durch die implementierten Contracts und die Entscheidungen in `docs/DECISIONS.md` konkretisiert oder als separate Betriebs-/Freigabegates abgegrenzt. Sie sind keine offenen Detail-Akzeptanzpunkte von Issue #1 mehr.
 
-1. Sync, in-place Update, Pause/Aktivierung, Delete und Inbox/adId sind über die dokumentierten Capability-Pfade ausführbar.
-2. Aufrufe, Merker, Replies und getrennte Nachrichten-/Interessentenmetriken sind technisch abrufbar.
-3. Login/MFA bleibt manuell; Tokens/Sessions bleiben lokale Adapterdetails.
-4. Für den technischen MVP ist D-006/D-007 gewählt: eigene dünne Adapter-Schicht statt Übernahme eines Gesamtsystems.
+## 5. Technische Gates und Betriebsgrenzen
 
-Weiter offen bleiben als **Produktionsgates**:
+Der aktuelle Core und die Runtime-Surfaces erzwingen insbesondere:
 
-- vertragliche Freigabe bzw. bewusste Account-/ToS-Risikoentscheidung für die inoffiziellen Schnittstellen,
-- Betriebs-/Polling-Grenzen,
-- separater Remote-Smoke-Test für Create/Publish,
-- menschliche fachliche Auswahl von `reaction_metric` für „wie viele geschrieben haben“,
-- menschliche Auswahl der `objective_metric` bzw. einer später ausdrücklich definierten Zielfunktion für „beste Lösung“,
-- Freigaberegeln für produktive Schreibaktionen.
+1. Plattformwrites sind standardmäßig deaktiviert und benötigen explizite Capability- und Runtime-Gates.
+2. ID-gebundene Writes verwenden einen frischen Owner-Pre-Read, genau einen Mutationsversuch und einen unabhängigen Post-Readback.
+3. Ein unklarer oder `AMBIGUOUS` Ausgang autorisiert keinen Blind-Retry.
+4. Delete benötigt zusätzlich eine explizite ID-gebundene Freigabe.
+5. Create/Publish und Media-Create besitzen eigene, strengere Reconciliation- und Persistenzevidenz.
+6. Login, MFA, CAPTCHA und sonstige Sicherheitschallenges werden nicht automatisiert oder umgangen.
+7. Die schreibfähige HTTP-Surface bleibt getrennt vom read-only Dashboard und loopback-only.
+8. Die Analytics-Entscheidungen `reaction_metric` und `objective_metric` bleiben unabhängig von den Write-Gates und standardmäßig ungesetzt.
 
-## 6. Vorgeschlagener MVP
+Die maßgeblichen Architektur- und Sicherheitsentscheidungen sind in D-006 bis D-018 dokumentiert. Ein implementierter technischer Pfad ist keine automatische Freigabe für reale Plattformwrites.
 
-Der MVP ist ein **Planungsvorschlag**, keine bereits bestätigte Detailanforderung.
+## 6. Aktueller MVP-Stand
 
-Ziel ist ein realer, begrenzter End-to-End-Pfad rund um **Verwaltung und Messbarkeit**:
+Der technische MVP umfasst inzwischen:
 
-1. eine vorhandene eigene Anzeige einlesen/synchronisieren,
-2. eine Testanzeige erstellen,
-3. diese ändern sowie pausieren/aktivieren,
-4. Besucher- und Watchlist-Zahlen erfassen,
-5. zugehörige Konversationen lesen und als definierte Reaktionsmetrik speichern,
-6. die Testanzeige wieder löschen,
-7. die Messwerte in einem einfachen Dashboard anzeigen.
+1. Synchronisation und read-only Besitzer-/Bestandsdaten,
+2. ID-gebundenes Content-Update,
+3. Pause/Reservierung und Aktivierung,
+4. Delete mit zusätzlicher Freigabe,
+5. separat gegatetes Create/Publish einschließlich optionalem Media-Pfad,
+6. Views, Merker, Replies und getrennte Reaktionsmetriken,
+7. Inbox-/Conversation-Zuordnung und source-explizite E-Mail-Projektionen,
+8. append-only SQLite-Snapshots und crash-idempotente lokale Write-Receipts,
+9. Analytics-Rohmetriken und Vergleiche nach Bild-Typ, Stadt, Text-Typ und Titel-Typ,
+10. read-only Dashboard, Grafiken, Top-Listen und lokale Runtime-Smokes.
 
-Text- und Bildgenerierung werden erst wieder aufgenommen, wenn dafür ein konkreter Zusatznutzen gegenüber Kleinanzeigen selbst belegt ist.
+Text- und Bildgenerierung bleiben dokumentiert, aber für diesen MVP depriorisiert.
 
-Technische Kandidaten und PoC-Plan: `docs/integration-options.md`.
+Reale sichtbare Testanzeigen, Testnachrichten oder zyklische Plattformwrites werden nicht als normale Regressionstests verwendet.
 
-## 7. Erfolgskriterium für die nächste Phase
+## 7. Erfolgskriterium für die nächste Produktphase
 
-Die technische Architektur-Sondierung ist für den getesteten Kernablauf abgeschlossen. Der Create/Publish-Pfad und die vertragliche Produktionsfreigabe bleiben ausdrücklich außerhalb dieses Abschlusses und müssen vor entsprechender Write-Freigabe separat belegt werden.
+Die technische Architektur für den dokumentierten MVP-Kern ist ausreichend konkret und umgesetzt. Der nächste fachliche Gate besteht aus genau zwei Entscheidungen:
+
+1. `reaction_metric` für „wie viele geschrieben haben“ festlegen,
+2. `objective_metric` beziehungsweise eine ausdrücklich definierte Zielfunktion für „beste Lösung“ festlegen.
+
+Erst danach darf eine objective-gebundene Empfehlung als fachlich gewollt behandelt werden. Liegt die gewünschte Zielfunktion außerhalb der bereits vorhandenen Analytics-Rohmetriken, entsteht daraus ein neuer eigener Implementierungs-Slice.
+
+Issue #1 bleibt bis zur ausdrücklichen menschlichen Festlegung dieser beiden Punkte offen. Produktive Plattformwrites behalten unabhängig davon ihre separaten technischen und menschlichen Freigaben.
