@@ -25,14 +25,42 @@ ANALYTICS_METRICS = (
     "email_inbound_message_count",
 )
 
-_AD_METRICS = frozenset(("views", "watch_count", "reply_count"))
-_REACTION_METRICS = frozenset(
-    ("conversation_count", "unique_buyer_count", "inbound_message_count")
+REACTION_METRICS = (
+    "conversation_count",
+    "unique_buyer_count",
+    "inbound_message_count",
 )
+
+_AD_METRICS = frozenset(("views", "watch_count", "reply_count"))
+_REACTION_METRICS = frozenset(REACTION_METRICS)
 _EMAIL_REACTION_METRICS = {
     "email_conversation_count": "conversation_count",
     "email_inbound_message_count": "inbound_message_count",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class AnalyticsContract:
+    """Explicit product choices layered over the preserved raw metrics."""
+
+    reaction_metric: str | None = None
+    objective_metric: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.reaction_metric is not None
+            and self.reaction_metric not in REACTION_METRICS
+        ):
+            raise ValueError(
+                f"unknown reaction metric: {self.reaction_metric}"
+            )
+        if (
+            self.objective_metric is not None
+            and self.objective_metric not in ANALYTICS_METRICS
+        ):
+            raise ValueError(
+                f"unknown analytics objective metric: {self.objective_metric}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,9 +92,19 @@ class AnalyticsService:
     combine with ReactionSnapshot metrics.
     """
 
-    def __init__(self, store: SnapshotStore) -> None:
+    def __init__(
+        self,
+        store: SnapshotStore,
+        *,
+        contract: AnalyticsContract | None = None,
+    ) -> None:
         self._store = store
         self._query = MarkQueryService(store)
+        self._contract = contract or AnalyticsContract()
+
+    @property
+    def contract(self) -> AnalyticsContract:
+        return self._contract
 
     @staticmethod
     def _validate_metric(metric: str) -> None:
@@ -145,6 +183,12 @@ class AnalyticsService:
         rows.sort(key=lambda item: (-item.value, item.ad_id))
         return tuple(rows)
 
+    def rank_ads_for_objective(self) -> tuple[AdMetricRanking, ...]:
+        metric = self._contract.objective_metric
+        if metric is None:
+            raise ValueError("analytics objective metric is not configured")
+        return self.rank_ads(metric)
+
     def group_rankings(
         self,
         dimension: str,
@@ -185,6 +229,26 @@ class AnalyticsService:
             )
         )
         return tuple(rows)
+
+    def group_rankings_for_objective(
+        self,
+        dimension: str,
+    ) -> tuple[GroupMetricRanking, ...]:
+        metric = self._contract.objective_metric
+        if metric is None:
+            raise ValueError("analytics objective metric is not configured")
+        return self.group_rankings(dimension, metric)
+
+
+def analytics_contract_to_dict(
+    contract: AnalyticsContract,
+) -> dict[str, object]:
+    return {
+        "reaction_metric": contract.reaction_metric,
+        "objective_metric": contract.objective_metric,
+        "allowed_reaction_metrics": list(REACTION_METRICS),
+        "allowed_objective_metrics": list(ANALYTICS_METRICS),
+    }
 
 
 def ad_metric_ranking_to_dict(item: AdMetricRanking) -> dict[str, object]:

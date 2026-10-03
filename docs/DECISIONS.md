@@ -224,3 +224,19 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - Shutdown quiesziert zuerst HTTP. Meldet PrivateWebMediaCreateRuntime.close() einen unresolved Submit, wird PrivateWebSubmitUnknownError unverändert weitergereicht; Content- und Media-Runtime bleiben für die explizite observation-only reconcile_media_submit() erhalten, während der HTTP-Server nicht neu gestartet werden darf,
 - erst nach erfolgreicher Reconciliation kann ein erneutes close() die restlichen lokalen Ressourcen deterministisch schließen,
 - dieser Slice führt keinen realen Kleinanzeigen-Plattformwrite aus und fügt keinen Auth-, MFA-, CAPTCHA- oder Security-Challenge-Bypass hinzu.
+
+## D-017 — Analytics-Ziel und Reaktionsmetrik sind explizite, default-off Produktentscheidungen
+
+**Entscheidung:** Die drei Reaktionsrohmetriken `conversation_count`, `unique_buyer_count` und `inbound_message_count` bleiben getrennt. `AnalyticsContract.reaction_metric` darf genau eine davon explizit auswählen, hat aber keinen Default. Unabhängig davon bindet `AnalyticsContract.objective_metric` eine vorhandene Analytics-Rohmetrik als Optimierungsziel; auch diese Auswahl ist standardmäßig nicht gesetzt. Die beiden Felder dürfen unterschiedliche Metriken benennen und werden nicht voneinander abgeleitet.
+
+**Begründung:** Issue #1 belegt den Wunsch nach „wie viele geschrieben haben“ und nach einer „besten Lösung“, enthält aber keine autorisierte fachliche Auswahl der Einheit beziehungsweise Zielfunktion. Eine technische Defaultmetrik würde eine Produktentscheidung erfinden. Gleichzeitig sollen vorhandene Rohdaten und deskriptive Vergleiche weiterhin nutzbar bleiben.
+
+**Folgen:**
+- unbekannte `reaction_metric`- oder `objective_metric`-Werte werden fail-closed abgewiesen,
+- objective-gebundene Rankings sind ohne konfigurierte Zielmetrik nicht ausführbar,
+- die bestehenden Rohmetrik-Rankings bleiben erhalten, verlangen aber weiterhin eine explizite Metrik,
+- fehlende Messwerte werden aus Rankings ausgeschlossen; ein tatsächlich beobachteter Wert `0` bleibt erhalten,
+- das Dashboard exponiert `GET /api/analytics/contract` und wählt ohne explizite Konfiguration keine erste Metrik implizit aus,
+- `mark-api-dashboard` kann die beiden Entscheidungen zur Laufzeit mit `--reaction-metric` beziehungsweise `--objective-metric` erhalten; das Repository speichert oder setzt dafür keinen Produktdefault,
+- Rankings bleiben deskriptiv. Aus ihnen wird weder Kausalität noch Qualität abgeleitet,
+- Issue #1 bleibt offen, bis ein Mensch die fachliche Reaktionsmetrik und das Optimierungsziel tatsächlich festlegt.

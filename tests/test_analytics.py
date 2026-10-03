@@ -9,8 +9,11 @@ from pathlib import Path
 from mark_api.analytics import (
     ANALYTICS_DIMENSIONS,
     ANALYTICS_METRICS,
+    REACTION_METRICS,
+    AnalyticsContract,
     AnalyticsService,
     ad_metric_ranking_to_dict,
+    analytics_contract_to_dict,
     group_metric_ranking_to_dict,
 )
 from mark_api.domain import (
@@ -33,6 +36,144 @@ class AnalyticsTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         return SnapshotStore(Path(tmp.name) / "mark.sqlite")
+
+    def test_contract_defaults_do_not_choose_reaction_or_objective(self) -> None:
+        contract = AnalyticsContract()
+
+        self.assertIsNone(contract.reaction_metric)
+        self.assertIsNone(contract.objective_metric)
+        self.assertEqual(
+            REACTION_METRICS,
+            (
+                "conversation_count",
+                "unique_buyer_count",
+                "inbound_message_count",
+            ),
+        )
+        payload = analytics_contract_to_dict(contract)
+        self.assertIsNone(payload["reaction_metric"])
+        self.assertIsNone(payload["objective_metric"])
+        self.assertEqual(
+            payload["allowed_reaction_metrics"],
+            list(REACTION_METRICS),
+        )
+        self.assertEqual(
+            payload["allowed_objective_metrics"],
+            list(ANALYTICS_METRICS),
+        )
+
+    def test_contract_rejects_implicit_or_unknown_metric_choices(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown reaction metric"):
+            AnalyticsContract(reaction_metric="views")
+        with self.assertRaisesRegex(
+            ValueError,
+            "unknown analytics objective metric",
+        ):
+            AnalyticsContract(objective_metric="engagement")
+
+        analytics = AnalyticsService(self.make_store())
+        with self.assertRaisesRegex(
+            ValueError,
+            "analytics objective metric is not configured",
+        ):
+            analytics.rank_ads_for_objective()
+        with self.assertRaisesRegex(
+            ValueError,
+            "analytics objective metric is not configured",
+        ):
+            analytics.group_rankings_for_objective("city")
+
+    def test_explicit_reaction_and_objective_metrics_remain_distinct(self) -> None:
+        store = self.make_store()
+        for ad_id in ("1", "2"):
+            store.append_ad_snapshot(
+                AdSnapshot(
+                    ad_id=ad_id,
+                    observed_at=T0,
+                    source="management",
+                    lifecycle_state=LifecycleState.ACTIVE,
+                    views=1,
+                )
+            )
+        store.append_reaction_snapshot(
+            ReactionSnapshot(
+                ad_id="1",
+                observed_at=T0,
+                source="mobile",
+                conversation_count=4,
+                unique_buyer_count=1,
+                inbound_message_count=6,
+            )
+        )
+        store.append_reaction_snapshot(
+            ReactionSnapshot(
+                ad_id="2",
+                observed_at=T0,
+                source="mobile",
+                conversation_count=2,
+                unique_buyer_count=2,
+                inbound_message_count=3,
+            )
+        )
+        analytics = AnalyticsService(
+            store,
+            contract=AnalyticsContract(
+                reaction_metric="unique_buyer_count",
+                objective_metric="inbound_message_count",
+            ),
+        )
+
+        reaction_rows = analytics.rank_ads(
+            analytics.contract.reaction_metric
+        )
+        objective_rows = analytics.rank_ads_for_objective()
+
+        self.assertEqual(
+            [(row.ad_id, row.metric, row.value) for row in reaction_rows],
+            [
+                ("2", "unique_buyer_count", 2),
+                ("1", "unique_buyer_count", 1),
+            ],
+        )
+        self.assertEqual(
+            [(row.ad_id, row.metric, row.value) for row in objective_rows],
+            [
+                ("1", "inbound_message_count", 6),
+                ("2", "inbound_message_count", 3),
+            ],
+        )
+
+    def test_objective_ranking_excludes_missing_but_keeps_observed_zero(self) -> None:
+        store = self.make_store()
+        store.append_ad_snapshot(
+            AdSnapshot(
+                ad_id="1",
+                observed_at=T0,
+                source="management",
+                lifecycle_state=LifecycleState.ACTIVE,
+                views=None,
+            )
+        )
+        store.append_ad_snapshot(
+            AdSnapshot(
+                ad_id="2",
+                observed_at=T0,
+                source="management",
+                lifecycle_state=LifecycleState.ACTIVE,
+                views=0,
+            )
+        )
+        analytics = AnalyticsService(
+            store,
+            contract=AnalyticsContract(objective_metric="views"),
+        )
+
+        rows = analytics.rank_ads_for_objective()
+
+        self.assertEqual(
+            [(row.ad_id, row.metric, row.value) for row in rows],
+            [("2", "views", 0)],
+        )
 
     def test_classification_labels_are_opaque_trimmed_and_blank_rejected(self) -> None:
         item = AdClassification(

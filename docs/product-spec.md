@@ -1,6 +1,6 @@
 # Produktspezifikation
 
-Stand: 23.09.2026
+Stand: 03.10.2026
 
 Status: **funktionaler Scope konkretisiert; technischer MVP-Integrationsweg nach Realtest gewählt; Detail-Akzeptanz und Produktionsfreigabe noch offen**
 
@@ -40,10 +40,12 @@ Ein Dashboard soll die relevanten Anzeigen- und Leistungsdaten sichtbar machen.
 ### 2.5 Datensammlung und Auswertung
 Gewünscht sind mindestens:
 - Aufrufe,
-- die Kennzahl „wie viele geschrieben haben“; ob damit Chats, eindeutige Personen oder Nachrichten gemeint sind, ist noch offen,
+- die Kennzahl „wie viele geschrieben haben“; ob damit Konversationen, eindeutige Interessenten oder eingehende Nachrichten gemeint sind, ist weiterhin eine menschliche Produktentscheidung,
 - daraus berechnete Kennzahlen,
 - Grafiken,
 - Top-Listen.
+
+Der Datenvertrag hält dafür `conversation_count`, `unique_buyer_count` und `inbound_message_count` getrennt. `reaction_metric` ist standardmäßig nicht gesetzt und darf nur explizit auf eine dieser drei Rohmetriken gebunden werden. Keine davon ist technisch oder fachlich als Default bevorzugt.
 
 ### 2.6 Vergleichsdimensionen
 Top-Listen bzw. Vergleiche sollen insbesondere nach folgenden Merkmalen möglich sein:
@@ -55,6 +57,8 @@ Top-Listen bzw. Vergleiche sollen insbesondere nach folgenden Merkmalen möglich
 ### 2.7 Empfehlungen
 Aus den Daten sollen Vorschläge für die besten bzw. erfolgversprechendsten Lösungen abgeleitet werden.
 
+Dafür ist eine explizite `objective_metric` erforderlich. Der Contract setzt keine Zielmetrik als Default; ohne konfigurierte Zielgröße bleibt die Optimierungssemantik neutral/fail-closed. Rohmetriken und explizit angeforderte deskriptive Rankings bleiben davon getrennt und begründen weder Kausalität noch eine Qualitätsaussage.
+
 ## 3. Funktionale Anforderungen
 
 - **FR-01:** Anzeigen erstellen.
@@ -65,10 +69,10 @@ Aus den Daten sollen Vorschläge für die besten bzw. erfolgversprechendsten Lö
 - **FR-06 (depriorisiert):** Bilder anhand eines Prompts generieren.
 - **FR-07 (depriorisiert):** Generierte Bilder einer Anzeige automatisch zur Verwendung zuführen.
 - **FR-08:** Aufrufzahlen erfassen, soweit der Integrationsweg diese Daten bereitstellt.
-- **FR-09:** Die vom Auftraggeber gewünschte Kennzahl „wie viele geschrieben haben“ erfassen, sobald ihre Einheit (z. B. Chats, eindeutige Personen oder Nachrichten) definiert und technisch verfügbar ist.
+- **FR-09:** `conversation_count`, `unique_buyer_count` und `inbound_message_count` getrennt erfassen; die fachliche Bedeutung von „wie viele geschrieben haben“ nur über eine explizite `reaction_metric` festlegen.
 - **FR-10:** Kennzahlen und Grafiken im Dashboard visualisieren.
-- **FR-11:** Top-Listen nach Bild-Typ, Stadt, Text-Typ und Titel-Typ erzeugen.
-- **FR-12:** Aus beobachteten Ergebnissen Optimierungsvorschläge ableiten.
+- **FR-11:** Top-Listen nach Bild-Typ, Stadt, Text-Typ und Titel-Typ nur gegen eine explizit ausgewählte Rohmetrik erzeugen.
+- **FR-12:** Optimierungsvorschläge nur gegen eine explizit konfigurierte `objective_metric` ableiten; ohne Zielmetrik keine „beste Lösung“ behaupten.
 
 ## 4. Noch nicht belegte Detailanforderungen
 
@@ -77,13 +81,13 @@ Folgende Punkte dürfen nicht als bereits entschieden behandelt werden:
 1. Welche Einzelaktionen umfasst „Anzeigen verwalten“ genau?
 2. Welche Pflichtfelder muss eine Anzeige enthalten?
 3. Welche Aktionen laufen automatisch und welche benötigen Freigabe?
-4. Was bedeutet „wie viele geschrieben haben“ exakt: Chats, eindeutige Interessenten oder Nachrichten?
+4. Welche der getrennten Rohmetriken `conversation_count`, `unique_buyer_count` oder `inbound_message_count` soll fachlich „wie viele geschrieben haben“ bedeuten?
 5. Wie werden Bild-, Text- und Titel-Typen klassifiziert?
 6. Welche Zeiträume und Vergleichsgruppen gelten im Dashboard?
 7. Wo soll die Anwendung laufen?
 8. Welche Kosten- und Betriebsgrenzen gelten?
 9. Welche Daten dürfen wie lange gespeichert werden?
-10. Welche Mindestqualität bzw. Zielwerte definieren „beste Lösung“?
+10. Welche explizite Zielmetrik bzw. Zielfunktion und welche Mindestqualität definieren „beste Lösung“?
 
 ## 5. Technische Gates
 
@@ -99,7 +103,8 @@ Weiter offen bleiben als **Produktionsgates**:
 - vertragliche Freigabe bzw. bewusste Account-/ToS-Risikoentscheidung für die inoffiziellen Schnittstellen,
 - Betriebs-/Polling-Grenzen,
 - separater Remote-Smoke-Test für Create/Publish,
-- fachliche Auswahl der Kennzahl „wie viele geschrieben haben“,
+- menschliche fachliche Auswahl von `reaction_metric` für „wie viele geschrieben haben“,
+- menschliche Auswahl der `objective_metric` bzw. einer später ausdrücklich definierten Zielfunktion für „beste Lösung“,
 - Freigaberegeln für produktive Schreibaktionen.
 
 ## 6. Vorgeschlagener MVP
