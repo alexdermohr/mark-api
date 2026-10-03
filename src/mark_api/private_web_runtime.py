@@ -1222,6 +1222,7 @@ def build_private_web_write_api_runtime(
     cdp_port: int,
     store: SnapshotStore,
     access: WriteApiAccess,
+    confirmation_runtime: PrivateWebInventoryRuntime | None = None,
     media_bindings: Mapping[str, PrivateWebMediaSource] | None = None,
     core_writes_enabled: bool = False,
     media_writes_enabled: bool = False,
@@ -1229,10 +1230,21 @@ def build_private_web_write_api_runtime(
     timeout_seconds: float = 5.0,
     clock: Callable[[], datetime] | None = None,
 ) -> PrivateWebWriteApiRuntime:
-    """Build a loopback-only PrivateWeb write runtime for an existing CDP worker."""
+    """Build a loopback-only PrivateWeb write runtime for an existing CDP worker.
+
+    A caller may supply one separately established confirmation runtime. This
+    builder never constructs a second inventory source automatically.
+    """
 
     if not isinstance(access, WriteApiAccess):
         raise TypeError("access must be WriteApiAccess")
+    if (
+        confirmation_runtime is not None
+        and not isinstance(confirmation_runtime, PrivateWebInventoryRuntime)
+    ):
+        raise TypeError(
+            "confirmation_runtime must be PrivateWebInventoryRuntime or None"
+        )
     if not isinstance(core_writes_enabled, bool):
         raise TypeError("core_writes_enabled must be bool")
     if not isinstance(media_writes_enabled, bool):
@@ -1292,6 +1304,7 @@ def build_private_web_write_api_runtime(
             )
         return compose_private_web_write_api_runtime(
             content_runtime=content_runtime,
+            confirmation_runtime=confirmation_runtime,
             media_runtime=media_runtime,
             media_resolver=media_resolver,
             store=store,
