@@ -617,6 +617,7 @@ class PrivateWebMediaCreateService:
 
         return replace(
             receipt,
+            completed_at=max(receipt.completed_at, self._clock()),
             media_post_read_status=status,
             media_persistence_confirmed=(
                 status is MediaPostReadStatus.CONFIRMED

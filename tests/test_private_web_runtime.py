@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib import metadata
 from pathlib import Path
 from unittest.mock import patch
@@ -878,6 +878,71 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM create_operation_receipts"
             ).fetchone()
         self.assertEqual(persisted, (1,))
+        runtime.close()
+
+    def test_media_create_service_completion_time_includes_media_post_read(
+        self,
+    ) -> None:
+        events: list[tuple] = []
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: MediaCreatePage(events)
+        )
+        created_id = "4000000024"
+        created_inventory = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+        )
+        created_content = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+            description=self.request.description,
+        )
+        times = iter(
+            (
+                NOW,
+                NOW + timedelta(seconds=1),
+                NOW + timedelta(seconds=2),
+                NOW + timedelta(seconds=3),
+            )
+        )
+        db_path = Path(self.tmp.name) / "media-completion-time.sqlite"
+        verifier = MediaPersistenceVerifier()
+        service = PrivateWebMediaCreateService(
+            runtime=runtime,
+            resolver=PrivateWebMediaRefResolver(
+                {"cover_01": self.sources[0]}
+            ),
+            reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            confirmation_reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            content_reader_factory=lambda _ad_id: OwnerReader(
+                ReadResult.success_nonempty((created_content,))
+            ),
+            media_persistence_verifier=verifier,
+            store=SnapshotStore(db_path),
+            writes_enabled=True,
+            clock=lambda: next(times),
+        )
+
+        receipt = service.create_with_media(self.request, ("cover_01",))
+
+        self.assertEqual(receipt.started_at, NOW + timedelta(seconds=1))
+        self.assertEqual(receipt.completed_at, NOW + timedelta(seconds=3))
+        self.assertTrue(receipt.media_persistence_confirmed)
+        self.assertEqual(len(verifier.calls), 1)
+        with sqlite3.connect(db_path) as connection:
+            persisted_completed_at = connection.execute(
+                "SELECT completed_at FROM create_operation_receipts"
+            ).fetchone()
+        self.assertEqual(
+            persisted_completed_at,
+            ((NOW + timedelta(seconds=3)).isoformat(),),
+        )
         runtime.close()
 
     def test_media_create_service_unknown_ref_short_circuits_reads(self) -> None:
