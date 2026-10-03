@@ -13,7 +13,14 @@ from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 from mark_api.adapters.management import MANAGEMENT_URL
-from mark_api.domain import AdCreateRequest, AdSnapshot, DeleteApproval, LifecycleState, OperationOutcome
+from mark_api.domain import (
+    AdCreateRequest,
+    AdSnapshot,
+    DeleteApproval,
+    LifecycleState,
+    OperationOutcome,
+    OperationReceipt,
+)
 from mark_api.orchestrator import SafeWriteOrchestrator
 from mark_api.ports import WriteNotAttemptedError
 from mark_api.private_web import (
@@ -2131,6 +2138,27 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             "price_eur": 12,
         }
 
+    @staticmethod
+    def _operation_receipt(
+        operation: str,
+        ad_id: str,
+        *,
+        authorization_by: str | None,
+        authorization_reference: str | None,
+    ) -> OperationReceipt:
+        return OperationReceipt(
+            operation=operation,
+            ad_id=ad_id,
+            started_at=NOW,
+            completed_at=NOW,
+            outcome=OperationOutcome.CONFIRMED,
+            pre_read_status="success_nonempty",
+            post_read_status="success_nonempty",
+            writer_invoked=True,
+            authorization_by=authorization_by,
+            authorization_reference=authorization_reference,
+        )
+
     def test_composition_starts_loopback_with_independent_core_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SnapshotStore(Path(tmp) / "runtime.sqlite")
@@ -2417,6 +2445,197 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+            self.assertEqual(close_events, ["content"])
+
+    def test_composition_serializes_shared_private_web_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(
+                OwnerReader(ReadResult.success_empty(())),
+                close_events,
+            )
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=content_runtime,
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.SET_STATE}),
+                    writes_enabled=True,
+                ),
+                core_writes_enabled=True,
+            )
+            first_entered = threading.Event()
+            release_first = threading.Event()
+            second_entered = threading.Event()
+            errors: list[BaseException] = []
+            results: list[tuple[int, dict[str, object]]] = []
+
+            def pause(
+                ad_id: str,
+                *,
+                authorization_by: str | None = None,
+                authorization_reference: str | None = None,
+            ) -> OperationReceipt:
+                first_entered.set()
+                if not release_first.wait(timeout=2):
+                    raise AssertionError("first operation was not released")
+                return self._operation_receipt(
+                    "set_state:paused",
+                    ad_id,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+
+            def activate(
+                ad_id: str,
+                *,
+                authorization_by: str | None = None,
+                authorization_reference: str | None = None,
+            ) -> OperationReceipt:
+                second_entered.set()
+                return self._operation_receipt(
+                    "set_state:active",
+                    ad_id,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+
+            runtime._mark_service.pause = pause
+            runtime._mark_service.activate = activate
+
+            def request(path: str, key: str) -> None:
+                try:
+                    results.append(
+                        self._request(
+                            runtime,
+                            "POST",
+                            path,
+                            idempotency_key=key,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            first = threading.Thread(
+                target=request,
+                args=(f"/api/write/ads/{AD_ID}/pause", "serialize-pause"),
+            )
+            second = threading.Thread(
+                target=request,
+                args=(f"/api/write/ads/{AD_ID}/activate", "serialize-activate"),
+            )
+            runtime.start()
+            first.start()
+            try:
+                self.assertTrue(first_entered.wait(timeout=2))
+                second.start()
+                self.assertFalse(second_entered.wait(timeout=0.25))
+            finally:
+                release_first.set()
+                first.join(timeout=2)
+                if second.ident is not None:
+                    second.join(timeout=2)
+                runtime.close()
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertTrue(second_entered.is_set())
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(status for status, _ in results), [200, 200])
+            self.assertEqual(close_events, ["content"])
+
+    def test_close_drains_active_handler_before_runtime_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(
+                OwnerReader(ReadResult.success_empty(())),
+                close_events,
+            )
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=content_runtime,
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.SET_STATE}),
+                    writes_enabled=True,
+                ),
+                core_writes_enabled=True,
+            )
+            handler_entered = threading.Event()
+            release_handler = threading.Event()
+            request_errors: list[BaseException] = []
+            request_results: list[tuple[int, dict[str, object]]] = []
+            close_errors: list[BaseException] = []
+
+            def pause(
+                ad_id: str,
+                *,
+                authorization_by: str | None = None,
+                authorization_reference: str | None = None,
+            ) -> OperationReceipt:
+                handler_entered.set()
+                if not release_handler.wait(timeout=2):
+                    raise AssertionError("handler was not released")
+                return self._operation_receipt(
+                    "set_state:paused",
+                    ad_id,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+
+            runtime._mark_service.pause = pause
+
+            def request() -> None:
+                try:
+                    request_results.append(
+                        self._request(
+                            runtime,
+                            "POST",
+                            f"/api/write/ads/{AD_ID}/pause",
+                            idempotency_key="drain-pause",
+                        )
+                    )
+                except BaseException as exc:
+                    request_errors.append(exc)
+
+            def close() -> None:
+                try:
+                    runtime.close()
+                except BaseException as exc:
+                    close_errors.append(exc)
+
+            runtime.start()
+            request_thread = threading.Thread(target=request)
+            close_thread = threading.Thread(target=close)
+            request_thread.start()
+            try:
+                self.assertTrue(handler_entered.wait(timeout=2))
+                close_thread.start()
+                for _ in range(200):
+                    if runtime._server_shutdown:
+                        break
+                    threading.Event().wait(0.01)
+                self.assertTrue(runtime._server_shutdown)
+                self.assertTrue(close_thread.is_alive())
+                self.assertEqual(close_events, [])
+            finally:
+                release_handler.set()
+                request_thread.join(timeout=2)
+                if close_thread.ident is not None:
+                    close_thread.join(timeout=2)
+
+            self.assertFalse(request_thread.is_alive())
+            self.assertFalse(close_thread.is_alive())
+            self.assertEqual(request_errors, [])
+            self.assertEqual(close_errors, [])
+            self.assertEqual(
+                [status for status, _ in request_results],
+                [200],
+            )
             self.assertEqual(close_events, ["content"])
 
     def test_close_preserves_runtimes_if_http_cannot_quiesce(self) -> None:

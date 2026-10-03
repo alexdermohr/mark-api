@@ -20,8 +20,10 @@ from .domain import (
     AdCreateRequest,
     AdSnapshot,
     CreateOperationReceipt,
+    DeleteApproval,
     LifecycleState,
     OperationOutcome,
+    OperationReceipt,
 )
 from .orchestrator import SafeWriteOrchestrator
 from .ports import (
@@ -755,6 +757,111 @@ class _PrivateWebRuntimeAdsReader:
         return self._runtime.read_inventory()
 
 
+class _SerializedPrivateWebWriteService:
+    """Serialize whole MarkService operations over one shared browser worker."""
+
+    def __init__(self, delegate: MarkService, operation_lock: Lock) -> None:
+        self._delegate = delegate
+        self._operation_lock = operation_lock
+
+    def create(
+        self,
+        request: AdCreateRequest,
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> CreateOperationReceipt:
+        with self._operation_lock:
+            return self._delegate.create(
+                request,
+                authorization_by=authorization_by,
+                authorization_reference=authorization_reference,
+            )
+
+    def pause(
+        self,
+        ad_id: str,
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> OperationReceipt:
+        with self._operation_lock:
+            return self._delegate.pause(
+                ad_id,
+                authorization_by=authorization_by,
+                authorization_reference=authorization_reference,
+            )
+
+    def activate(
+        self,
+        ad_id: str,
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> OperationReceipt:
+        with self._operation_lock:
+            return self._delegate.activate(
+                ad_id,
+                authorization_by=authorization_by,
+                authorization_reference=authorization_reference,
+            )
+
+    def delete(
+        self,
+        ad_id: str,
+        *,
+        approval: DeleteApproval,
+    ) -> OperationReceipt:
+        with self._operation_lock:
+            return self._delegate.delete(ad_id, approval=approval)
+
+    def update_content(
+        self,
+        ad_id: str,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> OperationReceipt:
+        with self._operation_lock:
+            return self._delegate.update_content(
+                ad_id,
+                title=title,
+                description=description,
+                authorization_by=authorization_by,
+                authorization_reference=authorization_reference,
+            )
+
+
+class _SerializedPrivateWebMediaService:
+    """Serialize media creates with every other PrivateWeb write operation."""
+
+    def __init__(
+        self,
+        delegate: PrivateWebMediaCreateService,
+        operation_lock: Lock,
+    ) -> None:
+        self._delegate = delegate
+        self._operation_lock = operation_lock
+
+    def create_with_media(
+        self,
+        request: AdCreateRequest,
+        media_refs: tuple[str, ...],
+        *,
+        authorization_by: str | None = None,
+        authorization_reference: str | None = None,
+    ) -> CreateOperationReceipt:
+        with self._operation_lock:
+            return self._delegate.create_with_media(
+                request,
+                media_refs,
+                authorization_by=authorization_by,
+                authorization_reference=authorization_reference,
+            )
+
+
 class _WriteOnlyReactionReader:
     """Deliberately unavailable reaction surface for the write-only composition."""
 
@@ -783,12 +890,14 @@ class PrivateWebWriteApiRuntime:
         media_runtime: PrivateWebMediaCreateRuntime | None,
         mark_service: MarkService,
         media_service: PrivateWebMediaCreateService | None,
+        operation_lock: Lock,
     ) -> None:
         self._server = server
         self._content_runtime = content_runtime
         self._media_runtime = media_runtime
         self._mark_service = mark_service
         self._media_service = media_service
+        self._operation_lock = operation_lock
         self._state_lock = Lock()
         self._close_lock = Lock()
         self._server_thread: Thread | None = None
@@ -845,7 +954,8 @@ class PrivateWebWriteApiRuntime:
             raise PrivateWebRuntimeSetupError(
                 "private Web media runtime is not configured"
             )
-        runtime.reconcile_media_submit()
+        with self._operation_lock:
+            runtime.reconcile_media_submit()
 
     def close(self) -> None:
         with self._close_lock:
@@ -890,28 +1000,37 @@ class PrivateWebWriteApiRuntime:
                 else:
                     self._server_closed = True
 
+            # server_close() is the request-handler drain boundary for this
+            # composition. Never close browser runtimes unless that boundary
+            # completed successfully.
+            if not self._server_closed:
+                raise PrivateWebRuntimeSetupError(
+                    "private Web write API runtime cleanup failed"
+                )
+
             media_unknown: PrivateWebSubmitUnknownError | None = None
-            if self._media_runtime is not None:
+            with self._operation_lock:
+                if self._media_runtime is not None:
+                    try:
+                        self._media_runtime.close()
+                    except PrivateWebSubmitUnknownError as exc:
+                        media_unknown = exc
+                    except Exception:
+                        self._runtime_cleanup_failed = True
+                        cleanup_failed = True
+
+                # UNKNOWN is the only close outcome that must preserve the owned
+                # browser/content state for an explicit observation-only
+                # reconciliation. HTTP is already quiesced above, so no new write
+                # can enter while shutdown remains pending.
+                if media_unknown is not None:
+                    raise media_unknown
+
                 try:
-                    self._media_runtime.close()
-                except PrivateWebSubmitUnknownError as exc:
-                    media_unknown = exc
+                    self._content_runtime.close()
                 except Exception:
                     self._runtime_cleanup_failed = True
                     cleanup_failed = True
-
-            # UNKNOWN is the only close outcome that must preserve the owned
-            # browser/content state for an explicit observation-only
-            # reconciliation. HTTP is already quiesced above, so no new write
-            # can enter while shutdown remains pending.
-            if media_unknown is not None:
-                raise media_unknown
-
-            try:
-                self._content_runtime.close()
-            except Exception:
-                self._runtime_cleanup_failed = True
-                cleanup_failed = True
 
             if cleanup_failed:
                 raise PrivateWebRuntimeSetupError(
@@ -1028,15 +1147,30 @@ def compose_private_web_write_api_runtime(
             clock=runtime_clock,
         )
 
-    server = create_write_api_server(
+    operation_lock = Lock()
+    serialized_mark_service = _SerializedPrivateWebWriteService(
         mark_service,
+        operation_lock,
+    )
+    serialized_media_service = (
+        None
+        if media_service is None
+        else _SerializedPrivateWebMediaService(media_service, operation_lock)
+    )
+    server = create_write_api_server(
+        serialized_mark_service,
         store,
         access,
-        media_service=media_service,
+        media_service=serialized_media_service,
         host="127.0.0.1",
         port=port,
         clock=runtime_clock,
     )
+    # The generic Write API keeps daemon request threads for its standalone
+    # use. This composition owns browser runtimes, so close must drain every
+    # accepted handler before those runtimes can be released.
+    server.daemon_threads = False
+    server.block_on_close = True
     try:
         return PrivateWebWriteApiRuntime(
             server=server,
@@ -1044,6 +1178,7 @@ def compose_private_web_write_api_runtime(
             media_runtime=media_runtime,
             mark_service=mark_service,
             media_service=media_service,
+            operation_lock=operation_lock,
         )
     except Exception:
         try:
