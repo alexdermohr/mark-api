@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
+import time
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -163,6 +165,20 @@ class PrivateWebMediaVerifierParserTests(unittest.TestCase):
     "Pillow optional dependency is not installed",
 )
 class PrivateWebMediaVerifierPillowTests(unittest.TestCase):
+    def test_signature_dimensions_follow_exif_transpose(self) -> None:
+        from PIL import Image
+        from mark_api.private_web_media_verify import _pillow_signature
+
+        image = Image.new("RGB", (20, 30), (10, 20, 30))
+        exif = Image.Exif()
+        exif[274] = 6
+        encoded = io.BytesIO()
+        image.save(encoded, "JPEG", quality=95, exif=exif)
+
+        result = _pillow_signature(encoded.getvalue())
+
+        self.assertEqual((result.width, result.height), (30, 20))
+
     def test_real_jpeg_downscale_and_recompression_still_matches(self) -> None:
         from PIL import Image
 
@@ -473,6 +489,25 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
             timeout_seconds=10.0,
         )
         self.assertEqual(result.status, ReadStatus.PARSE_ERROR)
+
+    def test_default_verifier_bounds_blocked_local_read_with_worker_timeout(self) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO is unavailable on this platform")
+        fifo = Path(self.tmp.name) / "blocked.jpg"
+        os.mkfifo(fifo)
+        verifier = PrivateWebPublicMediaPersistenceVerifier()
+
+        started = time.monotonic()
+        result = verifier.verify_media(
+            AD_ID,
+            (PrivateWebMediaSource(str(fifo)),),
+            timeout_seconds=0.2,
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(result.status, ReadStatus.TRANSPORT_ERROR)
+        self.assertEqual(result.error, "private_web_media_verify_timeout")
+        self.assertLess(elapsed, 1.5)
 
     def test_invalid_contract_inputs_fail_before_network(self) -> None:
         calls = 0

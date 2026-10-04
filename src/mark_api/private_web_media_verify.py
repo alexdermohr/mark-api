@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import multiprocessing
 import os
 import re
 import stat
@@ -352,6 +353,7 @@ def _pillow_signature(data: bytes) -> _ImageSignature:
                 raise _MediaDecodeError("image dimensions are invalid")
             opened.load()
             image = ImageOps.exif_transpose(opened)
+            width, height = image.size
             bands = image.getbands()
             if "transparency" in opened.info:
                 raise _MediaDecodeError(
@@ -464,6 +466,13 @@ class PrivateWebPublicMediaPersistenceVerifier:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic
         self._sleep = sleep
+        self._use_isolated_default = (
+            fetch is None
+            and signature_loader is None
+            and clock is None
+            and monotonic is time.monotonic
+            and sleep is time.sleep
+        )
 
     def _remaining(self, deadline: float) -> float:
         remaining = deadline - self._monotonic()
@@ -509,6 +518,25 @@ class PrivateWebPublicMediaPersistenceVerifier:
         return tuple(signatures)
 
     def verify_media(
+        self,
+        ad_id: str,
+        expected_sources: tuple[PrivateWebMediaSource, ...],
+        *,
+        timeout_seconds: float,
+    ) -> ReadResult[PrivateWebMediaPersistenceSnapshot]:
+        if self._use_isolated_default:
+            return _verify_media_in_isolated_process(
+                ad_id,
+                expected_sources,
+                timeout_seconds=timeout_seconds,
+            )
+        return self._verify_media_inline(
+            ad_id,
+            expected_sources,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _verify_media_inline(
         self,
         ad_id: str,
         expected_sources: tuple[PrivateWebMediaSource, ...],
@@ -653,3 +681,141 @@ class PrivateWebPublicMediaPersistenceVerifier:
             ReadStatus.TRANSPORT_ERROR,
             error="private_web_media_verify_timeout",
         )
+
+_WORKER_CLEANUP_SECONDS = 0.25
+
+
+def _default_verification_worker(
+    connection,
+    ad_id: str,
+    source_paths: tuple[str, ...],
+    timeout_seconds: float,
+) -> None:
+    try:
+        sources = tuple(
+            PrivateWebMediaSource(path)
+            for path in source_paths
+        )
+        verifier = PrivateWebPublicMediaPersistenceVerifier(
+            fetch=_default_fetch,
+            signature_loader=_pillow_signature,
+        )
+        result = verifier._verify_media_inline(
+            ad_id,
+            sources,
+            timeout_seconds=timeout_seconds,
+        )
+        connection.send(result)
+    except BaseException:
+        try:
+            connection.send(
+                ReadResult.failure(
+                    ReadStatus.TRANSPORT_ERROR,
+                    error="private_web_media_worker_failed",
+                )
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+def _verify_media_in_isolated_process(
+    ad_id: str,
+    expected_sources: tuple[PrivateWebMediaSource, ...],
+    *,
+    timeout_seconds: float,
+) -> ReadResult[PrivateWebMediaPersistenceSnapshot]:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or timeout_seconds <= 0
+    ):
+        return ReadResult.failure(
+            ReadStatus.PARSE_ERROR,
+            error="invalid_media_verifier_timeout",
+        )
+    if (
+        not isinstance(expected_sources, tuple)
+        or not expected_sources
+        or len(expected_sources) > _MAX_GALLERY_IMAGES
+        or any(
+            not isinstance(source, PrivateWebMediaSource)
+            for source in expected_sources
+        )
+    ):
+        return ReadResult.failure(
+            ReadStatus.PARSE_ERROR,
+            error="invalid_expected_media",
+        )
+    try:
+        _validate_ad_id(ad_id)
+    except (TypeError, ValueError):
+        return ReadResult.failure(
+            ReadStatus.PARSE_ERROR,
+            error="invalid_media_verifier_ad_id",
+        )
+
+    deadline = time.monotonic() + float(timeout_seconds)
+    context = multiprocessing.get_context("spawn")
+    receiving, sending = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_default_verification_worker,
+        args=(
+            sending,
+            ad_id,
+            tuple(source.path for source in expected_sources),
+            float(timeout_seconds),
+        ),
+        daemon=True,
+    )
+    try:
+        process.start()
+    except Exception:
+        receiving.close()
+        sending.close()
+        return ReadResult.failure(
+            ReadStatus.TRANSPORT_ERROR,
+            error="private_web_media_worker_start_failed",
+        )
+    sending.close()
+
+    remaining = max(0.0, deadline - time.monotonic())
+    process.join(remaining)
+    if process.is_alive():
+        process.terminate()
+        process.join(_WORKER_CLEANUP_SECONDS)
+        if process.is_alive():
+            process.kill()
+            process.join(_WORKER_CLEANUP_SECONDS)
+        receiving.close()
+        return ReadResult.failure(
+            ReadStatus.TRANSPORT_ERROR,
+            error="private_web_media_verify_timeout",
+        )
+
+    try:
+        if process.exitcode != 0 or not receiving.poll():
+            return ReadResult.failure(
+                ReadStatus.TRANSPORT_ERROR,
+                error="private_web_media_worker_failed",
+            )
+        result = receiving.recv()
+    except Exception:
+        return ReadResult.failure(
+            ReadStatus.TRANSPORT_ERROR,
+            error="private_web_media_worker_failed",
+        )
+    finally:
+        receiving.close()
+
+    if not isinstance(result, ReadResult):
+        return ReadResult.failure(
+            ReadStatus.TRANSPORT_ERROR,
+            error="private_web_media_worker_failed",
+        )
+    return result
