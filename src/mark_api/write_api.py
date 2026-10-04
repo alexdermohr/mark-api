@@ -366,6 +366,10 @@ def _handler_factory(
     # media and media-free create cannot share/contaminate the same delta
     # window. Other write routes remain independent.
     create_lock = Lock()
+    # A staging request may buffer up to _MAX_MEDIA_BODY_BYTES. Serialize
+    # staging reads so ThreadingHTTPServer cannot multiply that bound by the
+    # number of concurrent authenticated clients.
+    media_staging_lock = Lock()
 
     class WriteApiHandler(BaseHTTPRequestHandler):
         server_version = "mark-api-write/0.1"
@@ -624,8 +628,9 @@ def _handler_factory(
                     self._error(503, "media_staging_unavailable")
                     return
                 try:
-                    filename, raw_media = self._read_media_upload()
-                    media_ref = media_stager.stage_media(filename, raw_media)
+                    with media_staging_lock:
+                        filename, raw_media = self._read_media_upload()
+                        media_ref = media_stager.stage_media(filename, raw_media)
                 except ValueError as exc:
                     self._error(400, str(exc))
                     return
