@@ -598,11 +598,36 @@ class PrivateWebPublicMediaPersistenceVerifier:
         last_http_status: int | None = None
         terminal_observation = "unknown"
         attempt_limit_exhausted = False
+        last_complete_mismatch_seconds: float | None = None
         for attempt in range(_MAX_VERIFY_ATTEMPTS):
+            if (
+                attempt > 0
+                and terminal_observation == "mismatch"
+                and last_complete_mismatch_seconds is not None
+            ):
+                try:
+                    remaining = self._remaining(deadline)
+                except TimeoutError:
+                    break
+                minimum_retry_budget = (
+                    last_complete_mismatch_seconds
+                    + _FINAL_OBSERVATION_RESERVE_SECONDS
+                )
+                if (
+                    remaining
+                    <= minimum_retry_budget + _DEADLINE_EPSILON_SECONDS
+                ):
+                    break
+
+            attempt_started = self._monotonic()
             try:
                 urls = self._listing(target_ad_id, deadline=deadline)
                 if len(urls) != len(expected):
                     terminal_observation = "mismatch"
+                    last_complete_mismatch_seconds = max(
+                        0.0,
+                        self._monotonic() - attempt_started,
+                    )
                 else:
                     observed = self._observed_signatures(
                         urls,
@@ -626,11 +651,23 @@ class PrivateWebPublicMediaPersistenceVerifier:
                             )
                         )
                     terminal_observation = "mismatch"
+                    last_complete_mismatch_seconds = max(
+                        0.0,
+                        self._monotonic() - attempt_started,
+                    )
             except _MediaHttpStatusError as exc:
                 last_http_status = exc.status
                 terminal_observation = "http_error"
             except TimeoutError:
-                terminal_observation = "unknown"
+                if not (
+                    terminal_observation == "mismatch"
+                    and last_complete_mismatch_seconds is not None
+                    and (
+                        deadline - self._monotonic()
+                        <= _DEADLINE_EPSILON_SECONDS
+                    )
+                ):
+                    terminal_observation = "unknown"
                 break
             except (_MediaParseError, _MediaDecodeError):
                 terminal_observation = "parse_error"
@@ -655,17 +692,22 @@ class PrivateWebPublicMediaPersistenceVerifier:
                 remaining = self._remaining(deadline)
             except TimeoutError:
                 break
+            retry_reserve = _FINAL_OBSERVATION_RESERVE_SECONDS
+            if (
+                terminal_observation == "mismatch"
+                and last_complete_mismatch_seconds is not None
+            ):
+                retry_reserve += last_complete_mismatch_seconds
             if (
                 remaining
-                <= _FINAL_OBSERVATION_RESERVE_SECONDS
-                + _DEADLINE_EPSILON_SECONDS
+                <= retry_reserve + _DEADLINE_EPSILON_SECONDS
             ):
                 break
             delay = min(
                 _RETRY_DELAY_SECONDS,
                 max(
                     0.0,
-                    remaining - _FINAL_OBSERVATION_RESERVE_SECONDS,
+                    remaining - retry_reserve,
                 ),
             )
             if delay <= 0:

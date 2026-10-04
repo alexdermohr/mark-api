@@ -460,6 +460,125 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
         assert result.value is not None
         self.assertFalse(result.value.exact_match)
 
+    def test_complete_mismatch_stops_before_retry_without_full_observation_budget(
+        self,
+    ) -> None:
+        first_url = IMAGE_A.replace("$_59.JPG", "$_57.JPG")
+        second_url = IMAGE_B.replace("$_59.AUTO", "$_57.JPG")
+        listing_calls = 0
+        timer = _FakeMonotonic()
+
+        def spend(seconds: float, timeout: float) -> None:
+            if timeout < seconds:
+                timer.sleep(timeout)
+                raise TimeoutError("verification budget exhausted")
+            timer.sleep(seconds)
+
+        def fetch(url: str, timeout: float, maximum: int) -> _Fetched:
+            nonlocal listing_calls
+            if url == f"https://www.kleinanzeigen.de/s-anzeige/{AD_ID}":
+                listing_calls += 1
+                spend(0.30, timeout)
+                return _Fetched(
+                    url,
+                    "text/html",
+                    listing_html(IMAGE_A, IMAGE_B),
+                )
+            if url == first_url:
+                spend(0.20, timeout)
+                return _Fetched(url, "image/jpeg", b"remote-first")
+            if url == second_url:
+                spend(0.20, timeout)
+                return _Fetched(url, "image/jpeg", b"remote-wrong")
+            raise AssertionError(url)
+
+        verifier = PrivateWebPublicMediaPersistenceVerifier(
+            fetch=fetch,
+            signature_loader=self._signature_loader,
+            clock=lambda: NOW,
+            monotonic=timer,
+            sleep=timer.sleep,
+        )
+        result = verifier.verify_media(
+            AD_ID,
+            self.sources,
+            timeout_seconds=1.0,
+        )
+
+        self.assertEqual(listing_calls, 1)
+        self.assertAlmostEqual(timer.value, 0.70)
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        assert result.value is not None
+        self.assertFalse(result.value.exact_match)
+
+    def test_deadline_expiry_after_complete_mismatch_keeps_last_observation(
+        self,
+    ) -> None:
+        listing_calls = 0
+        timer = _FakeMonotonic()
+
+        def fetch(url: str, timeout: float, maximum: int) -> _Fetched:
+            nonlocal listing_calls
+            if url != f"https://www.kleinanzeigen.de/s-anzeige/{AD_ID}":
+                raise AssertionError("count mismatch must not fetch images")
+            listing_calls += 1
+            if listing_calls == 1:
+                timer.sleep(0.10)
+                return _Fetched(url, "text/html", listing_html(IMAGE_A))
+            timer.sleep(timeout)
+            raise TimeoutError("shared deadline reached")
+
+        verifier = PrivateWebPublicMediaPersistenceVerifier(
+            fetch=fetch,
+            signature_loader=self._signature_loader,
+            clock=lambda: NOW,
+            monotonic=timer,
+            sleep=timer.sleep,
+        )
+        result = verifier.verify_media(
+            AD_ID,
+            self.sources,
+            timeout_seconds=1.0,
+        )
+
+        self.assertEqual(listing_calls, 2)
+        self.assertAlmostEqual(timer.value, 1.0)
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        assert result.value is not None
+        self.assertFalse(result.value.exact_match)
+
+    def test_early_timeout_after_mismatch_remains_unknown(self) -> None:
+        listing_calls = 0
+        timer = _FakeMonotonic()
+
+        def fetch(url: str, timeout: float, maximum: int) -> _Fetched:
+            nonlocal listing_calls
+            if url != f"https://www.kleinanzeigen.de/s-anzeige/{AD_ID}":
+                raise AssertionError("count mismatch must not fetch images")
+            listing_calls += 1
+            if listing_calls == 1:
+                timer.sleep(0.10)
+                return _Fetched(url, "text/html", listing_html(IMAGE_A))
+            raise TimeoutError("upstream timeout before shared deadline")
+
+        verifier = PrivateWebPublicMediaPersistenceVerifier(
+            fetch=fetch,
+            signature_loader=self._signature_loader,
+            clock=lambda: NOW,
+            monotonic=timer,
+            sleep=timer.sleep,
+        )
+        result = verifier.verify_media(
+            AD_ID,
+            self.sources,
+            timeout_seconds=1.0,
+        )
+
+        self.assertEqual(listing_calls, 2)
+        self.assertLess(timer.value, 1.0)
+        self.assertEqual(result.status, ReadStatus.TRANSPORT_ERROR)
+        self.assertIsNone(result.value)
+
     def test_gallery_count_mismatch_returns_explicit_mismatch(self) -> None:
         def fetch(url: str, timeout: float, maximum: int) -> _Fetched:
             if url == f"https://www.kleinanzeigen.de/s-anzeige/{AD_ID}":
@@ -542,7 +661,7 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
             timeout_seconds=1.0,
         )
 
-        self.assertGreater(listing_calls, 4)
+        self.assertGreaterEqual(listing_calls, 4)
         self.assertGreaterEqual(timer.value, 0.9)
         self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
         assert result.value is not None
