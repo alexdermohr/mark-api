@@ -329,3 +329,22 @@ Kleinanzeigen stellt Galerievarianten serverseitig skaliert beziehungsweise reko
 - Dashboard erst nach erfolgreichem Sync und nur auf Loopback,
 - keine Plattformwrites aus diesem Launcher und keine Änderung der Write-Gates,
 - Freshness/Recovery sowie Default-on Write Composition folgen separat.
+## D-023 — Product Launcher komponiert vorhandene Write-Funktionen default-on
+
+**Fortschreibung:** D-023 supersediert ausschließlich die D-022-Aussagen, dass der Launcher keine Write API exponiert, keine Write-Gates ändert und die Default-on Write Composition erst später folgt. Die D-022-Grenzen für Initial-Sync, Loopback, Browser-/Login-Lifecycle und Dashboard-Shutdown bleiben bestehen.
+
+**Entscheidung:** Der normale installierte Produktstart `mark-api-launch` bleibt an eine bereits laufende, bereits nutzerauthentifizierte loopback-CDP-Sitzung gebunden, komponiert nach dem erfolgreichen Initial-Inventory-Sync aber zusätzlich die bestehende `PrivateWebWriteApiRuntime`. Der Launcher erzeugt pro Prozess einen neuen zufälligen Bearer, setzt dessen `WriteApiAccess.writes_enabled=true`, gewährt die vorhandenen Capabilities `CREATE`, `CREATE_MEDIA`, `UPDATE_CONTENT`, `SET_STATE` und `DELETE` und ruft den bestehenden High-Level-Builder mit `core_writes_enabled=true` und `media_writes_enabled=true` auf. Die Write API bindet weiterhin ausschließlich an Loopback; der Produktdefault ist Port 8766 und kann wie der Dashboard-Port mit `0` auf einen ephemeren lokalen Port gelegt werden. Es gibt absichtlich keinen zusätzlichen `--enable-writes`-Schalter und keinen vom Nutzer bereitzustellenden CLI-Token.
+
+**Safety-Grenze:** D-023 ändert keine Low-Level-Defaults. `WriteApiAccess`, `MarkService`, `compose_private_web_write_api_runtime(...)` und `build_private_web_write_api_runtime(...)` bleiben außerhalb des Produkt-Launchers fail-safe default-off. Der Launcher öffnet die drei bestehenden Write-Gates bewusst als Produktkomposition; Authentifizierung, Capability-Prüfung, persistente HTTP-Idempotenz, exakte Anzeigen-ID-/Ownership-Bindung, Pre-/Post-Reads, Confirmation, TOCTOU-Stabilisierung, Media-Persistenzevidenz und `platform_retry_authorized=false` bleiben unverändert. Ein `AMBIGUOUS`- oder Submit-`UNKNOWN`-Ergebnis autorisiert weiterhin keinen erneuten Plattformversuch.
+
+**Startup und Shutdown:** Dashboard und Write-Runtime werden erst nach dem erfolgreichen Initial-Sync konstruiert. Kann die Write-Runtime nicht vollständig gebaut und gestartet werden, scheitert der Produktstart fail-closed und bereits erzeugte lokale Runtime-Ressourcen werden geschlossen. Beim Shutdown wird zuerst die Dashboard-Serve-Schleife quiesziert; danach werden Write-Runtime und Initial-Inventory-Runtime kontrolliert geschlossen. Meldet der Media-Runtime-Cleanup einen `PrivateWebSubmitUnknownError`, darf der CLI genau die bestehende observation-only `reconcile_media_submit()`-Beobachtung ausführen und anschließend den Cleanup erneut versuchen. Diese Reconciliation führt keinen zweiten Submit aus und ist keine Retry-Autorisierung.
+
+**Folgen:**
+- `mark-api-launch` liefert nach erfolgreichem Start Dashboard-URL, Write-API-URL und den prozesslokalen Bearer an den lokalen Operator,
+- der Bearer wird vom Launcher nicht in SQLite persistiert und ist kein Plattform-Credential,
+- der Launcher-Output enthält diesen temporären Write-Bearer und ist während der Laufzeit entsprechend wie lokales Write-Secret-Material zu behandeln; automatisches Service-/Log-Secret-Handling bleibt Gegenstand der nachgelagerten internen Auth-Härtung,
+- alle bereits implementierten Standard- und Media-Write-Routen sind im normalen Produktstart komponiert, ohne dass ein separates Write-Opt-in nötig ist,
+- Dashboard und Write API bleiben getrennte HTTP-Surfaces und ausschließlich loopback-bound,
+- Browserstart, Login, MFA, CAPTCHA und Security-Challenge-Handling bleiben vollständig caller-/nutzer-owned,
+- Tests dieses Slices verwenden ausschließlich Fakes beziehungsweise lokale Loopback-Surfaces und führen keinen realen Kleinanzeigen-Plattformwrite aus,
+- interne Auth-/Idempotency-Härtung und die weitergehende Recovery UX bleiben nachgelagerte Produktslices.
