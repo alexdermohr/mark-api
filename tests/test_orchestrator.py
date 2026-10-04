@@ -174,25 +174,44 @@ class SafeWriteOrchestratorTests(unittest.TestCase):
         self.assertEqual(reader.calls, 0)
         self.assertEqual(confirmation.calls, 0)
 
-    def test_create_rejects_same_inventory_reader_before_any_read_or_write(self) -> None:
-        reader = SequenceReader()
+    def test_create_accepts_same_inventory_reader_with_fresh_reads_and_exact_content(self) -> None:
+        request = create_request()
+        created = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="200",
+            title=request.title,
+            description=None,
+        )
+        exact_content = snapshot(
+            LifecycleState.ACTIVE,
+            ad_id="200",
+            title=request.title,
+            description=request.description,
+        )
+        reader = SequenceReader(
+            ReadResult.success_empty(()),
+            ReadResult.success_empty(()),
+            ReadResult.success_nonempty((created,)),
+            ReadResult.success_nonempty((created,)),
+        )
+        content_reader = SequenceReader(
+            ReadResult.success_nonempty((exact_content,)),
+        )
         writer = CreateWriter()
 
         receipt = self.service().create(
-            request=create_request(),
+            request=request,
             reader=reader,
             confirmation_reader=reader,
             writer=writer,
-            content_reader_factory=lambda _ad_id: SequenceReader(),
+            content_reader_factory=lambda _ad_id: content_reader,
         )
 
-        self.assertEqual(receipt.outcome, OperationOutcome.PRECONDITION_FAILED)
-        self.assertEqual(
-            receipt.confirmation_pre_read_status,
-            "confirmation_reader_not_independent",
-        )
-        self.assertEqual(reader.calls, 0)
-        self.assertEqual(writer.calls, 0)
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertEqual(receipt.created_ad_id, "200")
+        self.assertEqual(reader.calls, 4)
+        self.assertEqual(content_reader.calls, 1)
+        self.assertEqual(writer.calls, 1)
 
     def test_create_confirms_one_new_id_in_both_inventories_and_exact_content(self) -> None:
         request = create_request()

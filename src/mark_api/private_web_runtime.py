@@ -1279,10 +1279,10 @@ def compose_private_web_write_api_runtime(
         raise TypeError("clock must be callable")
 
     owner_reader = _PrivateWebRuntimeAdsReader(content_runtime)
-    # Reuse the exact primary reader as a fail-closed sentinel when no
-    # independently established confirmation runtime was supplied. The
-    # SafeWriteOrchestrator then rejects Create before any read/write and
-    # refuses to CONFIRM Delete from a single inventory source.
+    # Without a separate inventory runtime, reuse the authoritative owner
+    # inventory for temporally distinct observations. Create still requires
+    # the separate target-bound content/detail read; Delete requires a second
+    # fresh absence observation after exactly one submit.
     confirmation_reader = (
         owner_reader
         if confirmation_runtime is None
@@ -1381,8 +1381,10 @@ def build_private_web_write_api_runtime(
 ) -> PrivateWebWriteApiRuntime:
     """Build a loopback-only PrivateWeb write runtime for an existing CDP worker.
 
-    A caller may supply one separately established confirmation runtime. This
-    builder never constructs a second inventory source automatically.
+    A caller may still supply a separately established inventory runtime, but
+    normal Create/Delete do not require one. When absent, the authoritative
+    owner inventory is observed at distinct points in time and Create also
+    requires the separate target-bound content/detail read.
     """
 
     if not isinstance(access, WriteApiAccess):

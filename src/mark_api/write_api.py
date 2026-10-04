@@ -616,23 +616,11 @@ def _handler_factory(
                     ):
                         raise ValueError("description_must_be_string")
                 elif action == "delete":
-                    payload = self._read_json_object()
-                    if set(payload) != {
-                        "confirm_ad_id",
-                        "approval_reference",
-                    }:
-                        raise ValueError("invalid_delete_approval")
-                    approval_reference = payload["approval_reference"]
-                    if (
-                        payload["confirm_ad_id"] != ad_id
-                        or not isinstance(approval_reference, str)
-                        or not approval_reference
-                        or approval_reference != approval_reference.strip()
-                        or len(approval_reference) > 256
-                        or "\r" in approval_reference
-                        or "\n" in approval_reference
-                    ):
-                        raise ValueError("invalid_delete_approval")
+                    # The exact URL target plus this authenticated user action
+                    # is the approval. Audit/idempotency identity is generated
+                    # internally; callers do not manufacture a second token.
+                    self._require_empty_body()
+                    payload = {}
                 else:
                     self._require_empty_body()
                     payload = {}
@@ -807,7 +795,7 @@ def _handler_factory(
                         approval=DeleteApproval(
                             ad_id=ad_id,
                             approved_by=access.principal,
-                            reference=str(payload["approval_reference"]),
+                            reference=authorization_reference,
                         ),
                     )
 
@@ -820,11 +808,7 @@ def _handler_factory(
                         "activate": "set_state:active",
                         "delete": "delete",
                     }[action]
-                    expected_authorization_reference = (
-                        str(payload["approval_reference"])
-                        if action == "delete"
-                        else authorization_reference
-                    )
+                    expected_authorization_reference = authorization_reference
                     if (
                         receipt.ad_id != ad_id
                         or receipt.operation != expected_operation
