@@ -434,7 +434,10 @@ class PrivateWebMediaRefResolver:
 
 
 class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
-    """Own ephemeral private media copies behind generated opaque handles."""
+    """Own bounded ephemeral private media copies behind generated opaque handles."""
+
+    _MAX_STAGED_HANDLES = 32
+    _MAX_STAGED_BYTES = 100 * 1024 * 1024
 
     def __init__(self) -> None:
         super().__init__({})
@@ -443,6 +446,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         )
         self._lock = Lock()
         self._closed = False
+        self._staged_bytes = 0
 
     @staticmethod
     def _extension(filename: str, data: bytes) -> str:
@@ -476,6 +480,11 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         with self._lock:
             if self._closed:
                 raise RuntimeError("media handle store is closed")
+            if (
+                len(self._sources) >= self._MAX_STAGED_HANDLES
+                or self._staged_bytes + len(data) > self._MAX_STAGED_BYTES
+            ):
+                raise ValueError("media staging quota exceeded")
             while True:
                 ref = "media_" + token_urlsafe(18)
                 if _MEDIA_REF_RE.fullmatch(ref) is not None and ref not in self._sources:
@@ -500,6 +509,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             finally:
                 os.close(fd)
             self._sources[ref] = PrivateWebMediaSource(path)
+            self._staged_bytes += len(data)
             return ref
 
     def resolve(
@@ -514,6 +524,14 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
     def discard(self, media_refs: tuple[str, ...]) -> None:
         with self._lock:
             sources = [self._sources.pop(ref, None) for ref in media_refs]
+            released_bytes = 0
+            for source in sources:
+                if source is not None:
+                    try:
+                        released_bytes += os.path.getsize(source.path)
+                    except FileNotFoundError:
+                        pass
+            self._staged_bytes = max(0, self._staged_bytes - released_bytes)
         for source in sources:
             if source is not None:
                 try:
@@ -527,6 +545,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 return
             self._closed = True
             self._sources.clear()
+            self._staged_bytes = 0
         self._directory.cleanup()
 
 

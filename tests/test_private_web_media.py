@@ -143,6 +143,36 @@ class PrivateWebMediaContractTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_media_handle_store_bounds_abandoned_handles_and_recovers_capacity(self) -> None:
+        store = PrivateWebMediaHandleStore()
+        try:
+            store._MAX_STAGED_HANDLES = 2
+            store._MAX_STAGED_BYTES = 16
+            first = store.stage_media("one.jpg", b"\xff\xd8\xffone")
+            second = store.stage_media("two.jpg", b"\xff\xd8\xfftwo")
+            with self.assertRaisesRegex(ValueError, "media staging quota exceeded"):
+                store.stage_media("three.jpg", b"\xff\xd8\xffx")
+            store.discard((first,))
+            third = store.stage_media("three.jpg", b"\xff\xd8\xffx")
+            self.assertNotEqual(third, second)
+        finally:
+            store.close()
+
+    def test_media_handle_store_enforces_total_byte_quota_before_writing(self) -> None:
+        store = PrivateWebMediaHandleStore()
+        try:
+            store._MAX_STAGED_HANDLES = 10
+            store._MAX_STAGED_BYTES = 7
+            ref = store.stage_media("one.jpg", b"\xff\xd8\xffone")
+            with self.assertRaisesRegex(ValueError, "media staging quota exceeded"):
+                store.stage_media("two.jpg", b"\xff\xd8\xffx")
+            self.assertEqual(len(store._sources), 1)
+            store.discard((ref,))
+            replacement = store.stage_media("two.jpg", b"\xff\xd8\xffx")
+            self.assertIsInstance(replacement, str)
+        finally:
+            store.close()
+
     def test_media_handle_store_rejects_mismatched_or_unsafe_images(self) -> None:
         store = PrivateWebMediaHandleStore()
         try:
