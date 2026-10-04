@@ -1354,39 +1354,36 @@ class WriteApiTests(unittest.TestCase):
         )
         self.assertIsNone(self.store.write_api_request("pause-invalid"))
 
-    def test_delete_requires_explicit_matching_confirmation(self) -> None:
+    def test_delete_uses_request_identity_as_internal_approval(self) -> None:
         service = FakeWriteService()
         with self.server(service) as server:
             bad_status, _, bad_body = self.request(
                 server,
                 "DELETE",
                 "/api/write/ads/1234567890",
-                payload={
-                    "confirm_ad_id": "9999999999",
-                    "approval_reference": "ticket-42",
-                },
+                payload={"approval_reference": "caller-token-not-accepted"},
                 idempotency_key="delete-bad",
             )
             ok_status, _, ok_body = self.request(
                 server,
                 "DELETE",
                 "/api/write/ads/1234567890",
-                payload={
-                    "confirm_ad_id": "1234567890",
-                    "approval_reference": "ticket-42",
-                },
                 idempotency_key="delete-ok",
             )
 
         self.assertEqual(bad_status, 400)
-        self.assertEqual(bad_body["error"], "invalid_delete_approval")
+        self.assertEqual(bad_body["error"], "request_body_not_allowed")
         self.assertIsNone(self.store.write_api_request("delete-bad"))
         self.assertEqual(ok_status, 200)
         self.assertEqual(service.calls, [("delete", "1234567890")])
         assert service.delete_approval is not None
         self.assertEqual(service.delete_approval.ad_id, "1234567890")
         self.assertEqual(service.delete_approval.approved_by, "api-test-owner")
-        self.assertEqual(service.delete_approval.reference, "ticket-42")
+        self.assertEqual(service.delete_approval.reference, "write-api:delete-ok")
+        self.assertEqual(
+            ok_body["operation_receipt"]["authorization_reference"],
+            "write-api:delete-ok",
+        )
         self.assertEqual(
             ok_body["operation_receipt"]["authorization_by"],
             "api-test-owner",

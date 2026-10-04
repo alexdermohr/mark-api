@@ -138,14 +138,14 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - gleicher Key + gleicher abgeschlossener Request gibt nur die gespeicherte Response zurück und ruft keinen Writer erneut auf,
 - gleicher Key + anderer Request wird fail-closed abgewiesen,
 - ein persistiertes `in_progress` nach Crash bleibt ein harter Retry-Blocker und verlangt Reconciliation statt Wiederholung,
-- Delete benötigt zusätzlich eine explizite, zur Pfad-ID identische `confirm_ad_id` sowie eine Approval-Referenz,
+- die hier ursprünglich verlangte caller-supplied `confirm_ad_id`/Approval-Referenz für Delete wird durch D-019 supersediert; Pfad-ID, authentifizierte Nutzeroperation und stabile Idempotency-ID binden Ziel, Freigabe und Audit-Referenz intern,
 - Operation-Receipts werden sanitisiert über HTTP exponiert; ein `AMBIGUOUS`-Outcome erteilt ausdrücklich keine Retry-Autorisierung,
 - dieser Slice konstruiert keine Browser-/PrivateWeb-Runtime und führt keinen Kleinanzeigen-Plattformwrite aus.
 ## D-012 — Create wird als eigener Mark-Write-API-Contract exponiert
 
 **Entscheidung:** Die lokale loopback-only Mark Write API erweitert D-011 um `POST /api/write/ads`. Exponiert wird ausschließlich der bereits gehärtete enge `AdCreateRequest` mit Kategoriepfad, Titel, Beschreibung und ganzzahligem EUR-Festpreis. Media-Publish und Reply bleiben weiterhin separate Gates.
 
-**Begründung:** Der Core-Createpfad besitzt bereits eine strengere Reconciliation als ID-gebundene Writes: zwei unabhängige Inventar-Pre-/Post-Reads müssen exakt dieselbe einzelne neue Anzeigen-ID erkennen, anschließend muss ein target-bound Content-Read Titel und Beschreibung bestätigen. Diese Semantik kann über dieselbe crash-idempotente HTTP-Ledger exponiert werden, ohne einen Browser zu starten oder einen Plattformwrite im Implementierungs-Slice auszuführen.
+**Begründung:** Der Core-Createpfad besitzt eine strengere Reconciliation als ID-gebundene Writes: gemäß D-019 müssen zeitlich getrennte frische Inventar-Pre-/Post-Beobachtungen exakt dieselbe einzelne neue Anzeigen-ID erkennen; anschließend muss ein target-bound Content-Read Titel und Beschreibung bestätigen. Eine tatsächlich separate Inventarquelle kann optional zusätzlich injiziert werden, ist aber keine Produktvoraussetzung. Diese Semantik kann über dieselbe crash-idempotente HTTP-Ledger exponiert werden, ohne einen Browser zu starten oder einen Plattformwrite im Implementierungs-Slice auszuführen.
 
 **Folgen:**
 - Create benötigt eine eigene `CREATE`-Capability sowie Bearer-Authentisierung und den API-`writes_enabled`-Gate vor jeder Body-/Service-Ausführung,
@@ -218,7 +218,7 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - WriteApiAccess.writes_enabled, core_writes_enabled und media_writes_enabled bleiben unabhängige Freigabegates und sind standardmäßig false; ein geöffnetes HTTP-Gate öffnet weder Core- noch Media-Writes,
 - CREATE_MEDIA darf nur mit gemeinsam vorhandener PrivateWebMediaCreateRuntime und PrivateWebMediaRefResolver komponiert werden; der High-Level-Builder verlangt dafür nicht leere explizite media_ref -> PrivateWebMediaSource-Bindings und kopiert sie über den bestehenden Resolver immutable,
 - Media-Bindings ohne CREATE_MEDIA, CREATE_MEDIA ohne vollständige Media-Komposition sowie media_writes_enabled=true ohne Media-Komposition scheitern vor Browserzugriff,
-- der High-Level-Builder fabriziert keine unabhängige Bestätigung aus einer zweiten Instanz derselben Management-Quelle: eine vom Caller separat etablierte `PrivateWebInventoryRuntime` kann explizit über `confirmation_runtime=` injiziert werden; ohne diese explizite Runtime stoppt Create vor dem Writer mit `confirmation_reader_not_independent`, und Delete kann ohne zweite Abwesenheitsquelle nicht `CONFIRMED` werden,
+- der High-Level-Builder fabriziert keine unabhängige Bestätigung aus einer zweiten Instanz derselben Management-Quelle; die hier ursprünglich festgelegte Pflicht zu einer separat injizierten Confirmation-Runtime für Create/Delete wird durch D-019 supersediert,
 - der Builder bereinigt von ihm bereits erzeugte Runtimes bei partieller Konstruktion; eine fehlgeschlagene Low-Level-Komposition übernimmt dagegen keine caller-owned Runtimes,
 - bleibt nach einem Media-Submit `PrivateWebMediaCreateRuntime.reconciliation_required` wahr, blockiert die gemeinsame PrivateWeb-Komposition sämtliche weiteren Core- und Media-Writes unter demselben Operations-Lock noch vor ihrem Service-Delegate; nur erfolgreiche `reconcile_media_submit()`-Beobachtung hebt diesen Fence wieder auf,
 - Shutdown quiesziert zuerst HTTP. Meldet PrivateWebMediaCreateRuntime.close() einen unresolved Submit, wird PrivateWebSubmitUnknownError unverändert weitergereicht; Content- und Media-Runtime bleiben für die explizite observation-only reconcile_media_submit() erhalten, während der HTTP-Server nicht neu gestartet werden darf,
@@ -260,3 +260,19 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - persistente Idempotency-Replays geben die zuvor gespeicherte Media-Response unverändert zurück und führen weder Service noch Verifier erneut aus,
 - HTTP-Antwort und persistente Media-Evidenz enthalten keine `media_refs`, lokalen Pfade, Bytes, Browser-`FileList`-Zustände oder provider-spezifischen Media-IDs,
 - dieser Slice führt keinen realen Kleinanzeigen-Plattformwrite aus.
+
+## D-019 — Create/Delete bestätigen Produktwrites ohne künstlich duplizierte Confirmation-Runtime
+
+**Fortschreibung:** D-019 supersediert ausschließlich die widersprechenden Create/Delete-Confirmation- und Delete-Approval-Klauseln von D-011, D-012 und D-016 sowie die entsprechende ältere technische Capability-Beschreibung. Alle übrigen Sicherheits-, Idempotenz-, one-shot-, UNKNOWN- und No-Blind-Retry-Regeln dieser Entscheidungen bleiben bestehen. Die one-shot-, exakte Zielbindungs-, UNKNOWN-, Idempotenz- und No-Blind-Retry-Regeln bleiben unverändert. Eine tatsächlich separat etablierte `PrivateWebInventoryRuntime` bleibt als optionaler Injection-Seam zulässig, ist aber keine Voraussetzung des normalen Produktpfads und wird nicht allein aufgrund einer zweiten Instanz derselben Management-Quelle als unabhängig behandelt.
+
+**Entscheidung:** Der normale PrivateWeb-Produktpfad verwendet die autoritative Owner-/Management-Inventarquelle zu mehreren klar getrennten Beobachtungszeitpunkten statt eine zweite gleichartige Runtime als Scheinsicherheit zu verlangen. Create benötigt zwei erfolgreiche Pre-Read-Inventarbeobachtungen, genau einen Publish-Versuch, zwei erfolgreiche Post-Read-Inventarbeobachtungen mit exakt derselben einzelnen neuen ID und anschließend den bereits getrennten target-bound Content-/Detail-Read für genau diese ID; Titel und Beschreibung müssen dort exakt dem Auftrag entsprechen. Delete benötigt einen erfolgreichen target-bound Pre-Read, genau einen Delete-Submit und danach zwei frische erfolgreiche Inventarbeobachtungen, in denen exakt die Ziel-ID fehlt. Reicht diese Evidenz nicht aus, bleibt das Ergebnis `AMBIGUOUS`; ein möglicher Plattformwrite wird nicht wiederholt.
+
+**Begründung:** Zwei Objektinstanzen gegen dieselbe Management-Quelle belegen keine Quellenunabhängigkeit. Die tatsächlich benötigte Sicherheit ist stattdessen an den beobachteten Zustandsübergang, die exakte Ziel-ID, zeitlich getrennte frische Reads und bei Create zusätzlich an den separaten target-bound Detailpfad gebunden. Damit entfällt eine künstliche Produktbarriere, ohne die one-write-/No-Blind-Retry-Grenze zu schwächen.
+
+**Folgen:**
+- `confirmation_runtime=` bleibt optional; der Builder erzeugt keine zweite Management-Runtime automatisch,
+- Create wird nicht mehr allein wegen `confirmation_reader is reader` vor dem Writer abgewiesen,
+- Delete darf dieselbe autoritative Inventarquelle für die zweite frische Post-Submit-Abwesenheitsbeobachtung verwenden,
+- Read-/Transportfehler, uneindeutige Inventardeltas, mehrere neue IDs, abweichende Titel-/Detailwerte oder eine nach dem Delete noch sichtbare Ziel-ID verhindern `CONFIRMED`,
+- die lokale Write API behandelt die authentifizierte, exakt ID-gebundene Delete-Nutzeroperation selbst als Freigabe; ihre stabile Idempotency-ID erzeugt intern die Audit-/Authorization-Referenz, sodass kein caller-erfundener `approval_reference` oder `confirm_ad_id` erforderlich ist,
+- diese Änderung erzeugt keine zusätzliche Retry-Autorität und führt in automatischen Tests keinen realen Kleinanzeigen-Plattformwrite aus.

@@ -340,7 +340,7 @@ class WriteDashboardIntegrationTests(unittest.TestCase):
         self.assertEqual(self.platform.calls, ["set_state", "set_state"])
 
     def test_confirmed_delete_marks_only_target_absent_and_retains_history(self) -> None:
-        status, receipt, _ = self.request(self.api, f"/api/write/ads/{TARGET}", "DELETE", {"confirm_ad_id": TARGET, "approval_reference": "synthetic-approval"})
+        status, receipt, _ = self.request(self.api, f"/api/write/ads/{TARGET}", "DELETE")
         self.assertEqual(status, 200)
         self.assertFalse(receipt["platform_retry_authorized"])
         rows = self.ads()
@@ -367,7 +367,7 @@ class WriteDashboardIntegrationTests(unittest.TestCase):
 
     def test_ambiguous_delete_does_not_invent_absence(self) -> None:
         self.primary.fail_after_first_read = True
-        status, receipt, _ = self.request(self.api, f"/api/write/ads/{TARGET}", "DELETE", {"confirm_ad_id": TARGET, "approval_reference": "synthetic-approval"})
+        status, receipt, _ = self.request(self.api, f"/api/write/ads/{TARGET}", "DELETE")
         self.assertEqual(status, 202)
         self.assertEqual(receipt["operation_receipt"]["outcome"], "ambiguous")
         self.assertTrue(self.ads()[TARGET]["present"])

@@ -276,11 +276,10 @@ class SafeWriteOrchestrator:
                 pre_status="create_writer_unavailable",
                 confirmation_pre_status="not_read",
             )
-        if confirmation_reader is reader:
-            return precondition(
-                pre_status="not_read",
-                confirmation_pre_status="confirmation_reader_not_independent",
-            )
+        # A second inventory reader may be the same authoritative source.
+        # Safety comes from fresh before/after observations plus the separate,
+        # target-bound content read below; object identity is not evidence of
+        # source independence.
         if content_reader_factory is None:
             return precondition(
                 pre_status="not_read",
@@ -558,7 +557,10 @@ class SafeWriteOrchestrator:
 
         confirmation = None
         confirmation_snapshot = None
-        if confirmation_reader is not None and confirmation_reader is not reader:
+        if confirmation_reader is not None:
+            # This is a second fresh post-delete observation. It may use the
+            # same authoritative inventory source; do not mistake object
+            # identity for source independence.
             confirmation = confirmation_reader.read_ads()
             confirmation_snapshot = self._find_target(confirmation, ad_id)
 

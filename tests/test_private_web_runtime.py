@@ -2697,12 +2697,40 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
 
             self.assertEqual(close_events, ["content"])
 
-    def test_create_fails_closed_without_independent_confirmation_runtime(self) -> None:
+    def test_create_uses_fresh_owner_observations_and_target_detail_without_second_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SnapshotStore(Path(tmp) / "runtime.sqlite")
-            reader = OwnerReader(ReadResult.success_empty(()))
+            created = owner_snapshot(
+                title="Neue Vase",
+                description="Beschreibung",
+            )
+            reader = SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created,)),
+                ReadResult.success_nonempty((created,)),
+                ReadResult.success_nonempty((created,)),
+            )
             close_events: list[str] = []
-            content_runtime = self._content_runtime(reader, close_events)
+            events: list[tuple] = []
+            pages = [
+                CreatePage(events),
+                SharedPage(
+                    {"title": "Neue Vase", "description": "Beschreibung"},
+                    events,
+                ),
+            ]
+
+            def page_factory():
+                if not pages:
+                    raise AssertionError("unexpected extra browser page")
+                return pages.pop(0)
+
+            content_runtime = PrivateWebContentRuntime(
+                owner_reader=reader,
+                page_factory=page_factory,
+                close_runtime=lambda: close_events.append("content"),
+            )
             runtime = compose_private_web_write_api_runtime(
                 content_runtime=content_runtime,
                 store=store,
@@ -2720,26 +2748,30 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                     "POST",
                     "/api/write/ads",
                     payload=self._create_payload(),
-                    idempotency_key="missing-independent-confirmation",
+                    idempotency_key="single-inventory-create",
                 )
-                self.assertEqual(status, 409)
+                self.assertEqual(status, 200, body)
                 receipt = body["operation_receipt"]
-                self.assertEqual(receipt["pre_read_status"], "not_read")
+                self.assertEqual(receipt["outcome"], "confirmed")
+                self.assertEqual(receipt["created_ad_id"], AD_ID)
+                self.assertTrue(receipt["writer_invoked"])
+                self.assertEqual(reader.calls, 5)
                 self.assertEqual(
-                    receipt["confirmation_pre_read_status"],
-                    "confirmation_reader_not_independent",
+                    [event[0] for event in events].count("submit_create"),
+                    1,
                 )
-                self.assertFalse(receipt["writer_invoked"])
-                self.assertEqual(reader.calls, 0)
+                self.assertIn(("open_editor", AD_ID), events)
+                self.assertEqual(pages, [])
             finally:
                 runtime.close()
             self.assertEqual(close_events, ["content"])
 
-    def test_delete_stays_ambiguous_without_independent_confirmation_runtime(self) -> None:
+    def test_delete_uses_two_fresh_absence_reads_without_second_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SnapshotStore(Path(tmp) / "runtime.sqlite")
             reader = SequenceReader(
                 ReadResult.success_nonempty((owner_snapshot(),)),
+                ReadResult.success_empty(()),
                 ReadResult.success_empty(()),
             )
             close_events: list[str] = []
@@ -2765,18 +2797,18 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                     runtime,
                     "DELETE",
                     f"/api/write/ads/{AD_ID}",
-                    payload={
-                        "confirm_ad_id": AD_ID,
-                        "approval_reference": "ticket-independent-confirmation",
-                    },
-                    idempotency_key="missing-delete-confirmation",
+                    idempotency_key="single-inventory-delete",
                 )
-                self.assertEqual(status, 202)
+                self.assertEqual(status, 200)
                 receipt = body["operation_receipt"]
-                self.assertEqual(receipt["outcome"], "ambiguous")
+                self.assertEqual(receipt["outcome"], "confirmed")
+                self.assertEqual(
+                    receipt["authorization_reference"],
+                    "write-api:single-inventory-delete",
+                )
                 self.assertTrue(receipt["writer_invoked"])
                 self.assertFalse(body["platform_retry_authorized"])
-                self.assertEqual(reader.calls, 2)
+                self.assertEqual(reader.calls, 3)
                 self.assertEqual(
                     [event[0] for event in events].count("submit_delete"),
                     1,
@@ -2915,21 +2947,6 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 self.assertEqual(runtime.server_address[0], "127.0.0.1")
                 media_builder.assert_not_called()
                 confirmation_builder.assert_not_called()
-                status, body = self._request(
-                    runtime,
-                    "POST",
-                    "/api/write/ads",
-                    payload=self._create_payload(),
-                    idempotency_key="builder-no-independent-confirmation",
-                )
-                self.assertEqual(status, 409)
-                receipt = body["operation_receipt"]
-                self.assertEqual(receipt["pre_read_status"], "not_read")
-                self.assertEqual(
-                    receipt["confirmation_pre_read_status"],
-                    "confirmation_reader_not_independent",
-                )
-                self.assertFalse(receipt["writer_invoked"])
                 self.assertEqual(reader.calls, 0)
             finally:
                 runtime.close()

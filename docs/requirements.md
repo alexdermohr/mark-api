@@ -38,7 +38,7 @@ Die normalisierte Produktspezifikation liegt in `docs/product-spec.md`. Technisc
 
 Create/Publish bleibt ein separat gegateter Write-Pfad und ist kein implizit freigegebener Standardbetrieb.
 
-Schreibende Operationen bleiben fail-closed: Writes sind standardmäßig deaktiviert, Ziel-IDs werden frisch owner-verifiziert, es gibt genau einen Mutationsversuch ohne Blind-Retry und einen unabhängigen Post-Readback. Delete verlangt zusätzlich eine explizite ID-gebundene Freigabe. Die konkreten Runtime- und Write-Sicherheitsentscheidungen sind in D-010 bis D-018 dokumentiert.
+Schreibende Operationen bleiben fail-closed: Writes sind im aktuellen Low-Level-Core standardmäßig deaktiviert, Ziel-IDs werden frisch owner-verifiziert, und es gibt genau einen Mutationsversuch ohne Blind-Retry. ID-gebundene Writes verwenden einen frischen target-bound Post-Readback; Create/Delete folgen dem D-019-Confirmation-Vertrag mit zeitlich getrennten frischen Inventarbeobachtungen statt einer künstlich duplizierten Management-Runtime. Bei Delete ist die authentifizierte, exakt pfad-ID-gebundene Nutzeroperation selbst die Freigabe; die stabile Idempotency-ID liefert intern die Audit-/Authorization-Referenz. Die konkreten Runtime- und Write-Sicherheitsentscheidungen sind in D-010 bis D-019 dokumentiert.
 
 ## Expliziter Analytics-Contract
 

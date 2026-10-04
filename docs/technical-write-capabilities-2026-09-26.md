@@ -34,7 +34,7 @@ SafeWriteOrchestrator
       +-- unabhängige Readback-Adapter
 ```
 
-Der Mark-Core bleibt provider-neutral. Jeder Plattform-Write bleibt standardmäßig deaktiviert und läuft weiterhin über frischen Precondition-Read, genau einen Mutationsversuch und unabhängigen Post-Readback.
+Der Mark-Core bleibt provider-neutral. Jeder Plattform-Write bleibt im aktuellen Low-Level-Core standardmäßig deaktiviert und läuft weiterhin über frischen Precondition-Read und genau einen Mutationsversuch ohne Blind-Retry. ID-gebundene Content-/Lifecycle-Writes verwenden ihren target-bound Post-Readback; Create/Delete folgen der durch D-019 supersedierten Confirmation-Semantik mit zeitlich getrennten frischen Inventarbeobachtungen und bei Create zusätzlichem target-bound Detailread.
 
 ## Evidenzklassen
 
@@ -260,7 +260,7 @@ Darauf basiert der neue enge `PrivateWebCreateWriter`:
 - unmittelbar vor Publish werden Formvertrag und alle drei gesetzten Werte erneut geprüft,
 - exakt ein Browser-Input auf `Anzeige aufgeben`; ab dem ersten möglichen Publish-Input gilt jeder unklare Ausgang als `SubmitUnknown` und wird nicht wiederholt.
 
-Create benötigt wegen der erst nach dem Write bekannten Anzeigen-ID einen eigenen `CreateOperationReceipt`. `SafeWriteOrchestrator.create()` liest vor dem Write Primär- und unabhängiges Bestätigungsinventar. Nach dem einzigen Publish-Versuch müssen beide gegenüber ihrem jeweiligen Pre-State exakt dieselbe einzelne neue ID sehen und den angeforderten Titel tragen; anschließend muss der target-bound Private-Web-Reader für genau diese ID Titel und Beschreibung exakt bestätigen. Nur dann ist der Create `CONFIRMED`. Andernfalls bleibt er `AMBIGUOUS`; eine erkannte `WriteNotAttemptedError` bleibt ohne Post-Read `PRECONDITION_FAILED`.
+Create benötigt wegen der erst nach dem Write bekannten Anzeigen-ID einen eigenen `CreateOperationReceipt`. Gemäß D-019 liest `SafeWriteOrchestrator.create()` die autoritative Owner-/Management-Inventarquelle vor dem Write zweimal zu getrennten Beobachtungszeitpunkten; eine optional separat etablierte `PrivateWebInventoryRuntime` kann weiterhin als zweite Quelle injiziert werden, ist aber keine Produktvoraussetzung. Nach dem einzigen Publish-Versuch müssen die beiden Post-Read-Inventarbeobachtungen gegenüber den jeweiligen Pre-States exakt dieselbe einzelne neue ID sehen und den angeforderten Titel tragen; anschließend muss der getrennte target-bound Private-Web-Reader für genau diese ID Titel und Beschreibung exakt bestätigen. Nur dann ist der Create `CONFIRMED`. Andernfalls bleibt er `AMBIGUOUS`; eine erkannte `WriteNotAttemptedError` bleibt ohne Post-Read `PRECONDITION_FAILED`. Für Delete gilt derselbe Grundsatz ohne Scheinsicherheit durch eine duplizierte Runtime: erfolgreicher target-bound Pre-Read, genau ein Delete-Submit und danach zwei frische erfolgreiche Inventarbeobachtungen ohne die Ziel-ID; sonst bleibt das Ergebnis `AMBIGUOUS` und der Plattformwrite wird nicht wiederholt.
 
 ### Fortschreibung 30.09.2026 — read-only PrivateWeb Runtime-Smoke
 
@@ -352,7 +352,7 @@ Der erste lokale Write-API-Contract ist implementiert, ohne Plattformzugriff:
 - Bearer-Authentisierung + explizite Capabilities + eigener default-off Write-Gate vor dem Service-Aufruf,
 - persistente SQLite-Idempotency-Ledger: Claim vor dem Service-Aufruf, exakter Response-Replay nach Abschluss, Konflikt bei anderem Request und harter Retry-Block bei verbliebenem `in_progress`,
 - sanitizierte `OperationReceipt`-/`CreateOperationReceipt`-Exposition mit `platform_retry_authorized=false`; Create-Authorization wird bis in den SQLite-Audit persistiert,
-- Delete verlangt zusätzlich explizite ID-Bestätigung + Approval-Referenz,
+- bei Delete ist gemäß D-019 die authentifizierte, exakt pfad-ID-gebundene Nutzeroperation selbst die Freigabe; die stabile Idempotency-ID liefert intern die Audit-/Authorization-Referenz, sodass keine caller-supplied ID-Bestätigung oder Approval-Referenz erforderlich ist,
 - Create akzeptiert nur Kategoriepfad, Titel, Beschreibung und ganzzahligen EUR-Festpreis; Media-Publish und Reply bleiben außerhalb der HTTP-Surface.
 
 ## Nicht-Ziele
