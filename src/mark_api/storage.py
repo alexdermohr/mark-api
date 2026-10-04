@@ -964,17 +964,25 @@ class SnapshotStore:
         return len(snapshots) + len(absent_ids)
 
     def ad_history(self, ad_id: str) -> tuple[AdSnapshot, ...]:
+        """Return observations by actual instant, then insertion ID for ties."""
+
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT ad_id, observed_at, source, lifecycle_state, title,
+                SELECT id, ad_id, observed_at, source, lifecycle_state, title,
                        description, views, watch_count, reply_count
                 FROM ad_snapshots
                 WHERE ad_id = ?
-                ORDER BY id ASC
                 """,
                 (ad_id,),
             ).fetchall()
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: (
+                datetime.fromisoformat(row["observed_at"]),
+                int(row["id"]),
+            ),
+        )
         return tuple(
             AdSnapshot(
                 ad_id=row["ad_id"],
@@ -987,7 +995,7 @@ class SnapshotStore:
                 watch_count=row["watch_count"],
                 reply_count=row["reply_count"],
             )
-            for row in rows
+            for row in ordered_rows
         )
 
     def latest_ad_snapshot(self, ad_id: str) -> AdSnapshot | None:

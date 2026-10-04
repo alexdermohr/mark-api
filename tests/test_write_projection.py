@@ -23,6 +23,7 @@ from mark_api.domain import (
     OperationOutcome,
     OperationReceipt,
 )
+from mark_api.query import MarkQueryService
 from mark_api.results import ReadResult, ReadStatus
 from mark_api.storage import SnapshotStore
 from mark_api.write_api import WriteApiAccess, WriteCapability, create_write_api_server
@@ -188,6 +189,52 @@ class ProjectionStorageTests(unittest.TestCase):
                 self.store.append_create_operation_receipt(receipt)
                 self.assertIsNone(self.store.latest_ad_snapshot(CREATED))
                 self.assertEqual(self.store.tracked_ad_ids(), (TARGET, OTHER))
+
+    def test_late_older_confirmed_write_does_not_replace_newer_observation(self) -> None:
+        newer = snapshot(
+            title="Newer confirmed title",
+            observed_at=NOW + timedelta(seconds=5),
+        )
+        self.store.append_operation_receipt(replace(self.receipt, post_snapshot=newer))
+        # A second store simulates another request committing a prior read late.
+        other_connection = SnapshotStore(self.store.path)
+        other_connection.append_operation_receipt(self.receipt)
+        self.assertEqual(self.store.latest_ad_snapshot(TARGET), newer)
+        self.assertEqual(
+            self.store.ad_history(TARGET), (snapshot(), self.post, newer),
+        )
+        rows = {ad.ad_id: ad for ad in MarkQueryService(self.store).latest_ads()}
+        self.assertEqual(rows[TARGET].title, "Newer confirmed title")
+        self.assertEqual(self.store.ad_history(OTHER), (snapshot(OTHER),))
+
+    def test_ad_history_compares_instants_across_timezone_offsets(self) -> None:
+        newer = snapshot(
+            title="Chronologically newest",
+            observed_at=(NOW + timedelta(minutes=30)).astimezone(
+                timezone(timedelta(hours=-4)),
+            ),
+        )
+        older = snapshot(
+            title="Lexically later but older",
+            observed_at=(NOW + timedelta(minutes=15)).astimezone(
+                timezone(timedelta(hours=2)),
+            ),
+        )
+        self.store.append_ad_snapshot(newer)
+        self.store.append_ad_snapshot(older)
+        self.assertEqual(self.store.ad_history(TARGET), (snapshot(), older, newer))
+        self.assertEqual(self.store.latest_ad_snapshot(TARGET), newer)
+
+    def test_equal_observation_instants_use_append_order_as_tiebreak(self) -> None:
+        first = snapshot(title="First at instant", observed_at=NOW + timedelta(seconds=1))
+        second = replace(
+            first, title="Second at instant",
+            observed_at=first.observed_at.astimezone(timezone(timedelta(hours=2))),
+        )
+        self.store.append_ad_snapshot(first)
+        self.store.append_ad_snapshot(second)
+        self.assertEqual(self.store.ad_history(TARGET), (snapshot(), first, second))
+        self.assertEqual(self.store.latest_ad_snapshot(TARGET), second)
 
     def test_projection_failure_rolls_back_operation_receipt(self) -> None:
         with patch.object(self.store, "_insert_ad_snapshot", side_effect=sqlite3.OperationalError("synthetic")):

@@ -140,6 +140,8 @@ Die SQLite-Persistenz speichert bei einem tatsächlich ausgeführten, vollständ
 
 Nach erneutem Laden liest das weiterhin read-only Dashboard diese persistierten Beobachtungen ohne zusätzlichen Plattformzugriff. `AMBIGUOUS`, `PRECONDITION_FAILED` und unvollständige alte Receipts aktualisieren die Anzeigenprojektion nicht. Ein Idempotency-Replay schreibt weder ein weiteres Receipt noch einen weiteren Snapshot. Scheitert die gemeinsame Transaktion, meldet die Write API keinen Erfolg und autorisiert keine Wiederholung des Plattformversuchs.
 
+Die Anzeigenhistorie und die daraus gelesene aktuelle Ansicht sind nach dem tatsächlichen, zeitzonenbewussten `observed_at` sortiert; nur bei demselben Zeitpunkt entscheidet die Einfügereihenfolge. Ein verspätet gespeicherter älterer Readback bleibt damit als Historie erhalten, verdrängt aber keinen neueren Zustand. Das gilt auch bei konkurrierenden Requests beziehungsweise getrennten Store-Instanzen.
+
 Die lokale Anzeigenansicht bestätigt weder Medienpersistenz noch Datenfrische außerhalb der übernommenen Beobachtung. Alte Receipts werden nicht nachträglich rückprojiziert; reine Crash-Checkpoints vor dem Media-Post-Read bleiben Recovery-Evidenz. Die übrigen Integrations-, Frische- und Recovery-Aufgaben aus Issue #57 sind dadurch nicht abgeschlossen.
 
 ## Offene fachliche Punkte
