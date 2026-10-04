@@ -10,7 +10,7 @@ requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
-private-web = ["websocket-client>=1.8,<2"]
+private-web = ["websocket-client>=1.8,<2", "Pillow>=10.4,<13"]
 
 [project.scripts]
 mark-api-dashboard = "mark_api.dashboard:main"

@@ -294,3 +294,22 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - große Staging-Bodies werden serverweit einzeln eingelesen und sämtliche Write-API-Body-Reads besitzen eine 10-Sekunden-Read-Deadline; stockende Clients können damit weder beliebig RAM multiplizieren noch den non-daemon Handler-Drain unbegrenzt festhalten,
 - Runtime-Shutdown entfernt verbliebene gestagte Dateien deterministisch,
 - D-018 bleibt das separate Abnahmegate: ohne realen autoritativen `PrivateWebMediaPersistenceVerifier` bleibt ein content-bestätigter Media-Create hinsichtlich serverseitiger Medienpersistenz unbestätigt.
+
+## D-021 — Öffentliche VIP-Galerie bestätigt serverseitige Media-Persistenz
+
+**Fortschreibung:** D-021 konkretisiert den in D-018 vorgesehenen `PrivateWebMediaPersistenceVerifier` für den normalen privaten Webpfad. D-014 bis D-020 bleiben hinsichtlich one-shot Submit, UNKNOWN-Fence, opaken Handles, lokaler Stabilisierung, Idempotenz und No-Blind-Retry unverändert. Die öffentliche Detailseite ist ein normaler Kleinanzeigen-Webpfad; private/mobile Reverse-Engineering-HTTP-APIs werden nicht verwendet.
+
+**Entscheidung:** Wenn `CREATE_MEDIA` aktiviert ist und kein expliziter Low-Level-/Test-Verifier injiziert wurde, komponiert `build_private_web_write_api_runtime(...)` automatisch `PrivateWebPublicMediaPersistenceVerifier`. Nach bestätigtem Anzeigen-/Content-Create liest er innerhalb des bestehenden Verifier-Zeitbudgets ausschließlich `https://www.kleinanzeigen.de/s-anzeige/{ad_id}`, verlangt eine exakt an dieselbe Anzeigen-ID gebundene Canonical-URL und genau einen `vip-image-gallery ... j-gallery-image`-Container. Nur dessen `ImageObject.contentUrl`-Einträge werden akzeptiert; Empfehlungs-/ähnliche Anzeigen bleiben außerhalb des Beweisraums. Galerieobjekte müssen auf `https://img.kleinanzeigen.de/api/v1/prod-ads/images/<prefix>/<uuid>` liegen, ihre Prefix-/UUID-Struktur erfüllen und werden ohne Redirect-Folgen sowie mit festen Größen-/Timeoutgrenzen read-only geladen.
+
+Kleinanzeigen stellt Galerievarianten serverseitig skaliert beziehungsweise rekodiert bereit. Deshalb wäre Bytegleichheit zwischen der lokal stabilisierten Uploadquelle und der öffentlichen CDN-Variante sachlich falsch. Die Verifikation dekodiert beide Seiten begrenzt mit Pillow, normalisiert EXIF-Orientierung, bindet das Seitenverhältnis und vergleicht eine klein skalierte RGB-Repräsentation mit engen Fehlergrenzen. Bestätigung verlangt identische Bildanzahl und ein vollständiges one-to-one Matching des gesamten erwarteten Satzes; Reihenfolge allein ist nicht identitätsstiftend. Provider-UUIDs, CDN-URLs, Bildbytes und lokale Pfade werden weder in Receipt noch SQLite persistiert.
+
+**Folgen:**
+- `media_persistence_confirmed=true` ist im normalen High-Level-PrivateWeb-Pfad nun ohne caller-supplied Verifier möglich, aber weiterhin nur nach bereits bestätigtem Create/Content-Post-Read,
+- ein vollständig lesbarer Galerie-Satz mit abweichender Anzahl oder nicht vollständig matchendem Bildinhalt liefert `exact_match=false` und damit `MediaPostReadStatus.MISMATCH`,
+- HTTP-/Transport-/Timeout-/HTML-/URL-/Decoderunsicherheit, mehrdeutige Galerie-Struktur oder nicht konservativ verifizierbare Medien bleiben `UNKNOWN`; ein früherer Mismatch darf durch eine spätere unsichere Beobachtung nicht als Mismatch fortgeschrieben werden,
+- Redirects werden nicht verfolgt; Listing- und Image-Hosts, Pfade, Antwortgrößen, Pixelzahl und Bildanzahl sind hart begrenzt,
+- der `private-web`-Extra enthält neben `websocket-client` nun Pillow; der Runtime-Dependency-Check verlangt beide Distributionen und die benötigten Modul-APIs vor Browserzugriff,
+- ein explizit injizierter `PrivateWebMediaPersistenceVerifier` bleibt als Low-Level-/Test-Seam erhalten und wird nicht durch den Default ersetzt,
+- die Verifikation ist ausschließlich read-only und erzeugt weder Plattformwrites noch neue Retry-Autorität,
+- transparente oder animierte Medien, deren öffentliche Rekodierung nicht konservativ eindeutig gebunden werden kann, werden nicht fälschlich bestätigt, sondern bleiben fail-closed,
+- dieser Slice führt keinen realen Kleinanzeigen-Publish aus; der kontrollierte Live-Publish-Smoke bleibt ein separates Betriebs-/Abnahmegate.

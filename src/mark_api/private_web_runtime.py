@@ -55,6 +55,9 @@ from .private_web_cdp import (
     CdpPrivateWebPage,
 )
 from .private_web_cdp_media import CdpPrivateWebMediaPage
+from .private_web_media_verify import (
+    PrivateWebPublicMediaPersistenceVerifier,
+)
 from .private_web_media import (
     PrivateWebCreateMediaPublishPage,
     PrivateWebCreateMediaWriter,
@@ -1473,6 +1476,10 @@ def build_private_web_write_api_runtime(
     content_runtime: PrivateWebContentRuntime | None = None
     media_runtime: PrivateWebMediaCreateRuntime | None = None
     media_handle_store: PrivateWebMediaHandleStore | None = None
+    if media_capability and media_persistence_verifier is None:
+        media_persistence_verifier = (
+            PrivateWebPublicMediaPersistenceVerifier()
+        )
     try:
         content_runtime = build_private_web_content_runtime(
             cdp_port=cdp_port,
@@ -1527,6 +1534,7 @@ def require_private_web_runtime_dependency() -> None:
 
     try:
         metadata.version("websocket-client")
+        metadata.version("Pillow")
     except metadata.PackageNotFoundError:
         raise PrivateWebRuntimeDependencyError(
             "private Web runtime requires the private-web optional dependency set"
@@ -1534,12 +1542,16 @@ def require_private_web_runtime_dependency() -> None:
 
     try:
         websocket = import_module("websocket")
+        pillow_image = import_module("PIL.Image")
     except Exception:
         raise PrivateWebRuntimeDependencyError(
             "private Web runtime requires the private-web optional dependency set"
         ) from None
 
-    if not callable(getattr(websocket, "create_connection", None)):
+    if (
+        not callable(getattr(websocket, "create_connection", None))
+        or not callable(getattr(pillow_image, "open", None))
+    ):
         raise PrivateWebRuntimeDependencyError(
             "private Web runtime requires the private-web optional dependency set"
         )
