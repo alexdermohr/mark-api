@@ -9,6 +9,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 from pathlib import Path
+from urllib.error import URLError
 
 from mark_api.private_web_media import PrivateWebMediaSource
 from mark_api.private_web_media_verify import (
@@ -16,6 +17,7 @@ from mark_api.private_web_media_verify import (
     _Fetched,
     _ImageSignature,
     _NoRedirectHandler,
+    _default_fetch,
     _has_exact_matching,
     _parse_listing_gallery,
     _read_local_source,
@@ -546,6 +548,90 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
         self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
         assert result.value is not None
         self.assertFalse(result.value.exact_match)
+
+    def test_default_fetch_budget_timeout_after_mismatch_keeps_last_observation(
+        self,
+    ) -> None:
+        listing_calls = 0
+        timer = _FakeMonotonic()
+
+        class _BudgetTimeoutOpener:
+            def open(self, request, timeout: float):
+                timer.sleep(max(0.0, timeout - 0.01))
+                raise URLError(TimeoutError("timed out"))
+
+        def fetch(url: str, timeout: float, maximum: int) -> _Fetched:
+            nonlocal listing_calls
+            if url != f"https://www.kleinanzeigen.de/s-anzeige/{AD_ID}":
+                raise AssertionError("count mismatch must not fetch images")
+            listing_calls += 1
+            if listing_calls == 1:
+                timer.sleep(0.10)
+                return _Fetched(url, "text/html", listing_html(IMAGE_A))
+            with patch(
+                "mark_api.private_web_media_verify.build_opener",
+                return_value=_BudgetTimeoutOpener(),
+            ):
+                return _default_fetch(url, timeout, maximum)
+
+        verifier = PrivateWebPublicMediaPersistenceVerifier(
+            fetch=fetch,
+            signature_loader=self._signature_loader,
+            clock=lambda: NOW,
+            monotonic=timer,
+            sleep=timer.sleep,
+        )
+        result = verifier.verify_media(
+            AD_ID,
+            self.sources,
+            timeout_seconds=1.0,
+        )
+
+        self.assertEqual(listing_calls, 2)
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        assert result.value is not None
+        self.assertFalse(result.value.exact_match)
+
+    def test_default_fetch_non_timeout_urlerror_after_mismatch_is_unknown(
+        self,
+    ) -> None:
+        listing_calls = 0
+        timer = _FakeMonotonic()
+
+        class _TransportFailureOpener:
+            def open(self, request, timeout: float):
+                raise URLError(OSError("connection reset"))
+
+        def fetch(url: str, timeout: float, maximum: int) -> _Fetched:
+            nonlocal listing_calls
+            if url != f"https://www.kleinanzeigen.de/s-anzeige/{AD_ID}":
+                raise AssertionError("count mismatch must not fetch images")
+            listing_calls += 1
+            if listing_calls == 1:
+                timer.sleep(0.10)
+                return _Fetched(url, "text/html", listing_html(IMAGE_A))
+            with patch(
+                "mark_api.private_web_media_verify.build_opener",
+                return_value=_TransportFailureOpener(),
+            ):
+                return _default_fetch(url, timeout, maximum)
+
+        verifier = PrivateWebPublicMediaPersistenceVerifier(
+            fetch=fetch,
+            signature_loader=self._signature_loader,
+            clock=lambda: NOW,
+            monotonic=timer,
+            sleep=timer.sleep,
+        )
+        result = verifier.verify_media(
+            AD_ID,
+            self.sources,
+            timeout_seconds=1.0,
+        )
+
+        self.assertGreaterEqual(listing_calls, 2)
+        self.assertEqual(result.status, ReadStatus.TRANSPORT_ERROR)
+        self.assertIsNone(result.value)
 
     def test_early_timeout_after_mismatch_remains_unknown(self) -> None:
         listing_calls = 0

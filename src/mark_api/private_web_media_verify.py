@@ -67,6 +67,10 @@ class _MediaDecodeError(_MediaVerifierError):
     pass
 
 
+class _MediaFetchDeadlineTimeout(TimeoutError):
+    """The normal public-Web fetch exhausted its caller-supplied time budget."""
+
+
 class _NoRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -295,7 +299,15 @@ def _default_fetch(url: str, timeout_seconds: float, max_bytes: int) -> _Fetched
             )
     except HTTPError as exc:
         raise _MediaHttpStatusError(int(exc.code)) from None
+    except TimeoutError as exc:
+        raise _MediaFetchDeadlineTimeout(
+            "media verifier fetch exhausted its time budget"
+        ) from exc
     except URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise _MediaFetchDeadlineTimeout(
+                "media verifier fetch exhausted its time budget"
+            ) from exc
         raise OSError("media verifier transport failed") from exc
 
 
@@ -658,6 +670,13 @@ class PrivateWebPublicMediaPersistenceVerifier:
             except _MediaHttpStatusError as exc:
                 last_http_status = exc.status
                 terminal_observation = "http_error"
+            except _MediaFetchDeadlineTimeout:
+                if not (
+                    terminal_observation == "mismatch"
+                    and last_complete_mismatch_seconds is not None
+                ):
+                    terminal_observation = "unknown"
+                break
             except TimeoutError:
                 if not (
                     terminal_observation == "mismatch"
