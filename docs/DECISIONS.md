@@ -289,13 +289,8 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - Staging ist rein lokal und führt keinen Plattformwrite aus; deshalb benötigt der Staging-Endpunkt keinen Plattform-Idempotency-Claim,
 - Media-Create stabilisiert die aufgelösten Handle-Dateien mit der bestehenden Deskriptor-/TOCTOU-Prüfung erneut **vor** dem ersten Owner-/Browser-Read und verwirft danach die runtime-eigenen Handle-Kopien,
 - unbekannte/verbrauchte Handles scheitern lokal als `media_refs_unavailable`; daraus entsteht keine Plattform-Retry-Autorität,
+- Staging ist rein lokal und benötigt deshalb nicht das Plattform-`writes_enabled`-Gate; der eigentliche Media-Publish bleibt an Write-/Core-/Media-Gates, persistente Idempotenz und No-Blind-Retry gebunden,
+- unverbrauchte Produkt-Handles sind gleichzeitig auf 32 Einträge und 100 MiB Gesamtgröße begrenzt; Verbrauch gibt die belegte Kapazität frei,
+- große Staging-Bodies werden serverweit einzeln eingelesen und sämtliche Write-API-Body-Reads besitzen eine 10-Sekunden-Read-Deadline; stockende Clients können damit weder beliebig RAM multiplizieren noch den non-daemon Handler-Drain unbegrenzt festhalten,
 - Runtime-Shutdown entfernt verbliebene gestagte Dateien deterministisch,
 - D-018 bleibt das separate Abnahmegate: ohne realen autoritativen `PrivateWebMediaPersistenceVerifier` bleibt ein content-bestätigter Media-Create hinsichtlich serverseitiger Medienpersistenz unbestätigt.
-
-## D-020 — Produktinternes Media-Staging erzeugt opake Handles
-
-**Entscheidung:** Die PrivateWeb-Produktkomposition besitzt bei `CREATE_MEDIA` einen ephemeren `PrivateWebMediaHandleStore`. Eine authentifizierte lokale Produktoberfläche darf ausgewählte JPEG-/PNG-/WebP-Bytes über die loopback-only Staging-Surface übergeben. Der Store validiert Dateiname und Bildsignatur, erzeugt selbst einen zufälligen opaken `media_ref`, schreibt eine private `0600`-Kopie und gibt ausschließlich den Handle zurück. Der spätere Media-Create konsumiert weiterhin nur `media_refs`; die HTTP-/Core-Schicht erhält dadurch keine allgemeine Dateisystem-Leseautorität.
-
-**Sicherheitsgrenze:** Staging ist lokal und mutiert Kleinanzeigen nicht. Es benötigt Authentifizierung und `CREATE_MEDIA`, aber nicht das Plattform-`writes_enabled`-Gate. Der eigentliche Publish bleibt unverändert an Write-, Core- und Media-Gates sowie persistente Idempotenz gebunden. Nach erfolgreicher Stabilisierung in den bereits vorhandenen service-eigenen TOCTOU-geschützten Kopien wird der Produkt-Handle verworfen. Der Store begrenzt gleichzeitig unverbrauchte Handles auf 32 und deren Gesamtgröße auf 100 MiB; bei Verbrauch wird die Kapazität sofort freigegeben. Runtime-Close entfernt verbleibende Stagingkopien.
-
-**Nicht etabliert:** D-020 liefert keinen autoritativen serverseitigen Media-Post-Read. `media_persistence_confirmed` bleibt ohne solchen Verifier false; diese P1-Lücke wird separat geschlossen. Es werden keine realen Kleinanzeigen-Writes ausgeführt.

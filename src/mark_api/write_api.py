@@ -24,8 +24,13 @@ from .storage import SnapshotStore
 
 _MAX_BODY_BYTES = 16 * 1024
 _MAX_MEDIA_BODY_BYTES = 25 * 1024 * 1024
+_BODY_READ_TIMEOUT_SECONDS = 10.0
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MEDIA_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+class _RequestBodyTimeoutError(ValueError):
+    pass
 
 
 def _utc_now() -> datetime:
@@ -360,6 +365,7 @@ def _handler_factory(
     store: SnapshotStore,
     access: WriteApiAccess,
     clock: Callable[[], datetime],
+    body_read_timeout_seconds: float,
 ):
     # Both create routes infer their result from owner-inventory deltas.
     # Serialize the complete service calls across this threaded server so a
@@ -480,6 +486,22 @@ def _handler_factory(
                 raise ValueError("invalid_content_length")
             return value
 
+        def _read_request_body(self, length: int) -> bytes:
+            previous_timeout = self.connection.gettimeout()
+            self.connection.settimeout(body_read_timeout_seconds)
+            try:
+                try:
+                    return self.rfile.read(length)
+                except TimeoutError as exc:
+                    raise _RequestBodyTimeoutError(
+                        "request_body_timeout"
+                    ) from exc
+            finally:
+                try:
+                    self.connection.settimeout(previous_timeout)
+                except OSError:
+                    pass
+
         def _read_json_object(self) -> dict[str, object]:
             content_type = self.headers.get("Content-Type", "")
             if content_type.split(";", 1)[0].strip().lower() != "application/json":
@@ -487,7 +509,7 @@ def _handler_factory(
             length = self._content_length()
             if length is None or length == 0:
                 raise ValueError("json_body_required")
-            raw = self.rfile.read(length)
+            raw = self._read_request_body(length)
             if len(raw) != length:
                 raise ValueError("incomplete_request_body")
             try:
@@ -509,7 +531,7 @@ def _handler_factory(
             length = self._content_length(max_bytes=_MAX_MEDIA_BODY_BYTES)
             if length is None or length == 0:
                 raise ValueError("media_body_required")
-            raw = self.rfile.read(length)
+            raw = self._read_request_body(length)
             if len(raw) != length:
                 raise ValueError("incomplete_request_body")
             return filename, raw
@@ -517,7 +539,7 @@ def _handler_factory(
         def _require_empty_body(self) -> None:
             length = self._content_length()
             if length not in (None, 0):
-                self.rfile.read(length)
+                self._read_request_body(length)
                 raise ValueError("request_body_not_allowed")
 
         @staticmethod
@@ -631,6 +653,9 @@ def _handler_factory(
                     with media_staging_lock:
                         filename, raw_media = self._read_media_upload()
                         media_ref = media_stager.stage_media(filename, raw_media)
+                except _RequestBodyTimeoutError:
+                    self._error(408, "request_body_timeout")
+                    return
                 except ValueError as exc:
                     self._error(400, str(exc))
                     return
@@ -687,6 +712,9 @@ def _handler_factory(
                 else:
                     self._require_empty_body()
                     payload = {}
+            except _RequestBodyTimeoutError:
+                self._error(408, "request_body_timeout")
+                return
             except ValueError as exc:
                 self._error(400, str(exc))
                 return
@@ -974,6 +1002,7 @@ def create_write_api_server(
     host: str = "127.0.0.1",
     port: int = 0,
     clock: Callable[[], datetime] = _utc_now,
+    body_read_timeout_seconds: float = _BODY_READ_TIMEOUT_SECONDS,
 ) -> LoopbackWriteApiServer:
     if host != "127.0.0.1":
         raise ValueError("write API must bind to 127.0.0.1")
@@ -985,6 +1014,12 @@ def create_write_api_server(
         raise ValueError("port must be an integer between 0 and 65535")
     if not isinstance(access, WriteApiAccess):
         raise TypeError("access must be WriteApiAccess")
+    if (
+        isinstance(body_read_timeout_seconds, bool)
+        or not isinstance(body_read_timeout_seconds, (int, float))
+        or body_read_timeout_seconds <= 0
+    ):
+        raise ValueError("body read timeout must be positive")
     if (
         WriteCapability.CREATE_MEDIA in access.capabilities
         and media_service is None
@@ -1002,5 +1037,6 @@ def create_write_api_server(
             store=store,
             access=access,
             clock=clock,
+            body_read_timeout_seconds=float(body_read_timeout_seconds),
         ),
     )

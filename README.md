@@ -138,6 +138,7 @@ Die HTTP-Antwort exponiert den sanitisierten `OperationReceipt` beziehungsweise 
 ## Produktinternes Media-Staging
 
 Wenn `CREATE_MEDIA` vorhanden ist, stellt die lokale Write-Runtime zusätzlich `POST /api/write/media/stage` bereit. Die Produktoberfläche kann damit ausgewählte JPEG-, PNG- oder WebP-Dateien an die loopback-only Runtime übergeben und erhält einen zufällig erzeugten opaken `media_ref`. Die Runtime kopiert die Datei in einen privaten `0600`-Stagingbereich; weder Dateipfad noch Bytes werden im späteren Create-Payload benötigt. Der Handle wird nach erfolgreicher Stabilisierung für den Media-Create verbraucht und die Stagingkopie entfernt. Authentifizierung und `CREATE_MEDIA` bleiben erforderlich; das lokale Staging selbst ist kein Plattformwrite und hängt deshalb nicht am Plattform-`writes_enabled`-Gate. Der eigentliche `POST /api/write/media/ads`-Publish bleibt an Write-/Core-/Media-Gates, Idempotenz und alle bestehenden No-Blind-Retry-Regeln gebunden.
+Unverbrauchte Staging-Handles sind auf 32 Einträge und 100 MiB Gesamtgröße begrenzt. Staging-Bodies werden jeweils nur einzeln gepuffert; Write-API-Body-Reads haben eine 10-Sekunden-Deadline, damit stockende lokale Clients den Runtime-Shutdown nicht unbegrenzt blockieren.
 
 Dieser Schritt bestätigt noch **nicht** die serverseitige Medienpersistenz. Ohne einen autoritativen media-aware Post-Read bleibt `media_persistence_confirmed=false`; die konkrete PrivateWeb-Verifikation ist der nächste P1-Schritt.
 
