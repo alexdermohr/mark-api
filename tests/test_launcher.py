@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import tempfile
+import threading
 import tomllib
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from urllib.request import ProxyHandler, build_opener
 
 from mark_api.analytics import AnalyticsContract
 from mark_api.domain import AdSnapshot, LifecycleState
@@ -46,6 +48,7 @@ class DashboardServer:
     def __init__(self, *, close_failures: int = 0) -> None:
         self.server_address = ("127.0.0.1", 18765)
         self.serve_calls = 0
+        self.shutdown_calls = 0
         self.close_calls = 0
         self.closed = False
         self.close_failures = close_failures
@@ -53,12 +56,35 @@ class DashboardServer:
     def serve_forever(self) -> None:
         self.serve_calls += 1
 
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
     def server_close(self) -> None:
         self.close_calls += 1
         if self.close_failures:
             self.close_failures -= 1
             raise OSError("close failed")
         self.closed = True
+
+
+class BlockingDashboardServer(DashboardServer):
+    def __init__(self, *, shutdown_failures: int = 0) -> None:
+        super().__init__()
+        self.shutdown_failures = shutdown_failures
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def serve_forever(self) -> None:
+        self.serve_calls += 1
+        self.started.set()
+        self.release.wait()
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        if self.shutdown_failures:
+            self.shutdown_failures -= 1
+            raise OSError("shutdown failed")
+        self.release.set()
 
 
 class ProductLauncherTests(unittest.TestCase):
@@ -267,6 +293,110 @@ class ProductLauncherTests(unittest.TestCase):
             )
 
         self.assertTrue(inventory.closed)
+
+    def test_close_shuts_down_active_serving_loop_before_cleanup(self) -> None:
+        _tmp, db = self.make_db()
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        server = BlockingDashboardServer()
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            runtime_factory=lambda **kwargs: inventory,
+            dashboard_factory=lambda *args, **kwargs: server,
+            clock=lambda: NOW,
+        )
+        thread = threading.Thread(target=launcher.serve_forever)
+        self.addCleanup(server.release.set)
+        self.addCleanup(lambda: thread.join(timeout=1))
+        thread.start()
+        self.assertTrue(server.started.wait(timeout=1))
+
+        launcher.close()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(server.shutdown_calls, 1)
+        self.assertEqual(server.close_calls, 1)
+        self.assertTrue(server.closed)
+        self.assertTrue(inventory.closed)
+
+    def test_close_stops_real_dashboard_server_thread(self) -> None:
+        _tmp, db = self.make_db()
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            dashboard_port=0,
+            runtime_factory=lambda **kwargs: inventory,
+            clock=lambda: NOW,
+        )
+        thread = threading.Thread(target=launcher.serve_forever)
+        self.addCleanup(lambda: launcher.close())
+        self.addCleanup(lambda: thread.join(timeout=1))
+        thread.start()
+
+        host, port = launcher.server_address
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(f"http://{host}:{port}/healthz", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+
+        launcher.close()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(inventory.closed)
+
+    def test_close_skips_shutdown_after_serve_loop_already_exited(self) -> None:
+        _tmp, db = self.make_db()
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        server = DashboardServer()
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            runtime_factory=lambda **kwargs: inventory,
+            dashboard_factory=lambda *args, **kwargs: server,
+            clock=lambda: NOW,
+        )
+
+        launcher.serve_forever()
+        launcher.close()
+
+        self.assertEqual(server.shutdown_calls, 0)
+        self.assertEqual(server.close_calls, 1)
+        self.assertTrue(inventory.closed)
+
+    def test_failed_server_shutdown_blocks_cleanup_and_is_retryable(self) -> None:
+        _tmp, db = self.make_db()
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        server = BlockingDashboardServer(shutdown_failures=1)
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            runtime_factory=lambda **kwargs: inventory,
+            dashboard_factory=lambda *args, **kwargs: server,
+            clock=lambda: NOW,
+        )
+        thread = threading.Thread(target=launcher.serve_forever)
+        self.addCleanup(server.release.set)
+        self.addCleanup(lambda: thread.join(timeout=1))
+        thread.start()
+        self.assertTrue(server.started.wait(timeout=1))
+
+        with self.assertRaisesRegex(ProductLauncherError, "cleanup failed"):
+            launcher.close()
+
+        self.assertTrue(thread.is_alive())
+        self.assertEqual(server.shutdown_calls, 1)
+        self.assertEqual(server.close_calls, 0)
+        self.assertEqual(inventory.close_calls, 0)
+
+        launcher.close()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(server.shutdown_calls, 2)
+        self.assertEqual(server.close_calls, 1)
+        self.assertEqual(inventory.close_calls, 1)
 
     def test_close_retries_failed_server_cleanup_without_reclosing_inventory(self) -> None:
         _tmp, db = self.make_db()

@@ -6,6 +6,7 @@ import sys
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock, Thread, current_thread
 from typing import Protocol
 
 from .analytics import (
@@ -120,14 +121,22 @@ class ProductLauncherRuntime:
         self._server = server
         self._startup_inventory_count = startup_inventory_count
         self._startup_persisted_count = startup_persisted_count
+        self._state_lock = Lock()
+        self._close_lock = Lock()
         self._shutdown_started = False
+        self._serve_thread: Thread | None = None
+        self._server_quiesced = False
         self._server_closed = False
         self._inventory_closed = False
         self._inventory_close_failed = False
 
-    def _ensure_open(self) -> None:
+    def _ensure_open_locked(self) -> None:
         if self._shutdown_started:
             raise ProductLauncherError("product launcher is closed")
+
+    def _ensure_open(self) -> None:
+        with self._state_lock:
+            self._ensure_open_locked()
 
     @property
     def server_address(self) -> tuple[str, int]:
@@ -143,36 +152,74 @@ class ProductLauncherRuntime:
         return self._startup_persisted_count
 
     def serve_forever(self) -> None:
-        self._ensure_open()
-        self._server.serve_forever()
+        with self._state_lock:
+            self._ensure_open_locked()
+            if self._serve_thread is not None:
+                raise ProductLauncherError("product launcher is already serving")
+            self._serve_thread = current_thread()
+            self._server_quiesced = False
+
+        try:
+            self._server.serve_forever()
+        finally:
+            with self._state_lock:
+                if self._serve_thread is current_thread():
+                    self._serve_thread = None
+                    self._server_quiesced = True
 
     def close(self) -> None:
-        if self._server_closed and self._inventory_closed:
-            return
-        self._shutdown_started = True
+        with self._close_lock:
+            with self._state_lock:
+                if self._server_closed and self._inventory_closed:
+                    return
+                self._shutdown_started = True
+                serve_thread = self._serve_thread
+                server_quiesced = self._server_quiesced or serve_thread is None
+                if serve_thread is current_thread():
+                    raise ProductLauncherError(
+                        "product launcher cannot close from serving thread"
+                    )
+                if server_quiesced:
+                    self._server_quiesced = True
 
-        cleanup_failed = False
-        if not self._server_closed:
-            try:
-                self._server.server_close()
-            except Exception:
+            cleanup_failed = False
+            if not server_quiesced:
+                try:
+                    self._server.shutdown()
+                except Exception:
+                    with self._state_lock:
+                        server_quiesced = self._server_quiesced
+                    if not server_quiesced:
+                        cleanup_failed = True
+                else:
+                    server_quiesced = True
+                    with self._state_lock:
+                        self._server_quiesced = True
+
+            if not server_quiesced:
+                raise ProductLauncherError("product launcher cleanup failed")
+
+            if not self._server_closed:
+                try:
+                    self._server.server_close()
+                except Exception:
+                    cleanup_failed = True
+                else:
+                    self._server_closed = True
+
+            if self._inventory_close_failed:
                 cleanup_failed = True
-            else:
-                self._server_closed = True
+            elif not self._inventory_closed:
+                try:
+                    self._inventory_runtime.close()
+                except Exception:
+                    self._inventory_close_failed = True
+                    cleanup_failed = True
+                else:
+                    self._inventory_closed = True
 
-        if self._inventory_close_failed:
-            cleanup_failed = True
-        elif not self._inventory_closed:
-            try:
-                self._inventory_runtime.close()
-            except Exception:
-                self._inventory_close_failed = True
-                cleanup_failed = True
-            else:
-                self._inventory_closed = True
-
-        if cleanup_failed:
-            raise ProductLauncherError("product launcher cleanup failed")
+            if cleanup_failed:
+                raise ProductLauncherError("product launcher cleanup failed")
 
     def __enter__(self) -> "ProductLauncherRuntime":
         self._ensure_open()
