@@ -3128,7 +3128,7 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 default_verifier,
             )
 
-    def test_builder_preserves_explicit_media_persistence_verifier(self) -> None:
+    def test_builder_passes_explicit_media_persistence_verifier_to_composition(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SnapshotStore(Path(tmp) / "runtime.sqlite")
             reader = OwnerReader(ReadResult.success_empty(()))
