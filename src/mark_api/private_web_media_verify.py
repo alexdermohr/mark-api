@@ -300,7 +300,9 @@ def _default_fetch(url: str, timeout_seconds: float, max_bytes: int) -> _Fetched
 
 
 def _read_local_source(source: PrivateWebMediaSource) -> bytes:
-    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:

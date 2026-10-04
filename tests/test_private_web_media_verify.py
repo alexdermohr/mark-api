@@ -18,6 +18,7 @@ from mark_api.private_web_media_verify import (
     _NoRedirectHandler,
     _has_exact_matching,
     _parse_listing_gallery,
+    _read_local_source,
     _signatures_match,
 )
 from mark_api.results import ReadStatus
@@ -316,6 +317,22 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
         self.second_signature = signature(190)
         self.remote_first_signature = signature(43)
         self.remote_second_signature = signature(187)
+
+    def test_local_source_read_works_without_o_cloexec(self) -> None:
+        class _OsWithoutCloexec:
+            def __getattr__(self, name: str):
+                if name == "O_CLOEXEC":
+                    raise AttributeError(name)
+                return getattr(os, name)
+
+        with patch(
+            "mark_api.private_web_media_verify.os",
+            _OsWithoutCloexec(),
+        ):
+            self.assertEqual(
+                _read_local_source(self.sources[0]),
+                b"local-first",
+            )
 
     def _signature_loader(self, payload: bytes) -> _ImageSignature:
         mapping = {
