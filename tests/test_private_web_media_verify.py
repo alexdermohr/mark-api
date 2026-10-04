@@ -7,6 +7,7 @@ import time
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 from pathlib import Path
 
 from mark_api.private_web_media import PrivateWebMediaSource
@@ -92,6 +93,19 @@ def signature(
         height=height,
         normalized_rgb=bytes([value]) * 96,
     )
+
+
+class _FakeMonotonic:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        if seconds < 0:
+            raise AssertionError("sleep must not be negative")
+        self.value += seconds
 
 
 class PrivateWebMediaVerifierParserTests(unittest.TestCase):
@@ -356,6 +370,43 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
         )
         self.assertEqual(result.value.observed_at, NOW)
 
+    def test_delayed_convergence_after_four_mismatches_confirms(self) -> None:
+        first_url = IMAGE_A.replace("$_59.JPG", "$_57.JPG")
+        second_url = IMAGE_B.replace("$_59.AUTO", "$_57.JPG")
+        listing_calls = 0
+
+        def fetch(url: str, timeout: float, maximum: int) -> _Fetched:
+            nonlocal listing_calls
+            if url == f"https://www.kleinanzeigen.de/s-anzeige/{AD_ID}":
+                listing_calls += 1
+                visible = (IMAGE_A,) if listing_calls <= 4 else (IMAGE_A, IMAGE_B)
+                return _Fetched(url, "text/html", listing_html(*visible))
+            if url == first_url:
+                return _Fetched(url, "image/jpeg", b"remote-first")
+            if url == second_url:
+                return _Fetched(url, "image/jpeg", b"remote-second")
+            raise AssertionError(url)
+
+        timer = _FakeMonotonic()
+        verifier = PrivateWebPublicMediaPersistenceVerifier(
+            fetch=fetch,
+            signature_loader=self._signature_loader,
+            clock=lambda: NOW,
+            monotonic=timer,
+            sleep=timer.sleep,
+        )
+
+        result = verifier.verify_media(
+            AD_ID,
+            self.sources,
+            timeout_seconds=2.0,
+        )
+
+        self.assertEqual(listing_calls, 5)
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        assert result.value is not None
+        self.assertTrue(result.value.exact_match)
+
     def test_complete_content_mismatch_returns_explicit_mismatch(self) -> None:
         first_url = IMAGE_A.replace("$_59.JPG", "$_57.JPG")
         second_url = IMAGE_B.replace("$_59.AUTO", "$_57.JPG")
@@ -373,18 +424,19 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
                 return _Fetched(url, "image/jpeg", b"remote-wrong")
             raise AssertionError(url)
 
+        timer = _FakeMonotonic()
         verifier = PrivateWebPublicMediaPersistenceVerifier(
             fetch=fetch,
             signature_loader=self._signature_loader,
             clock=lambda: NOW,
-            monotonic=lambda: 0.0,
-            sleep=lambda _seconds: None,
+            monotonic=timer,
+            sleep=timer.sleep,
         )
 
         result = verifier.verify_media(
             AD_ID,
             self.sources,
-            timeout_seconds=10.0,
+            timeout_seconds=1.0,
         )
 
         self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
@@ -401,19 +453,80 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
                 )
             raise AssertionError("image fetch must not occur for count mismatch")
 
+        timer = _FakeMonotonic()
         verifier = PrivateWebPublicMediaPersistenceVerifier(
             fetch=fetch,
             signature_loader=self._signature_loader,
             clock=lambda: NOW,
-            monotonic=lambda: 0.0,
-            sleep=lambda _seconds: None,
+            monotonic=timer,
+            sleep=timer.sleep,
         )
         result = verifier.verify_media(
             AD_ID,
             self.sources,
-            timeout_seconds=10.0,
+            timeout_seconds=1.0,
         )
 
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        assert result.value is not None
+        self.assertFalse(result.value.exact_match)
+
+    def test_attempt_cap_with_remaining_budget_is_unknown(self) -> None:
+        listing_calls = 0
+
+        def fetch(url: str, timeout: float, maximum: int) -> _Fetched:
+            nonlocal listing_calls
+            if url != f"https://www.kleinanzeigen.de/s-anzeige/{AD_ID}":
+                raise AssertionError("count mismatch must not fetch images")
+            listing_calls += 1
+            return _Fetched(url, "text/html", listing_html(IMAGE_A))
+
+        timer = _FakeMonotonic()
+        verifier = PrivateWebPublicMediaPersistenceVerifier(
+            fetch=fetch,
+            signature_loader=self._signature_loader,
+            monotonic=timer,
+            sleep=timer.sleep,
+        )
+
+        with patch("mark_api.private_web_media_verify._MAX_VERIFY_ATTEMPTS", 2):
+            result = verifier.verify_media(
+                AD_ID,
+                self.sources,
+                timeout_seconds=10.0,
+            )
+
+        self.assertEqual(listing_calls, 2)
+        self.assertEqual(result.status, ReadStatus.TRANSPORT_ERROR)
+        self.assertEqual(result.error, "private_web_media_verify_attempt_limit")
+        self.assertLess(timer.value, 1.0)
+
+    def test_stable_mismatch_polls_until_near_deadline(self) -> None:
+        listing_calls = 0
+
+        def fetch(url: str, timeout: float, maximum: int) -> _Fetched:
+            nonlocal listing_calls
+            if url != f"https://www.kleinanzeigen.de/s-anzeige/{AD_ID}":
+                raise AssertionError("count mismatch must not fetch images")
+            listing_calls += 1
+            return _Fetched(url, "text/html", listing_html(IMAGE_A))
+
+        timer = _FakeMonotonic()
+        verifier = PrivateWebPublicMediaPersistenceVerifier(
+            fetch=fetch,
+            signature_loader=self._signature_loader,
+            clock=lambda: NOW,
+            monotonic=timer,
+            sleep=timer.sleep,
+        )
+        result = verifier.verify_media(
+            AD_ID,
+            self.sources,
+            timeout_seconds=1.0,
+        )
+
+        self.assertGreater(listing_calls, 4)
+        self.assertGreaterEqual(timer.value, 0.9)
         self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
         assert result.value is not None
         self.assertFalse(result.value.exact_match)
@@ -434,17 +547,18 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
                 )
             raise OSError("network down")
 
+        timer = _FakeMonotonic()
         verifier = PrivateWebPublicMediaPersistenceVerifier(
             fetch=fetch,
             signature_loader=self._signature_loader,
             clock=lambda: NOW,
-            monotonic=lambda: 0.0,
-            sleep=lambda _seconds: None,
+            monotonic=timer,
+            sleep=timer.sleep,
         )
         result = verifier.verify_media(
             AD_ID,
             self.sources,
-            timeout_seconds=10.0,
+            timeout_seconds=1.0,
         )
 
         self.assertEqual(result.status, ReadStatus.TRANSPORT_ERROR)
@@ -456,16 +570,17 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
 
             raise _MediaHttpStatusError(404)
 
+        http_timer = _FakeMonotonic()
         verifier = PrivateWebPublicMediaPersistenceVerifier(
             fetch=http_fetch,
             signature_loader=self._signature_loader,
-            monotonic=lambda: 0.0,
-            sleep=lambda _seconds: None,
+            monotonic=http_timer,
+            sleep=http_timer.sleep,
         )
         result = verifier.verify_media(
             AD_ID,
             self.sources,
-            timeout_seconds=10.0,
+            timeout_seconds=1.0,
         )
         self.assertEqual(result.status, ReadStatus.HTTP_ERROR)
         self.assertEqual(result.http_status, 404)
@@ -477,16 +592,17 @@ class PrivateWebPublicMediaPersistenceVerifierTests(unittest.TestCase):
                 listing_html(IMAGE_A, canonical_ad_id="9999999999"),
             )
 
+        parse_timer = _FakeMonotonic()
         verifier = PrivateWebPublicMediaPersistenceVerifier(
             fetch=parse_fetch,
             signature_loader=self._signature_loader,
-            monotonic=lambda: 0.0,
-            sleep=lambda _seconds: None,
+            monotonic=parse_timer,
+            sleep=parse_timer.sleep,
         )
         result = verifier.verify_media(
             AD_ID,
             self.sources,
-            timeout_seconds=10.0,
+            timeout_seconds=1.0,
         )
         self.assertEqual(result.status, ReadStatus.PARSE_ERROR)
 

@@ -30,8 +30,10 @@ _MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024
 _MAX_LOCAL_IMAGE_BYTES = 25 * 1024 * 1024
 _MAX_IMAGE_PIXELS = 60_000_000
 _MAX_GALLERY_IMAGES = 32
-_VERIFY_ATTEMPTS = 4
+_MAX_VERIFY_ATTEMPTS = 128
 _RETRY_DELAY_SECONDS = 0.25
+_FINAL_OBSERVATION_RESERVE_SECONDS = 0.05
+_DEADLINE_EPSILON_SECONDS = 1e-9
 _NORMALIZED_SIZE = (64, 64)
 _MAX_ASPECT_RATIO_LOG_DELTA = 0.02
 _MAX_RGB_MEAN_ABS_ERROR = 3.0
@@ -593,7 +595,8 @@ class PrivateWebPublicMediaPersistenceVerifier:
 
         last_http_status: int | None = None
         terminal_observation = "unknown"
-        for attempt in range(_VERIFY_ATTEMPTS):
+        attempt_limit_exhausted = False
+        for attempt in range(_MAX_VERIFY_ATTEMPTS):
             try:
                 urls = self._listing(target_ad_id, deadline=deadline)
                 if len(urls) != len(expected):
@@ -629,30 +632,53 @@ class PrivateWebPublicMediaPersistenceVerifier:
                 break
             except (_MediaParseError, _MediaDecodeError):
                 terminal_observation = "parse_error"
-                if attempt == _VERIFY_ATTEMPTS - 1:
-                    return ReadResult.failure(
-                        ReadStatus.PARSE_ERROR,
-                        error="private_web_media_read_unverifiable",
-                    )
             except Exception:
                 terminal_observation = "transport_error"
-                if attempt == _VERIFY_ATTEMPTS - 1:
-                    return ReadResult.failure(
-                        ReadStatus.TRANSPORT_ERROR,
-                        error="private_web_media_read_failed",
-                    )
 
-            if attempt < _VERIFY_ATTEMPTS - 1:
+            if attempt == _MAX_VERIFY_ATTEMPTS - 1:
                 try:
-                    delay = min(
-                        _RETRY_DELAY_SECONDS,
-                        self._remaining(deadline),
-                    )
-                    self._sleep(delay)
-                except Exception:
-                    terminal_observation = "unknown"
+                    remaining = self._remaining(deadline)
+                except TimeoutError:
                     break
+                if (
+                    remaining
+                    > _FINAL_OBSERVATION_RESERVE_SECONDS
+                    + _DEADLINE_EPSILON_SECONDS
+                ):
+                    attempt_limit_exhausted = True
+                    terminal_observation = "unknown"
+                break
 
+            try:
+                remaining = self._remaining(deadline)
+            except TimeoutError:
+                break
+            if (
+                remaining
+                <= _FINAL_OBSERVATION_RESERVE_SECONDS
+                + _DEADLINE_EPSILON_SECONDS
+            ):
+                break
+            delay = min(
+                _RETRY_DELAY_SECONDS,
+                max(
+                    0.0,
+                    remaining - _FINAL_OBSERVATION_RESERVE_SECONDS,
+                ),
+            )
+            if delay <= 0:
+                break
+            try:
+                self._sleep(delay)
+            except Exception:
+                terminal_observation = "unknown"
+                break
+
+        if attempt_limit_exhausted:
+            return ReadResult.failure(
+                ReadStatus.TRANSPORT_ERROR,
+                error="private_web_media_verify_attempt_limit",
+            )
         if terminal_observation == "mismatch":
             observed_at = self._clock()
             if observed_at.tzinfo is None or observed_at.utcoffset() is None:
@@ -677,19 +703,30 @@ class PrivateWebPublicMediaPersistenceVerifier:
                 error="private_web_media_http_error",
                 http_status=last_http_status,
             )
+        if terminal_observation == "parse_error":
+            return ReadResult.failure(
+                ReadStatus.PARSE_ERROR,
+                error="private_web_media_read_unverifiable",
+            )
+        if terminal_observation == "transport_error":
+            return ReadResult.failure(
+                ReadStatus.TRANSPORT_ERROR,
+                error="private_web_media_read_failed",
+            )
         return ReadResult.failure(
             ReadStatus.TRANSPORT_ERROR,
             error="private_web_media_verify_timeout",
         )
 
 _WORKER_CLEANUP_SECONDS = 0.25
+_WORKER_RESULT_GRACE_SECONDS = 0.10
 
 
 def _default_verification_worker(
     connection,
     ad_id: str,
     source_paths: tuple[str, ...],
-    timeout_seconds: float,
+    deadline_monotonic: float,
 ) -> None:
     try:
         sources = tuple(
@@ -700,11 +737,22 @@ def _default_verification_worker(
             fetch=_default_fetch,
             signature_loader=_pillow_signature,
         )
-        result = verifier._verify_media_inline(
-            ad_id,
-            sources,
-            timeout_seconds=timeout_seconds,
+        remaining = (
+            deadline_monotonic
+            - time.monotonic()
+            - _WORKER_RESULT_GRACE_SECONDS
         )
+        if remaining <= 0:
+            result = ReadResult.failure(
+                ReadStatus.TRANSPORT_ERROR,
+                error="private_web_media_verify_timeout",
+            )
+        else:
+            result = verifier._verify_media_inline(
+                ad_id,
+                sources,
+                timeout_seconds=remaining,
+            )
         connection.send(result)
     except BaseException:
         try:
@@ -769,7 +817,7 @@ def _verify_media_in_isolated_process(
             sending,
             ad_id,
             tuple(source.path for source in expected_sources),
-            float(timeout_seconds),
+            deadline,
         ),
         daemon=True,
     )
