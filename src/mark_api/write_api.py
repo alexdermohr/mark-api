@@ -23,6 +23,7 @@ from .storage import SnapshotStore
 
 
 _MAX_BODY_BYTES = 16 * 1024
+_MAX_MEDIA_BODY_BYTES = 25 * 1024 * 1024
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MEDIA_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
@@ -83,6 +84,12 @@ class _MediaWriteService(Protocol):
         authorization_reference: str | None = None,
     ) -> CreateOperationReceipt:
         ...
+
+
+class _MediaStager(Protocol):
+    def stage_media(self, filename: str, data: bytes) -> str:
+        ...
+
 
 
 class _WriteService(Protocol):
@@ -349,6 +356,7 @@ def _handler_factory(
     *,
     service: _WriteService,
     media_service: _MediaWriteService | None,
+    media_stager: _MediaStager | None,
     store: SnapshotStore,
     access: WriteApiAccess,
     clock: Callable[[], datetime],
@@ -448,7 +456,11 @@ def _handler_factory(
                 return None
             return value
 
-        def _content_length(self) -> int | None:
+        def _content_length(
+            self,
+            *,
+            max_bytes: int = _MAX_BODY_BYTES,
+        ) -> int | None:
             if self.headers.get("Transfer-Encoding") is not None:
                 raise ValueError("transfer_encoding_not_allowed")
             values = self.headers.get_all("Content-Length") or []
@@ -460,7 +472,7 @@ def _handler_factory(
                 value = int(values[0], 10)
             except ValueError as exc:
                 raise ValueError("invalid_content_length") from exc
-            if value < 0 or value > _MAX_BODY_BYTES:
+            if value < 0 or value > max_bytes:
                 raise ValueError("invalid_content_length")
             return value
 
@@ -482,6 +494,22 @@ def _handler_factory(
                 raise ValueError("json_body_must_be_object")
             return value
 
+        def _read_media_upload(self) -> tuple[str, bytes]:
+            filename_values = self.headers.get_all("X-Mark-Media-Filename") or []
+            if len(filename_values) != 1:
+                raise ValueError("invalid_media_filename")
+            filename = filename_values[0]
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+                raise ValueError("unsupported_media_type")
+            length = self._content_length(max_bytes=_MAX_MEDIA_BODY_BYTES)
+            if length is None or length == 0:
+                raise ValueError("media_body_required")
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ValueError("incomplete_request_body")
+            return filename, raw
+
         def _require_empty_body(self) -> None:
             length = self._content_length()
             if length not in (None, 0):
@@ -501,6 +529,15 @@ def _handler_factory(
             if parts == ["api", "write", "ads"]:
                 if method == "POST":
                     return ("create", None, WriteCapability.CREATE)
+                return ("method_not_allowed", "POST", None)
+
+            if parts == ["api", "write", "media", "stage"]:
+                if method == "POST":
+                    return (
+                        "stage_media",
+                        None,
+                        WriteCapability.CREATE_MEDIA,
+                    )
                 return ("method_not_allowed", "POST", None)
 
             if parts == ["api", "write", "media", "ads"]:
@@ -569,18 +606,39 @@ def _handler_factory(
                     authenticate=True,
                 )
                 return
-            if not access.writes_enabled:
-                self._error(
-                    403,
-                    "writes_disabled",
-                    platform_retry_authorized=False,
-                )
-                return
             assert isinstance(capability, WriteCapability)
             if capability not in access.capabilities:
                 self._error(
                     403,
                     "capability_denied",
+                    platform_retry_authorized=False,
+                )
+                return
+
+            if action == "stage_media":
+                # Staging is a local-only product operation. Authentication
+                # and CREATE_MEDIA capability still apply, but the platform
+                # write gate is enforced only when the staged handle is later
+                # used for the actual media Create.
+                if media_stager is None:
+                    self._error(503, "media_staging_unavailable")
+                    return
+                try:
+                    filename, raw_media = self._read_media_upload()
+                    media_ref = media_stager.stage_media(filename, raw_media)
+                except ValueError as exc:
+                    self._error(400, str(exc))
+                    return
+                except Exception:
+                    self._error(500, "media_staging_error")
+                    return
+                self._send_json(201, {"media_ref": media_ref})
+                return
+
+            if not access.writes_enabled:
+                self._error(
+                    403,
+                    "writes_disabled",
                     platform_retry_authorized=False,
                 )
                 return
@@ -907,6 +965,7 @@ def create_write_api_server(
     access: WriteApiAccess,
     *,
     media_service: _MediaWriteService | None = None,
+    media_stager: _MediaStager | None = None,
     host: str = "127.0.0.1",
     port: int = 0,
     clock: Callable[[], datetime] = _utc_now,
@@ -934,6 +993,7 @@ def create_write_api_server(
         _handler_factory(
             service=service,
             media_service=media_service,
+            media_stager=media_stager,
             store=store,
             access=access,
             clock=clock,

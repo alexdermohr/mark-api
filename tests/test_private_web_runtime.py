@@ -31,6 +31,7 @@ from mark_api.private_web import (
     PrivateWebEditorState,
     PrivateWebStateSnapshot,
     PrivateWebSubmitUnknownError,
+    PrivateWebWriteNotAttemptedError,
 )
 from mark_api.private_web_runtime import (
     PrivateWebContentRuntime,
@@ -54,6 +55,7 @@ from mark_api.private_web_media import (
     PrivateWebCreateMediaSnapshot,
     PrivateWebMediaFileSnapshot,
     PrivateWebMediaPersistenceSnapshot,
+    PrivateWebMediaHandleStore,
     PrivateWebMediaRefResolver,
     PrivateWebMediaSource,
 )
@@ -1034,6 +1036,50 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             persisted_completed_at,
             ((NOW + timedelta(seconds=3)).isoformat(),),
         )
+        runtime.close()
+
+    def test_media_create_service_consumes_product_handle_after_stabilizing(self) -> None:
+        events: list[tuple] = []
+        runtime = PrivateWebMediaCreateRuntime(
+            page_factory=lambda: MediaCreatePage(events)
+        )
+        created_id = "4000000025"
+        created_inventory = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+        )
+        created_content = owner_snapshot(
+            ad_id=created_id,
+            title=self.request.title,
+            description=self.request.description,
+        )
+        handles = PrivateWebMediaHandleStore()
+        ref = handles.stage_media("photo.jpg", b"\xff\xd8\xffjpeg")
+        service = PrivateWebMediaCreateService(
+            runtime=runtime,
+            resolver=handles,
+            reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            confirmation_reader=SequenceReader(
+                ReadResult.success_empty(()),
+                ReadResult.success_nonempty((created_inventory,)),
+            ),
+            content_reader_factory=lambda _ad_id: OwnerReader(
+                ReadResult.success_nonempty((created_content,))
+            ),
+            media_persistence_verifier=MediaPersistenceVerifier(),
+            writes_enabled=True,
+        )
+
+        receipt = service.create_with_media(self.request, (ref,))
+
+        self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
+        self.assertTrue(receipt.media_persistence_confirmed)
+        with self.assertRaises(PrivateWebWriteNotAttemptedError):
+            handles.resolve((ref,))
+        handles.close()
         runtime.close()
 
     def test_media_create_service_unknown_ref_short_circuits_reads(self) -> None:
@@ -2878,8 +2924,8 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                     bearer_token=self.TOKEN,
                     capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
                 ),
-                None,
-                "non-empty media_bindings",
+                {},
+                "media_bindings must be non-empty when provided",
             ),
             (
                 WriteApiAccess(
@@ -2907,6 +2953,60 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                                 media_bindings=bindings,
                             )
                         builder.assert_not_called()
+
+    def test_builder_creates_product_media_stager_without_caller_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            reader = OwnerReader(ReadResult.success_empty(()))
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(reader, close_events)
+            media_runtime = PrivateWebMediaCreateRuntime(
+                page_factory=lambda: (_ for _ in ()).throw(
+                    AssertionError("media page must stay lazy")
+                )
+            )
+            access = WriteApiAccess(
+                principal="runtime-test",
+                bearer_token=self.TOKEN,
+                capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                writes_enabled=True,
+            )
+            with (
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_content_runtime",
+                    return_value=content_runtime,
+                ),
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_media_create_runtime",
+                    return_value=media_runtime,
+                ),
+            ):
+                runtime = build_private_web_write_api_runtime(
+                    cdp_port=19610,
+                    store=store,
+                    access=access,
+                    media_writes_enabled=True,
+                )
+            try:
+                host, port = runtime.start()
+                request = Request(
+                    f"http://{host}:{port}/api/write/media/stage",
+                    data=b"\xff\xd8\xffjpeg",
+                    headers={
+                        "Authorization": f"Bearer {self.TOKEN}",
+                        "Content-Type": "image/jpeg",
+                        "X-Mark-Media-Filename": "photo.jpg",
+                    },
+                    method="POST",
+                )
+                opener = build_opener(ProxyHandler({}))
+                with opener.open(request, timeout=2.0) as response:
+                    body = json.loads(response.read())
+                    self.assertEqual(response.status, 201)
+                self.assertRegex(body["media_ref"], r"^media_[A-Za-z0-9_-]+$")
+            finally:
+                runtime.close()
+            self.assertEqual(close_events, ["content"])
 
     def test_builder_accepts_empty_media_bindings_without_media_capability(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
