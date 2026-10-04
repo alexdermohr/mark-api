@@ -516,7 +516,86 @@ class SnapshotStore:
         data["lifecycle_state"] = snapshot.lifecycle_state.value
         return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
+    @staticmethod
+    def _confirmed_write_snapshot(
+        receipt: OperationReceipt | CreateOperationReceipt,
+    ) -> AdSnapshot | None:
+        """Project only target-bound observations from a confirmed core outcome.
+
+        This consumes the orchestrator's confirmation; it does not establish
+        independent evidence or treat a target-only read as a full inventory.
+        Incomplete/legacy receipts remain audit records without a projection.
+        """
+
+        if (
+            receipt.outcome is not OperationOutcome.CONFIRMED
+            or receipt.writer_invoked is not True
+        ):
+            return None
+
+        if isinstance(receipt, CreateOperationReceipt):
+            snapshots = (
+                receipt.post_snapshot,
+                receipt.confirmation_post_snapshot,
+                receipt.content_post_snapshot,
+            )
+            if (
+                receipt.operation != "create"
+                or receipt.created_ad_id is None
+                or any(
+                    status != ReadStatus.SUCCESS_NONEMPTY.value
+                    for status in (
+                        receipt.post_read_status,
+                        receipt.confirmation_post_read_status,
+                        receipt.content_post_read_status,
+                    )
+                )
+                or any(
+                    item is None or item.ad_id != receipt.created_ad_id
+                    for item in snapshots
+                )
+            ):
+                return None
+            # This is the final target-bound owner/content observation, not
+            # the submitted request and not a claim about media persistence.
+            return receipt.content_post_snapshot
+
+        if (
+            receipt.pre_read_status != ReadStatus.SUCCESS_NONEMPTY.value
+            or receipt.pre_snapshot is None
+            or receipt.pre_snapshot.ad_id != receipt.ad_id
+        ):
+            return None
+        if receipt.operation == "delete":
+            if (
+                receipt.post_snapshot is not None
+                or receipt.post_read_status not in {
+                    ReadStatus.SUCCESS_EMPTY.value,
+                    ReadStatus.SUCCESS_NONEMPTY.value,
+                }
+            ):
+                return None
+            # The core has already confirmed absence through both inventories.
+            # Only this ID is absent; never infer anything about other ads.
+            return AdSnapshot(
+                ad_id=receipt.ad_id,
+                observed_at=receipt.completed_at,
+                source="confirmed-write:delete",
+                lifecycle_state=LifecycleState.ABSENT,
+            )
+        if (
+            receipt.operation not in {
+                "update_content", "set_state:active", "set_state:paused",
+            }
+            or receipt.post_read_status != ReadStatus.SUCCESS_NONEMPTY.value
+            or receipt.post_snapshot is None
+            or receipt.post_snapshot.ad_id != receipt.ad_id
+        ):
+            return None
+        return receipt.post_snapshot
+
     def append_operation_receipt(self, receipt: OperationReceipt) -> None:
+        snapshot = self._confirmed_write_snapshot(receipt)
         with self._connect() as connection:
             connection.execute(
                 """
@@ -543,6 +622,8 @@ class SnapshotStore:
                     self._snapshot_json(receipt.post_snapshot),
                 ),
             )
+            if snapshot is not None:
+                self._insert_ad_snapshot(connection, snapshot)
 
     def append_create_operation_checkpoint(
         self,
@@ -610,6 +691,7 @@ class SnapshotStore:
         self,
         receipt: CreateOperationReceipt,
     ) -> None:
+        snapshot = self._confirmed_write_snapshot(receipt)
         with self._connect() as connection:
             connection.execute(
                 """
@@ -650,6 +732,8 @@ class SnapshotStore:
                     self._snapshot_json(receipt.content_post_snapshot),
                 ),
             )
+            if snapshot is not None:
+                self._insert_ad_snapshot(connection, snapshot)
 
     @staticmethod
     def _write_api_request_record(
@@ -880,17 +964,25 @@ class SnapshotStore:
         return len(snapshots) + len(absent_ids)
 
     def ad_history(self, ad_id: str) -> tuple[AdSnapshot, ...]:
+        """Return observations by actual instant, then insertion ID for ties."""
+
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT ad_id, observed_at, source, lifecycle_state, title,
+                SELECT id, ad_id, observed_at, source, lifecycle_state, title,
                        description, views, watch_count, reply_count
                 FROM ad_snapshots
                 WHERE ad_id = ?
-                ORDER BY id ASC
                 """,
                 (ad_id,),
             ).fetchall()
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: (
+                datetime.fromisoformat(row["observed_at"]),
+                int(row["id"]),
+            ),
+        )
         return tuple(
             AdSnapshot(
                 ad_id=row["ad_id"],
@@ -903,7 +995,7 @@ class SnapshotStore:
                 watch_count=row["watch_count"],
                 reply_count=row["reply_count"],
             )
-            for row in rows
+            for row in ordered_rows
         )
 
     def latest_ad_snapshot(self, ad_id: str) -> AdSnapshot | None:
