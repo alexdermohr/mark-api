@@ -17,8 +17,10 @@ from mark_api.launcher import (
     build_product_launcher,
     main,
 )
+from mark_api.private_web import PrivateWebSubmitUnknownError
 from mark_api.results import ReadResult, ReadStatus
 from mark_api.storage import SnapshotStore
+from mark_api.write_api import WriteCapability
 
 
 NOW = datetime(2026, 10, 4, 15, 0, tzinfo=timezone.utc)
@@ -87,11 +89,100 @@ class BlockingDashboardServer(DashboardServer):
         self.release.set()
 
 
+class WriteRuntime:
+    def __init__(self) -> None:
+        self.server_address = ("127.0.0.1", 18766)
+        self.start_calls = 0
+        self.close_calls = 0
+        self.reconcile_calls = 0
+        self.closed = False
+        self.start_error: Exception | None = None
+        self.close_error: Exception | None = None
+        self.pending_unknown = False
+
+    def start(self) -> tuple[str, int]:
+        self.start_calls += 1
+        if self.start_error is not None:
+            raise self.start_error
+        return self.server_address
+
+    def reconcile_media_submit(self) -> None:
+        self.reconcile_calls += 1
+        self.pending_unknown = False
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.pending_unknown:
+            raise PrivateWebSubmitUnknownError("create_media_submit_settle")
+        if self.close_error is not None:
+            raise self.close_error
+        self.closed = True
+
+
 class ProductLauncherTests(unittest.TestCase):
+    TOKEN = "fake-launcher-test-token-0001"
+
+    def setUp(self) -> None:
+        self.write_runtime = WriteRuntime()
+        write_patch = patch(
+            "mark_api.launcher.build_private_web_write_api_runtime",
+            return_value=self.write_runtime,
+        )
+        self.write_factory = write_patch.start()
+        self.addCleanup(write_patch.stop)
+
+        token_patch = patch(
+            "mark_api.launcher._default_write_token",
+            return_value=self.TOKEN,
+        )
+        token_patch.start()
+        self.addCleanup(token_patch.stop)
+
     def make_db(self) -> tuple[tempfile.TemporaryDirectory, Path]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         return tmp, Path(tmp.name) / "mark.sqlite"
+
+    def test_default_write_runtime_is_composed_started_and_exposed(self) -> None:
+        _tmp, db = self.make_db()
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        server = DashboardServer()
+        clock = lambda: NOW
+
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            dashboard_port=0,
+            write_port=0,
+            timeout_seconds=3.5,
+            analytics_contract=AnalyticsContract(),
+            runtime_factory=lambda **kwargs: inventory,
+            dashboard_factory=lambda *args, **kwargs: server,
+            clock=clock,
+        )
+        self.addCleanup(launcher.close)
+
+        self.assertEqual(self.write_runtime.start_calls, 1)
+        self.assertEqual(
+            launcher.write_server_address,
+            ("127.0.0.1", 18766),
+        )
+        self.assertEqual(launcher.write_bearer_token, self.TOKEN)
+
+        kwargs = self.write_factory.call_args.kwargs
+        self.assertEqual(kwargs["cdp_port"], 9222)
+        self.assertIsInstance(kwargs["store"], SnapshotStore)
+        self.assertEqual(kwargs["port"], 0)
+        self.assertEqual(kwargs["timeout_seconds"], 3.5)
+        self.assertIs(kwargs["clock"], clock)
+        self.assertTrue(kwargs["core_writes_enabled"])
+        self.assertTrue(kwargs["media_writes_enabled"])
+
+        access = kwargs["access"]
+        self.assertEqual(access.principal, "mark-api-launch")
+        self.assertEqual(access.bearer_token, self.TOKEN)
+        self.assertEqual(access.capabilities, frozenset(WriteCapability))
+        self.assertTrue(access.writes_enabled)
 
     def test_build_syncs_inventory_marks_missing_tracked_ads_absent(self) -> None:
         _tmp, db = self.make_db()
@@ -237,6 +328,7 @@ class ProductLauncherTests(unittest.TestCase):
 
         self.assertTrue(inventory.closed)
         self.assertEqual(dashboard_calls, 0)
+        self.write_factory.assert_not_called()
         self.assertEqual(SnapshotStore(db).ad_history("1111111111"), (original,))
 
     def test_duplicate_inventory_fails_before_dashboard(self) -> None:
@@ -272,6 +364,7 @@ class ProductLauncherTests(unittest.TestCase):
             )
 
         self.assertTrue(inventory.closed)
+        self.write_factory.assert_not_called()
 
     def test_dashboard_construction_failure_closes_inventory_runtime(self) -> None:
         _tmp, db = self.make_db()
@@ -292,6 +385,30 @@ class ProductLauncherTests(unittest.TestCase):
                 clock=lambda: NOW,
             )
 
+        self.assertTrue(inventory.closed)
+        self.write_factory.assert_not_called()
+
+    def test_write_runtime_start_failure_closes_dashboard_and_inventory(self) -> None:
+        _tmp, db = self.make_db()
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        server = DashboardServer()
+        self.write_runtime.start_error = OSError("write server failed")
+
+        with self.assertRaisesRegex(
+            ProductLauncherError,
+            "product launcher startup failed",
+        ):
+            build_product_launcher(
+                db_path=db,
+                cdp_port=9222,
+                runtime_factory=lambda **kwargs: inventory,
+                dashboard_factory=lambda *args, **kwargs: server,
+                clock=lambda: NOW,
+            )
+
+        self.assertEqual(self.write_runtime.start_calls, 1)
+        self.assertEqual(self.write_runtime.close_calls, 1)
+        self.assertTrue(server.closed)
         self.assertTrue(inventory.closed)
 
     def test_close_shuts_down_active_serving_loop_before_cleanup(self) -> None:
@@ -388,6 +505,7 @@ class ProductLauncherTests(unittest.TestCase):
         self.assertTrue(thread.is_alive())
         self.assertEqual(server.shutdown_calls, 1)
         self.assertEqual(server.close_calls, 0)
+        self.assertEqual(self.write_runtime.close_calls, 0)
         self.assertEqual(inventory.close_calls, 0)
 
         launcher.close()
@@ -396,6 +514,7 @@ class ProductLauncherTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(server.shutdown_calls, 2)
         self.assertEqual(server.close_calls, 1)
+        self.assertEqual(self.write_runtime.close_calls, 1)
         self.assertEqual(inventory.close_calls, 1)
 
     def test_close_retries_failed_server_cleanup_without_reclosing_inventory(self) -> None:
@@ -418,16 +537,20 @@ class ProductLauncherTests(unittest.TestCase):
 
         self.assertFalse(server.closed)
         self.assertEqual(server.close_calls, 1)
+        self.assertTrue(self.write_runtime.closed)
+        self.assertEqual(self.write_runtime.close_calls, 1)
         self.assertTrue(inventory.closed)
         self.assertEqual(inventory.close_calls, 1)
 
         launcher.close()
         self.assertTrue(server.closed)
         self.assertEqual(server.close_calls, 2)
+        self.assertEqual(self.write_runtime.close_calls, 1)
         self.assertEqual(inventory.close_calls, 1)
 
         launcher.close()
         self.assertEqual(server.close_calls, 2)
+        self.assertEqual(self.write_runtime.close_calls, 1)
         self.assertEqual(inventory.close_calls, 1)
 
     def test_failed_inventory_cleanup_remains_fail_closed_on_repeated_close(self) -> None:
@@ -461,6 +584,33 @@ class ProductLauncherTests(unittest.TestCase):
         with self.assertRaisesRegex(ProductLauncherError, "closed"):
             launcher.serve_forever()
 
+    def test_unknown_media_close_can_reconcile_then_finish_shutdown(self) -> None:
+        _tmp, db = self.make_db()
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        server = DashboardServer()
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            runtime_factory=lambda **kwargs: inventory,
+            dashboard_factory=lambda *args, **kwargs: server,
+            clock=lambda: NOW,
+        )
+        self.write_runtime.pending_unknown = True
+
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            launcher.close()
+
+        self.assertTrue(server.closed)
+        self.assertTrue(inventory.closed)
+        self.assertFalse(self.write_runtime.closed)
+
+        launcher.reconcile_media_submit()
+        launcher.close()
+
+        self.assertEqual(self.write_runtime.reconcile_calls, 1)
+        self.assertEqual(self.write_runtime.close_calls, 2)
+        self.assertTrue(self.write_runtime.closed)
+
     def test_pyproject_registers_product_launcher_entry_point(self) -> None:
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
         with pyproject.open("rb") as handle:
@@ -474,6 +624,8 @@ class ProductLauncherTests(unittest.TestCase):
     def test_main_reports_dashboard_and_closes_on_keyboard_interrupt(self) -> None:
         class Launcher:
             server_address = ("127.0.0.1", 18765)
+            write_server_address = ("127.0.0.1", 18766)
+            write_bearer_token = self.TOKEN
             startup_inventory_count = 2
             startup_persisted_count = 3
 
@@ -505,6 +657,8 @@ class ProductLauncherTests(unittest.TestCase):
                     "9222",
                     "--dashboard-port",
                     "0",
+                    "--write-port",
+                    "0",
                     "--reaction-metric",
                     "conversation_count",
                     "--objective-metric",
@@ -520,12 +674,70 @@ class ProductLauncherTests(unittest.TestCase):
             stdout.getvalue(),
         )
         self.assertIn(
+            "Mark write API: http://127.0.0.1:18766/api/write/",
+            stdout.getvalue(),
+        )
+        self.assertIn(
+            f"Mark write bearer token: {self.TOKEN}",
+            stdout.getvalue(),
+        )
+        self.assertIn(
             "Startup sync: 2 current ad(s), 3 observation(s) persisted.",
             stdout.getvalue(),
         )
+        self.assertEqual(build.call_args.kwargs["write_port"], 0)
         contract = build.call_args.kwargs["analytics_contract"]
         self.assertEqual(contract.reaction_metric, "conversation_count")
         self.assertEqual(contract.objective_metric, "views")
+
+    def test_main_reconciles_unknown_media_before_clean_exit(self) -> None:
+        class Launcher:
+            server_address = ("127.0.0.1", 18765)
+            write_server_address = ("127.0.0.1", 18766)
+            write_bearer_token = "runtime-token-0000001"
+            startup_inventory_count = 0
+            startup_persisted_count = 0
+
+            def __init__(self) -> None:
+                self.close_calls = 0
+                self.reconcile_calls = 0
+                self.pending_unknown = True
+
+            def serve_forever(self) -> None:
+                raise KeyboardInterrupt
+
+            def close(self) -> None:
+                self.close_calls += 1
+                if self.pending_unknown:
+                    raise PrivateWebSubmitUnknownError(
+                        "create_media_submit_settle"
+                    )
+
+            def reconcile_media_submit(self) -> None:
+                self.reconcile_calls += 1
+                self.pending_unknown = False
+
+        launcher = Launcher()
+        stdout = io.StringIO()
+        with (
+            patch(
+                "mark_api.launcher.build_product_launcher",
+                return_value=launcher,
+            ),
+            patch("sys.stdout", stdout),
+        ):
+            status = main(
+                [
+                    "--db",
+                    "/tmp/mark.sqlite",
+                    "--cdp-port",
+                    "9222",
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(launcher.reconcile_calls, 1)
+        self.assertEqual(launcher.close_calls, 2)
 
     def test_main_returns_two_for_sanitized_startup_failure(self) -> None:
         stderr = io.StringIO()

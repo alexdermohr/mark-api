@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import secrets
 import sys
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -16,12 +17,15 @@ from .analytics import (
 )
 from .dashboard import LoopbackDashboardServer, create_server
 from .domain import AdSnapshot
+from .private_web import PrivateWebSubmitUnknownError
 from .private_web_runtime import (
     PrivateWebRuntimeDependencyError,
     build_private_web_inventory_runtime,
+    build_private_web_write_api_runtime,
 )
 from .results import ReadResult
 from .storage import SnapshotStore
+from .write_api import WriteApiAccess, WriteCapability
 
 
 _LAUNCHER_SOURCE = "private-web-product-launcher"
@@ -39,14 +43,35 @@ class _InventoryRuntime(Protocol):
         ...
 
 
+class _WriteRuntime(Protocol):
+    @property
+    def server_address(self) -> tuple[str, int]:
+        ...
+
+    def start(self) -> tuple[str, int]:
+        ...
+
+    def reconcile_media_submit(self) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
 _RuntimeFactory = Callable[..., _InventoryRuntime]
+_WriteRuntimeFactory = Callable[..., _WriteRuntime]
 _DashboardFactory = Callable[..., LoopbackDashboardServer]
 _StoreFactory = Callable[[Path], SnapshotStore]
 _Clock = Callable[[], datetime]
+_TokenFactory = Callable[[], str]
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _default_write_token() -> str:
+    return secrets.token_urlsafe(32)
 
 
 def _validated_port(value: int, *, name: str, allow_zero: bool) -> int:
@@ -107,17 +132,21 @@ def _validated_inventory(
 
 
 class ProductLauncherRuntime:
-    """Own the long-lived read-only dashboard after one fresh startup sync."""
+    """Own the dashboard, default-on Write API, and startup inventory runtime."""
 
     def __init__(
         self,
         *,
         inventory_runtime: _InventoryRuntime,
+        write_runtime: _WriteRuntime,
+        write_access: WriteApiAccess,
         server: LoopbackDashboardServer,
         startup_inventory_count: int,
         startup_persisted_count: int,
     ) -> None:
         self._inventory_runtime = inventory_runtime
+        self._write_runtime = write_runtime
+        self._write_access = write_access
         self._server = server
         self._startup_inventory_count = startup_inventory_count
         self._startup_persisted_count = startup_persisted_count
@@ -127,6 +156,7 @@ class ProductLauncherRuntime:
         self._serve_thread: Thread | None = None
         self._server_quiesced = False
         self._server_closed = False
+        self._write_closed = False
         self._inventory_closed = False
         self._inventory_close_failed = False
 
@@ -151,6 +181,21 @@ class ProductLauncherRuntime:
     def startup_persisted_count(self) -> int:
         return self._startup_persisted_count
 
+    @property
+    def write_server_address(self) -> tuple[str, int]:
+        host, port = self._write_runtime.server_address
+        return str(host), int(port)
+
+    @property
+    def write_bearer_token(self) -> str:
+        return self._write_access.bearer_token
+
+    def reconcile_media_submit(self) -> None:
+        with self._state_lock:
+            if self._write_closed:
+                raise ProductLauncherError("product launcher write runtime is closed")
+        self._write_runtime.reconcile_media_submit()
+
     def serve_forever(self) -> None:
         with self._state_lock:
             self._ensure_open_locked()
@@ -170,7 +215,11 @@ class ProductLauncherRuntime:
     def close(self) -> None:
         with self._close_lock:
             with self._state_lock:
-                if self._server_closed and self._inventory_closed:
+                if (
+                    self._server_closed
+                    and self._write_closed
+                    and self._inventory_closed
+                ):
                     return
                 self._shutdown_started = True
                 serve_thread = self._serve_thread
@@ -207,6 +256,17 @@ class ProductLauncherRuntime:
                 else:
                     self._server_closed = True
 
+            media_unknown: PrivateWebSubmitUnknownError | None = None
+            if not self._write_closed:
+                try:
+                    self._write_runtime.close()
+                except PrivateWebSubmitUnknownError as exc:
+                    media_unknown = exc
+                except Exception:
+                    cleanup_failed = True
+                else:
+                    self._write_closed = True
+
             if self._inventory_close_failed:
                 cleanup_failed = True
             elif not self._inventory_closed:
@@ -218,6 +278,8 @@ class ProductLauncherRuntime:
                 else:
                     self._inventory_closed = True
 
+            if media_unknown is not None:
+                raise media_unknown
             if cleanup_failed:
                 raise ProductLauncherError("product launcher cleanup failed")
 
@@ -234,18 +296,21 @@ def build_product_launcher(
     db_path: Path,
     cdp_port: int,
     dashboard_port: int = 8765,
+    write_port: int = 8766,
     timeout_seconds: float = 5.0,
     analytics_contract: AnalyticsContract | None = None,
     runtime_factory: _RuntimeFactory = build_private_web_inventory_runtime,
+    write_runtime_factory: _WriteRuntimeFactory | None = None,
     dashboard_factory: _DashboardFactory = create_server,
     store_factory: _StoreFactory = SnapshotStore,
+    token_factory: _TokenFactory | None = None,
     clock: _Clock = _utc_now,
 ) -> ProductLauncherRuntime:
-    """Perform one fresh owner sync, then build the loopback read-only dashboard.
+    """Perform one fresh owner sync, then start dashboard and Write API.
 
     Authentication and browser lifecycle remain caller-owned. This launcher
-    consumes only an already-running loopback CDP endpoint. It intentionally
-    exposes no Write API and does not change any platform-write gate.
+    consumes only an already-running loopback CDP endpoint. Product writes are
+    composed by default through the existing authenticated/idempotent Write API.
     """
 
     if not isinstance(db_path, Path):
@@ -256,6 +321,7 @@ def build_product_launcher(
         name="dashboard_port",
         allow_zero=True,
     )
+    _validated_port(write_port, name="write_port", allow_zero=True)
     timeout = _validated_timeout(timeout_seconds)
     if analytics_contract is not None and not isinstance(
         analytics_contract,
@@ -264,12 +330,25 @@ def build_product_launcher(
         raise TypeError("analytics_contract must be AnalyticsContract or None")
     if not callable(runtime_factory):
         raise TypeError("runtime_factory must be callable")
+    if write_runtime_factory is not None and not callable(write_runtime_factory):
+        raise TypeError("write_runtime_factory must be callable or None")
     if not callable(dashboard_factory):
         raise TypeError("dashboard_factory must be callable")
     if not callable(store_factory):
         raise TypeError("store_factory must be callable")
+    if token_factory is not None and not callable(token_factory):
+        raise TypeError("token_factory must be callable or None")
     if not callable(clock):
         raise TypeError("clock must be callable")
+
+    resolved_write_runtime_factory = (
+        build_private_web_write_api_runtime
+        if write_runtime_factory is None
+        else write_runtime_factory
+    )
+    resolved_token_factory = (
+        _default_write_token if token_factory is None else token_factory
+    )
 
     try:
         store = store_factory(db_path)
@@ -287,6 +366,8 @@ def build_product_launcher(
     except Exception:
         raise ProductLauncherError("private Web runtime startup failed") from None
 
+    server: LoopbackDashboardServer | None = None
+    write_runtime: _WriteRuntime | None = None
     try:
         result = inventory_runtime.read_inventory()
         snapshots = _validated_inventory(result)
@@ -303,13 +384,66 @@ def build_product_launcher(
             port=dashboard_port,
             analytics_contract=analytics_contract,
         )
+        write_access = WriteApiAccess(
+            principal="mark-api-launch",
+            bearer_token=resolved_token_factory(),
+            capabilities=frozenset(WriteCapability),
+            writes_enabled=True,
+        )
+        write_runtime = resolved_write_runtime_factory(
+            cdp_port=cdp_port,
+            store=store,
+            access=write_access,
+            core_writes_enabled=True,
+            media_writes_enabled=True,
+            port=write_port,
+            timeout_seconds=timeout,
+            clock=clock,
+        )
+        write_runtime.start()
     except ProductLauncherError:
+        if write_runtime is not None:
+            try:
+                write_runtime.close()
+            except Exception:
+                pass
+        if server is not None:
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        try:
+            inventory_runtime.close()
+        except Exception:
+            pass
+        raise
+    except PrivateWebRuntimeDependencyError:
+        if write_runtime is not None:
+            try:
+                write_runtime.close()
+            except Exception:
+                pass
+        if server is not None:
+            try:
+                server.server_close()
+            except Exception:
+                pass
         try:
             inventory_runtime.close()
         except Exception:
             pass
         raise
     except Exception:
+        if write_runtime is not None:
+            try:
+                write_runtime.close()
+            except Exception:
+                pass
+        if server is not None:
+            try:
+                server.server_close()
+            except Exception:
+                pass
         try:
             inventory_runtime.close()
         except Exception:
@@ -318,6 +452,8 @@ def build_product_launcher(
 
     return ProductLauncherRuntime(
         inventory_runtime=inventory_runtime,
+        write_runtime=write_runtime,
+        write_access=write_access,
         server=server,
         startup_inventory_count=len(snapshots),
         startup_persisted_count=persisted,
@@ -328,8 +464,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Start Mark from an already-authenticated local Chrome/CDP session, "
-            "perform one fresh owner-inventory sync, and serve the read-only "
-            "dashboard."
+            "perform one fresh owner-inventory sync, and serve the dashboard "
+            "plus default-on loopback Write API."
         ),
     )
     parser.add_argument(
@@ -349,6 +485,12 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=8765,
         help="Loopback dashboard port (default: 8765; use 0 for an ephemeral port).",
+    )
+    parser.add_argument(
+        "--write-port",
+        type=int,
+        default=8766,
+        help="Loopback Write API port (default: 8766; use 0 for an ephemeral port).",
     )
     parser.add_argument(
         "--timeout-seconds",
@@ -389,6 +531,7 @@ def main(argv: list[str] | None = None) -> int:
             db_path=args.db,
             cdp_port=args.cdp_port,
             dashboard_port=args.dashboard_port,
+            write_port=args.write_port,
             timeout_seconds=args.timeout_seconds,
             analytics_contract=contract,
         )
@@ -400,7 +543,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     host, port = launcher.server_address
+    write_host, write_port = launcher.write_server_address
     print(f"Mark dashboard: http://{host}:{port}/", flush=True)
+    print(
+        f"Mark write API: http://{write_host}:{write_port}/api/write/",
+        flush=True,
+    )
+    print(
+        f"Mark write bearer token: {launcher.write_bearer_token}",
+        flush=True,
+    )
     print(
         "Startup sync: "
         f"{launcher.startup_inventory_count} current ad(s), "
@@ -422,6 +574,16 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         try:
             launcher.close()
+        except PrivateWebSubmitUnknownError:
+            try:
+                launcher.reconcile_media_submit()
+                launcher.close()
+            except Exception:
+                print(
+                    "mark-api-launch: media submit reconciliation required",
+                    file=sys.stderr,
+                )
+                exit_code = 2
         except ProductLauncherError as exc:
             print(f"mark-api-launch: {exc}", file=sys.stderr)
             exit_code = 2
