@@ -1577,7 +1577,7 @@ def _build_private_web_owner_reader(
         # endpoint or transport override that could receive that Cookie header.
         "endpoint": MANAGEMENT_URL,
         "source": management_source,
-        "transport": _NoRedirectManagementTransport(),
+        "transport": _NoRedirectManagementTransport(timeout_seconds=timeout_seconds),
     }
     if clock is not None:
         management_kwargs["clock"] = clock

@@ -2546,6 +2546,7 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
         owner_reader = OwnerReader(
             ReadResult.success_nonempty((owner_snapshot(),))
         )
+        management_transport = object()
 
         with (
             patch(
@@ -2555,6 +2556,10 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
                 "mark_api.private_web_runtime.CdpCookieProvider.from_port",
                 return_value=delegate,
             ) as cookies,
+            patch(
+                "mark_api.private_web_runtime._NoRedirectManagementTransport",
+                return_value=management_transport,
+            ) as transport_factory,
             patch(
                 "mark_api.private_web_runtime.ManagementReadAdapter",
                 return_value=owner_reader,
@@ -2572,8 +2577,13 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
         self.assertIsInstance(runtime, PrivateWebInventoryRuntime)
         dependency.assert_called_once_with()
         cookies.assert_called_once_with(19610, timeout_seconds=4.0)
+        transport_factory.assert_called_once_with(timeout_seconds=4.0)
         self.assertEqual(management.call_count, 1)
         self.assertEqual(management.call_args.kwargs["endpoint"], MANAGEMENT_URL)
+        self.assertIs(
+            management.call_args.kwargs["transport"],
+            management_transport,
+        )
         pages.assert_not_called()
         for name in (
             "content_writer",
@@ -2635,7 +2645,7 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
 
         dependency.assert_called_once_with()
         cookies.assert_called_once_with(19610, timeout_seconds=4.0)
-        transport_factory.assert_called_once_with()
+        transport_factory.assert_called_once_with(timeout_seconds=4.0)
         self.assertEqual(management.call_count, 1)
         self.assertEqual(management.call_args.kwargs["endpoint"], MANAGEMENT_URL)
         self.assertIs(
