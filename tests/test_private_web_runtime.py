@@ -2367,56 +2367,125 @@ class PrivateWebContentRuntimeTests(unittest.TestCase):
         self.assertEqual(page_calls, 0)
 
     def test_dependency_check_fails_when_distribution_is_missing(self) -> None:
-        with patch(
-            "mark_api.private_web_runtime.metadata.version",
-            side_effect=metadata.PackageNotFoundError("websocket-client"),
-        ):
-            with self.assertRaises(PrivateWebRuntimeDependencyError) as caught:
-                require_private_web_runtime_dependency()
+        for missing in ("websocket-client", "Pillow"):
+            with self.subTest(missing=missing):
+                def version(name: str) -> str:
+                    if name == missing:
+                        raise metadata.PackageNotFoundError(name)
+                    return "1.9.0"
 
-        self.assertNotIn("websocket-client", str(caught.exception).lower())
+                with patch(
+                    "mark_api.private_web_runtime.metadata.version",
+                    side_effect=version,
+                ):
+                    with self.assertRaises(
+                        PrivateWebRuntimeDependencyError
+                    ) as caught:
+                        require_private_web_runtime_dependency()
+
+                self.assertNotIn(
+                    missing.lower(),
+                    str(caught.exception).lower(),
+                )
 
     def test_dependency_check_fails_when_import_module_is_missing(self) -> None:
-        with (
-            patch(
-                "mark_api.private_web_runtime.metadata.version",
-                return_value="1.9.0",
-            ),
-            patch(
-                "mark_api.private_web_runtime.import_module",
-                side_effect=ModuleNotFoundError("websocket"),
-            ),
-        ):
-            with self.assertRaises(PrivateWebRuntimeDependencyError):
-                require_private_web_runtime_dependency()
+        for missing in ("websocket", "PIL.Image"):
+            with self.subTest(missing=missing):
+                def importer(name: str):
+                    if name == missing:
+                        raise ModuleNotFoundError(name)
+                    if name == "websocket":
+                        return type(
+                            "WebSocketModule",
+                            (),
+                            {
+                                "create_connection": staticmethod(
+                                    lambda *args, **kwargs: None
+                                )
+                            },
+                        )()
+                    return type(
+                        "PillowImageModule",
+                        (),
+                        {"open": staticmethod(lambda *args, **kwargs: None)},
+                    )()
+
+                with (
+                    patch(
+                        "mark_api.private_web_runtime.metadata.version",
+                        return_value="1.9.0",
+                    ),
+                    patch(
+                        "mark_api.private_web_runtime.import_module",
+                        side_effect=importer,
+                    ),
+                ):
+                    with self.assertRaises(PrivateWebRuntimeDependencyError):
+                        require_private_web_runtime_dependency()
 
     def test_dependency_check_rejects_shadow_module_without_client_api(self) -> None:
-        with (
-            patch(
-                "mark_api.private_web_runtime.metadata.version",
-                return_value="1.9.0",
+        cases = (
+            (
+                object(),
+                type(
+                    "PillowImageModule",
+                    (),
+                    {"open": staticmethod(lambda *args, **kwargs: None)},
+                )(),
             ),
-            patch(
-                "mark_api.private_web_runtime.import_module",
-                return_value=object(),
-            ),
-        ):
-            with self.assertRaises(PrivateWebRuntimeDependencyError):
-                require_private_web_runtime_dependency()
-
-    def test_dependency_check_accepts_declared_distribution_and_module(self) -> None:
-        with (
-            patch(
-                "mark_api.private_web_runtime.metadata.version",
-                return_value="1.9.0",
-            ),
-            patch(
-                "mark_api.private_web_runtime.import_module",
-                return_value=type(
+            (
+                type(
                     "WebSocketModule",
                     (),
-                    {"create_connection": staticmethod(lambda *args, **kwargs: None)},
+                    {
+                        "create_connection": staticmethod(
+                            lambda *args, **kwargs: None
+                        )
+                    },
                 )(),
+                object(),
+            ),
+        )
+        for modules in cases:
+            with self.subTest(modules=modules):
+                with (
+                    patch(
+                        "mark_api.private_web_runtime.metadata.version",
+                        return_value="1.9.0",
+                    ),
+                    patch(
+                        "mark_api.private_web_runtime.import_module",
+                        side_effect=modules,
+                    ),
+                ):
+                    with self.assertRaises(PrivateWebRuntimeDependencyError):
+                        require_private_web_runtime_dependency()
+
+    def test_dependency_check_accepts_declared_distribution_and_module(self) -> None:
+        modules = (
+            type(
+                "WebSocketModule",
+                (),
+                {
+                    "create_connection": staticmethod(
+                        lambda *args, **kwargs: None
+                    )
+                },
+            )(),
+            type(
+                "PillowImageModule",
+                (),
+                {"open": staticmethod(lambda *args, **kwargs: None)},
+            )(),
+        )
+        with (
+            patch(
+                "mark_api.private_web_runtime.metadata.version",
+                return_value="1.9.0",
+            ),
+            patch(
+                "mark_api.private_web_runtime.import_module",
+                side_effect=modules,
             ),
         ):
             require_private_web_runtime_dependency()
@@ -3004,6 +3073,212 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                     body = json.loads(response.read())
                     self.assertEqual(response.status, 201)
                 self.assertRegex(body["media_ref"], r"^media_[A-Za-z0-9_-]+$")
+            finally:
+                runtime.close()
+            self.assertEqual(close_events, ["content"])
+
+    def test_builder_auto_composes_default_media_persistence_verifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            reader = OwnerReader(ReadResult.success_empty(()))
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(reader, close_events)
+            media_runtime = PrivateWebMediaCreateRuntime(
+                page_factory=lambda: (_ for _ in ()).throw(
+                    AssertionError("media page must stay lazy")
+                )
+            )
+            access = WriteApiAccess(
+                principal="runtime-test",
+                bearer_token=self.TOKEN,
+                capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                writes_enabled=True,
+            )
+            default_verifier = MediaPersistenceVerifier()
+            sentinel_runtime = object()
+            with (
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_content_runtime",
+                    return_value=content_runtime,
+                ),
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_media_create_runtime",
+                    return_value=media_runtime,
+                ),
+                patch(
+                    "mark_api.private_web_runtime.PrivateWebPublicMediaPersistenceVerifier",
+                    return_value=default_verifier,
+                ) as verifier_builder,
+                patch(
+                    "mark_api.private_web_runtime.compose_private_web_write_api_runtime",
+                    return_value=sentinel_runtime,
+                ) as compose,
+            ):
+                actual = build_private_web_write_api_runtime(
+                    cdp_port=19610,
+                    store=store,
+                    access=access,
+                    media_writes_enabled=True,
+                )
+
+            self.assertIs(actual, sentinel_runtime)
+            verifier_builder.assert_called_once_with()
+            self.assertIs(
+                compose.call_args.kwargs["media_persistence_verifier"],
+                default_verifier,
+            )
+
+    def test_builder_passes_explicit_media_persistence_verifier_to_composition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            reader = OwnerReader(ReadResult.success_empty(()))
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(reader, close_events)
+            media_runtime = PrivateWebMediaCreateRuntime(
+                page_factory=lambda: (_ for _ in ()).throw(
+                    AssertionError("media page must stay lazy")
+                )
+            )
+            access = WriteApiAccess(
+                principal="runtime-test",
+                bearer_token=self.TOKEN,
+                capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                writes_enabled=True,
+            )
+            explicit_verifier = MediaPersistenceVerifier()
+            sentinel_runtime = object()
+            with (
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_content_runtime",
+                    return_value=content_runtime,
+                ),
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_media_create_runtime",
+                    return_value=media_runtime,
+                ),
+                patch(
+                    "mark_api.private_web_runtime.PrivateWebPublicMediaPersistenceVerifier",
+                    side_effect=AssertionError(
+                        "default verifier must not be constructed"
+                    ),
+                ),
+                patch(
+                    "mark_api.private_web_runtime.compose_private_web_write_api_runtime",
+                    return_value=sentinel_runtime,
+                ) as compose,
+            ):
+                actual = build_private_web_write_api_runtime(
+                    cdp_port=19610,
+                    store=store,
+                    access=access,
+                    media_persistence_verifier=explicit_verifier,
+                    media_writes_enabled=True,
+                )
+
+            self.assertIs(actual, sentinel_runtime)
+            self.assertIs(
+                compose.call_args.kwargs["media_persistence_verifier"],
+                explicit_verifier,
+            )
+
+    def test_builder_composes_default_media_persistence_verifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            reader = OwnerReader(ReadResult.success_empty(()))
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(reader, close_events)
+            media_runtime = PrivateWebMediaCreateRuntime(
+                page_factory=lambda: (_ for _ in ()).throw(
+                    AssertionError("media page must stay lazy")
+                )
+            )
+            access = WriteApiAccess(
+                principal="runtime-test",
+                bearer_token=self.TOKEN,
+                capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                writes_enabled=True,
+            )
+            verifier = MediaPersistenceVerifier()
+            with (
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_content_runtime",
+                    return_value=content_runtime,
+                ),
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_media_create_runtime",
+                    return_value=media_runtime,
+                ),
+                patch(
+                    "mark_api.private_web_runtime.PrivateWebPublicMediaPersistenceVerifier",
+                    return_value=verifier,
+                ) as verifier_builder,
+            ):
+                runtime = build_private_web_write_api_runtime(
+                    cdp_port=19610,
+                    store=store,
+                    access=access,
+                    media_writes_enabled=True,
+                )
+            try:
+                verifier_builder.assert_called_once_with()
+                self.assertIsNotNone(runtime._media_service)
+                assert runtime._media_service is not None
+                self.assertIs(
+                    runtime._media_service._media_persistence_verifier,
+                    verifier,
+                )
+            finally:
+                runtime.close()
+            self.assertEqual(close_events, ["content"])
+
+    def test_builder_preserves_explicit_media_persistence_verifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            reader = OwnerReader(ReadResult.success_empty(()))
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(reader, close_events)
+            media_runtime = PrivateWebMediaCreateRuntime(
+                page_factory=lambda: (_ for _ in ()).throw(
+                    AssertionError("media page must stay lazy")
+                )
+            )
+            access = WriteApiAccess(
+                principal="runtime-test",
+                bearer_token=self.TOKEN,
+                capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                writes_enabled=True,
+            )
+            verifier = MediaPersistenceVerifier()
+            with (
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_content_runtime",
+                    return_value=content_runtime,
+                ),
+                patch(
+                    "mark_api.private_web_runtime.build_private_web_media_create_runtime",
+                    return_value=media_runtime,
+                ),
+                patch(
+                    "mark_api.private_web_runtime.PrivateWebPublicMediaPersistenceVerifier",
+                    side_effect=AssertionError(
+                        "default verifier must not be constructed"
+                    ),
+                ),
+            ):
+                runtime = build_private_web_write_api_runtime(
+                    cdp_port=19610,
+                    store=store,
+                    access=access,
+                    media_persistence_verifier=verifier,
+                    media_writes_enabled=True,
+                )
+            try:
+                self.assertIsNotNone(runtime._media_service)
+                assert runtime._media_service is not None
+                self.assertIs(
+                    runtime._media_service._media_persistence_verifier,
+                    verifier,
+                )
             finally:
                 runtime.close()
             self.assertEqual(close_events, ["content"])
