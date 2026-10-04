@@ -2,7 +2,7 @@
 
 Stand: 04.10.2026
 
-Status: **funktionaler MVP-Scope technisch umgesetzt; Detail-Akzeptanz auf zwei Analytics-Produktentscheidungen reduziert; produktive Plattformwrites bleiben separat gegated**
+Status: **MVP-Kern technisch vorhanden; read-only Product Launcher als kohärenter Startpfad ergänzt; Gesamtprodukt, Default-on Write Composition, Freshness/Recovery und finale E2E-Abnahme noch nicht abgeschlossen**
 
 Quelle: `docs/requirements-source-2026-09-23.md`
 
@@ -43,9 +43,11 @@ Diese ursprünglich bestätigte Anforderung ist **kein MVP-Schwerpunkt**.
 
 Diese ursprünglich bestätigte Anforderung ist **kein MVP-Schwerpunkt**. Der vorhandene Media-Create-Pfad betrifft dagegen die sichere Verwendung explizit zugelassener lokaler Medien und ersetzt keine generative Bildfunktion.
 
-### 2.4 Dashboard
+### 2.4 Dashboard und Product Launcher
 
 Ein read-only Dashboard samt lokaler API stellt Anzeigen-, Reaktions- und Analytics-Daten dar. Grafiken und Ranglisten verwenden ausschließlich explizit angeforderte Rohmetriken.
+
+Der installierte Einstieg `mark-api-launch` bildet den kohärenten read-only Startpfad für eine bereits laufende, bereits authentifizierte lokale Chrome-/Chromium-Sitzung über loopback-CDP. Er führt genau einen frischen Owner-Inventory-Read aus und persistiert bestätigte aktuelle Anzeigen sowie `ABSENT`-Transitions für historisch bekannte, nun fehlende Anzeigen. Das Dashboard wird erst nach einem erfolgreichen Initial-Read verfügbar und bindet ausschließlich an Loopback. Ein fehlgeschlagener oder unklarer Initial-Read bricht den Start vorher ab. Dieser Slice enthält noch keine periodische Aktualisierung und keine Write-Komposition.
 
 ### 2.5 Datensammlung und Auswertung
 
@@ -114,8 +116,10 @@ Der aktuelle Core und die Runtime-Surfaces erzwingen insbesondere:
 6. Login, MFA, CAPTCHA und sonstige Sicherheitschallenges werden nicht automatisiert oder umgangen.
 7. Die schreibfähige HTTP-Surface bleibt getrennt vom read-only Dashboard und loopback-only.
 8. Die Analytics-Entscheidungen `reaction_metric` und `objective_metric` bleiben unabhängig von den Write-Gates und standardmäßig ungesetzt.
+9. `mark-api-launch` verwendet eine bereits authentifizierte loopback-CDP-Sitzung, führt genau einen fail-closed Initial-Inventory-Sync aus und startet das read-only Dashboard erst danach; er startet keinen Browser, automatisiert keinen Login und führt keine Plattformwrites aus.
+10. Periodische Synchronisation, Freshness/Recovery und die Default-on-Write-Komposition sind ausdrücklich spätere Produktslices.
 
-Die maßgeblichen Architektur- und Sicherheitsentscheidungen sind in D-006 bis D-019 dokumentiert. Ein implementierter technischer Pfad ist keine automatische Freigabe für reale Plattformwrites.
+Die maßgeblichen Architektur- und Sicherheitsentscheidungen sind in D-006 bis D-022 dokumentiert. Ein implementierter technischer Pfad ist keine automatische Freigabe für reale Plattformwrites.
 
 ## 6. Aktueller MVP-Stand
 
@@ -130,19 +134,17 @@ Der technische MVP umfasst inzwischen:
 7. Inbox-/Conversation-Zuordnung und source-explizite E-Mail-Projektionen,
 8. append-only SQLite-Snapshots und crash-idempotente lokale Write-Receipts,
 9. Analytics-Rohmetriken und Vergleiche nach Bild-Typ, Stadt, Text-Typ und Titel-Typ,
-10. read-only Dashboard, Grafiken, Top-Listen und lokale Runtime-Smokes.
+10. read-only Dashboard, Grafiken, Top-Listen und lokale Runtime-Smokes,
+11. installierter `mark-api-launch`-Startpfad mit genau einem bestätigten Startup-Inventory-Sync vor dem loopback-only Dashboard.
 
 Text- und Bildgenerierung bleiben dokumentiert, aber für diesen MVP depriorisiert.
 
 Reale sichtbare Testanzeigen, Testnachrichten oder zyklische Plattformwrites werden nicht als normale Regressionstests verwendet.
 
-## 7. Erfolgskriterium für die nächste Produktphase
+## 7. Nächste Produktphase
 
-Die technische Architektur für den dokumentierten MVP-Kern ist ausreichend konkret und umgesetzt. Der nächste fachliche Gate besteht aus genau zwei Entscheidungen:
+Der Product Launcher schließt den read-only Startpfad, aber nicht das Gesamtprodukt ab. Unmittelbar danach folgt als eigener, klein gehaltener Produktslice die **Default-on Write Composition**: Der normale Produktstart soll die bereits implementierten Write-Funktionen standardmäßig komponieren, ohne interne Authentizitäts-, Ownership-, Confirmation-, Idempotenz-, TOCTOU-, Readback- und No-Blind-Retry-Sicherheiten abzubauen.
 
-1. `reaction_metric` für „wie viele geschrieben haben“ festlegen,
-2. `objective_metric` beziehungsweise eine ausdrücklich definierte Zielfunktion für „beste Lösung“ festlegen.
+Danach folgen die separat priorisierten Arbeiten an interner Auth-/Idempotency-Härtung, Reaction Data, Email-only Classification, Dashboard Write UX, Freshness/Time, Recovery UX, SQLite Lifecycle, Shutdown, Packaging, Full E2E und finalem Produktaudit.
 
-Erst danach darf eine objective-gebundene Empfehlung als fachlich gewollt behandelt werden. Liegt die gewünschte Zielfunktion außerhalb der bereits vorhandenen Analytics-Rohmetriken, entsteht daraus ein neuer eigener Implementierungs-Slice.
-
-Issue #1 bleibt bis zur ausdrücklichen menschlichen Festlegung dieser beiden Punkte offen. Produktive Plattformwrites behalten unabhängig davon ihre separaten technischen und menschlichen Freigaben.
+Die beiden fachlichen Analytics-Entscheidungen bleiben weiterhin offen: `reaction_metric` für „wie viele geschrieben haben“ und `objective_metric` beziehungsweise eine ausdrücklich definierte Zielfunktion für „beste Lösung“. Ohne diese Festlegungen darf keine objective-gebundene Empfehlung als fachlich gewollt behauptet werden.

@@ -313,3 +313,19 @@ Kleinanzeigen stellt Galerievarianten serverseitig skaliert beziehungsweise reko
 - die Verifikation ist ausschließlich read-only und erzeugt weder Plattformwrites noch neue Retry-Autorität,
 - transparente oder animierte Medien, deren öffentliche Rekodierung nicht konservativ eindeutig gebunden werden kann, werden nicht fälschlich bestätigt, sondern bleiben fail-closed,
 - dieser Slice führt keinen realen Kleinanzeigen-Publish aus; der kontrollierte Live-Publish-Smoke bleibt ein separates Betriebs-/Abnahmegate.
+
+## D-022 — Product Launcher bündelt initialen Owner-Sync und read-only Dashboard
+
+**Entscheidung:** Der installierte Produkteinstieg `mark-api-launch` konsumiert ausschließlich eine bereits laufende, vom Nutzer bereits authentifizierte lokale Chrome-/Chromium-Sitzung über loopback-CDP. Beim Start führt er genau einen frischen Owner-Inventory-Read aus, persistiert dessen bestätigten Bestand in die konfigurierte SQLite-Datenbank und erzeugt über die bestehende Inventory-Persistenz für historisch bekannte, nun fehlende Anzeigen `ABSENT`-Transitions. Das bestehende read-only Dashboard wird erst nach diesem erfolgreichen Initial-Sync erstellt und bindet ausschließlich an `127.0.0.1`.
+
+**Fail-closed-Grenzen:** Ein fehlgeschlagener, ungültiger oder sonst unklarer Initial-Read beendet den Start vor dem Dashboard. Der Launcher automatisiert weder Browserstart noch Login, MFA, CAPTCHA oder sonstigen Browser-Lifecycle. Er exponiert in diesem Slice keine Write API, ändert keine bestehenden Write-Gates und führt keine periodische Synchronisation ein.
+
+**Shutdown:** Der Launcher beendet Dashboard und Private-Web-Runtime kontrolliert. Läuft `serve_forever()` beim externen `close()` noch in einem anderen Thread, wird zuerst `shutdown()` koordiniert und erst nach bestätigtem Ende der Serve-Schleife `server_close()` sowie der Runtime-Cleanup ausgeführt. Ist die Serve-Schleife bereits beendet oder wurde sie nie gestartet, wird `shutdown()` bewusst nicht aufgerufen, da `BaseServer.shutdown()` ohne laufende Schleife blockieren kann. Ein fehlgeschlagenes Quiescing blockiert den nachgelagerten Cleanup und kann bei einem späteren `close()` erneut versucht werden; ein transient fehlgeschlagenes `server_close()` wird ebenfalls erneut versucht. Nach begonnenem Shutdown ist der Launcher nicht wieder verwendbar. Ein vom darunterliegenden Private-Web-Runtime-Cleanup gemeldeter Fehler bleibt fail-closed sichtbar und wird nicht durch einen späteren scheinbaren Erfolg verdeckt. Die allgemeine Runtime-/Shutdown-Härtung bleibt ein eigener späterer Produktslice.
+
+**Folgen:**
+- installierter Einstieg: `mark-api-launch = mark_api.launcher:main`,
+- Voraussetzung ist eine bereits authentifizierte lokale CDP-Sitzung,
+- genau ein Startup-Inventory-Read, keine periodische Aktualisierung,
+- Dashboard erst nach erfolgreichem Sync und nur auf Loopback,
+- keine Plattformwrites aus diesem Launcher und keine Änderung der Write-Gates,
+- Freshness/Recovery sowie Default-on Write Composition folgen separat.

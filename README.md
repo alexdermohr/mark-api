@@ -4,7 +4,7 @@
 
 ## Status
 
-**Core, Dashboard und Analytics implementiert / PrivateWebWriter + Runtime-Smoke real belegt / lokale Mark Write API mit opakem Media-Ref-Adapter implementiert** — Stand: 02.10.2026.
+**Core, Dashboard und Analytics implementiert / PrivateWebWriter + Runtime-Smoke real belegt / read-only Product Launcher implementiert / lokale Mark Write API mit opakem Media-Ref-Adapter implementiert** — Stand: 04.10.2026.
 
 Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Der MVP-Fokus liegt auf Anzeigenverwaltung, Synchronisation, Verkäufermetriken, Inbox/Interessenten, Dashboard und datenbasierter Auswertung. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
 
@@ -22,6 +22,26 @@ Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkreti
 - Der Ein-Anzeigen-Realtest vom 24.09.2026 belegt Sync, stabiles in-place Update, Pause/Aktivierung, Verkäufermetriken, positiven Inbox/adId-Fall und Delete mit unabhängigen Besitzerlisten-Readbacks.
 - Am 25.09.2026 wurde der aktuell eingeloggte eigene Account read-only durch `ManagementReadAdapter -> EnrichedOwnerReader -> MarkService -> SnapshotStore` geführt: erfolgreicher leerer Besitzerbestand (`success_empty`), keine Plattformmutation.
 - Plattformwrites sind im Core standardmäßig deaktiviert. Der mediafreie Create/Publish-Vertrag, der getrennte media-aware Browser-Publish-Primitive und die read-only öffentliche Media-Persistenzverifikation sind lokal implementiert und regressionsgetestet; ein kontrollierter Live-Publish-Smoke und die spätere Produkt-/Betriebsfreigabe bleiben weiterhin offen.
+
+## Product Launcher
+
+Der installierte Startpfad für den aktuellen Produktstand ist `mark-api-launch`. Er verwendet einen **bereits laufenden, vom Nutzer bereits authentifizierten** lokalen Chrome-/Chromium-Prozess mit loopback-CDP; der Launcher startet keinen Browser und automatisiert weder Login noch MFA/CAPTCHA.
+
+Installation mit dem benötigten Private-Web-Extra:
+
+```bash
+python -m pip install -e '.[private-web]'
+```
+
+Beispielstart:
+
+```bash
+mark-api-launch --db /pfad/mark.sqlite --cdp-port 9222
+```
+
+Beim Start führt der Launcher genau **einen frischen Owner-Inventory-Read** aus. Nur ein nachweislich erfolgreicher Read wird in die konfigurierte SQLite-Datenbank übernommen; zuvor bekannte, nun fehlende Anzeigen werden dabei mit der bestehenden `ABSENT`-Transition persistiert. Erst danach startet das bestehende read-only Dashboard auf `127.0.0.1:8765` (oder dem explizit gewählten Dashboard-Port). Schlägt der Initial-Read fehl oder ist sein Ergebnis unklar, startet kein Dashboard.
+
+CDP und Dashboard sind auf Loopback begrenzt. Dieser Launcher führt **keine Kleinanzeigen-Plattformwrites** aus, komponiert keine Write API und verändert keine bestehenden Write-Gates. Er führt derzeit auch **keine periodische Synchronisation** aus; Freshness/Recovery und die separate Default-on-Write-Komposition folgen in eigenen Produktslices. Beim Shutdown werden Dashboard und Private-Web-Runtime kontrolliert geschlossen; Cleanupfehler werden sanitisiert als Launcher-Fehler gemeldet.
 
 ## Lokale Klassifikationspflege
 
