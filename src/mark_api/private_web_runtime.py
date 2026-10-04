@@ -60,6 +60,7 @@ from .private_web_media import (
     PrivateWebCreateMediaWriter,
     PrivateWebMediaPersistenceSnapshot,
     PrivateWebMediaPersistenceVerifier,
+    PrivateWebMediaHandleStore,
     PrivateWebMediaRefResolver,
     PrivateWebMediaSource,
     _prepare_local_media,
@@ -687,6 +688,9 @@ class PrivateWebMediaCreateService:
                     PrivateWebMediaSource(path=path)
                     for path in prepared.paths
                 )
+                discard = getattr(self._resolver, "discard", None)
+                if callable(discard):
+                    discard(media_refs)
             except (PrivateWebWriteNotAttemptedError, TypeError, ValueError):
                 if prepared is not None:
                     try:
@@ -1020,6 +1024,7 @@ class PrivateWebWriteApiRuntime:
         media_runtime: PrivateWebMediaCreateRuntime | None,
         mark_service: MarkService,
         media_service: PrivateWebMediaCreateService | None,
+        media_handle_store: PrivateWebMediaHandleStore | None,
         operation_lock: Lock,
     ) -> None:
         self._server = server
@@ -1028,6 +1033,7 @@ class PrivateWebWriteApiRuntime:
         self._media_runtime = media_runtime
         self._mark_service = mark_service
         self._media_service = media_service
+        self._media_handle_store = media_handle_store
         self._operation_lock = operation_lock
         self._state_lock = Lock()
         self._close_lock = Lock()
@@ -1169,6 +1175,13 @@ class PrivateWebWriteApiRuntime:
                 except Exception:
                     self._runtime_cleanup_failed = True
                     cleanup_failed = True
+
+                if self._media_handle_store is not None:
+                    try:
+                        self._media_handle_store.close()
+                    except Exception:
+                        self._runtime_cleanup_failed = True
+                        cleanup_failed = True
 
             if cleanup_failed:
                 raise PrivateWebRuntimeSetupError(
@@ -1333,11 +1346,17 @@ def compose_private_web_write_api_runtime(
             media_runtime,
         )
     )
+    media_handle_store = (
+        media_resolver
+        if isinstance(media_resolver, PrivateWebMediaHandleStore)
+        else None
+    )
     server = create_write_api_server(
         serialized_mark_service,
         store,
         access,
         media_service=serialized_media_service,
+        media_stager=media_handle_store,
         host="127.0.0.1",
         port=port,
         clock=runtime_clock,
@@ -1355,6 +1374,7 @@ def compose_private_web_write_api_runtime(
             media_runtime=media_runtime,
             mark_service=mark_service,
             media_service=media_service,
+            media_handle_store=media_handle_store,
             operation_lock=operation_lock,
         )
     except Exception:
@@ -1422,12 +1442,12 @@ def build_private_web_write_api_runtime(
         raise TypeError("clock must be callable")
 
     media_capability = WriteCapability.CREATE_MEDIA in access.capabilities
-    if media_capability:
+    if media_capability and media_bindings is not None:
         if not isinstance(media_bindings, Mapping) or not media_bindings:
             raise ValueError(
-                "create_media capability requires non-empty media_bindings"
+                "media_bindings must be non-empty when provided"
             )
-    elif media_bindings is not None:
+    elif not media_capability and media_bindings is not None:
         if not isinstance(media_bindings, Mapping) or media_bindings:
             raise ValueError(
                 "media_bindings require create_media capability"
@@ -1452,6 +1472,7 @@ def build_private_web_write_api_runtime(
 
     content_runtime: PrivateWebContentRuntime | None = None
     media_runtime: PrivateWebMediaCreateRuntime | None = None
+    media_handle_store: PrivateWebMediaHandleStore | None = None
     try:
         content_runtime = build_private_web_content_runtime(
             cdp_port=cdp_port,
@@ -1460,8 +1481,11 @@ def build_private_web_write_api_runtime(
         )
         media_resolver = None
         if media_capability:
-            assert media_bindings is not None
-            media_resolver = PrivateWebMediaRefResolver(media_bindings)
+            if media_bindings is None:
+                media_handle_store = PrivateWebMediaHandleStore()
+                media_resolver = media_handle_store
+            else:
+                media_resolver = PrivateWebMediaRefResolver(media_bindings)
             media_runtime = build_private_web_media_create_runtime(
                 cdp_port=cdp_port,
                 timeout_seconds=float(timeout_seconds),
@@ -1480,6 +1504,11 @@ def build_private_web_write_api_runtime(
             clock=clock,
         )
     except Exception:
+        if media_handle_store is not None:
+            try:
+                media_handle_store.close()
+            except Exception:
+                pass
         if media_runtime is not None:
             try:
                 media_runtime.close()

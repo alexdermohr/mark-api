@@ -4,6 +4,8 @@ import os
 import re
 import stat
 import tempfile
+from secrets import token_urlsafe
+from threading import Lock
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -429,6 +431,123 @@ class PrivateWebMediaRefResolver:
             raise PrivateWebWriteNotAttemptedError(
                 "resolve_media_refs"
             ) from None
+
+
+class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
+    """Own bounded ephemeral private media copies behind generated opaque handles."""
+
+    _MAX_STAGED_HANDLES = 32
+    _MAX_STAGED_BYTES = 100 * 1024 * 1024
+
+    def __init__(self) -> None:
+        super().__init__({})
+        self._directory = tempfile.TemporaryDirectory(
+            prefix="mark-private-web-media-handles-"
+        )
+        self._lock = Lock()
+        self._closed = False
+        self._staged_bytes = 0
+
+    @staticmethod
+    def _extension(filename: str, data: bytes) -> str:
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or filename != os.path.basename(filename)
+            or filename in {".", ".."}
+            or len(filename) > 255
+            or any(ord(char) < 32 or ord(char) == 127 for char in filename)
+        ):
+            raise ValueError("invalid media filename")
+        lowered = filename.lower()
+        if data.startswith(b"\xff\xd8\xff") and lowered.endswith((".jpg", ".jpeg")):
+            return ".jpg"
+        if data.startswith(b"\x89PNG\r\n\x1a\n") and lowered.endswith(".png"):
+            return ".png"
+        if (
+            len(data) >= 12
+            and data[:4] == b"RIFF"
+            and data[8:12] == b"WEBP"
+            and lowered.endswith(".webp")
+        ):
+            return ".webp"
+        raise ValueError("unsupported media image")
+
+    def stage_media(self, filename: str, data: bytes) -> str:
+        if not isinstance(data, bytes) or not data:
+            raise ValueError("media bytes are required")
+        extension = self._extension(filename, data)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("media handle store is closed")
+            if (
+                len(self._sources) >= self._MAX_STAGED_HANDLES
+                or self._staged_bytes + len(data) > self._MAX_STAGED_BYTES
+            ):
+                raise ValueError("media staging quota exceeded")
+            while True:
+                ref = "media_" + token_urlsafe(18)
+                if _MEDIA_REF_RE.fullmatch(ref) is not None and ref not in self._sources:
+                    break
+            path = os.path.join(self._directory.name, ref + extension)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                view = memoryview(data)
+                written = 0
+                while written < len(view):
+                    count = os.write(fd, view[written:])
+                    if count <= 0:
+                        raise OSError("short media write")
+                    written += count
+                os.fsync(fd)
+            except Exception:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                raise
+            finally:
+                os.close(fd)
+            self._sources[ref] = PrivateWebMediaSource(path)
+            self._staged_bytes += len(data)
+            return ref
+
+    def resolve(
+        self,
+        media_refs: tuple[str, ...],
+    ) -> tuple[PrivateWebMediaSource, ...]:
+        with self._lock:
+            if self._closed:
+                raise PrivateWebWriteNotAttemptedError("resolve_media_refs")
+            return super().resolve(media_refs)
+
+    def discard(self, media_refs: tuple[str, ...]) -> None:
+        with self._lock:
+            sources = [self._sources.pop(ref, None) for ref in media_refs]
+            released_bytes = 0
+            for source in sources:
+                if source is not None:
+                    try:
+                        released_bytes += os.path.getsize(source.path)
+                    except FileNotFoundError:
+                        pass
+            self._staged_bytes = max(0, self._staged_bytes - released_bytes)
+        for source in sources:
+            if source is not None:
+                try:
+                    os.unlink(source.path)
+                except FileNotFoundError:
+                    pass
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._sources.clear()
+            self._staged_bytes = 0
+        self._directory.cleanup()
+
 
 
 class PrivateWebCreateMediaStager:

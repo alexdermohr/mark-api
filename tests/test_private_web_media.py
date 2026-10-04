@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -24,6 +25,7 @@ from mark_api.private_web_media import (
     PrivateWebCreateMediaStager,
     PrivateWebCreateMediaWriter,
     PrivateWebMediaFileSnapshot,
+    PrivateWebMediaHandleStore,
     PrivateWebMediaRefResolver,
     PrivateWebMediaSource,
     PrivateWebMediaUnknownError,
@@ -124,6 +126,62 @@ class PrivateWebMediaContractTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_media_handle_store_stages_private_images_and_discards_handles(self) -> None:
+        store = PrivateWebMediaHandleStore()
+        try:
+            ref = store.stage_media("photo.jpg", b"\xff\xd8\xffjpeg")
+            self.assertRegex(ref, r"^media_[A-Za-z0-9_-]+$")
+            (source,) = store.resolve((ref,))
+            self.assertEqual(Path(source.path).read_bytes(), b"\xff\xd8\xffjpeg")
+            self.assertEqual(stat.S_IMODE(Path(source.path).stat().st_mode), 0o600)
+            self.assertNotIn("photo.jpg", source.path)
+            store.discard((ref,))
+            self.assertFalse(Path(source.path).exists())
+            with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                store.resolve((ref,))
+        finally:
+            store.close()
+
+    def test_media_handle_store_bounds_abandoned_handles_and_recovers_capacity(self) -> None:
+        store = PrivateWebMediaHandleStore()
+        try:
+            store._MAX_STAGED_HANDLES = 2
+            store._MAX_STAGED_BYTES = 16
+            first = store.stage_media("one.jpg", b"\xff\xd8\xffone")
+            second = store.stage_media("two.jpg", b"\xff\xd8\xfftwo")
+            with self.assertRaisesRegex(ValueError, "media staging quota exceeded"):
+                store.stage_media("three.jpg", b"\xff\xd8\xffx")
+            store.discard((first,))
+            third = store.stage_media("three.jpg", b"\xff\xd8\xffx")
+            self.assertNotEqual(third, second)
+        finally:
+            store.close()
+
+    def test_media_handle_store_enforces_total_byte_quota_before_writing(self) -> None:
+        store = PrivateWebMediaHandleStore()
+        try:
+            store._MAX_STAGED_HANDLES = 10
+            store._MAX_STAGED_BYTES = 7
+            ref = store.stage_media("one.jpg", b"\xff\xd8\xffone")
+            with self.assertRaisesRegex(ValueError, "media staging quota exceeded"):
+                store.stage_media("two.jpg", b"\xff\xd8\xffx")
+            self.assertEqual(len(store._sources), 1)
+            store.discard((ref,))
+            replacement = store.stage_media("two.jpg", b"\xff\xd8\xffx")
+            self.assertIsInstance(replacement, str)
+        finally:
+            store.close()
+
+    def test_media_handle_store_rejects_mismatched_or_unsafe_images(self) -> None:
+        store = PrivateWebMediaHandleStore()
+        try:
+            with self.assertRaisesRegex(ValueError, "unsupported media image"):
+                store.stage_media("photo.png", b"\xff\xd8\xffjpeg")
+            with self.assertRaisesRegex(ValueError, "invalid media filename"):
+                store.stage_media("../photo.jpg", b"\xff\xd8\xffjpeg")
+        finally:
+            store.close()
 
     def test_media_ref_resolver_copies_binding_map_and_preserves_order(
         self,

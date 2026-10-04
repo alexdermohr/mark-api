@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import tempfile
 import threading
 import time
@@ -351,6 +352,16 @@ class MisboundCreateService(FakeWriteService):
         )
 
 
+class FakeMediaStager:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, bytes]] = []
+
+    def stage_media(self, filename: str, data: bytes) -> str:
+        self.calls.append((filename, data))
+        return "media_generated_handle"
+
+
+
 class WriteApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -364,6 +375,7 @@ class WriteApiTests(unittest.TestCase):
         service: FakeWriteService,
         *,
         media_service: FakeMediaWriteService | None = None,
+        media_stager: FakeMediaStager | None = None,
         capabilities: frozenset[WriteCapability] = frozenset(
             {
                 WriteCapability.CREATE,
@@ -373,6 +385,7 @@ class WriteApiTests(unittest.TestCase):
             }
         ),
         writes_enabled: bool = True,
+        body_read_timeout_seconds: float = 10.0,
     ):
         access = WriteApiAccess(
             principal="api-test-owner",
@@ -385,7 +398,9 @@ class WriteApiTests(unittest.TestCase):
             self.store,
             access,
             media_service=media_service,
+            media_stager=media_stager,
             port=0,
+            body_read_timeout_seconds=body_read_timeout_seconds,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -448,6 +463,193 @@ class WriteApiTests(unittest.TestCase):
                 host="0.0.0.0",
                 port=0,
             )
+
+    def test_media_stage_returns_generated_handle_without_idempotency_claim(self) -> None:
+        service = FakeWriteService()
+        media_service = FakeMediaWriteService()
+        stager = FakeMediaStager()
+        with self.server(
+            service,
+            media_service=media_service,
+            media_stager=stager,
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+        ) as server:
+            host, port = server.server_address
+            request = Request(
+                f"http://{host}:{port}/api/write/media/stage",
+                data=b"\xff\xd8\xffjpeg",
+                headers={
+                    "Authorization": f"Bearer {TOKEN}",
+                    "Content-Type": "image/jpeg",
+                    "X-Mark-Media-Filename": "photo.jpg",
+                },
+                method="POST",
+            )
+            with self.opener.open(request, timeout=2) as response:
+                body = json.loads(response.read())
+                self.assertEqual(response.status, 201)
+        self.assertEqual(body, {"media_ref": "media_generated_handle"})
+        self.assertEqual(stager.calls, [("photo.jpg", b"\xff\xd8\xffjpeg")])
+        self.assertIsNone(self.store.write_api_request("request-1"))
+
+    def test_stalled_media_body_times_out_without_staging(self) -> None:
+        service = FakeWriteService()
+        media_service = FakeMediaWriteService()
+        stager = FakeMediaStager()
+        with self.server(
+            service,
+            media_service=media_service,
+            media_stager=stager,
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+            body_read_timeout_seconds=0.05,
+        ) as server:
+            host, port = server.server_address
+            with socket.create_connection((host, port), timeout=1.0) as client:
+                client.settimeout(1.0)
+                newline = chr(13) + chr(10)
+                request = newline.join(
+                    (
+                        "POST /api/write/media/stage HTTP/1.1",
+                        f"Host: {host}:{port}",
+                        f"Authorization: Bearer {TOKEN}",
+                        "Content-Type: image/jpeg",
+                        "X-Mark-Media-Filename: photo.jpg",
+                        "Content-Length: 20",
+                        "Connection: close",
+                        "",
+                        "",
+                    )
+                ).encode("ascii") + b"\xff\xd8\xff"
+                client.sendall(request)
+                response = bytearray()
+                while True:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+        self.assertIn(b" 408 ", bytes(response))
+        self.assertIn(b'"error":"request_body_timeout"', bytes(response))
+        self.assertEqual(stager.calls, [])
+
+    def test_stalled_media_body_cannot_hold_non_daemon_server_close(self) -> None:
+        access = WriteApiAccess(
+            principal="api-test-owner",
+            bearer_token=TOKEN,
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+            writes_enabled=True,
+        )
+        server = create_write_api_server(
+            FakeWriteService(),
+            self.store,
+            access,
+            media_service=FakeMediaWriteService(),
+            media_stager=FakeMediaStager(),
+            port=0,
+            body_read_timeout_seconds=0.05,
+        )
+        server.daemon_threads = False
+        server.block_on_close = True
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        server_thread.start()
+        host, port = server.server_address
+        client = socket.create_connection((host, port), timeout=1.0)
+        client.settimeout(1.0)
+        newline = chr(13) + chr(10)
+        request = newline.join(
+            (
+                "POST /api/write/media/stage HTTP/1.1",
+                f"Host: {host}:{port}",
+                f"Authorization: Bearer {TOKEN}",
+                "Content-Type: image/jpeg",
+                "X-Mark-Media-Filename: photo.jpg",
+                "Content-Length: 20",
+                "Connection: close",
+                "",
+                "",
+            )
+        ).encode("ascii") + b"\xff\xd8\xff"
+        client.sendall(request)
+        time.sleep(0.02)
+
+        close_done = threading.Event()
+
+        def close_server() -> None:
+            try:
+                server.shutdown()
+                server.server_close()
+            finally:
+                close_done.set()
+
+        closer = threading.Thread(target=close_server)
+        closer.start()
+        try:
+            self.assertTrue(close_done.wait(timeout=1.0))
+        finally:
+            client.close()
+            if not close_done.is_set():
+                server.shutdown()
+            closer.join(timeout=1.0)
+            server_thread.join(timeout=1.0)
+        self.assertFalse(closer.is_alive())
+        self.assertFalse(server_thread.is_alive())
+
+    def test_media_stage_is_local_only_and_does_not_require_platform_write_gate(self) -> None:
+        service = FakeWriteService()
+        media_service = FakeMediaWriteService()
+        stager = FakeMediaStager()
+        with self.server(
+            service,
+            media_service=media_service,
+            media_stager=stager,
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+            writes_enabled=False,
+        ) as server:
+            host, port = server.server_address
+            request = Request(
+                f"http://{host}:{port}/api/write/media/stage",
+                data=b"\xff\xd8\xffjpeg",
+                headers={
+                    "Authorization": f"Bearer {TOKEN}",
+                    "Content-Type": "image/jpeg",
+                    "X-Mark-Media-Filename": "photo.jpg",
+                },
+                method="POST",
+            )
+            with self.opener.open(request, timeout=2) as response:
+                body = json.loads(response.read())
+                self.assertEqual(response.status, 201)
+        self.assertEqual(body, {"media_ref": "media_generated_handle"})
+        self.assertEqual(stager.calls, [("photo.jpg", b"\xff\xd8\xffjpeg")])
+        self.assertEqual(service.calls, [])
+        self.assertEqual(media_service.calls, [])
+
+    def test_media_stage_rejects_body_or_capability_before_staging(self) -> None:
+        service = FakeWriteService()
+        stager = FakeMediaStager()
+        with self.server(
+            service,
+            media_stager=stager,
+            capabilities=frozenset(),
+        ) as server:
+            host, port = server.server_address
+            request = Request(
+                f"http://{host}:{port}/api/write/media/stage",
+                data=b"\xff\xd8\xffjpeg",
+                headers={
+                    "Authorization": f"Bearer {TOKEN}",
+                    "Content-Type": "image/jpeg",
+                    "X-Mark-Media-Filename": "photo.jpg",
+                },
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as raised:
+                self.opener.open(request, timeout=2)
+            self.assertEqual(raised.exception.code, 403)
+            raised.exception.close()
+        self.assertEqual(stager.calls, [])
 
     def test_health_is_read_only_and_reports_write_gate(self) -> None:
         service = FakeWriteService()

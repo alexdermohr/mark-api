@@ -178,7 +178,7 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 
 **Entscheidung:** Die lokale loopback-only Mark Write API exponiert zusätzlich `POST /api/write/media/ads` als getrennten Media-Create-Vertrag. Dieser Pfad benötigt die eigene Capability `CREATE_MEDIA`; die bestehende `CREATE`-Capability autorisiert ihn nicht. Der HTTP-Payload verwendet die normalen `AdCreateRequest`-Felder plus eine nicht leere, reihenfolgeerhaltende Liste eindeutiger opaker `media_refs` mit der ASCII-Grammatik `[A-Za-z0-9][A-Za-z0-9_-]{0,127}`.
 
-**Begründung:** Die HTTP-Schicht soll weder absolute oder relative Dateipfade noch Bytes annehmen und damit keine allgemeine lokale Datei-Leseautorität erhalten. Die Referenzauflösung bleibt deshalb hinter einem separaten Media-Service-Port. `write_api.py` kennt weder `PrivateWebMediaSource` noch eine Dateisystemauflösung. Wenn `CREATE_MEDIA` konfiguriert ist, aber kein Media-Service bereitsteht, schlägt der Serveraufbau fail-closed fehl.
+**Begründung:** Die Media-Create-HTTP-Schicht soll weder absolute noch relative Dateipfade annehmen und damit keine allgemeine lokale Datei-Leseautorität erhalten. Die ursprüngliche Aussage, dass überhaupt keine Bildbytes über HTTP angenommen werden, wird durch den eng begrenzten lokalen Staging-Endpunkt aus D-020 supersediert. Die Referenzauflösung bleibt hinter einem separaten Media-Service-Port; `write_api.py` erhält keine beliebige Dateisystemauflösung. Wenn `CREATE_MEDIA` konfiguriert ist, aber kein Media-Service bereitsteht, schlägt der Serveraufbau fail-closed fehl.
 
 **Folgen:**
 - der normale `POST /api/write/ads`-Create bleibt unverändert mediafrei,
@@ -216,8 +216,8 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 **Folgen:**
 - der HTTP-Server bindet weiterhin ausschließlich an 127.0.0.1; start() startet nur seinen lokalen Serverthread,
 - WriteApiAccess.writes_enabled, core_writes_enabled und media_writes_enabled bleiben unabhängige Freigabegates und sind standardmäßig false; ein geöffnetes HTTP-Gate öffnet weder Core- noch Media-Writes,
-- CREATE_MEDIA darf nur mit gemeinsam vorhandener PrivateWebMediaCreateRuntime und PrivateWebMediaRefResolver komponiert werden; der High-Level-Builder verlangt dafür nicht leere explizite media_ref -> PrivateWebMediaSource-Bindings und kopiert sie über den bestehenden Resolver immutable,
-- Media-Bindings ohne CREATE_MEDIA, CREATE_MEDIA ohne vollständige Media-Komposition sowie media_writes_enabled=true ohne Media-Komposition scheitern vor Browserzugriff,
+- `CREATE_MEDIA` benötigt weiterhin `PrivateWebMediaCreateRuntime` und einen Resolver; die hier ursprünglich verlangten caller-supplied nicht leeren `media_ref -> PrivateWebMediaSource`-Bindings werden durch D-020 supersediert: der High-Level-Builder erzeugt standardmäßig einen runtime-eigenen `PrivateWebMediaHandleStore`, während explizite Bindings als Low-Level-/Test-Seam erhalten bleiben,
+- explizite Media-Bindings ohne `CREATE_MEDIA`, `CREATE_MEDIA` ohne vollständige Media-Komposition sowie `media_writes_enabled=true` ohne Media-Komposition scheitern vor Browserzugriff; fehlende explizite Bindings sind gemäß D-020 kein Fehler mehr,
 - der High-Level-Builder fabriziert keine unabhängige Bestätigung aus einer zweiten Instanz derselben Management-Quelle; die hier ursprünglich festgelegte Pflicht zu einer separat injizierten Confirmation-Runtime für Create/Delete wird durch D-019 supersediert,
 - der Builder bereinigt von ihm bereits erzeugte Runtimes bei partieller Konstruktion; eine fehlgeschlagene Low-Level-Komposition übernimmt dagegen keine caller-owned Runtimes,
 - bleibt nach einem Media-Submit `PrivateWebMediaCreateRuntime.reconciliation_required` wahr, blockiert die gemeinsame PrivateWeb-Komposition sämtliche weiteren Core- und Media-Writes unter demselben Operations-Lock noch vor ihrem Service-Delegate; nur erfolgreiche `reconcile_media_submit()`-Beobachtung hebt diesen Fence wieder auf,
@@ -276,3 +276,21 @@ Details: `docs/architecture-decision-2026-09-24.md` und `docs/poc-2026-09-24.md`
 - Read-/Transportfehler, uneindeutige Inventardeltas, mehrere neue IDs, abweichende Titel-/Detailwerte oder eine nach dem Delete noch sichtbare Ziel-ID verhindern `CONFIRMED`,
 - die lokale Write API behandelt die authentifizierte, exakt ID-gebundene Delete-Nutzeroperation selbst als Freigabe; ihre stabile Idempotency-ID erzeugt intern die Audit-/Authorization-Referenz, sodass kein caller-erfundener `approval_reference` oder `confirm_ad_id` erforderlich ist,
 - diese Änderung erzeugt keine zusätzliche Retry-Autorität und führt in automatischen Tests keinen realen Kleinanzeigen-Plattformwrite aus.
+
+## D-020 — Produkt-Medien werden lokal gestaged und erhalten intern erzeugte opaque Handles
+
+**Fortschreibung:** D-020 supersediert ausschließlich die D-014/D-015/D-016-Aussagen, nach denen der normale Produktpfad bereits vor dem Write-API-Aufruf externe `media_ref -> PrivateWebMediaSource`-Bindings bereitstellen muss beziehungsweise die HTTP-Schicht grundsätzlich keine Bildbytes annehmen darf. D-018 bleibt unverändert: lokales Staging und Browser-`FileList`-Readback sind keine serverseitige Persistenzbestätigung.
+
+**Entscheidung:** Die loopback-only Write API erhält `POST /api/write/media/stage` unter derselben Bearer-/`CREATE_MEDIA`-Capability-Grenze. Der Endpunkt akzeptiert genau einen bounded Bildkörper (JPEG, PNG oder WebP) plus sicheren Basename, schreibt ihn als private `0600`-Kopie in einen runtime-eigenen temporären Bereich und gibt ausschließlich einen zufällig erzeugten opaken `media_ref` zurück. Der normale High-Level-Builder erzeugt bei `CREATE_MEDIA` automatisch diesen `PrivateWebMediaHandleStore`; caller-supplied `media_bindings` bleiben nur als expliziter Low-Level-/Test-Seam optional.
+
+**Folgen:**
+- HTTP erhält keine beliebige Dateipfad-Leseautorität; der Uploadkörper selbst ist die explizit ausgewählte Nutzereingabe,
+- Dateiname und Magic Bytes müssen zu JPEG/PNG/WebP passen; Pfadsegmente, Steuerzeichen, leere Bodies und nicht unterstützte Typen werden vor Staging abgewiesen,
+- Staging ist rein lokal und führt keinen Plattformwrite aus; deshalb benötigt der Staging-Endpunkt keinen Plattform-Idempotency-Claim,
+- Media-Create stabilisiert die aufgelösten Handle-Dateien mit der bestehenden Deskriptor-/TOCTOU-Prüfung erneut **vor** dem ersten Owner-/Browser-Read und verwirft danach die runtime-eigenen Handle-Kopien,
+- unbekannte/verbrauchte Handles scheitern lokal als `media_refs_unavailable`; daraus entsteht keine Plattform-Retry-Autorität,
+- Staging ist rein lokal und benötigt deshalb nicht das Plattform-`writes_enabled`-Gate; der eigentliche Media-Publish bleibt an Write-/Core-/Media-Gates, persistente Idempotenz und No-Blind-Retry gebunden,
+- unverbrauchte Produkt-Handles sind gleichzeitig auf 32 Einträge und 100 MiB Gesamtgröße begrenzt; Verbrauch gibt die belegte Kapazität frei,
+- große Staging-Bodies werden serverweit einzeln eingelesen und sämtliche Write-API-Body-Reads besitzen eine 10-Sekunden-Read-Deadline; stockende Clients können damit weder beliebig RAM multiplizieren noch den non-daemon Handler-Drain unbegrenzt festhalten,
+- Runtime-Shutdown entfernt verbliebene gestagte Dateien deterministisch,
+- D-018 bleibt das separate Abnahmegate: ohne realen autoritativen `PrivateWebMediaPersistenceVerifier` bleibt ein content-bestätigter Media-Create hinsichtlich serverseitiger Medienpersistenz unbestätigt.
