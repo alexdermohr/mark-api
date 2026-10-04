@@ -107,15 +107,15 @@ Frühere offene Punkte zu Verwaltungsscope, Integrationsarchitektur, technischen
 Der aktuelle Core und die Runtime-Surfaces erzwingen insbesondere:
 
 1. Plattformwrites sind standardmäßig deaktiviert und benötigen explizite Capability- und Runtime-Gates.
-2. ID-gebundene Writes verwenden einen frischen Owner-Pre-Read, genau einen Mutationsversuch und einen unabhängigen Post-Readback.
+2. ID-gebundene Writes verwenden einen frischen Owner-Pre-Read, genau einen Mutationsversuch und einen frischen target-bound Post-Readback; Create/Delete folgen zusätzlich dem in D-019 festgelegten Confirmation-Vertrag ohne künstlich duplizierte Management-Runtime.
 3. Ein unklarer oder `AMBIGUOUS` Ausgang autorisiert keinen Blind-Retry.
-4. Delete benötigt zusätzlich eine explizite ID-gebundene Freigabe.
+4. Bei Delete ist die authentifizierte, exakt pfad-ID-gebundene Nutzeroperation selbst die Freigabe; die stabile Idempotency-ID liefert intern die Audit-/Authorization-Referenz.
 5. Create/Publish und Media-Create besitzen eigene, strengere Reconciliation- und Persistenzevidenz.
 6. Login, MFA, CAPTCHA und sonstige Sicherheitschallenges werden nicht automatisiert oder umgangen.
 7. Die schreibfähige HTTP-Surface bleibt getrennt vom read-only Dashboard und loopback-only.
 8. Die Analytics-Entscheidungen `reaction_metric` und `objective_metric` bleiben unabhängig von den Write-Gates und standardmäßig ungesetzt.
 
-Die maßgeblichen Architektur- und Sicherheitsentscheidungen sind in D-006 bis D-018 dokumentiert. Ein implementierter technischer Pfad ist keine automatische Freigabe für reale Plattformwrites.
+Die maßgeblichen Architektur- und Sicherheitsentscheidungen sind in D-006 bis D-019 dokumentiert. Ein implementierter technischer Pfad ist keine automatische Freigabe für reale Plattformwrites.
 
 ## 6. Aktueller MVP-Stand
 
@@ -124,7 +124,7 @@ Der technische MVP umfasst inzwischen:
 1. Synchronisation und read-only Besitzer-/Bestandsdaten,
 2. ID-gebundenes Content-Update,
 3. Pause/Reservierung und Aktivierung,
-4. Delete mit zusätzlicher Freigabe,
+4. Delete mit intern gebundener Nutzerfreigabe und D-019-Confirmation,
 5. separat gegatetes Create/Publish einschließlich optionalem Media-Pfad,
 6. Views, Merker, Replies und getrennte Reaktionsmetriken,
 7. Inbox-/Conversation-Zuordnung und source-explizite E-Mail-Projektionen,
