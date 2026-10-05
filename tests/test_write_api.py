@@ -1694,6 +1694,52 @@ class WriteApiTests(unittest.TestCase):
         self.assertFalse(recovered_body["platform_retry_authorized"])
         self.assertEqual(len(recovered_service.calls), 1)
 
+    def test_completion_persistence_failure_blocks_restart_reexecution(self) -> None:
+        payload = {"title": "one"}
+        service = FakeWriteService()
+        with patch.object(
+            self.store,
+            "complete_write_api_request",
+            side_effect=OSError("completion unavailable"),
+        ):
+            with self.server(service) as server:
+                first_status, _, first_body = self.request(
+                    server,
+                    "PATCH",
+                    "/api/write/ads/1234567890",
+                    payload=payload,
+                    idempotency_key="completion-fail",
+                )
+
+        self.assertEqual(first_status, 500)
+        self.assertEqual(
+            first_body["error"],
+            "idempotency_persistence_failed",
+        )
+        self.assertFalse(first_body["platform_retry_authorized"])
+        self.assertEqual(len(service.calls), 1)
+
+        stuck = self.store.write_api_request("completion-fail")
+        self.assertIsNotNone(stuck)
+        assert stuck is not None
+        self.assertEqual(stuck.state, "in_progress")
+        self.assertIsNotNone(stuck.execution_started_at)
+
+        fresh_service = FakeWriteService()
+        with self.server(fresh_service) as server:
+            second_status, _, second_body = self.request(
+                server,
+                "PATCH",
+                "/api/write/ads/1234567890",
+                payload=payload,
+                idempotency_key="completion-fail",
+            )
+
+        self.assertEqual(second_status, 409)
+        self.assertEqual(second_body["error"], "idempotency_in_progress")
+        self.assertFalse(second_body["platform_retry_authorized"])
+        self.assertEqual(fresh_service.calls, [])
+
     def test_in_progress_claim_blocks_retry_without_service_call(self) -> None:
         payload = {"title": "one"}
         fingerprint = _request_fingerprint(
