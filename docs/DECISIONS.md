@@ -348,3 +348,20 @@ Kleinanzeigen stellt Galerievarianten serverseitig skaliert beziehungsweise reko
 - Browserstart, Login, MFA, CAPTCHA und Security-Challenge-Handling bleiben vollständig caller-/nutzer-owned,
 - Tests dieses Slices verwenden ausschließlich Fakes beziehungsweise lokale Loopback-Surfaces und führen keinen realen Kleinanzeigen-Plattformwrite aus,
 - interne Auth-/Idempotency-Härtung und die weitergehende Recovery UX bleiben nachgelagerte Produktslices.
+
+## D-024 — Write-API-Claims trennen Claim und Execution-Start dauerhaft
+
+**Problem:** Ein persistenter `in_progress`-Claim wurde bisher vor dem Service-Aufruf geschrieben. Ein Prozessabbruch im kleinen Fenster zwischen Claim und tatsächlichem Delegate ließ den Idempotency-Key dauerhaft gesperrt, obwohl sicher kein Plattformwrite begonnen hatte. Ein pauschales Freigeben alter `in_progress`-Claims wäre umgekehrt unsicher, weil nach einem möglichen Delegate-Aufruf kein Blind-Retry erlaubt ist.
+
+**Entscheidung:** Jede `LoopbackWriteApiServer`-Instanz hält einen exklusiven, nicht blockierenden OS-Lock auf der SQLite-Datei selbst. Der Lock bleibt auch nach `server_close()` bestehen, solange die Serve-Schleife oder bereits akzeptierte Handler noch aktiv sind, und wird erst freigegeben, wenn der Socket erfolgreich geschlossen, die Serve-Schleife beendet und der letzte akzeptierte Handler abgeschlossen ist. Damit existiert für dieselbe persistente Claim-Domain höchstens eine aktive beziehungsweise noch nicht vollständig quieszierte Write-Runtime; Symlink-/Hardlink-Aliase treffen denselben Datei-Inode. Die Tabelle `write_api_requests` wird rückwärtskompatibel um `claim_owner` und `execution_started_at` erweitert. Neue Claims tragen einen zufälligen internen Runtime-Owner.
+
+Ein neuer Runtime-Owner darf einen identischen bestehenden `in_progress`-Claim nur dann atomar übernehmen, wenn der alte Claim einen bekannten anderen Owner besitzt und `execution_started_at IS NULL` ist. Der ursprüngliche `requested_at`-Zeitpunkt bleibt dabei unverändert. Unmittelbar vor jedem Service-/Write-Delegate muss derselbe Owner `execution_started_at` persistent setzen. Die spätere Completion ist ebenfalls per Owner-CAS gebunden und verlangt einen gesetzten Execution-Start.
+
+**Fail-closed-Grenzen:**
+- Scheitert das Persistieren des Execution-Starts, wird kein Delegate aufgerufen; der ungestartete Claim kann erst nach vollständigem Quiescing und Freigabe des exklusiven Runtime-Locks von einem neuen Prozess sicher übernommen werden.
+- Ist `execution_started_at` gesetzt, wird der Claim bei Neustart niemals automatisch übernommen, unabhängig davon, ob der Prozess vor, während oder nach dem externen Write starb.
+- Legacy-`in_progress`-Rows ohne `claim_owner` bleiben absichtlich dauerhaft fail-closed, weil ihre frühere Execution-Lage nicht beweisbar ist.
+- Abgeschlossene Requests replayen weiterhin nur die persistierte Response; Fingerprint-Konflikte bleiben `409`; `platform_retry_authorized=false` bleibt unverändert.
+- Ist der exklusive OS-Lock auf der Plattform nicht verfügbar oder bereits von einer Write-Runtime gehalten, startet keine zweite Write API für dieselbe SQLite-Datei.
+
+**Folgen:** Authentifizierung, Capability-Prüfung, Body-Validierung und Request-Normalisierung bleiben vor dem Claim. D-024 erweitert ausschließlich die interne Crash-/Restart-Idempotenz und erteilt keine neue Plattform-Write-Autorität. Tests verwenden lokale Fakes/Loopback und führen keinen realen Kleinanzeigen-Plattformwrite aus.

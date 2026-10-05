@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -11,6 +13,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock
 from typing import Callable, Protocol
 from urllib.parse import unquote, urlsplit
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX import compatibility
+    fcntl = None
 
 from .domain import (
     AdCreateRequest,
@@ -347,6 +354,45 @@ def _create_receipt_matches_request(
     )
 
 
+class _WriteApiStoreLock:
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor: int | None = descriptor
+
+    @classmethod
+    def acquire(cls, path) -> "_WriteApiStoreLock":
+        if fcntl is None:
+            raise RuntimeError(
+                "write API store locking is unavailable on this platform"
+            )
+        flags = os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        descriptor = os.open(path, flags)
+        try:
+            fcntl.flock(
+                descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError:
+            os.close(descriptor)
+            raise RuntimeError(
+                "write API runtime is already active for this snapshot store"
+            ) from None
+        except Exception:
+            os.close(descriptor)
+            raise
+        return cls(descriptor)
+
+    def close(self) -> None:
+        descriptor = self._descriptor
+        if descriptor is None:
+            return
+        assert fcntl is not None
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+        self._descriptor = None
+
+
 def _receipt_status(
     receipt: OperationReceipt | CreateOperationReceipt,
 ) -> int:
@@ -366,6 +412,7 @@ def _handler_factory(
     access: WriteApiAccess,
     clock: Callable[[], datetime],
     body_read_timeout_seconds: float,
+    claim_owner: str,
 ):
     # Both create routes infer their result from owner-inventory deltas.
     # Serialize the complete service calls across this threaded server so a
@@ -740,6 +787,8 @@ def _handler_factory(
                     idempotency_key=idempotency_key,
                     request_sha256=fingerprint,
                     requested_at=clock(),
+                    claim_owner=claim_owner,
+                    allow_abandoned_takeover=True,
                 )
             except Exception:
                 self._error(
@@ -779,6 +828,21 @@ def _handler_factory(
                 self._error(
                     500,
                     "invalid_idempotency_record",
+                    platform_retry_authorized=False,
+                )
+                return
+
+            try:
+                store.begin_write_api_request(
+                    idempotency_key=idempotency_key,
+                    request_sha256=fingerprint,
+                    claim_owner=claim_owner,
+                    execution_started_at=clock(),
+                )
+            except Exception:
+                self._error(
+                    500,
+                    "idempotency_store_error",
                     platform_retry_authorized=False,
                 )
                 return
@@ -931,6 +995,7 @@ def _handler_factory(
                 store.complete_write_api_request(
                     idempotency_key=idempotency_key,
                     request_sha256=fingerprint,
+                    claim_owner=claim_owner,
                     response_status=status,
                     response_json=response_json,
                     completed_at=clock(),
@@ -990,6 +1055,63 @@ def _handler_factory(
 class LoopbackWriteApiServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    _store_lock: _WriteApiStoreLock | None = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._store_lock_guard = Lock()
+        self._active_handler_count = 0
+        self._serve_loop_active = False
+        self._socket_close_succeeded = False
+        super().__init__(*args, **kwargs)
+
+    def _release_store_lock_if_quiesced(self) -> None:
+        lock: _WriteApiStoreLock | None = None
+        with self._store_lock_guard:
+            if (
+                self._socket_close_succeeded
+                and not self._serve_loop_active
+                and self._active_handler_count == 0
+                and self._store_lock is not None
+            ):
+                lock = self._store_lock
+                self._store_lock = None
+        if lock is not None:
+            lock.close()
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        with self._store_lock_guard:
+            self._serve_loop_active = True
+        try:
+            super().serve_forever(poll_interval=poll_interval)
+        finally:
+            with self._store_lock_guard:
+                self._serve_loop_active = False
+            self._release_store_lock_if_quiesced()
+
+    def process_request(self, request, client_address) -> None:
+        with self._store_lock_guard:
+            self._active_handler_count += 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._store_lock_guard:
+                self._active_handler_count -= 1
+            self._release_store_lock_if_quiesced()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._store_lock_guard:
+                self._active_handler_count -= 1
+            self._release_store_lock_if_quiesced()
+
+    def server_close(self) -> None:
+        super().server_close()
+        with self._store_lock_guard:
+            self._socket_close_succeeded = True
+        self._release_store_lock_if_quiesced()
 
 
 def create_write_api_server(
@@ -1028,15 +1150,24 @@ def create_write_api_server(
             "create_media capability requires media_service"
         )
 
-    return LoopbackWriteApiServer(
-        (host, port),
-        _handler_factory(
-            service=service,
-            media_service=media_service,
-            media_stager=media_stager,
-            store=store,
-            access=access,
-            clock=clock,
-            body_read_timeout_seconds=float(body_read_timeout_seconds),
-        ),
-    )
+    claim_owner = f"write-api-{secrets.token_hex(16)}"
+    store_lock = _WriteApiStoreLock.acquire(store.path)
+    try:
+        server = LoopbackWriteApiServer(
+            (host, port),
+            _handler_factory(
+                service=service,
+                media_service=media_service,
+                media_stager=media_stager,
+                store=store,
+                access=access,
+                clock=clock,
+                body_read_timeout_seconds=float(body_read_timeout_seconds),
+                claim_owner=claim_owner,
+            ),
+        )
+    except Exception:
+        store_lock.close()
+        raise
+    server._store_lock = store_lock
+    return server

@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from contextlib import contextmanager
+from unittest.mock import patch
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -463,6 +464,141 @@ class WriteApiTests(unittest.TestCase):
                 host="0.0.0.0",
                 port=0,
             )
+
+    def test_store_lock_prevents_parallel_write_api_runtime_for_same_sqlite(self) -> None:
+        access = WriteApiAccess(
+            principal="owner",
+            bearer_token=TOKEN,
+        )
+        service = FakeWriteService()
+        first = create_write_api_server(
+            service,
+            self.store,
+            access,
+            port=0,
+        )
+        self.addCleanup(first.server_close)
+
+        alias_path = Path(self.tmp.name) / "mark-alias.sqlite"
+        alias_path.symlink_to(self.store.path)
+        alias_store = SnapshotStore(alias_path)
+
+        with self.assertRaisesRegex(RuntimeError, "already active"):
+            create_write_api_server(
+                service,
+                alias_store,
+                access,
+                port=0,
+            )
+
+        first.server_close()
+        second = create_write_api_server(
+            service,
+            alias_store,
+            access,
+            port=0,
+        )
+        second.server_close()
+
+    def test_store_lock_survives_server_close_until_active_handler_finishes(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingService(FakeWriteService):
+            def update_content(
+                self,
+                ad_id: str,
+                *,
+                title: str | None = None,
+                description: str | None = None,
+                authorization_by: str | None = None,
+                authorization_reference: str | None = None,
+            ) -> OperationReceipt:
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise AssertionError("blocked write was not released")
+                return super().update_content(
+                    ad_id,
+                    title=title,
+                    description=description,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+
+        access = WriteApiAccess(
+            principal="api-test-owner",
+            bearer_token=TOKEN,
+            capabilities=frozenset({WriteCapability.UPDATE_CONTENT}),
+            writes_enabled=True,
+        )
+        server = create_write_api_server(
+            BlockingService(),
+            self.store,
+            access,
+            port=0,
+        )
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+        )
+        server_thread.start()
+        result: dict[str, object] = {}
+
+        def request_write() -> None:
+            result["response"] = self.request(
+                server,
+                "PATCH",
+                "/api/write/ads/1234567890",
+                payload={"title": "new"},
+                idempotency_key="active-handler-lock",
+            )
+
+        worker = threading.Thread(target=request_write)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(timeout=1))
+            server.shutdown()
+            server.server_close()
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                create_write_api_server(
+                    FakeWriteService(),
+                    self.store,
+                    access,
+                    port=0,
+                )
+
+            release.set()
+            worker.join(timeout=2)
+            server_thread.join(timeout=2)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(server_thread.is_alive())
+
+            replacement = None
+            for _ in range(20):
+                try:
+                    replacement = create_write_api_server(
+                        FakeWriteService(),
+                        self.store,
+                        access,
+                        port=0,
+                    )
+                    break
+                except RuntimeError:
+                    time.sleep(0.01)
+            self.assertIsNotNone(replacement)
+            assert replacement is not None
+            replacement.server_close()
+        finally:
+            release.set()
+            if server_thread.is_alive():
+                server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+            server_thread.join(timeout=2)
+
+        status, _, body = result["response"]
+        self.assertEqual(status, 200)
+        self.assertFalse(body["platform_retry_authorized"])
 
     def test_media_stage_returns_generated_handle_without_idempotency_claim(self) -> None:
         service = FakeWriteService()
@@ -1480,6 +1616,84 @@ class WriteApiTests(unittest.TestCase):
         self.assertFalse(second_body["platform_retry_authorized"])
         self.assertEqual(len(service.calls), 1)
 
+    def test_abandoned_unstarted_claim_is_taken_over_after_runtime_restart(self) -> None:
+        payload = {"title": "one"}
+        fingerprint = _request_fingerprint(
+            principal="api-test-owner",
+            method="PATCH",
+            path="/api/write/ads/1234567890",
+            payload=payload,
+        )
+        claim = self.store.claim_write_api_request(
+            idempotency_key="abandoned-key",
+            request_sha256=fingerprint,
+            requested_at=NOW,
+            claim_owner="runtime-owner-old",
+        )
+        self.assertTrue(claim.created)
+        self.assertIsNone(claim.record.execution_started_at)
+
+        service = FakeWriteService()
+        with self.server(service) as server:
+            status, _, body = self.request(
+                server,
+                "PATCH",
+                "/api/write/ads/1234567890",
+                payload=payload,
+                idempotency_key="abandoned-key",
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(service.calls), 1)
+        self.assertFalse(body["platform_retry_authorized"])
+        stored = self.store.write_api_request("abandoned-key")
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(stored.state, "completed")
+        self.assertNotEqual(stored.claim_owner, "runtime-owner-old")
+        self.assertIsNotNone(stored.execution_started_at)
+
+    def test_execution_start_persistence_failure_never_calls_delegate_and_is_recoverable(self) -> None:
+        payload = {"title": "one"}
+        service = FakeWriteService()
+        with patch.object(
+            self.store,
+            "begin_write_api_request",
+            side_effect=OSError("start barrier unavailable"),
+        ):
+            with self.server(service) as server:
+                status, _, body = self.request(
+                    server,
+                    "PATCH",
+                    "/api/write/ads/1234567890",
+                    payload=payload,
+                    idempotency_key="barrier-fail",
+                )
+
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"], "idempotency_store_error")
+        self.assertFalse(body["platform_retry_authorized"])
+        self.assertEqual(service.calls, [])
+        stuck = self.store.write_api_request("barrier-fail")
+        self.assertIsNotNone(stuck)
+        assert stuck is not None
+        self.assertEqual(stuck.state, "in_progress")
+        self.assertIsNone(stuck.execution_started_at)
+
+        recovered_service = FakeWriteService()
+        with self.server(recovered_service) as server:
+            recovered_status, _, recovered_body = self.request(
+                server,
+                "PATCH",
+                "/api/write/ads/1234567890",
+                payload=payload,
+                idempotency_key="barrier-fail",
+            )
+
+        self.assertEqual(recovered_status, 200)
+        self.assertFalse(recovered_body["platform_retry_authorized"])
+        self.assertEqual(len(recovered_service.calls), 1)
+
     def test_in_progress_claim_blocks_retry_without_service_call(self) -> None:
         payload = {"title": "one"}
         fingerprint = _request_fingerprint(
@@ -1492,8 +1706,15 @@ class WriteApiTests(unittest.TestCase):
             idempotency_key="stuck-key",
             request_sha256=fingerprint,
             requested_at=NOW,
+            claim_owner="runtime-owner-old",
         )
         self.assertTrue(claim.created)
+        self.store.begin_write_api_request(
+            idempotency_key="stuck-key",
+            request_sha256=fingerprint,
+            claim_owner="runtime-owner-old",
+            execution_started_at=NOW,
+        )
 
         service = FakeWriteService()
         with self.server(service) as server:
