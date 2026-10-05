@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.message import EmailMessage
@@ -16,7 +17,7 @@ from urllib.request import Request, urlopen
 
 from mark_api.analytics import ANALYTICS_METRICS, REACTION_METRICS, AnalyticsContract
 from mark_api.classification_cli import main as classification_main
-from mark_api.dashboard import create_server
+from mark_api.dashboard import DashboardWriteProxy, create_server
 from mark_api.email_import import import_kleinanzeigen_email_files
 from mark_api.domain import (
     AdClassification,
@@ -62,6 +63,331 @@ def email_notification(
         + reply_url
     )
     return message.as_bytes(policy=policy.default)
+
+
+class RecordingWriteBackend:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+        self.closed = False
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            server_version = "recording-write/0.1"
+            sys_version = ""
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def _handle(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length else b""
+                owner.requests.append(
+                    {
+                        "method": self.command,
+                        "path": self.path,
+                        "body": body,
+                        "authorization": self.headers.get("Authorization"),
+                        "idempotency_key": self.headers.get("Idempotency-Key"),
+                        "content_type": self.headers.get("Content-Type"),
+                        "filename": self.headers.get("X-Mark-Media-Filename"),
+                        "dashboard_token": self.headers.get(
+                            "X-Mark-Dashboard-Token"
+                        ),
+                        "dashboard_marker": self.headers.get(
+                            "X-Mark-Dashboard-Write"
+                        ),
+                    }
+                )
+                if self.path == "/api/write/media/stage":
+                    payload = {"media_ref": "staged-ref-1"}
+                else:
+                    payload = {
+                        "idempotency_key": self.headers.get("Idempotency-Key"),
+                        "operation_receipt": {"outcome": "confirmed"},
+                        "platform_retry_authorized": False,
+                    }
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type",
+                    "application/json; charset=utf-8",
+                )
+                self.send_header("Content-Length", str(len(encoded)))
+                if self.path != "/api/write/media/stage":
+                    self.send_header("Idempotency-Replayed", "true")
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_POST(self) -> None:
+                self._handle()
+
+            def do_PATCH(self) -> None:
+                self._handle()
+
+            def do_DELETE(self) -> None:
+                self._handle()
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.thread.start()
+
+    @property
+    def server_address(self) -> tuple[str, int]:
+        host, port = self.server.server_address
+        return str(host), int(port)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+
+class DashboardWriteProxyHttpTests(unittest.TestCase):
+    BACKEND_TOKEN = "backend-write-token-00000001"
+    UI_TOKEN = "dashboard-write-token-00000001"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = SnapshotStore(Path(self.tmp.name) / "mark.sqlite")
+        self.backend = RecordingWriteBackend()
+        self.addCleanup(self.backend.close)
+        backend_host, backend_port = self.backend.server_address
+        self.server = create_server(
+            self.store,
+            port=0,
+            write_proxy=DashboardWriteProxy(
+                host=backend_host,
+                port=backend_port,
+                bearer_token=self.BACKEND_TOKEN,
+                ui_token=self.UI_TOKEN,
+            ),
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.thread.start()
+        self.addCleanup(self.thread.join, 2)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        host, port = self.server.server_address
+        self.base = f"http://{host}:{port}"
+        self.origin = self.base
+
+    def write_headers(
+        self,
+        *,
+        content_type: str | None = None,
+        idempotency_key: str | None = None,
+        origin: str | None = None,
+    ) -> dict[str, str]:
+        headers = {
+            "Origin": self.origin if origin is None else origin,
+            "X-Mark-Dashboard-Write": "1",
+            "X-Mark-Dashboard-Token": self.UI_TOKEN,
+        }
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+        return headers
+
+    def test_proxy_requires_dashboard_secret_and_same_origin(self) -> None:
+        body = b'{"title":"Neu"}'
+        missing_secret = Request(
+            self.base + "/api/write/ads/2",
+            data=body,
+            method="PATCH",
+            headers={
+                "Origin": self.origin,
+                "Content-Type": "application/json",
+                "Idempotency-Key": "ui:test-missing-secret",
+            },
+        )
+        with self.assertRaises(HTTPError) as missing:
+            urlopen(missing_secret, timeout=2)
+        self.assertEqual(missing.exception.code, 403)
+
+        bad_origin = Request(
+            self.base + "/api/write/ads/2",
+            data=body,
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:test-bad-origin",
+                origin="http://127.0.0.1:1",
+            ),
+        )
+        with self.assertRaises(HTTPError) as bad:
+            urlopen(bad_origin, timeout=2)
+        self.assertEqual(bad.exception.code, 403)
+
+        non_exact_origin = Request(
+            self.base + "/api/write/ads/2",
+            data=body,
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:test-non-exact-origin",
+                origin=self.origin + "/",
+            ),
+        )
+        with self.assertRaises(HTTPError) as non_exact:
+            urlopen(non_exact_origin, timeout=2)
+        self.assertEqual(non_exact.exception.code, 403)
+
+        cross_site = Request(
+            self.base + "/api/write/ads/2",
+            data=body,
+            method="PATCH",
+            headers={
+                **self.write_headers(
+                    content_type="application/json",
+                    idempotency_key="ui:test-cross-site",
+                ),
+                "Sec-Fetch-Site": "cross-site",
+            },
+        )
+        with self.assertRaises(HTTPError) as cross_site_error:
+            urlopen(cross_site, timeout=2)
+        self.assertEqual(cross_site_error.exception.code, 403)
+
+        malformed_origin = Request(
+            self.base + "/api/write/ads/2",
+            data=body,
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:test-malformed-origin",
+                origin="http://127.0.0.1:not-a-port",
+            ),
+        )
+        with self.assertRaises(HTTPError) as malformed:
+            urlopen(malformed_origin, timeout=2)
+        self.assertEqual(malformed.exception.code, 403)
+
+        options = Request(
+            self.base + "/api/write/ads/2",
+            method="OPTIONS",
+            headers=self.write_headers(),
+        )
+        with self.assertRaises(HTTPError) as preflight:
+            urlopen(options, timeout=2)
+        self.assertEqual(preflight.exception.code, 405)
+        self.assertEqual(self.backend.requests, [])
+
+    def test_proxy_config_assets_hide_tokens_and_route_allowlist_is_closed(self) -> None:
+        for path in ("/", "/dashboard.js", "/api/dashboard/config"):
+            with urlopen(self.base + path, timeout=2) as response:
+                body = response.read()
+            self.assertNotIn(self.BACKEND_TOKEN.encode("utf-8"), body)
+            self.assertNotIn(self.UI_TOKEN.encode("utf-8"), body)
+
+        with urlopen(self.base + "/api/dashboard/config", timeout=2) as response:
+            self.assertEqual(
+                json.loads(response.read()),
+                {"write_ui_available": True},
+            )
+
+        blocked = Request(
+            self.base + "/api/write/proxy-anything",
+            data=b"{}",
+            method="POST",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:test-route-allowlist",
+            ),
+        )
+        with self.assertRaises(HTTPError) as error:
+            urlopen(blocked, timeout=2)
+        self.assertEqual(error.exception.code, 404)
+        self.assertEqual(self.backend.requests, [])
+
+    def test_proxy_forwards_exact_write_contract_and_hides_ui_secret(self) -> None:
+        payload = {"title": "Neu", "description": "Beschreibung"}
+        request = Request(
+            self.base + "/api/write/ads/2",
+            data=json.dumps(payload).encode("utf-8"),
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:test-forward-1",
+            ),
+        )
+        with urlopen(request, timeout=2) as response:
+            response_payload = json.loads(response.read())
+            replayed = response.headers.get("Idempotency-Replayed")
+
+        self.assertEqual(response_payload["idempotency_key"], "ui:test-forward-1")
+        self.assertEqual(replayed, "true")
+        self.assertEqual(len(self.backend.requests), 1)
+        captured = self.backend.requests[0]
+        self.assertEqual(captured["method"], "PATCH")
+        self.assertEqual(captured["path"], "/api/write/ads/2")
+        self.assertEqual(json.loads(captured["body"]), payload)
+        self.assertEqual(
+            captured["authorization"],
+            f"Bearer {self.BACKEND_TOKEN}",
+        )
+        self.assertEqual(captured["idempotency_key"], "ui:test-forward-1")
+        self.assertIsNone(captured["dashboard_token"])
+        self.assertIsNone(captured["dashboard_marker"])
+
+    def test_proxy_media_stage_keeps_bytes_local_and_uses_no_idempotency_key(self) -> None:
+        media = b"\x89PNG\r\n\x1a\nlocal-test"
+        request = Request(
+            self.base + "/api/write/media/stage",
+            data=media,
+            method="POST",
+            headers={
+                **self.write_headers(content_type="image/png"),
+                "X-Mark-Media-Filename": "bild.png",
+            },
+        )
+        with urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read())
+
+        self.assertEqual(payload, {"media_ref": "staged-ref-1"})
+        self.assertEqual(len(self.backend.requests), 1)
+        captured = self.backend.requests[0]
+        self.assertEqual(captured["body"], media)
+        self.assertEqual(captured["content_type"], "image/png")
+        self.assertEqual(captured["filename"], "bild.png")
+        self.assertIsNone(captured["idempotency_key"])
+        self.assertEqual(
+            captured["authorization"],
+            f"Bearer {self.BACKEND_TOKEN}",
+        )
+
+    def test_proxy_backend_transport_failure_is_unknown_and_not_retry_authorized(self) -> None:
+        backend_host, backend_port = self.backend.server_address
+        self.backend.close()
+        request = Request(
+            self.base + "/api/write/ads/2",
+            data=b'{"title":"Neu"}',
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:test-transport-unknown",
+            ),
+        )
+        with self.assertRaises(HTTPError) as error:
+            urlopen(request, timeout=2)
+        self.assertEqual(error.exception.code, 502)
+        self.assertEqual(
+            json.loads(error.exception.read()),
+            {
+                "error": "write_proxy_transport_unknown",
+                "platform_retry_authorized": False,
+            },
+        )
 
 
 class SeededStoreMixin:
@@ -628,6 +954,9 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertIn('id="groups-body"', html)
         self.assertIn('id="groups-chart"', html)
         self.assertIn('id="ranking-chart"', html)
+        self.assertIn('id="write-panel"', html)
+        self.assertIn('id="create-form"', html)
+        self.assertIn('id="manage-form"', html)
         self.assertIn('role="list"', html)
         self.assertNotIn("https://", html)
         self.assertNotIn("http://", html)
@@ -652,6 +981,11 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertNotIn(".style.width", javascript)
         self.assertNotIn("innerHTML", javascript)
         self.assertIn("let analyticsRequestGeneration = 0;", javascript)
+        self.assertIn('const WRITE_TOKEN_STORAGE_KEY = "mark-dashboard-write-token";', javascript)
+        self.assertIn('"X-Mark-Dashboard-Token": writeToken', javascript)
+        self.assertIn("const pendingWrites = new Map();", javascript)
+        self.assertIn("write_proxy_transport_unknown", javascript)
+        self.assertNotIn("Authorization", javascript)
         self.assertIn(
             "const generation = ++analyticsRequestGeneration;",
             javascript,
@@ -800,7 +1134,99 @@ assert.equal(groupChart.children[0].children[2].textContent, "12.00 (n=1)");
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_reuses_same_idempotency_request_after_transport_unknown(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+let loadCalls = 0;
+load = async () => { loadCalls += 1; };
+const calls = [];
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  if (calls.length === 1) {
+    throw new Error("transport interrupted");
+  }
+  const pending = pendingWrites.get("create");
+  return {
+    status: 200,
+    ok: true,
+    async text() {
+      return JSON.stringify({
+        idempotency_key: pending.key,
+        operation_receipt: {outcome: "confirmed"},
+        platform_retry_authorized: false,
+      });
+    },
+  };
+};
+
+(async () => {
+  const original = {
+    category_path: ["A", "B"],
+    title: "first",
+    description: "one",
+    price_eur: 1,
+  };
+  await runPlatformWrite("create", "POST", "/api/write/ads", original);
+  const pending = pendingWrites.get("create");
+  assert.ok(pending);
+  const firstKey = pending.key;
+  assert.match(writeStatus.textContent, /kein automatischer Retry/i);
+
+  await runPlatformWrite(
+    "create",
+    "POST",
+    "/api/write/ads/999",
+    {...original, title: "changed"},
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].path, "/api/write/ads");
+  assert.equal(calls[1].options.headers["Idempotency-Key"], firstKey);
+  assert.deepEqual(JSON.parse(calls[1].options.body), original);
+  assert.equal(pendingWrites.has("create"), false);
+  assert.equal(loadCalls, 1);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_non_get_methods_are_405_and_no_write_route_exists(self) -> None:
+        _, _, config_body = self.get("/api/dashboard/config")
+        self.assertEqual(
+            json.loads(config_body),
+            {"write_ui_available": False},
+        )
         for path in (
             "/api/ads/1",
             "/api/analytics/ads?metric=views",

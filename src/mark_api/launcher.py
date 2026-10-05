@@ -15,7 +15,7 @@ from .analytics import (
     REACTION_METRICS,
     AnalyticsContract,
 )
-from .dashboard import LoopbackDashboardServer, create_server
+from .dashboard import DashboardWriteProxy, LoopbackDashboardServer, create_server
 from .domain import AdSnapshot
 from .email_import import EmailImportReport, import_kleinanzeigen_email_files
 from .private_web import PrivateWebSubmitUnknownError
@@ -73,6 +73,10 @@ def _utc_now() -> datetime:
 
 
 def _default_write_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _default_dashboard_write_token() -> str:
     return secrets.token_urlsafe(32)
 
 
@@ -143,6 +147,7 @@ class ProductLauncherRuntime:
         write_runtime: _WriteRuntime,
         write_access: WriteApiAccess,
         server: LoopbackDashboardServer,
+        dashboard_write_token: str,
         startup_inventory_count: int,
         startup_persisted_count: int,
         startup_email_import_report: EmailImportReport,
@@ -151,6 +156,7 @@ class ProductLauncherRuntime:
         self._write_runtime = write_runtime
         self._write_access = write_access
         self._server = server
+        self._dashboard_write_token = dashboard_write_token
         self._startup_inventory_count = startup_inventory_count
         self._startup_persisted_count = startup_persisted_count
         self._startup_email_import_report = startup_email_import_report
@@ -176,6 +182,14 @@ class ProductLauncherRuntime:
     def server_address(self) -> tuple[str, int]:
         host, port = self._server.server_address
         return str(host), int(port)
+
+    @property
+    def dashboard_url(self) -> str:
+        host, port = self.server_address
+        return (
+            f"http://{host}:{port}/"
+            f"#write_token={self._dashboard_write_token}"
+        )
 
     @property
     def startup_inventory_count(self) -> int:
@@ -314,9 +328,10 @@ def build_product_launcher(
     dashboard_factory: _DashboardFactory = create_server,
     store_factory: _StoreFactory = SnapshotStore,
     token_factory: _TokenFactory | None = None,
+    dashboard_token_factory: _TokenFactory | None = None,
     clock: _Clock = _utc_now,
 ) -> ProductLauncherRuntime:
-    """Perform one fresh owner sync, then start dashboard and Write API.
+    """Perform one fresh owner sync, then start Write API and dashboard.
 
     Authentication and browser lifecycle remain caller-owned. This launcher
     consumes only an already-running loopback CDP endpoint. Product writes are
@@ -356,6 +371,10 @@ def build_product_launcher(
         raise TypeError("store_factory must be callable")
     if token_factory is not None and not callable(token_factory):
         raise TypeError("token_factory must be callable or None")
+    if dashboard_token_factory is not None and not callable(
+        dashboard_token_factory
+    ):
+        raise TypeError("dashboard_token_factory must be callable or None")
     if not callable(clock):
         raise TypeError("clock must be callable")
 
@@ -366,6 +385,11 @@ def build_product_launcher(
     )
     resolved_token_factory = (
         _default_write_token if token_factory is None else token_factory
+    )
+    resolved_dashboard_token_factory = (
+        _default_dashboard_write_token
+        if dashboard_token_factory is None
+        else dashboard_token_factory
     )
 
     try:
@@ -413,12 +437,6 @@ def build_product_launcher(
                 raise ProductLauncherError(
                     "local reaction email import failed"
                 )
-        server = dashboard_factory(
-            store,
-            host="127.0.0.1",
-            port=dashboard_port,
-            analytics_contract=analytics_contract,
-        )
         write_access = WriteApiAccess(
             principal="mark-api-launch",
             bearer_token=resolved_token_factory(),
@@ -436,6 +454,22 @@ def build_product_launcher(
             clock=clock,
         )
         write_runtime.start()
+        write_host, write_actual_port = write_runtime.server_address
+        dashboard_write_token = resolved_dashboard_token_factory()
+        write_proxy = DashboardWriteProxy(
+            host=str(write_host),
+            port=int(write_actual_port),
+            bearer_token=write_access.bearer_token,
+            ui_token=dashboard_write_token,
+            timeout_seconds=max(30.0, timeout * 12.0),
+        )
+        server = dashboard_factory(
+            store,
+            host="127.0.0.1",
+            port=dashboard_port,
+            analytics_contract=analytics_contract,
+            write_proxy=write_proxy,
+        )
     except ProductLauncherError:
         if write_runtime is not None:
             try:
@@ -490,6 +524,7 @@ def build_product_launcher(
         write_runtime=write_runtime,
         write_access=write_access,
         server=server,
+        dashboard_write_token=dashboard_write_token,
         startup_inventory_count=len(snapshots),
         startup_persisted_count=persisted,
         startup_email_import_report=email_report,
@@ -592,9 +627,8 @@ def main(argv: list[str] | None = None) -> int:
         print("mark-api-launch: invalid startup configuration", file=sys.stderr)
         return 2
 
-    host, port = launcher.server_address
     write_host, write_port = launcher.write_server_address
-    print(f"Mark dashboard: http://{host}:{port}/", flush=True)
+    print(f"Mark dashboard: {launcher.dashboard_url}", flush=True)
     print(
         f"Mark write API: http://{write_host}:{write_port}/api/write/",
         flush=True,

@@ -2,7 +2,7 @@
 
 Stand: 05.10.2026
 
-Status: **MVP-Kern technisch vorhanden; Product Launcher bündelt Initial-Sync, expliziten lokalen Reaction-E-Mail-Import, Dashboard und Default-on Write Composition; Email-only Classification ist integriert; Gesamtprodukt, Dashboard Write UX, Freshness/Recovery und finale E2E-Abnahme noch nicht abgeschlossen**
+Status: **MVP-Kern technisch vorhanden; Product Launcher bündelt Initial-Sync, expliziten lokalen Reaction-E-Mail-Import, Dashboard, Same-Origin Write UX und Default-on Write Composition; Email-only Classification ist integriert; Gesamtprodukt, Freshness/Recovery und finale E2E-Abnahme noch nicht abgeschlossen**
 
 Quelle: `docs/requirements-source-2026-09-23.md`
 
@@ -45,9 +45,11 @@ Diese ursprünglich bestätigte Anforderung ist **kein MVP-Schwerpunkt**. Der vo
 
 ### 2.4 Dashboard und Product Launcher
 
-Ein read-only Dashboard samt lokaler API stellt Anzeigen-, Reaktions- und Analytics-Daten dar. Grafiken und Ranglisten verwenden ausschließlich explizit angeforderte Rohmetriken.
+Die Daten-/Analytics-Surface des Dashboards ist read-only und stellt Anzeigen-, Reaktions- und Analytics-Daten dar; Grafiken und Ranglisten verwenden ausschließlich explizit angeforderte Rohmetriken. Der standalone Einstieg `mark-api-dashboard` bleibt vollständig GET-only/read-only. Im normalen Product Launcher ergänzt dieselbe sichtbare Oberfläche eine getrennt abgesicherte Write UX, die ausschließlich an die bestehende lokale Write API delegiert.
 
-Der installierte Einstieg `mark-api-launch` bildet den kohärenten Produktstart für eine bereits laufende, bereits authentifizierte lokale Chrome-/Chromium-Sitzung über loopback-CDP. Er führt genau einen frischen Owner-Inventory-Read aus und persistiert bestätigte aktuelle Anzeigen sowie `ABSENT`-Transitions für historisch bekannte, nun fehlende Anzeigen. Optional importiert er danach einen vom Nutzer ausdrücklich über `--email FILE` angegebenen lokalen Batch von Kleinanzeigen-Nachrichtenkopien mit der bestehenden idempotenten E-Mail-Importlogik in denselben Store. Erst nach erfolgreichem Initial-Read und einem gegebenenfalls angeforderten erfolgreichen Reaction-Import werden das read-only Dashboard und die bestehende loopback-only Mark Write API als gemeinsame Produkt-Runtime bereitgestellt. Der Launcher erzeugt dafür pro Prozess einen neuen lokalen Bearer, gewährt die bereits implementierten Write-Capabilities und öffnet API-, Core- und Media-Gate explizit; hierfür gibt es keinen zusätzlichen `--enable-writes`-Schalter. Ein fehlgeschlagener oder unklarer Initial-Read oder ein fehlerhafter ausdrücklich angeforderter Mail-Batch bricht den Start vor beiden HTTP-Surfaces ab. Mailbox-Suche, Messaging-Gateway-Reads und periodische Aktualisierung bleiben außerhalb dieses Slices.
+Der installierte Einstieg `mark-api-launch` bildet den kohärenten Produktstart für eine bereits laufende, bereits authentifizierte lokale Chrome-/Chromium-Sitzung über loopback-CDP. Er führt genau einen frischen Owner-Inventory-Read aus und persistiert bestätigte aktuelle Anzeigen sowie `ABSENT`-Transitions für historisch bekannte, nun fehlende Anzeigen. Optional importiert er danach einen vom Nutzer ausdrücklich über `--email FILE` angegebenen lokalen Batch von Kleinanzeigen-Nachrichtenkopien mit der bestehenden idempotenten E-Mail-Importlogik in denselben Store. Erst nach erfolgreichem Initial-Read und einem gegebenenfalls angeforderten erfolgreichen Reaction-Import wird zuerst die bestehende loopback-only Mark Write API gestartet und anschließend das Dashboard an deren tatsächliche Loopback-Adresse gebunden. Der Launcher erzeugt dafür pro Prozess einen neuen lokalen Write-API-Bearer sowie einen getrennten Dashboard-Write-Token. Letzterer wird ausschließlich als URL-Fragment der lokalen Dashboard-URL übergeben, vom Browser in `sessionStorage` übernommen und unmittelbar aus der sichtbaren URL entfernt; der Backend-Bearer wird nicht an Browser-JavaScript exponiert.
+
+Die Product-Launcher Write UX unterstützt die bereits implementierten Create-, Media-, Content-, State- und Delete-Surfaces. Ihre Same-Origin-Proxy-Schicht ist strikt route-/header-/body-allowlistet, verlangt den per-process Dashboard-Token, einen passenden `Origin` und einen CSRF-Marker und öffnet kein CORS. Sie implementiert keine eigene Write-Semantik: Capability, persistente Idempotenz, Ownership, Confirmation, TOCTOU, Post-Readback, Media-Persistenzevidenz und `platform_retry_authorized=false` bleiben ausschließlich beim vorhandenen Write-API-/Core-Pfad. Bei unbekanntem Transportausgang wird nicht automatisch erneut gesendet; eine manuelle Wiederholung derselben noch offenen UI-Aktion verwendet denselben Idempotency-Key und exakt denselben ursprünglichen Request. Ein zusätzlicher `--enable-writes`-Schalter existiert weiterhin nicht. Ein fehlgeschlagener oder unklarer Initial-Read oder ein fehlerhafter ausdrücklich angeforderter Mail-Batch bricht den Start vor beiden HTTP-Surfaces ab. Mailbox-Suche, Messaging-Gateway-Reads und periodische Aktualisierung bleiben außerhalb dieses Slices.
 
 ### 2.5 Datensammlung und Auswertung
 
@@ -114,14 +116,14 @@ Der aktuelle Core und die Runtime-Surfaces erzwingen insbesondere:
 4. Bei Delete ist die authentifizierte, exakt pfad-ID-gebundene Nutzeroperation selbst die Freigabe; die stabile Idempotency-ID liefert intern die Audit-/Authorization-Referenz.
 5. Create/Publish und Media-Create besitzen eigene, strengere Reconciliation- und Persistenzevidenz.
 6. Login, MFA, CAPTCHA und sonstige Sicherheitschallenges werden nicht automatisiert oder umgangen.
-7. Die schreibfähige HTTP-Surface bleibt vom read-only Dashboard getrennt und loopback-only; der Launcher erzeugt ihren Bearer pro Prozess neu und persistiert ihn nicht in SQLite. Der einmalig ausgegebene Bearer ist während der Prozesslaufzeit lokales Write-Secret-Material und darf nicht in geteilte Logs oder Support-Artefakte übernommen werden.
+7. Die schreibfähige HTTP-Surface bleibt als separate loopback-only Write API erhalten. Der Product Launcher bindet die sichtbare Dashboard Write UX ausschließlich über einen Same-Origin-Proxy daran; der Browser erhält nicht den Backend-Bearer, sondern einen getrennten per-process Dashboard-Token. Beide Tokens werden nicht in SQLite persistiert. Standalone `mark-api-dashboard` bleibt GET-only/read-only.
 8. Die Analytics-Entscheidungen `reaction_metric` und `objective_metric` bleiben unabhängig von den Write-Gates und standardmäßig ungesetzt.
-9. `mark-api-launch` verwendet eine bereits authentifizierte loopback-CDP-Sitzung, führt genau einen fail-closed Initial-Inventory-Sync aus und kann danach ausdrücklich angegebene lokale `.eml`-Reaction-Evidenz batch-atomar importieren. Erst anschließend startet er Dashboard und default-on Write API. Er startet keinen Browser, automatisiert keinen Login und öffnet keinen privaten/mobile Messaging-Readpfad. Automatisierte Tests dieses Slices führen keine Kleinanzeigen-Plattformwrites aus.
+9. `mark-api-launch` verwendet eine bereits authentifizierte loopback-CDP-Sitzung, führt genau einen fail-closed Initial-Inventory-Sync aus und kann danach ausdrücklich angegebene lokale `.eml`-Reaction-Evidenz batch-atomar importieren. Erst anschließend startet er die default-on Write API und danach das daran gebundene Dashboard. Die Dashboard Write UX delegiert ausschließlich an diese Write API, führt keine automatischen Retries aus und eröffnet weder CORS noch einen privaten/mobile Messaging-Readpfad. Der Launcher startet keinen Browser und automatisiert keinen Login. Automatisierte Tests dieses Slices führen keine Kleinanzeigen-Plattformwrites aus.
 10. E-Mail-Evidenz bleibt source-explizit: sie erzeugt keine Owner-Identität, keinen `AdSnapshot` und keinen `unique_buyer_count`; `reaction_metric` bleibt default-off. Lokale Klassifikation darf an eine durch Owner-Snapshot **oder** importiertes E-Mail-Event belegte ID gebunden werden. Email-only-IDs nehmen nur an Gruppenrankings von Metriken teil, deren eigene Ranking-Population sie enthält; insbesondere nicht an Views-/Owner-/`ReactionSnapshot`-Gruppen.
 11. Periodische Synchronisation sowie die weitergehende Freshness-/Recovery-UX bleiben spätere Produktslices. Ein Media-Submit-`UNKNOWN` autorisiert weiterhin keinen Write-Retry; beim Launcher-Shutdown ist höchstens die bestehende observation-only Media-Reconciliation vor erneutem Cleanup zulässig.
 12. Die Write API serialisiert ihre Prozessautorität zusätzlich über einen exklusiven OS-Lock auf der SQLite-Datei. Persistente Idempotency-Claims sind runtime-owner-gebunden und besitzen einen separaten Execution-Start-Barrier. Nur ein gleichartiger Claim eines beendeten Runtimes ohne gesetzten Barrier darf übernommen werden; gesetzter Barrier und Legacy-Claims ohne beweisbaren Owner bleiben über Neustarts fail-closed.
 
-Die maßgeblichen Architektur- und Sicherheitsentscheidungen sind in D-006 bis D-026 dokumentiert. Ein implementierter technischer Pfad ist keine automatische Freigabe für reale Plattformwrites außerhalb einer vom Nutzer ausgelösten Produktoperation.
+Die maßgeblichen Architektur- und Sicherheitsentscheidungen sind in D-006 bis D-027 dokumentiert. Ein implementierter technischer Pfad ist keine automatische Freigabe für reale Plattformwrites außerhalb einer vom Nutzer ausgelösten Produktoperation.
 
 ## 6. Aktueller MVP-Stand
 
@@ -136,12 +138,13 @@ Der technische MVP umfasst inzwischen:
 7. Inbox-/Conversation-Zuordnung und source-explizite E-Mail-Projektionen,
 8. append-only SQLite-Snapshots und crash-idempotente lokale Write-Receipts,
 9. Analytics-Rohmetriken und Vergleiche nach Bild-Typ, Stadt, Text-Typ und Titel-Typ,
-10. read-only Dashboard, Grafiken, Top-Listen und lokale Runtime-Smokes,
+10. read-only Daten-/Analytics-Dashboard plus im Product Launcher Same-Origin Write UX für die bestehenden Create-/Media-/Content-/State-/Delete-Surfaces, Grafiken, Top-Listen und lokale Runtime-Smokes,
 11. installierter `mark-api-launch`-Startpfad mit genau einem bestätigten Startup-Inventory-Sync vor Dashboard und Write API,
 12. Default-on Produktkomposition der bestehenden Create-, Media-, Content-, State- und Delete-Surfaces mit prozesslokalem Bearer und unveränderten Idempotency-/Confirmation-/No-Blind-Retry-Grenzen.
 13. Interne Auth-/Idempotency-Härtung mit exklusiver SQLite-Write-Runtime, runtime-owner-gebundenen Claims, persistiertem Execution-Start-Barrier und fail-closed Legacy-Migration.
 14. Im normalen Launcher optionaler, ausdrücklich dateigebundener Reaction-Import lokaler Kleinanzeigen-E-Mail-Kopien vor den HTTP-Surfaces; idempotent, ohne Mailbox-/Messaging-Netzwerkzugriff und ohne erfundene Owner- oder Buyer-Fakten.
 15. Explizite lokale Klassifikation von Email-only-IDs mit source-expliziten E-Mail-Gruppenrankings, ohne `AdSnapshot`, Owner-/Presence-Folgerung oder Ausweitung auf nicht belegte Metriken.
+16. Same-Origin Dashboard Write UX mit getrenntem UI-Token, serverseitiger Bearer-Injektion, strikter Proxy-Allowlist und exakt gebundener UI-Idempotenz ohne automatische Wiederholung bei unbekanntem Transportausgang.
 
 Text- und Bildgenerierung bleiben dokumentiert, aber für diesen MVP depriorisiert.
 
@@ -149,8 +152,8 @@ Reale sichtbare Testanzeigen, Testnachrichten oder zyklische Plattformwrites wer
 
 ## 7. Nächste Produktphase
 
-Der Product Launcher schließt jetzt den kohärenten Startpfad aus Initial-Sync, read-only Dashboard und default-on Write-Komposition. Die bestehenden Authentizitäts-, Ownership-, Confirmation-, TOCTOU-, Readback- und No-Blind-Retry-Sicherheiten bleiben erhalten; D-024 härtet zusätzlich die persistente Idempotenz über Prozessabbruch und Neustart.
+Der Product Launcher schließt jetzt den kohärenten Startpfad aus Initial-Sync, read-only Daten-/Analytics-Dashboard, Same-Origin Write UX und default-on Write-Komposition. Die bestehenden Authentizitäts-, Ownership-, Confirmation-, TOCTOU-, Readback- und No-Blind-Retry-Sicherheiten bleiben erhalten; D-024 härtet zusätzlich die persistente Idempotenz über Prozessabbruch und Neustart.
 
-Die interne Auth-/Idempotency-Härtung, der explizite lokale Reaction-Data-Startup-Pfad und Email-only Classification sind jetzt Bestandteil des Produktpfads. Als nächster eigener Produktslice folgt Dashboard Write UX; danach Freshness/Time, Recovery UX, SQLite Lifecycle, Shutdown, Packaging, Full E2E und finaler Produktaudit.
+Die interne Auth-/Idempotency-Härtung, der explizite lokale Reaction-Data-Startup-Pfad, Email-only Classification und Dashboard Write UX sind jetzt Bestandteil des Produktpfads. Als nächster eigener Produktslice folgt Freshness/Time; danach Recovery UX, SQLite Lifecycle, Shutdown, Packaging, Full E2E und finaler Produktaudit.
 
 Die beiden fachlichen Analytics-Entscheidungen bleiben weiterhin offen: `reaction_metric` für „wie viele geschrieben haben“ und `objective_metric` beziehungsweise eine ausdrücklich definierte Zielfunktion für „beste Lösung“. Ohne diese Festlegungen darf keine objective-gebundene Empfehlung als fachlich gewollt behauptet werden.
