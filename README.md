@@ -4,7 +4,7 @@
 
 ## Status
 
-**Core, Dashboard und Analytics implementiert / PrivateWebWriter + Runtime-Smoke real belegt / Product Launcher mit Default-on Write Composition implementiert / Write-API-Auth-/Idempotency-Runtime crash-sicher gehärtet** — Stand: 05.10.2026.
+**Core, Dashboard und Analytics implementiert / PrivateWebWriter + Runtime-Smoke real belegt / Product Launcher mit Default-on Write Composition und explizitem lokalem Reaction-Import implementiert / Write-API-Auth-/Idempotency-Runtime crash-sicher gehärtet** — Stand: 05.10.2026.
 
 Mark hat nach dem Telefonat die gewünschte Funktionalität schriftlich konkretisiert. Der MVP-Fokus liegt auf Anzeigenverwaltung, Synchronisation, Verkäufermetriken, Inbox/Interessenten, Dashboard und datenbasierter Auswertung. Externe Text-/Bildgenerierung war ursprünglich Teil des Wunsches, ist seit 24.09.2026 aber nicht mehr MVP-priorisiert.
 
@@ -36,10 +36,18 @@ python -m pip install -e '.[private-web]'
 Beispielstart:
 
 ```bash
-mark-api-launch --db /pfad/mark.sqlite --cdp-port 9222
+mark-api-launch \
+  --db /pfad/mark.sqlite \
+  --cdp-port 9222 \
+  --email /pfad/zu/nachricht-1.eml \
+  --email /pfad/zu/nachricht-2.eml
 ```
 
-Beim Start führt der Launcher genau **einen frischen Owner-Inventory-Read** aus. Nur ein nachweislich erfolgreicher Read wird in die konfigurierte SQLite-Datenbank übernommen; zuvor bekannte, nun fehlende Anzeigen werden dabei mit der bestehenden `ABSENT`-Transition persistiert. Erst danach startet das bestehende read-only Dashboard auf `127.0.0.1:8765` und die bestehende Mark Write API auf `127.0.0.1:8766` (jeweils oder auf dem explizit gewählten lokalen Port). Der Launcher erzeugt dafür pro Prozess einen neuen Bearer und gibt Write-API-URL und Bearer beim Start aus. Ein zusätzlicher Write-Opt-in oder caller-supplied Token ist nicht erforderlich. Der Bearer ist während der Prozesslaufzeit lokales Write-Secret-Material; Launcher-Ausgaben mit diesem Wert dürfen nicht geteilt oder in allgemein zugängliche Logs übernommen werden. Schlägt der Initial-Read fehl oder ist sein Ergebnis unklar, startet weder Dashboard noch Write API.
+Beim Start führt der Launcher genau **einen frischen Owner-Inventory-Read** aus. Nur ein nachweislich erfolgreicher Read wird in die konfigurierte SQLite-Datenbank übernommen; zuvor bekannte, nun fehlende Anzeigen werden dabei mit der bestehenden `ABSENT`-Transition persistiert. Optional kann der Nutzer mit wiederholtem `--email FILE` lokale rohe Kleinanzeigen-RFC822-/`.eml`-Nachrichtenkopien ausdrücklich in denselben Store importieren. Dieser Reaction-Import läuft nach dem erfolgreichen Inventory-Sync und **vor** der Konstruktion von Dashboard und Write API. Der vorhandene Import bleibt batch-atomar und idempotent; scheitert ein ausdrücklich angeforderter Mail-Batch, startet keine der beiden HTTP-Surfaces. Bereits bestätigte Inventory-Beobachtungen bleiben wie bei anderen späteren Startup-Fehlern persistiert.
+
+Der Launcher sucht weder ein Postfach noch ein Verzeichnis ab, beobachtet keine Dateien periodisch und ruft keine private/mobile Messaging-API auf. E-Mail-Evidenz erzeugt keine Besitzeridentität und keinen `AdSnapshot`: eine nur aus Mail bekannte Anzeigen-ID bleibt analytische Reaction-Evidenz. Sichtbar werden ausschließlich die bereits source-expliziten Größen `email_conversation_count` und `email_inbound_message_count`; `unique_buyer_count` wird daraus nicht erfunden und `reaction_metric` bleibt ohne ausdrückliche Nutzerwahl ungesetzt.
+
+Erst danach startet das bestehende read-only Dashboard auf `127.0.0.1:8765` und die bestehende Mark Write API auf `127.0.0.1:8766` (jeweils oder auf dem explizit gewählten lokalen Port). Der Launcher erzeugt dafür pro Prozess einen neuen Bearer und gibt Write-API-URL und Bearer beim Start aus. Ein zusätzlicher Write-Opt-in oder caller-supplied Token ist nicht erforderlich. Der Bearer ist während der Prozesslaufzeit lokales Write-Secret-Material; Launcher-Ausgaben mit diesem Wert dürfen nicht geteilt oder in allgemein zugängliche Logs übernommen werden. Schlägt der Initial-Read fehl oder ist sein Ergebnis unklar, startet weder Dashboard noch Write API.
 
 CDP, Dashboard und Write API sind auf Loopback begrenzt. Der Launcher öffnet für die normale Produktkomposition die bereits vorhandenen API-/Core-/Media-Gates und gewährt die vorhandenen Write-Capabilities; die darunterliegenden generischen Defaults bleiben unverändert fail-safe. Persistente Idempotenz, ID-/Ownership-Bindung, Confirmation, TOCTOU-Prüfung, Post-Readback und No-Blind-Retry bleiben erhalten. Ein Media-Submit-`UNKNOWN` kann beim Shutdown ausschließlich über die bestehende observation-only Reconciliation geklärt werden; ein zweiter Plattform-Submit wird dadurch nicht autorisiert. Der Launcher führt weiterhin **keine periodische Synchronisation** aus; Freshness/Recovery folgen separat.
 
@@ -80,6 +88,8 @@ mark-api-import-mail \
 Der Parser bindet Kleinanzeigen-Absender, `X-Conversation-ID`, `X-Message-ID`/standardisierte `Message-ID`, Anzeigen-ID und Zeitzone gegeneinander und bricht bei Widersprüchen fail-closed ab. Diese Prüfung validiert die Struktur und Konsistenz der nutzerbereitgestellten Rohmail; sie ist **keine kryptographische Absenderauthentifizierung**. Der Import setzt voraus, dass die rohe Nachricht aus dem eigenen Postfach bereitgestellt wird. Persistiert werden nur Anzeigen-ID, Conversation-ID, Provider-Message-ID, Zeitstempel und Quelle. **Nachrichtentext und Personennamen werden nicht gespeichert.** Exakte Wiederholungsimporte sind idempotent; dieselbe Provider-Message-ID mit abweichenden Daten blockiert den gesamten Batch.
 
 Die daraus ableitbaren Größen bleiben bewusst von `ReactionSnapshot` getrennt. Die read-only Query-Surface `/api/email-reactions` bzw. `/api/ads/{id}/email-reactions` exponiert die importierten Zähler; Analytics führt sie source-explizit als `email_conversation_count` und `email_inbound_message_count`. Die bestehenden Metriken `conversation_count`, `inbound_message_count` und `unique_buyer_count` bleiben unverändert ReactionSnapshot-basiert. Aus E-Mail-Kopien wird insbesondere kein `unique_buyer_count` erfunden und es findet keine additive Doppelzählung zwischen Quellen statt.
+
+Derselbe Import kann im normalen Produktstart direkt mit wiederholtem `mark-api-launch --email FILE` ausgeführt werden. Das ersetzt den separaten `mark-api-import-mail`-CLI nicht; es integriert dieselbe lokale, netzwerkfreie und idempotente Importlogik lediglich in den kohärenten Startup-Pfad, sodass die Reaction-Daten beim ersten Dashboard-Read bereits vorhanden sind.
 
 ## Lokaler E2E-Smoke
 

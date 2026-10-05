@@ -365,3 +365,19 @@ Ein neuer Runtime-Owner darf einen identischen bestehenden `in_progress`-Claim n
 - Ist der exklusive OS-Lock auf der Plattform nicht verfügbar oder bereits von einer Write-Runtime gehalten, startet keine zweite Write API für dieselbe SQLite-Datei.
 
 **Folgen:** Authentifizierung, Capability-Prüfung, Body-Validierung und Request-Normalisierung bleiben vor dem Claim. D-024 erweitert ausschließlich die interne Crash-/Restart-Idempotenz und erteilt keine neue Plattform-Write-Autorität. Tests verwenden lokale Fakes/Loopback und führen keinen realen Kleinanzeigen-Plattformwrite aus.
+
+## D-025 — Product Launcher integriert explizite lokale Reaction-E-Mail-Evidenz
+
+**Fortschreibung:** D-025 ändert D-008 nicht. Private/mobile Reverse-Engineering-HTTP, der historische `BrowserBotAdapter` und Messaging-Gateway-Reads bleiben außerhalb des automatischen Produktpfads. D-025 komponiert ausschließlich den bereits nach D-008 erlaubten lokalen Import nutzerbereitgestellter Kleinanzeigen-E-Mail-Kopien in den normalen `mark-api-launch`-Startpfad.
+
+**Entscheidung:** `mark-api-launch` akzeptiert optional ein oder mehrere ausdrücklich angegebene lokale RFC822-/`.eml`-Dateien über wiederholtes `--email FILE`. Nach dem erfolgreichen Owner-Inventory-Read und dessen Persistenz importiert der Launcher den vollständigen angeforderten Mail-Batch mit der bestehenden `import_kleinanzeigen_email_files(...)`-Semantik in dieselbe SQLite-Datenbank. Erst nach erfolgreichem Import werden Dashboard und Write API konstruiert und gestartet.
+
+**Fail-closed-Grenzen:**
+- der Launcher sucht weder Mailboxen noch Verzeichnisse, beobachtet keine Dateien periodisch und kontaktiert für Reaction Data weder Gmail noch Kleinanzeigen-Messaging- oder private/mobile APIs,
+- ein explizit angeforderter Mail-Batch bleibt parse-first/batch-atomar und provider-message-idempotent; ein Parser-, Konsistenz- oder lokaler Dateifehler beendet den Produktstart vor beiden HTTP-Surfaces,
+- ein späterer Startup-Fehler rollt einen bereits bestätigten Owner-Inventory-Snapshot nicht künstlich zurück,
+- E-Mail-Evidenz erzeugt keinen `AdSnapshot`, keine Owner-/Write-Autorität und macht eine nur aus Mail bekannte Anzeigen-ID nicht zu einer aktuell eigenen Anzeige,
+- aus E-Mail-Kopien werden weiterhin nur die source-expliziten Projektionen `email_conversation_count` und `email_inbound_message_count` abgeleitet; `unique_buyer_count` wird nicht erfunden und E-Mail-Werte werden nicht mit `ReactionSnapshot` additiv vermischt,
+- `reaction_metric` und `objective_metric` bleiben unabhängig und ohne explizite Nutzerwahl ungesetzt.
+
+**Folgen:** Der Product Launcher liefert beim ersten sichtbaren Dashboard-Read optional bereits die ausdrücklich bereitgestellte lokale Reaction-Evidenz, ohne einen neuen Plattform-Readpfad zu eröffnen. Automatische Discovery/Watching und Freshness bleiben spätere Arbeit. Die analytische Nutzung von Email-only-Anzeigen-IDs für Klassifikationen und Gruppenrankings bleibt bewusst der nachfolgenden Phase „Email-only Classification“ vorbehalten.
