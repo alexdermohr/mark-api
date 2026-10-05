@@ -3516,6 +3516,15 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             try:
                 self.assertTrue(first_entered.wait(timeout=2))
                 second.start()
+                second_claim = None
+                for _ in range(200):
+                    second_claim = store.write_api_request("serialize-activate")
+                    if second_claim is not None:
+                        break
+                    threading.Event().wait(0.01)
+                self.assertIsNotNone(second_claim)
+                assert second_claim is not None
+                self.assertIsNone(second_claim.execution_started_at)
                 self.assertFalse(second_entered.wait(timeout=0.25))
             finally:
                 release_first.set()

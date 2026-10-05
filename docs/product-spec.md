@@ -118,8 +118,9 @@ Der aktuelle Core und die Runtime-Surfaces erzwingen insbesondere:
 8. Die Analytics-Entscheidungen `reaction_metric` und `objective_metric` bleiben unabhängig von den Write-Gates und standardmäßig ungesetzt.
 9. `mark-api-launch` verwendet eine bereits authentifizierte loopback-CDP-Sitzung, führt genau einen fail-closed Initial-Inventory-Sync aus und startet erst danach Dashboard und default-on Write API. Er startet keinen Browser und automatisiert keinen Login. Automatisierte Tests dieses Slices führen keine Kleinanzeigen-Plattformwrites aus.
 10. Periodische Synchronisation sowie die weitergehende Freshness-/Recovery-UX bleiben spätere Produktslices. Ein Media-Submit-`UNKNOWN` autorisiert weiterhin keinen Write-Retry; beim Launcher-Shutdown ist höchstens die bestehende observation-only Media-Reconciliation vor erneutem Cleanup zulässig.
+11. Die Write API serialisiert ihre Prozessautorität zusätzlich über einen exklusiven OS-Lock auf der SQLite-Datei. Persistente Idempotency-Claims sind runtime-owner-gebunden und besitzen einen separaten Execution-Start-Barrier. Nur ein gleichartiger Claim eines beendeten Runtimes ohne gesetzten Barrier darf übernommen werden; gesetzter Barrier und Legacy-Claims ohne beweisbaren Owner bleiben über Neustarts fail-closed.
 
-Die maßgeblichen Architektur- und Sicherheitsentscheidungen sind in D-006 bis D-023 dokumentiert. Ein implementierter technischer Pfad ist keine automatische Freigabe für reale Plattformwrites außerhalb einer vom Nutzer ausgelösten Produktoperation.
+Die maßgeblichen Architektur- und Sicherheitsentscheidungen sind in D-006 bis D-024 dokumentiert. Ein implementierter technischer Pfad ist keine automatische Freigabe für reale Plattformwrites außerhalb einer vom Nutzer ausgelösten Produktoperation.
 
 ## 6. Aktueller MVP-Stand
 
@@ -137,6 +138,7 @@ Der technische MVP umfasst inzwischen:
 10. read-only Dashboard, Grafiken, Top-Listen und lokale Runtime-Smokes,
 11. installierter `mark-api-launch`-Startpfad mit genau einem bestätigten Startup-Inventory-Sync vor Dashboard und Write API,
 12. Default-on Produktkomposition der bestehenden Create-, Media-, Content-, State- und Delete-Surfaces mit prozesslokalem Bearer und unveränderten Idempotency-/Confirmation-/No-Blind-Retry-Grenzen.
+13. Interne Auth-/Idempotency-Härtung mit exklusiver SQLite-Write-Runtime, runtime-owner-gebundenen Claims, persistiertem Execution-Start-Barrier und fail-closed Legacy-Migration.
 
 Text- und Bildgenerierung bleiben dokumentiert, aber für diesen MVP depriorisiert.
 
@@ -144,8 +146,8 @@ Reale sichtbare Testanzeigen, Testnachrichten oder zyklische Plattformwrites wer
 
 ## 7. Nächste Produktphase
 
-Der Product Launcher schließt jetzt den kohärenten Startpfad aus Initial-Sync, read-only Dashboard und default-on Write-Komposition. Die bestehenden Authentizitäts-, Ownership-, Confirmation-, Idempotenz-, TOCTOU-, Readback- und No-Blind-Retry-Sicherheiten bleiben dabei unverändert in den darunterliegenden Contracts erhalten.
+Der Product Launcher schließt jetzt den kohärenten Startpfad aus Initial-Sync, read-only Dashboard und default-on Write-Komposition. Die bestehenden Authentizitäts-, Ownership-, Confirmation-, TOCTOU-, Readback- und No-Blind-Retry-Sicherheiten bleiben erhalten; D-024 härtet zusätzlich die persistente Idempotenz über Prozessabbruch und Neustart.
 
-Als nächster eigener Produktslice folgt die interne Auth-/Idempotency-Härtung. Danach folgen Reaction Data, Email-only Classification, Dashboard Write UX, Freshness/Time, Recovery UX, SQLite Lifecycle, Shutdown, Packaging, Full E2E und finaler Produktaudit.
+Die interne Auth-/Idempotency-Härtung ist jetzt Bestandteil des Produktpfads. Als nächster eigener Produktslice folgt Reaction Data; danach Email-only Classification, Dashboard Write UX, Freshness/Time, Recovery UX, SQLite Lifecycle, Shutdown, Packaging, Full E2E und finaler Produktaudit.
 
 Die beiden fachlichen Analytics-Entscheidungen bleiben weiterhin offen: `reaction_metric` für „wie viele geschrieben haben“ und `objective_metric` beziehungsweise eine ausdrücklich definierte Zielfunktion für „beste Lösung“. Ohne diese Festlegungen darf keine objective-gebundene Empfehlung als fachlich gewollt behauptet werden.

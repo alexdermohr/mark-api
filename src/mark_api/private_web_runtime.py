@@ -4,7 +4,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from importlib import import_module, metadata
-from threading import Lock, Thread, current_thread
+from threading import Lock, RLock, Thread, current_thread
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -1334,7 +1334,7 @@ def compose_private_web_write_api_runtime(
             clock=runtime_clock,
         )
 
-    operation_lock = Lock()
+    operation_lock = RLock()
     serialized_mark_service = _SerializedPrivateWebWriteService(
         mark_service,
         operation_lock,
@@ -1363,6 +1363,7 @@ def compose_private_web_write_api_runtime(
         host="127.0.0.1",
         port=port,
         clock=runtime_clock,
+        execution_lock=operation_lock,
     )
     # The generic Write API keeps daemon request threads for its standalone
     # use. This composition owns browser runtimes, so close must drain every

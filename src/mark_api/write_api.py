@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import hmac
 import json
+import os
 import re
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock
-from typing import Callable, Protocol
+from typing import Callable, ContextManager, Protocol
 from urllib.parse import unquote, urlsplit
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX import compatibility
+    fcntl = None
 
 from .domain import (
     AdCreateRequest,
@@ -347,6 +355,45 @@ def _create_receipt_matches_request(
     )
 
 
+class _WriteApiStoreLock:
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor: int | None = descriptor
+
+    @classmethod
+    def acquire(cls, path) -> "_WriteApiStoreLock":
+        if fcntl is None:
+            raise RuntimeError(
+                "write API store locking is unavailable on this platform"
+            )
+        flags = os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        descriptor = os.open(path, flags)
+        try:
+            fcntl.flock(
+                descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError:
+            os.close(descriptor)
+            raise RuntimeError(
+                "write API runtime is already active for this snapshot store"
+            ) from None
+        except Exception:
+            os.close(descriptor)
+            raise
+        return cls(descriptor)
+
+    def close(self) -> None:
+        descriptor = self._descriptor
+        if descriptor is None:
+            return
+        assert fcntl is not None
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+        self._descriptor = None
+
+
 def _receipt_status(
     receipt: OperationReceipt | CreateOperationReceipt,
 ) -> int:
@@ -366,6 +413,8 @@ def _handler_factory(
     access: WriteApiAccess,
     clock: Callable[[], datetime],
     body_read_timeout_seconds: float,
+    claim_owner: str,
+    execution_lock: ContextManager[object] | None,
 ):
     # Both create routes infer their result from owner-inventory deltas.
     # Serialize the complete service calls across this threaded server so a
@@ -740,6 +789,8 @@ def _handler_factory(
                     idempotency_key=idempotency_key,
                     request_sha256=fingerprint,
                     requested_at=clock(),
+                    claim_owner=claim_owner,
+                    allow_abandoned_takeover=True,
                 )
             except Exception:
                 self._error(
@@ -783,154 +834,175 @@ def _handler_factory(
                 )
                 return
 
-            try:
-                authorization_reference = f"write-api:{idempotency_key}"
-                if action in {"create", "create_media"}:
-                    assert create_request is not None
-                    with create_lock:
-                        if action == "create":
-                            create_receipt = service.create(
-                                create_request,
-                                authorization_by=access.principal,
-                                authorization_reference=authorization_reference,
+            with (
+                execution_lock
+                if execution_lock is not None
+                else nullcontext()
+            ):
+                try:
+                    store.begin_write_api_request(
+                        idempotency_key=idempotency_key,
+                        request_sha256=fingerprint,
+                        claim_owner=claim_owner,
+                        execution_started_at=clock(),
+                    )
+                except Exception:
+                    self._error(
+                        500,
+                        "idempotency_store_error",
+                        platform_retry_authorized=False,
+                    )
+                    return
+
+                try:
+                    authorization_reference = f"write-api:{idempotency_key}"
+                    if action in {"create", "create_media"}:
+                        assert create_request is not None
+                        with create_lock:
+                            if action == "create":
+                                create_receipt = service.create(
+                                    create_request,
+                                    authorization_by=access.principal,
+                                    authorization_reference=authorization_reference,
+                                )
+                            else:
+                                assert media_service is not None
+                                assert media_refs is not None
+                                create_receipt = media_service.create_with_media(
+                                    create_request,
+                                    media_refs,
+                                    authorization_by=access.principal,
+                                    authorization_reference=authorization_reference,
+                                )
+                        if not isinstance(
+                            create_receipt,
+                            CreateOperationReceipt,
+                        ):
+                            raise TypeError(
+                                "write service returned invalid create receipt"
                             )
-                        else:
-                            assert media_service is not None
-                            assert media_refs is not None
-                            create_receipt = media_service.create_with_media(
-                                create_request,
-                                media_refs,
-                                authorization_by=access.principal,
-                                authorization_reference=authorization_reference,
+                        if not _create_receipt_matches_request(
+                            create_receipt,
+                            create_request,
+                            principal=access.principal,
+                            authorization_reference=authorization_reference,
+                        ):
+                            raise TypeError(
+                                "write service returned misbound create receipt"
                             )
-                    if not isinstance(
-                        create_receipt,
-                        CreateOperationReceipt,
-                    ):
-                        raise TypeError(
-                            "write service returned invalid create receipt"
+                        status = _receipt_status(create_receipt)
+                        response = {
+                            "idempotency_key": idempotency_key,
+                            "operation_receipt": _create_receipt_to_dict(
+                                create_receipt
+                            ),
+                            "platform_retry_authorized": False,
+                        }
+                        if action == "create_media":
+                            # Content confirmation remains distinct from exact
+                            # server-side media persistence. A media create is HTTP
+                            # 200 only when both are confirmed; otherwise a
+                            # content-confirmed/media-unconfirmed result remains 202.
+                            if (
+                                status == 200
+                                and not create_receipt.media_persistence_confirmed
+                            ):
+                                status = 202
+                            response["media_persistence_confirmed"] = (
+                                create_receipt.media_persistence_confirmed
+                            )
+                            response["media_post_read_status"] = (
+                                create_receipt.media_post_read_status.value
+                                if create_receipt.media_post_read_status is not None
+                                else None
+                            )
+                        receipt = None
+                    elif action == "update_content":
+                        receipt = service.update_content(
+                            ad_id,
+                            title=(
+                                payload["title"]
+                                if "title" in payload
+                                else None
+                            ),
+                            description=(
+                                payload["description"]
+                                if "description" in payload
+                                else None
+                            ),
+                            authorization_by=access.principal,
+                            authorization_reference=(
+                                f"write-api:{idempotency_key}"
+                            ),
                         )
-                    if not _create_receipt_matches_request(
-                        create_receipt,
-                        create_request,
-                        principal=access.principal,
-                        authorization_reference=authorization_reference,
-                    ):
-                        raise TypeError(
-                            "write service returned misbound create receipt"
+                    elif action == "pause":
+                        receipt = service.pause(
+                            ad_id,
+                            authorization_by=access.principal,
+                            authorization_reference=(
+                                f"write-api:{idempotency_key}"
+                            ),
                         )
-                    status = _receipt_status(create_receipt)
+                    elif action == "activate":
+                        receipt = service.activate(
+                            ad_id,
+                            authorization_by=access.principal,
+                            authorization_reference=(
+                                f"write-api:{idempotency_key}"
+                            ),
+                        )
+                    else:
+                        receipt = service.delete(
+                            ad_id,
+                            approval=DeleteApproval(
+                                ad_id=ad_id,
+                                approved_by=access.principal,
+                                reference=authorization_reference,
+                            ),
+                        )
+
+                    if action not in {"create", "create_media"}:
+                        if not isinstance(receipt, OperationReceipt):
+                            raise TypeError("write service returned invalid receipt")
+                        expected_operation = {
+                            "update_content": "update_content",
+                            "pause": "set_state:paused",
+                            "activate": "set_state:active",
+                            "delete": "delete",
+                        }[action]
+                        expected_authorization_reference = authorization_reference
+                        if (
+                            receipt.ad_id != ad_id
+                            or receipt.operation != expected_operation
+                            or receipt.authorization_by != access.principal
+                            or receipt.authorization_reference
+                            != expected_authorization_reference
+                        ):
+                            raise TypeError(
+                                "write service returned misbound receipt"
+                            )
+                        status = _receipt_status(receipt)
+                        response = {
+                            "idempotency_key": idempotency_key,
+                            "operation_receipt": _receipt_to_dict(receipt),
+                            "platform_retry_authorized": False,
+                        }
+                except Exception:
+                    status = 500
                     response = {
+                        "error": "write_execution_error",
                         "idempotency_key": idempotency_key,
-                        "operation_receipt": _create_receipt_to_dict(
-                            create_receipt
-                        ),
                         "platform_retry_authorized": False,
                     }
                     if action == "create_media":
-                        # Content confirmation remains distinct from exact
-                        # server-side media persistence. A media create is HTTP
-                        # 200 only when both are confirmed; otherwise a
-                        # content-confirmed/media-unconfirmed result remains 202.
-                        if (
-                            status == 200
-                            and not create_receipt.media_persistence_confirmed
-                        ):
-                            status = 202
-                        response["media_persistence_confirmed"] = (
-                            create_receipt.media_persistence_confirmed
-                        )
-                        response["media_post_read_status"] = (
-                            create_receipt.media_post_read_status.value
-                            if create_receipt.media_post_read_status is not None
-                            else None
-                        )
-                    receipt = None
-                elif action == "update_content":
-                    receipt = service.update_content(
-                        ad_id,
-                        title=(
-                            payload["title"]
-                            if "title" in payload
-                            else None
-                        ),
-                        description=(
-                            payload["description"]
-                            if "description" in payload
-                            else None
-                        ),
-                        authorization_by=access.principal,
-                        authorization_reference=(
-                            f"write-api:{idempotency_key}"
-                        ),
-                    )
-                elif action == "pause":
-                    receipt = service.pause(
-                        ad_id,
-                        authorization_by=access.principal,
-                        authorization_reference=(
-                            f"write-api:{idempotency_key}"
-                        ),
-                    )
-                elif action == "activate":
-                    receipt = service.activate(
-                        ad_id,
-                        authorization_by=access.principal,
-                        authorization_reference=(
-                            f"write-api:{idempotency_key}"
-                        ),
-                    )
-                else:
-                    receipt = service.delete(
-                        ad_id,
-                        approval=DeleteApproval(
-                            ad_id=ad_id,
-                            approved_by=access.principal,
-                            reference=authorization_reference,
-                        ),
-                    )
-
-                if action not in {"create", "create_media"}:
-                    if not isinstance(receipt, OperationReceipt):
-                        raise TypeError("write service returned invalid receipt")
-                    expected_operation = {
-                        "update_content": "update_content",
-                        "pause": "set_state:paused",
-                        "activate": "set_state:active",
-                        "delete": "delete",
-                    }[action]
-                    expected_authorization_reference = authorization_reference
-                    if (
-                        receipt.ad_id != ad_id
-                        or receipt.operation != expected_operation
-                        or receipt.authorization_by != access.principal
-                        or receipt.authorization_reference
-                        != expected_authorization_reference
-                    ):
-                        raise TypeError(
-                            "write service returned misbound receipt"
-                        )
-                    status = _receipt_status(receipt)
-                    response = {
-                        "idempotency_key": idempotency_key,
-                        "operation_receipt": _receipt_to_dict(receipt),
-                        "platform_retry_authorized": False,
-                    }
-            except Exception:
-                status = 500
-                response = {
-                    "error": "write_execution_error",
-                    "idempotency_key": idempotency_key,
-                    "platform_retry_authorized": False,
-                }
-                if action == "create_media":
-                    response["media_persistence_confirmed"] = False
+                        response["media_persistence_confirmed"] = False
 
             response_json = _canonical_json(response)
             try:
                 store.complete_write_api_request(
                     idempotency_key=idempotency_key,
                     request_sha256=fingerprint,
+                    claim_owner=claim_owner,
                     response_status=status,
                     response_json=response_json,
                     completed_at=clock(),
@@ -990,6 +1062,63 @@ def _handler_factory(
 class LoopbackWriteApiServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    _store_lock: _WriteApiStoreLock | None = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._store_lock_guard = Lock()
+        self._active_handler_count = 0
+        self._serve_loop_active = False
+        self._socket_close_succeeded = False
+        super().__init__(*args, **kwargs)
+
+    def _release_store_lock_if_quiesced(self) -> None:
+        lock: _WriteApiStoreLock | None = None
+        with self._store_lock_guard:
+            if (
+                self._socket_close_succeeded
+                and not self._serve_loop_active
+                and self._active_handler_count == 0
+                and self._store_lock is not None
+            ):
+                lock = self._store_lock
+                self._store_lock = None
+        if lock is not None:
+            lock.close()
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        with self._store_lock_guard:
+            self._serve_loop_active = True
+        try:
+            super().serve_forever(poll_interval=poll_interval)
+        finally:
+            with self._store_lock_guard:
+                self._serve_loop_active = False
+            self._release_store_lock_if_quiesced()
+
+    def process_request(self, request, client_address) -> None:
+        with self._store_lock_guard:
+            self._active_handler_count += 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._store_lock_guard:
+                self._active_handler_count -= 1
+            self._release_store_lock_if_quiesced()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._store_lock_guard:
+                self._active_handler_count -= 1
+            self._release_store_lock_if_quiesced()
+
+    def server_close(self) -> None:
+        super().server_close()
+        with self._store_lock_guard:
+            self._socket_close_succeeded = True
+        self._release_store_lock_if_quiesced()
 
 
 def create_write_api_server(
@@ -1003,6 +1132,7 @@ def create_write_api_server(
     port: int = 0,
     clock: Callable[[], datetime] = _utc_now,
     body_read_timeout_seconds: float = _BODY_READ_TIMEOUT_SECONDS,
+    execution_lock: ContextManager[object] | None = None,
 ) -> LoopbackWriteApiServer:
     if host != "127.0.0.1":
         raise ValueError("write API must bind to 127.0.0.1")
@@ -1028,15 +1158,25 @@ def create_write_api_server(
             "create_media capability requires media_service"
         )
 
-    return LoopbackWriteApiServer(
-        (host, port),
-        _handler_factory(
-            service=service,
-            media_service=media_service,
-            media_stager=media_stager,
-            store=store,
-            access=access,
-            clock=clock,
-            body_read_timeout_seconds=float(body_read_timeout_seconds),
-        ),
-    )
+    claim_owner = f"write-api-{secrets.token_hex(16)}"
+    store_lock = _WriteApiStoreLock.acquire(store.path)
+    try:
+        server = LoopbackWriteApiServer(
+            (host, port),
+            _handler_factory(
+                service=service,
+                media_service=media_service,
+                media_stager=media_stager,
+                store=store,
+                access=access,
+                clock=clock,
+                body_read_timeout_seconds=float(body_read_timeout_seconds),
+                claim_owner=claim_owner,
+                execution_lock=execution_lock,
+            ),
+        )
+    except Exception:
+        store_lock.close()
+        raise
+    server._store_lock = store_lock
+    return server

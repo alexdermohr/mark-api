@@ -34,6 +34,8 @@ class WriteApiRequestRecord:
     request_sha256: str
     state: str
     requested_at: datetime
+    claim_owner: str | None
+    execution_started_at: datetime | None
     completed_at: datetime | None
     response_status: int | None
     response_json: str | None
@@ -43,6 +45,17 @@ class WriteApiRequestRecord:
 class WriteApiRequestClaim:
     created: bool
     record: WriteApiRequestRecord
+
+
+def _validated_write_api_claim_owner(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or any(character.isspace() for character in value)
+    ):
+        raise ValueError("claim_owner must contain 1..128 safe characters")
+    return value
 
 
 class SnapshotStore:
@@ -187,6 +200,8 @@ class SnapshotStore:
                     state TEXT NOT NULL
                         CHECK (state IN ('in_progress', 'completed')),
                     requested_at TEXT NOT NULL,
+                    claim_owner TEXT,
+                    execution_started_at TEXT,
                     completed_at TEXT,
                     response_status INTEGER,
                     response_json TEXT,
@@ -235,6 +250,23 @@ class SnapshotStore:
                     "ALTER TABLE create_operation_receipts "
                     "ADD COLUMN media_persistence_confirmed "
                     "INTEGER NOT NULL DEFAULT 0"
+                )
+
+            write_api_request_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(write_api_requests)"
+                ).fetchall()
+            }
+            if "claim_owner" not in write_api_request_columns:
+                connection.execute(
+                    "ALTER TABLE write_api_requests "
+                    "ADD COLUMN claim_owner TEXT"
+                )
+            if "execution_started_at" not in write_api_request_columns:
+                connection.execute(
+                    "ALTER TABLE write_api_requests "
+                    "ADD COLUMN execution_started_at TEXT"
                 )
 
     @staticmethod
@@ -744,6 +776,16 @@ class SnapshotStore:
             request_sha256=str(row["request_sha256"]),
             state=str(row["state"]),
             requested_at=datetime.fromisoformat(row["requested_at"]),
+            claim_owner=(
+                str(row["claim_owner"])
+                if row["claim_owner"] is not None
+                else None
+            ),
+            execution_started_at=(
+                datetime.fromisoformat(row["execution_started_at"])
+                if row["execution_started_at"] is not None
+                else None
+            ),
             completed_at=(
                 datetime.fromisoformat(row["completed_at"])
                 if row["completed_at"] is not None
@@ -769,7 +811,8 @@ class SnapshotStore:
             row = connection.execute(
                 """
                 SELECT idempotency_key, request_sha256, state, requested_at,
-                       completed_at, response_status, response_json
+                       claim_owner, execution_started_at, completed_at,
+                       response_status, response_json
                 FROM write_api_requests
                 WHERE idempotency_key = ?
                 """,
@@ -787,6 +830,8 @@ class SnapshotStore:
         idempotency_key: str,
         request_sha256: str,
         requested_at: datetime,
+        claim_owner: str,
+        allow_abandoned_takeover: bool = False,
     ) -> WriteApiRequestClaim:
         if not idempotency_key:
             raise ValueError("idempotency_key must not be empty")
@@ -803,40 +848,94 @@ class SnapshotStore:
             or requested_at.utcoffset() is None
         ):
             raise ValueError("requested_at must be timezone-aware")
+        owner = _validated_write_api_claim_owner(claim_owner)
+        if not isinstance(allow_abandoned_takeover, bool):
+            raise TypeError("allow_abandoned_takeover must be bool")
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
                 SELECT idempotency_key, request_sha256, state, requested_at,
-                       completed_at, response_status, response_json
+                       claim_owner, execution_started_at, completed_at,
+                       response_status, response_json
                 FROM write_api_requests
                 WHERE idempotency_key = ?
                 """,
                 (idempotency_key,),
             ).fetchone()
             if row is not None:
+                record = self._write_api_request_record(row)
+                can_take_over = (
+                    allow_abandoned_takeover
+                    and record.request_sha256 == request_sha256
+                    and record.state == "in_progress"
+                    and record.claim_owner is not None
+                    and record.claim_owner != owner
+                    and record.execution_started_at is None
+                )
+                if can_take_over:
+                    updated = connection.execute(
+                        """
+                        UPDATE write_api_requests
+                        SET claim_owner = ?
+                        WHERE idempotency_key = ?
+                          AND request_sha256 = ?
+                          AND state = 'in_progress'
+                          AND claim_owner = ?
+                          AND execution_started_at IS NULL
+                        """,
+                        (
+                            owner,
+                            idempotency_key,
+                            request_sha256,
+                            record.claim_owner,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise RuntimeError(
+                            "write API claim ownership changed unexpectedly"
+                        )
+                    row = connection.execute(
+                        """
+                        SELECT idempotency_key, request_sha256, state,
+                               requested_at, claim_owner,
+                               execution_started_at, completed_at,
+                               response_status, response_json
+                        FROM write_api_requests
+                        WHERE idempotency_key = ?
+                        """,
+                        (idempotency_key,),
+                    ).fetchone()
+                    assert row is not None
+                    return WriteApiRequestClaim(
+                        created=True,
+                        record=self._write_api_request_record(row),
+                    )
                 return WriteApiRequestClaim(
                     created=False,
-                    record=self._write_api_request_record(row),
+                    record=record,
                 )
 
             connection.execute(
                 """
                 INSERT INTO write_api_requests (
-                    idempotency_key, request_sha256, state, requested_at
-                ) VALUES (?, ?, 'in_progress', ?)
+                    idempotency_key, request_sha256, state, requested_at,
+                    claim_owner
+                ) VALUES (?, ?, 'in_progress', ?, ?)
                 """,
                 (
                     idempotency_key,
                     request_sha256,
                     requested_at.isoformat(),
+                    owner,
                 ),
             )
             row = connection.execute(
                 """
                 SELECT idempotency_key, request_sha256, state, requested_at,
-                       completed_at, response_status, response_json
+                       claim_owner, execution_started_at, completed_at,
+                       response_status, response_json
                 FROM write_api_requests
                 WHERE idempotency_key = ?
                 """,
@@ -848,11 +947,85 @@ class SnapshotStore:
                 record=self._write_api_request_record(row),
             )
 
+    def begin_write_api_request(
+        self,
+        *,
+        idempotency_key: str,
+        request_sha256: str,
+        claim_owner: str,
+        execution_started_at: datetime,
+    ) -> WriteApiRequestRecord:
+        owner = _validated_write_api_claim_owner(claim_owner)
+        if (
+            execution_started_at.tzinfo is None
+            or execution_started_at.utcoffset() is None
+        ):
+            raise ValueError("execution_started_at must be timezone-aware")
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT idempotency_key, request_sha256, state, requested_at,
+                       claim_owner, execution_started_at, completed_at,
+                       response_status, response_json
+                FROM write_api_requests
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("write API request was not claimed")
+            record = self._write_api_request_record(row)
+            if record.request_sha256 != request_sha256:
+                raise ValueError("write API request fingerprint mismatch")
+            if record.state != "in_progress":
+                raise ValueError("write API request is not in progress")
+            if record.claim_owner != owner:
+                raise ValueError("write API request is owned by another runtime")
+            if record.execution_started_at is not None:
+                raise ValueError("write API request execution already started")
+
+            updated = connection.execute(
+                """
+                UPDATE write_api_requests
+                SET execution_started_at = ?
+                WHERE idempotency_key = ?
+                  AND request_sha256 = ?
+                  AND state = 'in_progress'
+                  AND claim_owner = ?
+                  AND execution_started_at IS NULL
+                """,
+                (
+                    execution_started_at.isoformat(),
+                    idempotency_key,
+                    request_sha256,
+                    owner,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(
+                    "write API execution-start ownership changed unexpectedly"
+                )
+            row = connection.execute(
+                """
+                SELECT idempotency_key, request_sha256, state, requested_at,
+                       claim_owner, execution_started_at, completed_at,
+                       response_status, response_json
+                FROM write_api_requests
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            assert row is not None
+            return self._write_api_request_record(row)
+
     def complete_write_api_request(
         self,
         *,
         idempotency_key: str,
         request_sha256: str,
+        claim_owner: str,
         response_status: int,
         response_json: str,
         completed_at: datetime,
@@ -870,13 +1043,15 @@ class SnapshotStore:
             or completed_at.utcoffset() is None
         ):
             raise ValueError("completed_at must be timezone-aware")
+        owner = _validated_write_api_claim_owner(claim_owner)
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
                 SELECT idempotency_key, request_sha256, state, requested_at,
-                       completed_at, response_status, response_json
+                       claim_owner, execution_started_at, completed_at,
+                       response_status, response_json
                 FROM write_api_requests
                 WHERE idempotency_key = ?
                 """,
@@ -887,6 +1062,8 @@ class SnapshotStore:
             record = self._write_api_request_record(row)
             if record.request_sha256 != request_sha256:
                 raise ValueError("write API request fingerprint mismatch")
+            if record.claim_owner != owner:
+                raise ValueError("write API request is owned by another runtime")
             if record.state == "completed":
                 if (
                     record.response_status == response_status
@@ -896,8 +1073,10 @@ class SnapshotStore:
                 raise ValueError("write API request is already completed")
             if record.state != "in_progress":
                 raise ValueError("write API request has invalid state")
+            if record.execution_started_at is None:
+                raise ValueError("write API request execution has not started")
 
-            connection.execute(
+            updated = connection.execute(
                 """
                 UPDATE write_api_requests
                 SET state = 'completed',
@@ -905,18 +1084,29 @@ class SnapshotStore:
                     response_status = ?,
                     response_json = ?
                 WHERE idempotency_key = ?
+                  AND request_sha256 = ?
+                  AND state = 'in_progress'
+                  AND claim_owner = ?
+                  AND execution_started_at IS NOT NULL
                 """,
                 (
                     completed_at.isoformat(),
                     response_status,
                     response_json,
                     idempotency_key,
+                    request_sha256,
+                    owner,
                 ),
             )
+            if updated.rowcount != 1:
+                raise RuntimeError(
+                    "write API completion ownership changed unexpectedly"
+                )
             row = connection.execute(
                 """
                 SELECT idempotency_key, request_sha256, state, requested_at,
-                       completed_at, response_status, response_json
+                       claim_owner, execution_started_at, completed_at,
+                       response_status, response_json
                 FROM write_api_requests
                 WHERE idempotency_key = ?
                 """,
