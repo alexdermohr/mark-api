@@ -82,8 +82,8 @@ def _classification_to_dict(item: AdClassification) -> dict[str, object]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Append local analytics classification labels for an already "
-            "tracked mark-api ad."
+            "Append local analytics classification labels for an ad ID "
+            "already evidenced by owner snapshots or imported email events."
         ),
     )
     parser.add_argument(
@@ -95,7 +95,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ad-id",
         required=True,
-        help="Already tracked ad ID to classify.",
+        help=(
+            "Locally evidenced ad ID to classify; owner inventory and "
+            "imported Kleinanzeigen email events are accepted evidence."
+        ),
     )
     parser.add_argument("--image-type")
     parser.add_argument("--city")

@@ -427,7 +427,7 @@ class SnapshotStore:
         changes: Mapping[str, str | None],
         observed_at: datetime | None = None,
     ) -> AdClassification:
-        """Atomically merge one classification update for an already tracked ad."""
+        """Atomically merge one classification for a locally evidenced ad."""
 
         requested_changes = dict(changes)
         unknown_fields = sorted(
@@ -444,17 +444,21 @@ class SnapshotStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
 
-            tracked = connection.execute(
+            known = connection.execute(
                 """
                 SELECT 1
                 FROM ad_snapshots
                 WHERE ad_id = ?
+                UNION ALL
+                SELECT 1
+                FROM inbound_message_events
+                WHERE ad_id = ?
                 LIMIT 1
                 """,
-                (ad_id,),
+                (ad_id, ad_id),
             ).fetchone()
-            if tracked is None:
-                raise ValueError(f"unknown tracked ad_id: {ad_id}")
+            if known is None:
+                raise ValueError(f"unknown analytics ad_id: {ad_id}")
 
             rows = connection.execute(
                 """

@@ -72,7 +72,7 @@ mark-api-classify \
   --clear text-type
 ```
 
-Der CLI akzeptiert nur bereits im lokalen Store bekannte Anzeigen-IDs. Er greift weder auf Kleinanzeigen noch auf andere Netzwerkdienste zu und verändert keine Plattformdaten.
+Der CLI akzeptiert nur lokal bereits belegte analytische Anzeigen-IDs: entweder aus einem Owner-/Bestandssnapshot oder aus einem importierten Kleinanzeigen-E-Mail-Event. Eine nur per E-Mail belegte ID darf damit klassifiziert und für source-explizite E-Mail-Gruppenrankings verwendet werden, wird dadurch aber **nicht** zu einer eigenen/aktuellen Anzeige: `tracked_ad_ids()`, Bestandszusammenfassung und Write-Autorität bleiben unverändert. Der CLI greift weder auf Kleinanzeigen noch auf andere Netzwerkdienste zu und verändert keine Plattformdaten.
 
 ## Lokaler Import von Kleinanzeigen-Nachrichtenkopien
 
@@ -89,7 +89,7 @@ Der Parser bindet Kleinanzeigen-Absender, `X-Conversation-ID`, `X-Message-ID`/st
 
 Die daraus ableitbaren Größen bleiben bewusst von `ReactionSnapshot` getrennt. Die read-only Query-Surface `/api/email-reactions` bzw. `/api/ads/{id}/email-reactions` exponiert die importierten Zähler; Analytics führt sie source-explizit als `email_conversation_count` und `email_inbound_message_count`. Die bestehenden Metriken `conversation_count`, `inbound_message_count` und `unique_buyer_count` bleiben unverändert ReactionSnapshot-basiert. Aus E-Mail-Kopien wird insbesondere kein `unique_buyer_count` erfunden und es findet keine additive Doppelzählung zwischen Quellen statt.
 
-Derselbe Import kann im normalen Produktstart direkt mit wiederholtem `mark-api-launch --email FILE` ausgeführt werden. Das ersetzt den separaten `mark-api-import-mail`-CLI nicht; es integriert dieselbe lokale, netzwerkfreie und idempotente Importlogik lediglich in den kohärenten Startup-Pfad, sodass die Reaction-Daten beim ersten Dashboard-Read bereits vorhanden sind.
+Derselbe Import kann im normalen Produktstart direkt mit wiederholtem `mark-api-launch --email FILE` ausgeführt werden. Das ersetzt den separaten `mark-api-import-mail`-CLI nicht; es integriert dieselbe lokale, netzwerkfreie und idempotente Importlogik lediglich in den kohärenten Startup-Pfad, sodass die Reaction-Daten beim ersten Dashboard-Read bereits vorhanden sind. Danach kann `mark-api-classify` dieselbe Email-only-ID lokal labeln. Solche Labels nehmen nur an Rankings teil, deren gewählte Metrik diese ID tatsächlich enthält; insbesondere können Email-only-IDs nach `email_conversation_count` oder `email_inbound_message_count` gruppiert werden, ohne in Views-, Owner- oder `ReactionSnapshot`-Gruppen aufzutauchen.
 
 ## Lokaler E2E-Smoke
 

@@ -584,6 +584,54 @@ class AnalyticsTests(unittest.TestCase):
         self.assertIsNone(payload["present"])
         self.assertIsNone(payload["lifecycle_state"])
 
+    def test_email_only_classification_groups_only_email_metrics(self) -> None:
+        store = self.make_store()
+        store.append_inbound_message_events(
+            (
+                InboundMessageEvent(
+                    ad_id="9",
+                    conversation_id="conversation-only",
+                    provider_message_id="message-only",
+                    observed_at=T0,
+                    source="kleinanzeigen-email",
+                ),
+            )
+        )
+        store.append_classification(
+            AdClassification(
+                ad_id="9",
+                observed_at=T1,
+                source="manual-cli",
+                city="Dresden",
+            )
+        )
+        analytics = AnalyticsService(store)
+
+        email_groups = analytics.group_rankings(
+            "city",
+            "email_inbound_message_count",
+        )
+        views_groups = analytics.group_rankings("city", "views")
+        reaction_groups = analytics.group_rankings(
+            "city",
+            "inbound_message_count",
+        )
+
+        self.assertEqual(
+            [
+                (
+                    row.label,
+                    row.sample_size,
+                    row.metric_sum,
+                    row.metric_mean,
+                )
+                for row in email_groups
+            ],
+            [("Dresden", 1, 1, 1.0)],
+        )
+        self.assertEqual(views_groups, ())
+        self.assertEqual(reaction_groups, ())
+
     def test_allowed_contracts_are_exact_and_separate(self) -> None:
         self.assertEqual(
             ANALYTICS_DIMENSIONS,
