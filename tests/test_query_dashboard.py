@@ -1849,15 +1849,130 @@ setCreate({
     def test_write_runtime_blocks_concurrent_media_create_staging(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
-        definitions, marker, _ = javascript.partition('byId("reload").addEventListener')
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
         self.assertTrue(marker)
-        self.assertIn("let createMediaInFlight = false;", definitions)
-        self.assertIn("if (createMediaInFlight)", definitions)
-        self.assertIn("createMediaInFlight = true;", definitions)
-        self.assertIn("createMediaInFlight = false;", definitions)
-        self.assertLess(
-            definitions.index("createMediaInFlight = true;"),
-            definitions.index("const mediaRefs = await stageSelectedMedia(files);"),
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+const fields = new Map([
+  ["create-category", {value: "A > B"}],
+  ["create-title", {value: "Valid title"}],
+  ["create-description", {value: "Valid description"}],
+  ["create-price", {value: "1"}],
+  ["create-media", {
+    files: [{name: "one.jpg", type: "image/jpeg", size: 10}],
+  }],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    if (fields.has(id)) return fields.get(id);
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+load = async () => {};
+
+let releaseFirstStage;
+let markFirstStageStarted;
+const firstStageStarted = new Promise((resolve) => {
+  markFirstStageStarted = resolve;
+});
+const firstStageGate = new Promise((resolve) => {
+  releaseFirstStage = resolve;
+});
+let stageCalls = 0;
+let mediaCreateCalls = 0;
+let ackCalls = 0;
+
+globalThis.fetch = async (path, options) => {
+  if (path === "/api/write/media/stage") {
+    stageCalls += 1;
+    if (stageCalls === 1) {
+      markFirstStageStarted();
+      await firstStageGate;
+    }
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({media_ref: "media_" + stageCalls});
+      },
+    };
+  }
+  if (path === "/api/write/media/ads") {
+    mediaCreateCalls += 1;
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({
+          idempotency_key: options.headers["Idempotency-Key"],
+          operation_receipt: {outcome: "confirmed"},
+          platform_retry_authorized: false,
+        });
+      },
+    };
+  }
+  if (path === "/api/dashboard/pending-writes/ack") {
+    ackCalls += 1;
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  throw new Error("unexpected path: " + path);
+};
+
+(async () => {
+  const first = submitCreate({preventDefault() {}});
+  await firstStageStarted;
+  assert.equal(stageCalls, 1);
+  assert.equal(createMediaInFlight, true);
+
+  await submitCreate({preventDefault() {}});
+  assert.equal(stageCalls, 1);
+  assert.equal(mediaCreateCalls, 0);
+  assert.match(writeStatus.textContent, /läuft bereits/i);
+
+  releaseFirstStage();
+  await first;
+  assert.equal(stageCalls, 1);
+  assert.equal(mediaCreateCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.equal(createMediaInFlight, false);
+
+  await submitCreate({preventDefault() {}});
+  assert.equal(stageCalls, 2);
+  assert.equal(mediaCreateCalls, 2);
+  assert.equal(ackCalls, 2);
+  assert.equal(createMediaInFlight, false);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
     def test_write_runtime_exposes_absent_pending_recovery_without_new_writes(self) -> None:
