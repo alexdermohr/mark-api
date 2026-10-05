@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import threading
 import tomllib
 import unittest
 from datetime import datetime, timedelta, timezone
+from email import policy
+from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
 from urllib.request import ProxyHandler, build_opener
 
 from mark_api.analytics import AnalyticsContract
 from mark_api.domain import AdSnapshot, LifecycleState
+from mark_api.email_import import EmailImportReport
 from mark_api.launcher import (
     ProductLauncherError,
     build_product_launcher,
@@ -24,6 +28,32 @@ from mark_api.write_api import WriteCapability
 
 
 NOW = datetime(2026, 10, 4, 15, 0, tzinfo=timezone.utc)
+
+
+def reaction_email(
+    *,
+    ad_id: str = "3333333333",
+    conversation_id: str = "abc12:def34:ghi56",
+    provider_message_id: str = "11111111-2222-3333-4444-555555555555",
+) -> bytes:
+    message = EmailMessage(policy=policy.default)
+    message["From"] = "Kleinanzeigen <noreply@mail.kleinanzeigen.de>"
+    message["To"] = "owner@example.invalid"
+    message["Date"] = "Mon, 5 Oct 2026 06:30:00 +0000"
+    message["Message-ID"] = f"<{provider_message_id}@chat.kleinanzeigen.de>"
+    message["X-Conversation-ID"] = conversation_id
+    message["X-Message-ID"] = provider_message_id
+    reply_url = (
+        "https://www.kleinanzeigen.de/m-nachrichten.html?"
+        f"conversationId={conversation_id}"
+    )
+    message.set_content(
+        "Anfrage zu deiner Anzeige\n"
+        f"(Anzeigennummer: {ad_id})\n"
+        "Um auf diese Nachricht zu antworten: "
+        + reply_url
+    )
+    return message.as_bytes(policy=policy.default)
 
 
 class InventoryRuntime:
@@ -257,6 +287,180 @@ class ProductLauncherTests(unittest.TestCase):
 
         launcher.serve_forever()
         self.assertEqual(server.serve_calls, 1)
+
+    def test_startup_email_reactions_are_imported_before_http_surfaces(self) -> None:
+        tmp, db = self.make_db()
+        email_path = Path(tmp.name) / "reaction.eml"
+        email_path.write_bytes(reaction_email())
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        server = DashboardServer()
+        observed_at_dashboard_build: list[tuple[int, int]] = []
+
+        def dashboard_factory(store, **kwargs):
+            observed_at_dashboard_build.append(
+                store.inbound_message_counts("3333333333")
+            )
+            return server
+
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            email_paths=(email_path,),
+            runtime_factory=lambda **kwargs: inventory,
+            dashboard_factory=dashboard_factory,
+            clock=lambda: NOW,
+        )
+        self.addCleanup(launcher.close)
+
+        report = launcher.startup_email_import_report
+        self.assertEqual(report.parsed_files, 1)
+        self.assertEqual(report.inserted_events, 1)
+        self.assertEqual(report.duplicate_events, 0)
+        self.assertEqual(report.ad_ids, ("3333333333",))
+        self.assertEqual(observed_at_dashboard_build, [(1, 1)])
+
+        persisted = SnapshotStore(db)
+        self.assertEqual(
+            persisted.inbound_message_counts("3333333333"),
+            (1, 1),
+        )
+        self.assertNotIn("3333333333", persisted.tracked_ad_ids())
+        self.assertEqual(self.write_runtime.start_calls, 1)
+
+    def test_startup_email_reactions_are_served_by_real_dashboard(self) -> None:
+        tmp, db = self.make_db()
+        email_path = Path(tmp.name) / "reaction.eml"
+        email_path.write_bytes(reaction_email())
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            dashboard_port=0,
+            email_paths=(email_path,),
+            runtime_factory=lambda **kwargs: inventory,
+            clock=lambda: NOW,
+        )
+        thread = threading.Thread(target=launcher.serve_forever)
+        self.addCleanup(lambda: launcher.close())
+        self.addCleanup(lambda: thread.join(timeout=1))
+        thread.start()
+
+        host, port = launcher.server_address
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(
+            f"http://{host}:{port}/api/email-reactions",
+            timeout=2,
+        ) as response:
+            rows = json.loads(response.read())
+        with opener.open(
+            "http://"
+            f"{host}:{port}/api/analytics/ads"
+            "?metric=email_inbound_message_count",
+            timeout=2,
+        ) as response:
+            ranking = json.loads(response.read())
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ad_id"], "3333333333")
+        self.assertEqual(rows[0]["conversation_count"], 1)
+        self.assertEqual(rows[0]["inbound_message_count"], 1)
+        self.assertNotIn("unique_buyer_count", rows[0])
+        self.assertEqual(
+            [(item["ad_id"], item["value"]) for item in ranking],
+            [("3333333333", 1)],
+        )
+
+        launcher.close()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+
+    def test_startup_email_reimport_is_idempotent(self) -> None:
+        tmp, db = self.make_db()
+        email_path = Path(tmp.name) / "reaction.eml"
+        email_path.write_bytes(reaction_email())
+
+        first_write = WriteRuntime()
+        first = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            email_paths=(email_path,),
+            runtime_factory=lambda **kwargs: InventoryRuntime(
+                ReadResult.success_empty(())
+            ),
+            write_runtime_factory=lambda **kwargs: first_write,
+            dashboard_factory=lambda *args, **kwargs: DashboardServer(),
+            clock=lambda: NOW,
+        )
+        first_report = first.startup_email_import_report
+        first.close()
+
+        second_write = WriteRuntime()
+        second = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            email_paths=(email_path,),
+            runtime_factory=lambda **kwargs: InventoryRuntime(
+                ReadResult.success_empty(())
+            ),
+            write_runtime_factory=lambda **kwargs: second_write,
+            dashboard_factory=lambda *args, **kwargs: DashboardServer(),
+            clock=lambda: NOW,
+        )
+        self.addCleanup(second.close)
+        second_report = second.startup_email_import_report
+
+        self.assertEqual(first_report.inserted_events, 1)
+        self.assertEqual(first_report.duplicate_events, 0)
+        self.assertEqual(second_report.inserted_events, 0)
+        self.assertEqual(second_report.duplicate_events, 1)
+        self.assertEqual(
+            SnapshotStore(db).inbound_message_counts("3333333333"),
+            (1, 1),
+        )
+
+    def test_invalid_startup_email_batch_fails_before_http_surfaces(self) -> None:
+        tmp, db = self.make_db()
+        email_path = Path(tmp.name) / "invalid.eml"
+        email_path.write_bytes(b"not a Kleinanzeigen notification")
+        current = AdSnapshot(
+            ad_id="2222222222",
+            observed_at=NOW,
+            source="current",
+            lifecycle_state=LifecycleState.ACTIVE,
+        )
+        inventory = InventoryRuntime(ReadResult.success_nonempty((current,)))
+        dashboard_calls = 0
+
+        def dashboard_factory(*args, **kwargs):
+            nonlocal dashboard_calls
+            dashboard_calls += 1
+            return DashboardServer()
+
+        with self.assertRaisesRegex(
+            ProductLauncherError,
+            "local reaction email import failed",
+        ):
+            build_product_launcher(
+                db_path=db,
+                cdp_port=9222,
+                email_paths=(email_path,),
+                runtime_factory=lambda **kwargs: inventory,
+                dashboard_factory=dashboard_factory,
+                clock=lambda: NOW,
+            )
+
+        self.assertTrue(inventory.closed)
+        self.assertEqual(dashboard_calls, 0)
+        self.write_factory.assert_not_called()
+        persisted = SnapshotStore(db)
+        self.assertEqual(
+            persisted.latest_ad_snapshot("2222222222"),
+            current,
+        )
+        self.assertEqual(
+            persisted.inbound_message_counts("3333333333"),
+            (0, 0),
+        )
 
     def test_successful_empty_inventory_marks_history_absent(self) -> None:
         _tmp, db = self.make_db()
@@ -628,6 +832,12 @@ class ProductLauncherTests(unittest.TestCase):
             write_bearer_token = self.TOKEN
             startup_inventory_count = 2
             startup_persisted_count = 3
+            startup_email_import_report = EmailImportReport(
+                parsed_files=1,
+                inserted_events=1,
+                duplicate_events=0,
+                ad_ids=("3333333333",),
+            )
 
             def __init__(self) -> None:
                 self.closed = False
@@ -659,6 +869,8 @@ class ProductLauncherTests(unittest.TestCase):
                     "0",
                     "--write-port",
                     "0",
+                    "--email",
+                    "/tmp/reaction.eml",
                     "--reaction-metric",
                     "conversation_count",
                     "--objective-metric",
@@ -685,7 +897,16 @@ class ProductLauncherTests(unittest.TestCase):
             "Startup sync: 2 current ad(s), 3 observation(s) persisted.",
             stdout.getvalue(),
         )
+        self.assertIn(
+            "Startup reaction import: 1 email file(s), "
+            "1 new event(s), 0 duplicate event(s).",
+            stdout.getvalue(),
+        )
         self.assertEqual(build.call_args.kwargs["write_port"], 0)
+        self.assertEqual(
+            build.call_args.kwargs["email_paths"],
+            (Path("/tmp/reaction.eml"),),
+        )
         contract = build.call_args.kwargs["analytics_contract"]
         self.assertEqual(contract.reaction_metric, "conversation_count")
         self.assertEqual(contract.objective_metric, "views")

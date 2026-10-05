@@ -17,6 +17,7 @@ from .analytics import (
 )
 from .dashboard import LoopbackDashboardServer, create_server
 from .domain import AdSnapshot
+from .email_import import EmailImportReport, import_kleinanzeigen_email_files
 from .private_web import PrivateWebSubmitUnknownError
 from .private_web_runtime import (
     PrivateWebRuntimeDependencyError,
@@ -64,6 +65,7 @@ _DashboardFactory = Callable[..., LoopbackDashboardServer]
 _StoreFactory = Callable[[Path], SnapshotStore]
 _Clock = Callable[[], datetime]
 _TokenFactory = Callable[[], str]
+_EmailImporter = Callable[[SnapshotStore, tuple[Path, ...]], EmailImportReport]
 
 
 def _utc_now() -> datetime:
@@ -143,6 +145,7 @@ class ProductLauncherRuntime:
         server: LoopbackDashboardServer,
         startup_inventory_count: int,
         startup_persisted_count: int,
+        startup_email_import_report: EmailImportReport,
     ) -> None:
         self._inventory_runtime = inventory_runtime
         self._write_runtime = write_runtime
@@ -150,6 +153,7 @@ class ProductLauncherRuntime:
         self._server = server
         self._startup_inventory_count = startup_inventory_count
         self._startup_persisted_count = startup_persisted_count
+        self._startup_email_import_report = startup_email_import_report
         self._state_lock = Lock()
         self._close_lock = Lock()
         self._shutdown_started = False
@@ -180,6 +184,10 @@ class ProductLauncherRuntime:
     @property
     def startup_persisted_count(self) -> int:
         return self._startup_persisted_count
+
+    @property
+    def startup_email_import_report(self) -> EmailImportReport:
+        return self._startup_email_import_report
 
     @property
     def write_server_address(self) -> tuple[str, int]:
@@ -299,6 +307,8 @@ def build_product_launcher(
     write_port: int = 8766,
     timeout_seconds: float = 5.0,
     analytics_contract: AnalyticsContract | None = None,
+    email_paths: tuple[Path, ...] = (),
+    email_importer: _EmailImporter = import_kleinanzeigen_email_files,
     runtime_factory: _RuntimeFactory = build_private_web_inventory_runtime,
     write_runtime_factory: _WriteRuntimeFactory | None = None,
     dashboard_factory: _DashboardFactory = create_server,
@@ -328,6 +338,14 @@ def build_product_launcher(
         AnalyticsContract,
     ):
         raise TypeError("analytics_contract must be AnalyticsContract or None")
+    try:
+        normalized_email_paths = tuple(email_paths)
+    except TypeError as exc:
+        raise TypeError("email_paths must be iterable") from exc
+    if any(not isinstance(path, Path) for path in normalized_email_paths):
+        raise TypeError("email_paths must contain pathlib.Path values")
+    if not callable(email_importer):
+        raise TypeError("email_importer must be callable")
     if not callable(runtime_factory):
         raise TypeError("runtime_factory must be callable")
     if write_runtime_factory is not None and not callable(write_runtime_factory):
@@ -378,6 +396,23 @@ def build_product_launcher(
             observed_at=observed_at,
             source=_LAUNCHER_SOURCE,
         )
+        email_report = EmailImportReport(
+            parsed_files=0,
+            inserted_events=0,
+            duplicate_events=0,
+            ad_ids=(),
+        )
+        if normalized_email_paths:
+            try:
+                email_report = email_importer(store, normalized_email_paths)
+            except Exception:
+                raise ProductLauncherError(
+                    "local reaction email import failed"
+                ) from None
+            if not isinstance(email_report, EmailImportReport):
+                raise ProductLauncherError(
+                    "local reaction email import failed"
+                )
         server = dashboard_factory(
             store,
             host="127.0.0.1",
@@ -457,6 +492,7 @@ def build_product_launcher(
         server=server,
         startup_inventory_count=len(snapshots),
         startup_persisted_count=persisted,
+        startup_email_import_report=email_report,
     )
 
 
@@ -499,6 +535,19 @@ def _parser() -> argparse.ArgumentParser:
         help="Private-Web setup/read timeout in seconds (default: 5).",
     )
     parser.add_argument(
+        "--email",
+        dest="email_paths",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="FILE",
+        help=(
+            "Import one user-provided local Kleinanzeigen RFC822/.eml "
+            "notification before serving; repeat for multiple files. "
+            "No mailbox or Kleinanzeigen messaging API is contacted."
+        ),
+    )
+    parser.add_argument(
         "--reaction-metric",
         choices=REACTION_METRICS,
         default=None,
@@ -534,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
             write_port=args.write_port,
             timeout_seconds=args.timeout_seconds,
             analytics_contract=contract,
+            email_paths=tuple(args.email_paths),
         )
     except (ProductLauncherError, PrivateWebRuntimeDependencyError) as exc:
         print(f"mark-api-launch: {exc}", file=sys.stderr)
@@ -559,6 +609,15 @@ def main(argv: list[str] | None = None) -> int:
         f"{launcher.startup_persisted_count} observation(s) persisted.",
         flush=True,
     )
+    if args.email_paths:
+        email_report = launcher.startup_email_import_report
+        print(
+            "Startup reaction import: "
+            f"{email_report.parsed_files} email file(s), "
+            f"{email_report.inserted_events} new event(s), "
+            f"{email_report.duplicate_events} duplicate event(s).",
+            flush=True,
+        )
 
     exit_code = 0
     try:
