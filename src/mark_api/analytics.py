@@ -198,18 +198,16 @@ class AnalyticsService:
         self._validate_metric(metric)
 
         grouped: dict[str, list[int]] = {}
-        for ad in self._query.latest_ads():
-            classification = self._store.latest_classification(ad.ad_id)
+        for ranking in self.rank_ads(metric):
+            classification = self._store.latest_classification(
+                ranking.ad_id
+            )
             if classification is None:
                 continue
             label = getattr(classification, dimension)
             if label is None:
                 continue
-
-            value = self._metric_value(ad, metric)
-            if value is None:
-                continue
-            grouped.setdefault(label, []).append(value)
+            grouped.setdefault(label, []).append(ranking.value)
 
         rows = [
             GroupMetricRanking(

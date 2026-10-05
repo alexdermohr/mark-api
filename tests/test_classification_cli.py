@@ -9,7 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mark_api.classification_cli import main, update_classification
-from mark_api.domain import AdClassification, AdSnapshot, LifecycleState
+from mark_api.domain import (
+    AdClassification,
+    AdSnapshot,
+    InboundMessageEvent,
+    LifecycleState,
+)
 from mark_api.storage import SnapshotStore
 
 
@@ -37,7 +42,7 @@ class ClassificationCliTests(unittest.TestCase):
     def test_unknown_ad_is_rejected_before_append(self) -> None:
         _, store = self.make_store()
 
-        with self.assertRaisesRegex(ValueError, "unknown tracked ad_id"):
+        with self.assertRaisesRegex(ValueError, "unknown analytics ad_id"):
             update_classification(
                 store,
                 ad_id="999",
@@ -46,6 +51,33 @@ class ClassificationCliTests(unittest.TestCase):
             )
 
         self.assertEqual(store.classification_history("999"), ())
+
+    def test_email_only_ad_can_be_classified_without_becoming_owner_tracked(self) -> None:
+        _, store = self.make_store()
+        store.append_inbound_message_events(
+            (
+                InboundMessageEvent(
+                    ad_id="9",
+                    conversation_id="email-conversation",
+                    provider_message_id="email-message",
+                    observed_at=T0,
+                    source="kleinanzeigen-email",
+                ),
+            )
+        )
+
+        item = update_classification(
+            store,
+            ad_id="9",
+            labels={"city": "Dresden", "image_type": "overview"},
+            observed_at=T1,
+        )
+
+        self.assertEqual(item.ad_id, "9")
+        self.assertEqual(item.city, "Dresden")
+        self.assertEqual(item.image_type, "overview")
+        self.assertEqual(store.latest_classification("9"), item)
+        self.assertEqual(store.tracked_ad_ids(), ())
 
     def test_partial_update_preserves_unspecified_latest_labels(self) -> None:
         _, store = self.make_store()

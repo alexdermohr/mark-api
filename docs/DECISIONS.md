@@ -381,3 +381,19 @@ Ein neuer Runtime-Owner darf einen identischen bestehenden `in_progress`-Claim n
 - `reaction_metric` und `objective_metric` bleiben unabhängig und ohne explizite Nutzerwahl ungesetzt.
 
 **Folgen:** Der Product Launcher liefert beim ersten sichtbaren Dashboard-Read optional bereits die ausdrücklich bereitgestellte lokale Reaction-Evidenz, ohne einen neuen Plattform-Readpfad zu eröffnen. Automatische Discovery/Watching und Freshness bleiben spätere Arbeit. Die analytische Nutzung von Email-only-Anzeigen-IDs für Klassifikationen und Gruppenrankings bleibt bewusst der nachfolgenden Phase „Email-only Classification“ vorbehalten.
+
+## D-026 — Klassifikation trennt analytische Identität von Owner-Bestand
+
+**Problem:** Der erlaubte lokale E-Mail-Pfad aus D-008/D-025 konnte Email-only-Anzeigen-IDs bereits source-explizit ranken, `mark-api-classify` akzeptierte jedoch ausschließlich IDs mit einem `ad_snapshots`-Eintrag. Dadurch endete der unterstützte Datenpfad vor den gewünschten Gruppenvergleichen, obwohl die E-Mail-Evidenz die Anzeigen-ID bereits lokal und fail-closed gebunden hatte. Ein künstlicher `AdSnapshot` wäre falsch, weil E-Mail-Evidenz keinen aktuellen Besitzerbestand beweist.
+
+**Entscheidung:** Der nutzerseitige Merge-/CLI-Pfad für lokale Klassifikationsänderungen ist zulässig, wenn dieselbe Anzeigen-ID in der SQLite-Datenbank entweder durch mindestens einen `ad_snapshots`-Eintrag **oder** durch mindestens ein `inbound_message_events`-Event belegt ist. Die Admission wird innerhalb derselben `BEGIN IMMEDIATE`-Transaktion geprüft, in der die Klassifikation zusammengeführt wird. Beliebige unbekannte IDs bleiben abgewiesen. Es wird kein `AdSnapshot` erzeugt und `tracked_ad_ids()` behält ausschließlich seine Owner-/Bestandssnapshot-Semantik.
+
+Gruppenrankings verwenden als Population exakt die bereits definierte Anzeigenrangliste der angeforderten Metrik (`rank_ads(metric)`). Damit können Email-only-IDs mit expliziter Klassifikation an `email_conversation_count`- und `email_inbound_message_count`-Gruppen teilnehmen. Für Views, Watch/Reply sowie `ReactionSnapshot`-Metriken bleibt die bisherige Population unverändert; eine nur per E-Mail bekannte ID erhält daraus keinen Wert und erscheint dort nicht.
+
+**Folgen:**
+- lokale analytische Identität und nachgewiesener Owner-Bestand sind getrennte Konzepte,
+- E-Mail-Evidenz erteilt keine Ownership-, Presence- oder Write-Autorität und verändert Dashboard-Bestandszahlen nicht,
+- `unique_buyer_count` wird weiterhin nicht aus E-Mail-Kopien abgeleitet,
+- Labels bleiben explizite lokale Nutzereingaben; es gibt keine automatische Klassifikation aus Nachrichtentext oder Absenderdaten,
+- die Metrik-/Objective-Defaults aus D-017 bleiben unverändert ungesetzt,
+- der lokale Integrationspfad `RFC822-Datei → Import → Klassifikation → source-explizites E-Mail-Gruppenranking → Loopback-Dashboard` ist regressionsgetestet, ohne Kleinanzeigen zu kontaktieren oder Plattformwrites auszuführen.

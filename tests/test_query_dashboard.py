@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+from email import policy
+from email.message import EmailMessage
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from mark_api.analytics import ANALYTICS_METRICS, REACTION_METRICS, AnalyticsContract
+from mark_api.classification_cli import main as classification_main
 from mark_api.dashboard import create_server
+from mark_api.email_import import import_kleinanzeigen_email_files
 from mark_api.domain import (
     AdClassification,
     AdSnapshot,
@@ -30,6 +36,32 @@ from mark_api.storage import SnapshotStore
 
 T0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
 T1 = T0 + timedelta(minutes=5)
+
+
+def email_notification(
+    *,
+    ad_id: str = "3333333333",
+    conversation_id: str = "abc12:def34:ghi56",
+    provider_message_id: str = "11111111-2222-3333-4444-555555555555",
+) -> bytes:
+    message = EmailMessage(policy=policy.default)
+    message["From"] = "Kleinanzeigen <noreply@mail.kleinanzeigen.de>"
+    message["To"] = "owner@example.invalid"
+    message["Date"] = "Thu, 24 Sep 2026 12:00:00 +0000"
+    message["Message-ID"] = f"<{provider_message_id}@chat.kleinanzeigen.de>"
+    message["X-Conversation-ID"] = conversation_id
+    message["X-Message-ID"] = provider_message_id
+    reply_url = (
+        "https://www.kleinanzeigen.de/m-nachrichten.html?"
+        f"conversationId={conversation_id}"
+    )
+    message.set_content(
+        "Anfrage zu deiner Anzeige\n"
+        f"(Anzeigennummer: {ad_id})\n"
+        "Um auf diese Nachricht zu antworten: "
+        + reply_url
+    )
+    return message.as_bytes(policy=policy.default)
 
 
 class SeededStoreMixin:
@@ -185,6 +217,71 @@ class MarkQueryServiceTests(SeededStoreMixin, unittest.TestCase):
         json.dumps(summary_payload)
         self.assertNotIn("message", ad_payload)
         self.assertEqual(ad_payload["lifecycle_state"], "absent")
+
+
+class EmailOnlyClassificationIntegrationTests(unittest.TestCase):
+    def test_email_import_classification_and_group_dashboard(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "mark.sqlite"
+        email_path = Path(tmp.name) / "reaction.eml"
+        email_path.write_bytes(email_notification())
+        store = SnapshotStore(db_path)
+
+        report = import_kleinanzeigen_email_files(store, (email_path,))
+        self.assertEqual(report.inserted_events, 1)
+        self.assertEqual(store.tracked_ad_ids(), ())
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = classification_main(
+                [
+                    "--db",
+                    str(db_path),
+                    "--ad-id",
+                    "3333333333",
+                    "--city",
+                    "Dresden",
+                ]
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())["city"], "Dresden")
+        self.assertEqual(store.tracked_ad_ids(), ())
+
+        server = create_server(store, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        thread.start()
+        host, port = server.server_address
+
+        with urlopen(
+            "http://"
+            f"{host}:{port}/api/analytics/groups"
+            "?dimension=city&metric=email_inbound_message_count",
+            timeout=2,
+        ) as response:
+            groups = json.loads(response.read())
+        with urlopen(
+            f"http://{host}:{port}/api/summary",
+            timeout=2,
+        ) as response:
+            summary = json.loads(response.read())
+
+        self.assertEqual(
+            groups,
+            [
+                {
+                    "label": "Dresden",
+                    "sample_size": 1,
+                    "metric_sum": 1,
+                    "metric_mean": 1.0,
+                }
+            ],
+        )
+        self.assertEqual(summary["tracked_ads"], 0)
+        self.assertEqual(summary["current_ads"], 0)
 
 
 class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
@@ -391,6 +488,40 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         email_only = email_ranking[1]
         self.assertIsNone(email_only["present"])
         self.assertIsNone(email_only["lifecycle_state"])
+
+        self.store.append_classification(
+            AdClassification(
+                ad_id="3",
+                observed_at=T1 + timedelta(seconds=1),
+                source="manual-cli",
+                city="Dresden",
+            )
+        )
+        _, _, email_groups_body = self.get(
+            "/api/analytics/groups"
+            "?dimension=city&metric=email_inbound_message_count"
+        )
+        email_groups = json.loads(email_groups_body)
+        self.assertEqual(
+            email_groups,
+            [
+                {
+                    "label": "Berlin",
+                    "sample_size": 1,
+                    "metric_sum": 2,
+                    "metric_mean": 2.0,
+                },
+                {
+                    "label": "Dresden",
+                    "sample_size": 1,
+                    "metric_sum": 1,
+                    "metric_mean": 1.0,
+                },
+            ],
+        )
+
+        _, _, summary_body = self.get("/api/summary")
+        self.assertEqual(json.loads(summary_body)["tracked_ads"], 2)
 
         _, _, mobile_ranking_body = self.get(
             "/api/analytics/ads?metric=inbound_message_count"

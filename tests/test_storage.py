@@ -12,6 +12,7 @@ from pathlib import Path
 from mark_api.domain import (
     AdSnapshot,
     CreateOperationReceipt,
+    InboundMessageEvent,
     LifecycleState,
     MediaPostReadStatus,
     OperationOutcome,
@@ -525,6 +526,31 @@ class SnapshotStoreTests(unittest.TestCase):
 
         self.assertEqual(store.reaction_history("3521676801"), (first, second))
 
+
+    def test_merge_classification_accepts_email_evidence_without_owner_snapshot(self) -> None:
+        store = self.make_store()
+        store.append_inbound_message_events(
+            (
+                InboundMessageEvent(
+                    ad_id="9",
+                    conversation_id="email-conversation",
+                    provider_message_id="email-message",
+                    observed_at=NOW,
+                    source="kleinanzeigen-email",
+                ),
+            )
+        )
+
+        item = store.merge_classification(
+            ad_id="9",
+            source="manual-cli",
+            changes={"city": "Dresden"},
+            observed_at=NOW + timedelta(minutes=1),
+        )
+
+        self.assertEqual(item.city, "Dresden")
+        self.assertEqual(store.latest_classification("9"), item)
+        self.assertEqual(store.tracked_ad_ids(), ())
 
     def test_merge_classification_serializes_symlink_aliases(self) -> None:
         tmp = tempfile.TemporaryDirectory()
