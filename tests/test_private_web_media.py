@@ -182,6 +182,37 @@ class PrivateWebMediaContractTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_media_handle_store_preserves_only_requested_expired_refs(self) -> None:
+        now = [100.0]
+        store = PrivateWebMediaHandleStore(clock=lambda: now[0])
+        try:
+            store._MAX_STAGED_HANDLES = 2
+            store._STAGED_HANDLE_TTL_SECONDS = 10
+            protected = store.stage_media("protected.jpg", b"\xff\xd8\xffone")
+            orphan = store.stage_media("orphan.jpg", b"\xff\xd8\xfftwo")
+            (protected_source,) = store.resolve((protected,))
+            (orphan_source,) = store.resolve((orphan,))
+
+            now[0] = 110.0
+            self.assertEqual(store.resolve((protected,)), (protected_source,))
+            self.assertTrue(Path(protected_source.path).exists())
+            self.assertFalse(Path(orphan_source.path).exists())
+            self.assertEqual(set(store._sources), {protected})
+            self.assertEqual(store._staged_bytes, len(b"\xff\xd8\xffone"))
+
+            with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                store.resolve((orphan,))
+            with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                store.resolve(("media_missing",))
+
+            store.discard((protected,))
+            store.discard((protected,))
+            self.assertFalse(Path(protected_source.path).exists())
+            with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                store.resolve((protected,))
+        finally:
+            store.close()
+
     def test_media_handle_store_enforces_total_byte_quota_before_writing(self) -> None:
         store = PrivateWebMediaHandleStore()
         try:

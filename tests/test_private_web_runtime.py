@@ -1053,7 +1053,9 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             title=self.request.title,
             description=self.request.description,
         )
-        handles = PrivateWebMediaHandleStore()
+        now = [100.0]
+        handles = PrivateWebMediaHandleStore(clock=lambda: now[0])
+        handles._STAGED_HANDLE_TTL_SECONDS = 10
         ref = handles.stage_media("photo.jpg", b"\xff\xd8\xffjpeg")
         service = PrivateWebMediaCreateService(
             runtime=runtime,
@@ -1073,6 +1075,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             writes_enabled=True,
         )
 
+        now[0] = 110.0
         receipt = service.create_with_media(self.request, (ref,))
 
         self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)

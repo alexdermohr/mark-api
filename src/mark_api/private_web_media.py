@@ -480,11 +480,15 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         self._staged_bytes = max(0, self._staged_bytes - released_bytes)
         return tuple(sources)
 
-    def _prune_expired_locked(self, now: float) -> None:
+    def _prune_expired_locked(
+        self,
+        now: float,
+        preserve: frozenset[str] = frozenset(),
+    ) -> None:
         expired = tuple(
             ref
             for ref, expires_at in self._expires_at.items()
-            if expires_at <= now
+            if expires_at <= now and ref not in preserve
         )
         if expired:
             self._unlink_sources(self._pop_handles_locked(expired))
@@ -565,7 +569,16 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         with self._lock:
             if self._closed:
                 raise PrivateWebWriteNotAttemptedError("resolve_media_refs")
-            self._prune_expired_locked(float(self._clock()))
+            preserve = (
+                frozenset(media_refs)
+                if isinstance(media_refs, tuple)
+                and all(isinstance(ref, str) for ref in media_refs)
+                else frozenset()
+            )
+            self._prune_expired_locked(
+                float(self._clock()),
+                preserve=preserve,
+            )
             return super().resolve(media_refs)
 
     def discard(self, media_refs: tuple[str, ...]) -> None:

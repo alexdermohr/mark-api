@@ -683,11 +683,12 @@ function renderAds(ads) {
     row.append(td(ad.observed_at));
 
     const actionCell = document.createElement("td");
-    if (writeUiReady() && ad.present) {
+    const pending = pendingForAd(ad.ad_id);
+    if (writeUiReady() && (ad.present || pending !== null)) {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "row-action";
-      button.textContent = "Verwalten";
+      button.textContent = ad.present ? "Verwalten" : "Recovery";
       button.addEventListener("click", () => populateManageForm(ad));
       actionCell.append(button);
     }
@@ -962,19 +963,95 @@ async function runPlatformWrite(scope, method, path, payload, {adId = null} = {}
   }
 }
 
+function isPythonWhitespace(character) {
+  const codePoint = character.codePointAt(0);
+  return (
+    (codePoint >= 0x0009 && codePoint <= 0x000d)
+    || (codePoint >= 0x001c && codePoint <= 0x0020)
+    || codePoint === 0x0085
+    || codePoint === 0x00a0
+    || codePoint === 0x1680
+    || (codePoint >= 0x2000 && codePoint <= 0x200a)
+    || codePoint === 0x2028
+    || codePoint === 0x2029
+    || codePoint === 0x202f
+    || codePoint === 0x205f
+    || codePoint === 0x3000
+  );
+}
+
+function pythonStrip(value) {
+  const characters = Array.from(value);
+  let start = 0;
+  let end = characters.length;
+  while (start < end && isPythonWhitespace(characters[start])) start += 1;
+  while (end > start && isPythonWhitespace(characters[end - 1])) end -= 1;
+  return characters.slice(start, end).join("");
+}
+
+function requireUnicodeScalarText(value, fieldName) {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) {
+      throw new Error(fieldName + " darf keine ungültigen Unicode-Surrogates enthalten.");
+    }
+  }
+}
+
 function createPayload() {
-  const categoryPath = byId("create-category").value
-    .split(">")
-    .map((item) => item.trim())
-    .filter(Boolean);
+  const rawCategoryPath = byId("create-category").value.split(">");
+  if (rawCategoryPath.length < 2 || rawCategoryPath.length > 6) {
+    throw new Error("Kategoriepfad muss zwischen 2 und 6 Labels enthalten.");
+  }
+  const categoryPath = rawCategoryPath.map((label) => {
+    const normalized = pythonStrip(label);
+    requireUnicodeScalarText(normalized, "Kategorie");
+    if (!normalized) {
+      throw new Error("Kategorie-Labels dürfen nicht leer sein.");
+    }
+    if (Array.from(normalized).length > 120) {
+      throw new Error("Kategorie-Labels dürfen höchstens 120 Zeichen enthalten.");
+    }
+    return normalized;
+  });
+  if (new Set(categoryPath).size !== categoryPath.length) {
+    throw new Error("Kategoriepfad darf keine doppelten Labels enthalten.");
+  }
+
+  const title = byId("create-title").value;
+  requireUnicodeScalarText(title, "Titel");
+  if (!pythonStrip(title)) {
+    throw new Error("Titel darf nicht leer sein.");
+  }
+  if (title !== pythonStrip(title)) {
+    throw new Error("Titel darf keine umgebenden Whitespaces enthalten.");
+  }
+  if (title.includes("\\r") || title.includes("\\n")) {
+    throw new Error("Titel darf keine Zeilenumbrüche enthalten.");
+  }
+  if (title.length > 65) {
+    throw new Error("Titel darf höchstens 65 UTF-16-Code-Units enthalten.");
+  }
+
+  const description = byId("create-description").value
+    .replace(/\\r\\n/g, "\\n")
+    .replace(/\\r/g, "\\n");
+  requireUnicodeScalarText(description, "Beschreibung");
+  if (!pythonStrip(description)) {
+    throw new Error("Beschreibung darf nicht leer sein.");
+  }
+  if (description.length > 4000) {
+    throw new Error("Beschreibung darf höchstens 4000 UTF-16-Code-Units enthalten.");
+  }
+
   const price = Number(byId("create-price").value);
-  if (!Number.isSafeInteger(price) || price <= 0) {
-    throw new Error("Festpreis muss eine positive ganze Euro-Zahl sein.");
+  if (!Number.isSafeInteger(price) || price < 1 || price > 99999999) {
+    throw new Error("Festpreis muss eine ganze Euro-Zahl zwischen 1 und 99999999 sein.");
   }
   return {
     category_path: categoryPath,
-    title: byId("create-title").value,
-    description: byId("create-description").value,
+    title,
+    description,
     price_eur: price,
   };
 }
@@ -1104,6 +1181,14 @@ function selectedAdId() {
   const adId = byId("manage-ad-id").value;
   if (!adId || !latestAdsById.has(adId)) {
     setWriteStatus("Zuerst eine aktuelle Anzeige über „Verwalten“ auswählen.", "error");
+    return null;
+  }
+  const ad = latestAdsById.get(adId);
+  if (ad.present === false && pendingForAd(adId) === null) {
+    setWriteStatus(
+      "Diese Anzeige ist nicht mehr vorhanden. Ohne gebundene Recovery-Anfrage sind keine neuen Writes zulässig.",
+      "warning",
+    );
     return null;
   }
   return adId;

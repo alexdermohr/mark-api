@@ -1727,6 +1727,301 @@ const files = [
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_validates_complete_create_before_media_staging(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+const fields = new Map([
+  ["create-category", {value: ""}],
+  ["create-title", {value: ""}],
+  ["create-description", {value: ""}],
+  ["create-price", {value: ""}],
+  ["create-media", {files: []}],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    if (fields.has(id)) return fields.get(id);
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+const calls = [];
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  throw new Error("fetch must not run for invalid create data");
+};
+
+function setCreate({
+  category = "A > B",
+  title = "Valid title",
+  description = "Valid description",
+  price = "1",
+  files = [],
+} = {}) {
+  fields.get("create-category").value = category;
+  fields.get("create-title").value = title;
+  fields.get("create-description").value = description;
+  fields.get("create-price").value = price;
+  fields.get("create-media").files = files;
+}
+
+setCreate({
+  category: " A > B ",
+  title: "😀".repeat(32) + "x",
+  description: "line 1\r\nline 2\rline 3",
+  price: "99999999",
+});
+const normalized = createPayload();
+assert.deepEqual(normalized.category_path, ["A", "B"]);
+assert.equal(normalized.title, "😀".repeat(32) + "x");
+assert.equal(normalized.description, "line 1\nline 2\nline 3");
+assert.equal(normalized.price_eur, 99999999);
+
+setCreate({title: "   "});
+assert.throws(() => createPayload(), /Titel darf nicht leer/i);
+setCreate({title: " surrounded "});
+assert.throws(() => createPayload(), /umgebenden Whitespaces/i);
+setCreate({title: "line\nbreak"});
+assert.throws(() => createPayload(), /Zeilenumbrüche/i);
+setCreate({title: "line\rbreak"});
+assert.throws(() => createPayload(), /Zeilenumbrüche/i);
+setCreate({title: "😀".repeat(33)});
+assert.throws(() => createPayload(), /65 UTF-16/i);
+
+setCreate({category: "A"});
+assert.throws(() => createPayload(), /zwischen 2 und 6/i);
+setCreate({category: "A>B>C>D>E>F>G"});
+assert.throws(() => createPayload(), /zwischen 2 und 6/i);
+setCreate({category: "A >   > B"});
+assert.throws(() => createPayload(), /nicht leer/i);
+setCreate({category: "x".repeat(121) + " > B"});
+assert.throws(() => createPayload(), /120 Zeichen/i);
+setCreate({category: " A > B > A "});
+assert.throws(() => createPayload(), /doppelten Labels/i);
+
+setCreate({title: "\uD800"});
+assert.throws(() => createPayload(), /Unicode-Surrogates/i);
+setCreate({description: "   "});
+assert.throws(() => createPayload(), /Beschreibung darf nicht leer/i);
+setCreate({description: "x".repeat(4001)});
+assert.throws(() => createPayload(), /4000 UTF-16/i);
+setCreate({price: "100000000"});
+assert.throws(() => createPayload(), /99999999/i);
+
+setCreate({
+  title: "   ",
+  files: [{name: "one.jpg", type: "image/jpeg", size: 10}],
+});
+(async () => {
+  await submitCreate({preventDefault() {}});
+  assert.equal(calls.length, 0);
+  assert.match(writeStatus.textContent, /Titel darf nicht leer/i);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+    def test_write_runtime_exposes_absent_pending_recovery_without_new_writes(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+
+class Element {
+  constructor(tagName) {
+    this.tagName = tagName;
+    this.children = [];
+    this.attributes = {};
+    this.listeners = {};
+    this.hidden = false;
+    this.textContent = "";
+    this.className = "";
+    this.value = "";
+    this.type = "";
+  }
+  replaceChildren(...children) {
+    this.children = children;
+  }
+  append(...children) {
+    this.children.push(...children);
+  }
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+  }
+  addEventListener(name, handler) {
+    this.listeners[name] = handler;
+  }
+  scrollIntoView() {}
+}
+
+const elements = new Map([
+  ["ads-body", new Element("tbody")],
+  ["empty", new Element("p")],
+  ["manage-ad-id", new Element("input")],
+  ["manage-title", new Element("input")],
+  ["manage-description", new Element("textarea")],
+  ["manage-state", new Element("span")],
+  ["manage-form", new Element("form")],
+  ["write-status", new Element("p")],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (!elements.has(id)) throw new Error("unexpected element: " + id);
+    return elements.get(id);
+  },
+  createElement(tagName) {
+    return new Element(tagName);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+let loadCalls = 0;
+load = async () => { loadCalls += 1; };
+
+const original = {
+  scope: "ad:2:delete",
+  key: "ui:pending-delete-key",
+  method: "DELETE",
+  path: "/api/write/ads/2",
+  payload: null,
+  adId: "2",
+};
+pendingWrites.set(original.scope, original);
+
+const absent = {
+  ad_id: "2",
+  title: "Deleted ad",
+  description: "Original description",
+  lifecycle_state: "absent",
+  present: false,
+  views: 1,
+  watch_count: 2,
+  reply_count: 3,
+  observed_at: "2026-10-05T18:00:00Z",
+};
+renderAds([absent]);
+const row = elements.get("ads-body").children[0];
+const actionCell = row.children[7];
+assert.equal(actionCell.children.length, 1);
+const recoveryButton = actionCell.children[0];
+assert.equal(recoveryButton.textContent, "Recovery");
+recoveryButton.listeners.click();
+assert.equal(elements.get("manage-ad-id").value, "2");
+assert.equal(elements.get("manage-title").value, "Deleted ad");
+assert.equal(elements.get("manage-description").value, "Original description");
+
+const calls = [];
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  if (path === "/api/dashboard/pending-writes/ack") {
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  return {
+    status: 200,
+    ok: true,
+    async text() {
+      return JSON.stringify({
+        idempotency_key: original.key,
+        operation_receipt: {outcome: "confirmed"},
+        platform_retry_authorized: false,
+      });
+    },
+  };
+};
+
+(async () => {
+  await runAdAction(
+    "update",
+    "PATCH",
+    "",
+    {title: "must not replace pending delete"},
+  );
+  assert.equal(calls.length, 0);
+  assert.equal(pendingWrites.get(original.scope), original);
+
+  await runAdAction("delete", "DELETE", "");
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].path, original.path);
+  assert.equal(calls[0].options.method, original.method);
+  assert.equal(calls[0].options.headers["Idempotency-Key"], original.key);
+  assert.equal(calls[0].options.body, null);
+  assert.equal(calls[1].path, "/api/dashboard/pending-writes/ack");
+  assert.equal(pendingWrites.size, 0);
+  assert.equal(loadCalls, 1);
+
+  await runAdAction(
+    "update",
+    "PATCH",
+    "",
+    {title: "must stay blocked after recovery"},
+  );
+  assert.equal(calls.length, 2);
+  assert.match(elements.get("write-status").textContent, /keine neuen Writes/i);
+
+  renderAds([{
+    ...absent,
+    ad_id: "3",
+    title: "Absent without pending",
+  }]);
+  const absentWithoutPending = elements.get("ads-body").children[0];
+  assert.equal(absentWithoutPending.children[7].children.length, 0);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_non_get_methods_are_405_and_no_write_route_exists(self) -> None:
         _, _, config_body = self.get("/api/dashboard/config")
         self.assertEqual(
