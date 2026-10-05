@@ -100,6 +100,10 @@ class RecordingWriteBackend:
                 )
                 if self.path == "/api/write/media/stage":
                     payload = {"media_ref": "staged-ref-1"}
+                elif self.path == "/api/write/media/discard":
+                    payload = {
+                        "discarded": len(json.loads(body).get("media_refs", []))
+                    }
                 else:
                     payload = {
                         "idempotency_key": self.headers.get("Idempotency-Key"),
@@ -340,6 +344,45 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
         self.assertIsNone(captured["dashboard_token"])
         self.assertIsNone(captured["dashboard_marker"])
 
+        pending = self.store.dashboard_pending_writes()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].scope, "ad:2:update")
+        self.assertEqual(pending[0].idempotency_key, "ui:test-forward-1")
+
+        wrong_ack = Request(
+            self.base + "/api/dashboard/pending-writes/ack",
+            data=json.dumps(
+                {
+                    "scope": "ad:2:update",
+                    "idempotency_key": "ui:wrong-key",
+                }
+            ).encode("utf-8"),
+            method="POST",
+            headers=self.write_headers(content_type="application/json"),
+        )
+        with self.assertRaises(HTTPError) as wrong_ack_error:
+            urlopen(wrong_ack, timeout=2)
+        self.assertEqual(wrong_ack_error.exception.code, 409)
+        self.assertEqual(self.store.dashboard_pending_writes(), pending)
+
+        ack = Request(
+            self.base + "/api/dashboard/pending-writes/ack",
+            data=json.dumps(
+                {
+                    "scope": "ad:2:update",
+                    "idempotency_key": "ui:test-forward-1",
+                }
+            ).encode("utf-8"),
+            method="POST",
+            headers=self.write_headers(content_type="application/json"),
+        )
+        with urlopen(ack, timeout=2) as response:
+            self.assertEqual(
+                json.loads(response.read()),
+                {"acknowledged": True},
+            )
+        self.assertEqual(self.store.dashboard_pending_writes(), ())
+
     def test_proxy_media_stage_keeps_bytes_local_and_uses_no_idempotency_key(self) -> None:
         media = b"\x89PNG\r\n\x1a\nlocal-test"
         request = Request(
@@ -366,8 +409,29 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
             f"Bearer {self.BACKEND_TOKEN}",
         )
 
-    def test_proxy_backend_transport_failure_is_unknown_and_not_retry_authorized(self) -> None:
-        backend_host, backend_port = self.backend.server_address
+    def test_proxy_media_discard_is_allowlisted_without_platform_idempotency(self) -> None:
+        body = json.dumps({"media_refs": ["staged-ref-1"]}).encode("utf-8")
+        request = Request(
+            self.base + "/api/write/media/discard",
+            data=body,
+            method="POST",
+            headers=self.write_headers(content_type="application/json"),
+        )
+        with urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read())
+
+        self.assertEqual(payload, {"discarded": 1})
+        self.assertEqual(len(self.backend.requests), 1)
+        captured = self.backend.requests[0]
+        self.assertEqual(captured["path"], "/api/write/media/discard")
+        self.assertEqual(json.loads(captured["body"]), {"media_refs": ["staged-ref-1"]})
+        self.assertIsNone(captured["idempotency_key"])
+        self.assertEqual(
+            captured["authorization"],
+            f"Bearer {self.BACKEND_TOKEN}",
+        )
+
+    def test_proxy_persists_unknown_request_and_recovers_exactly_after_restart(self) -> None:
         self.backend.close()
         request = Request(
             self.base + "/api/write/ads/2",
@@ -388,6 +452,144 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
                 "platform_retry_authorized": False,
             },
         )
+
+        pending = self.store.dashboard_pending_writes()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].scope, "ad:2:update")
+        self.assertEqual(pending[0].resource_key, "ad:2")
+        self.assertEqual(
+            pending[0].idempotency_key,
+            "ui:test-transport-unknown",
+        )
+        self.assertEqual(pending[0].method, "PATCH")
+        self.assertEqual(pending[0].path, "/api/write/ads/2")
+        self.assertEqual(
+            json.loads(pending[0].payload_json or "{}"),
+            {"title": "Neu"},
+        )
+        self.assertEqual(pending[0].ad_id, "2")
+
+        conflict = Request(
+            self.base + "/api/write/ads/2",
+            data=b'{"title":"Changed"}',
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:different-key",
+            ),
+        )
+        with self.assertRaises(HTTPError) as conflict_error:
+            urlopen(conflict, timeout=2)
+        self.assertEqual(conflict_error.exception.code, 409)
+        self.assertEqual(
+            json.loads(conflict_error.exception.read()),
+            {
+                "error": "dashboard_pending_write_conflict",
+                "platform_retry_authorized": False,
+            },
+        )
+        self.assertEqual(
+            self.store.dashboard_pending_writes(),
+            pending,
+        )
+
+        replacement_backend = RecordingWriteBackend()
+        self.addCleanup(replacement_backend.close)
+        backend_host, backend_port = replacement_backend.server_address
+        replacement_token = "dashboard-write-token-rotated-0001"
+        replacement_server = create_server(
+            self.store,
+            port=0,
+            write_proxy=DashboardWriteProxy(
+                host=backend_host,
+                port=backend_port,
+                bearer_token=self.BACKEND_TOKEN,
+                ui_token=replacement_token,
+            ),
+        )
+        replacement_thread = threading.Thread(
+            target=replacement_server.serve_forever,
+            daemon=True,
+        )
+        replacement_thread.start()
+        self.addCleanup(replacement_thread.join, 2)
+        self.addCleanup(replacement_server.server_close)
+        self.addCleanup(replacement_server.shutdown)
+        host, port = replacement_server.server_address
+        replacement_base = f"http://{host}:{port}"
+
+        pending_request = Request(
+            replacement_base + "/api/dashboard/pending-writes",
+            headers={
+                "X-Mark-Dashboard-Write": "1",
+                "X-Mark-Dashboard-Token": replacement_token,
+            },
+        )
+        with urlopen(pending_request, timeout=2) as response:
+            recovered = json.loads(response.read())
+        self.assertEqual(
+            recovered,
+            {
+                "pending_writes": [
+                    {
+                        "scope": "ad:2:update",
+                        "key": "ui:test-transport-unknown",
+                        "method": "PATCH",
+                        "path": "/api/write/ads/2",
+                        "payload": {"title": "Neu"},
+                        "adId": "2",
+                    }
+                ]
+            },
+        )
+
+        retry = Request(
+            replacement_base + "/api/write/ads/2",
+            data=b'{"title":"Neu"}',
+            method="PATCH",
+            headers={
+                "Origin": replacement_base,
+                "X-Mark-Dashboard-Write": "1",
+                "X-Mark-Dashboard-Token": replacement_token,
+                "Content-Type": "application/json",
+                "Idempotency-Key": "ui:test-transport-unknown",
+            },
+        )
+        with urlopen(retry, timeout=2) as response:
+            replay_payload = json.loads(response.read())
+        self.assertEqual(
+            replay_payload["idempotency_key"],
+            "ui:test-transport-unknown",
+        )
+        self.assertEqual(len(replacement_backend.requests), 1)
+        self.assertEqual(
+            replacement_backend.requests[0]["idempotency_key"],
+            "ui:test-transport-unknown",
+        )
+        self.assertEqual(len(self.store.dashboard_pending_writes()), 1)
+
+        ack = Request(
+            replacement_base + "/api/dashboard/pending-writes/ack",
+            data=json.dumps(
+                {
+                    "scope": "ad:2:update",
+                    "idempotency_key": "ui:test-transport-unknown",
+                }
+            ).encode("utf-8"),
+            method="POST",
+            headers={
+                "Origin": replacement_base,
+                "X-Mark-Dashboard-Write": "1",
+                "X-Mark-Dashboard-Token": replacement_token,
+                "Content-Type": "application/json",
+            },
+        )
+        with urlopen(ack, timeout=2) as response:
+            self.assertEqual(
+                json.loads(response.read()),
+                {"acknowledged": True},
+            )
+        self.assertEqual(self.store.dashboard_pending_writes(), ())
 
 
 class SeededStoreMixin:
@@ -1134,6 +1336,114 @@ assert.equal(groupChart.children[0].children[2].textContent, "12.00 (n=1)");
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_restores_pending_from_server_and_blocks_on_recovery_failure(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const sessionStorageState = new Map();
+globalThis.window = {
+  location: {
+    hash: "#write_token=dashboard-write-token-new-0001",
+    pathname: "/",
+    search: "",
+  },
+  history: {
+    replaceState() {
+      window.location.hash = "";
+    },
+  },
+  sessionStorage: {
+    getItem(key) {
+      return sessionStorageState.has(key) ? sessionStorageState.get(key) : null;
+    },
+    setItem(key, value) {
+      sessionStorageState.set(key, String(value));
+    },
+    removeItem(key) {
+      sessionStorageState.delete(key);
+    },
+  },
+};
+writeUiAvailable = true;
+sessionStorageState.set(
+  WRITE_TOKEN_STORAGE_KEY,
+  "dashboard-write-token-old-0001",
+);
+const original = {
+  scope: "create",
+  key: "ui:restart-bound-key",
+  method: "POST",
+  path: "/api/write/ads",
+  payload: {
+    category_path: ["A", "B"],
+    title: "first",
+    description: "one",
+    price_eur: 1,
+  },
+  adId: null,
+};
+let recoveryFails = false;
+globalThis.fetch = async (path, options) => {
+  assert.equal(path, "/api/dashboard/pending-writes");
+  assert.equal(
+    options.headers["X-Mark-Dashboard-Token"],
+    "dashboard-write-token-new-0001",
+  );
+  if (recoveryFails) {
+    return {
+      status: 500,
+      ok: false,
+      async text() {
+        return JSON.stringify({error: "dashboard_pending_store_error"});
+      },
+    };
+  }
+  return {
+    status: 200,
+    ok: true,
+    async text() {
+      return JSON.stringify({pending_writes: [original]});
+    },
+  };
+};
+
+(async () => {
+  consumeWriteToken();
+  assert.equal(writeToken, "dashboard-write-token-new-0001");
+  await refreshPendingWrites();
+  assert.equal(pendingRecoveryBlocked, false);
+  assert.deepEqual(pendingWrites.get("create"), original);
+  assert.equal(writeUiReady(), true);
+
+  recoveryFails = true;
+  await refreshPendingWrites();
+  assert.equal(pendingRecoveryBlocked, true);
+  assert.equal(pendingWrites.size, 0);
+  assert.equal(writeUiReady(), false);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_write_runtime_clears_bound_terminal_202_receipt(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
@@ -1161,6 +1471,15 @@ load = async () => { loadCalls += 1; };
 const calls = [];
 globalThis.fetch = async (path, options) => {
   calls.push({path, options});
+  if (path === "/api/dashboard/pending-writes/ack") {
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
   return {
     status: 202,
     ok: true,
@@ -1182,7 +1501,10 @@ globalThis.fetch = async (path, options) => {
     null,
     {adId: "2"},
   );
-  assert.equal(calls.length, 1);
+  assert.deepEqual(
+    calls.map((item) => item.path),
+    ["/api/write/ads/2/pause", "/api/dashboard/pending-writes/ack"],
+  );
   assert.equal(pendingWrites.has("ad:2:pause"), false);
   assert.equal(pendingForAd("2"), null);
   assert.equal(loadCalls, 1);
@@ -1233,8 +1555,29 @@ load = async () => { loadCalls += 1; };
 const calls = [];
 globalThis.fetch = async (path, options) => {
   calls.push({path, options});
+  if (path === "/api/dashboard/pending-writes/ack") {
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
   if (calls.length === 1) {
     throw new Error("transport interrupted");
+  }
+  if (calls.length === 2) {
+    return {
+      status: 403,
+      ok: false,
+      async text() {
+        return JSON.stringify({
+          error: "write_session_required",
+          platform_retry_authorized: false,
+        });
+      },
+    };
   }
   const pending = pendingWrites.get("create");
   return {
@@ -1273,8 +1616,99 @@ globalThis.fetch = async (path, options) => {
   assert.equal(calls[1].path, "/api/write/ads");
   assert.equal(calls[1].options.headers["Idempotency-Key"], firstKey);
   assert.deepEqual(JSON.parse(calls[1].options.body), original);
+  assert.equal(pendingWrites.has("create"), true);
+  assert.equal(loadCalls, 0);
+
+  await runPlatformWrite(
+    "create",
+    "POST",
+    "/api/write/ads/777",
+    {...original, title: "changed again"},
+  );
+  assert.equal(calls.length, 4);
+  assert.equal(calls[2].path, "/api/write/ads");
+  assert.equal(calls[3].path, "/api/dashboard/pending-writes/ack");
+  assert.equal(calls[2].options.headers["Idempotency-Key"], firstKey);
+  assert.deepEqual(JSON.parse(calls[2].options.body), original);
   assert.equal(pendingWrites.has("create"), false);
   assert.equal(loadCalls, 1);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+    def test_write_runtime_discards_known_refs_after_partial_media_staging_failure(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+const calls = [];
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  if (path === "/api/write/media/stage" && calls.filter((item) => item.path === path).length === 1) {
+    return {
+      status: 201,
+      ok: true,
+      async text() { return JSON.stringify({media_ref: "media_first"}); },
+    };
+  }
+  if (path === "/api/write/media/stage") {
+    return {
+      status: 400,
+      ok: false,
+      async text() { return JSON.stringify({error: "unsupported media image"}); },
+    };
+  }
+  if (path === "/api/write/media/discard") {
+    const refs = JSON.parse(options.body).media_refs;
+    return {
+      status: 200,
+      ok: true,
+      async text() { return JSON.stringify({discarded: refs.length}); },
+    };
+  }
+  throw new Error("unexpected path: " + path);
+};
+const files = [
+  {name: "one.jpg", type: "image/jpeg", size: 10},
+  {name: "two.jpg", type: "image/jpeg", size: 10},
+];
+
+(async () => {
+  await assert.rejects(stageSelectedMedia(files), /unsupported media image/i);
+  assert.deepEqual(
+    calls.map((item) => item.path),
+    [
+      "/api/write/media/stage",
+      "/api/write/media/stage",
+      "/api/write/media/discard",
+    ],
+  );
+  assert.deepEqual(
+    JSON.parse(calls[2].options.body),
+    {media_refs: ["media_first"]},
+  );
+  assert.equal(calls[2].options.headers["Idempotency-Key"], undefined);
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

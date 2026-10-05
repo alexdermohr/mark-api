@@ -6,7 +6,8 @@ import stat
 import tempfile
 from secrets import token_urlsafe
 from threading import Lock
-from collections.abc import Mapping
+from time import monotonic
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
@@ -438,8 +439,11 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
 
     _MAX_STAGED_HANDLES = 32
     _MAX_STAGED_BYTES = 100 * 1024 * 1024
+    _STAGED_HANDLE_TTL_SECONDS = 15 * 60
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] = monotonic) -> None:
+        if not callable(clock):
+            raise TypeError("media handle store clock must be callable")
         super().__init__({})
         self._directory = tempfile.TemporaryDirectory(
             prefix="mark-private-web-media-handles-"
@@ -447,6 +451,43 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         self._lock = Lock()
         self._closed = False
         self._staged_bytes = 0
+        self._clock = clock
+        self._sizes: dict[str, int] = {}
+        self._expires_at: dict[str, float] = {}
+
+    @staticmethod
+    def _unlink_sources(
+        sources: tuple[PrivateWebMediaSource, ...],
+    ) -> None:
+        for source in sources:
+            try:
+                os.unlink(source.path)
+            except FileNotFoundError:
+                pass
+
+    def _pop_handles_locked(
+        self,
+        media_refs: tuple[str, ...],
+    ) -> tuple[PrivateWebMediaSource, ...]:
+        sources: list[PrivateWebMediaSource] = []
+        released_bytes = 0
+        for ref in media_refs:
+            source = self._sources.pop(ref, None)
+            released_bytes += self._sizes.pop(ref, 0)
+            self._expires_at.pop(ref, None)
+            if source is not None:
+                sources.append(source)
+        self._staged_bytes = max(0, self._staged_bytes - released_bytes)
+        return tuple(sources)
+
+    def _prune_expired_locked(self, now: float) -> None:
+        expired = tuple(
+            ref
+            for ref, expires_at in self._expires_at.items()
+            if expires_at <= now
+        )
+        if expired:
+            self._unlink_sources(self._pop_handles_locked(expired))
 
     @staticmethod
     def _extension(filename: str, data: bytes) -> str:
@@ -480,6 +521,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         with self._lock:
             if self._closed:
                 raise RuntimeError("media handle store is closed")
+            self._prune_expired_locked(float(self._clock()))
             if (
                 len(self._sources) >= self._MAX_STAGED_HANDLES
                 or self._staged_bytes + len(data) > self._MAX_STAGED_BYTES
@@ -509,6 +551,10 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             finally:
                 os.close(fd)
             self._sources[ref] = PrivateWebMediaSource(path)
+            self._sizes[ref] = len(data)
+            self._expires_at[ref] = (
+                float(self._clock()) + self._STAGED_HANDLE_TTL_SECONDS
+            )
             self._staged_bytes += len(data)
             return ref
 
@@ -519,25 +565,13 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         with self._lock:
             if self._closed:
                 raise PrivateWebWriteNotAttemptedError("resolve_media_refs")
+            self._prune_expired_locked(float(self._clock()))
             return super().resolve(media_refs)
 
     def discard(self, media_refs: tuple[str, ...]) -> None:
         with self._lock:
-            sources = [self._sources.pop(ref, None) for ref in media_refs]
-            released_bytes = 0
-            for source in sources:
-                if source is not None:
-                    try:
-                        released_bytes += os.path.getsize(source.path)
-                    except FileNotFoundError:
-                        pass
-            self._staged_bytes = max(0, self._staged_bytes - released_bytes)
-        for source in sources:
-            if source is not None:
-                try:
-                    os.unlink(source.path)
-                except FileNotFoundError:
-                    pass
+            sources = self._pop_handles_locked(media_refs)
+        self._unlink_sources(sources)
 
     def close(self) -> None:
         with self._lock:
@@ -545,6 +579,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 return
             self._closed = True
             self._sources.clear()
+            self._sizes.clear()
+            self._expires_at.clear()
             self._staged_bytes = 0
         self._directory.cleanup()
 

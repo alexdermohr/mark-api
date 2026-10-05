@@ -158,6 +158,30 @@ class PrivateWebMediaContractTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_media_handle_store_expires_abandoned_handle_and_recovers_quota(self) -> None:
+        now = [100.0]
+        store = PrivateWebMediaHandleStore(clock=lambda: now[0])
+        try:
+            store._MAX_STAGED_HANDLES = 1
+            store._STAGED_HANDLE_TTL_SECONDS = 10
+            abandoned = store.stage_media("one.jpg", b"\xff\xd8\xffone")
+            (source,) = store.resolve((abandoned,))
+
+            now[0] = 109.999
+            self.assertEqual(store.resolve((abandoned,)), (source,))
+            self.assertTrue(Path(source.path).exists())
+
+            now[0] = 110.0
+            replacement = store.stage_media("two.jpg", b"\xff\xd8\xfftwo")
+            self.assertNotEqual(replacement, abandoned)
+            self.assertFalse(Path(source.path).exists())
+            self.assertEqual(len(store._sources), 1)
+            self.assertEqual(store._staged_bytes, len(b"\xff\xd8\xfftwo"))
+            with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                store.resolve((abandoned,))
+        finally:
+            store.close()
+
     def test_media_handle_store_enforces_total_byte_quota_before_writing(self) -> None:
         store = PrivateWebMediaHandleStore()
         try:

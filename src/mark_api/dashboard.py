@@ -455,10 +455,10 @@ const byId = (id) => document.getElementById(id);
 
 const display = (value) => value === null || value === undefined ? "—" : String(value);
 const WRITE_TOKEN_STORAGE_KEY = "mark-dashboard-write-token";
-const PENDING_WRITES_STORAGE_KEY = "mark-dashboard-pending-writes";
 const pendingWrites = new Map();
 let writeUiAvailable = false;
 let writeToken = null;
+let pendingRecoveryBlocked = false;
 let latestAdsById = new Map();
 
 function consumeWriteToken() {
@@ -493,23 +493,12 @@ function consumeWriteToken() {
 }
 
 function writeUiReady() {
-  return writeUiAvailable && typeof writeToken === "string" && writeToken.length >= 16;
-}
-
-function persistPendingWrites() {
-  if (typeof writeToken !== "string") return;
-  const value = {
-    token: writeToken,
-    entries: Array.from(pendingWrites.values()),
-  };
-  try {
-    window.sessionStorage.setItem(
-      PENDING_WRITES_STORAGE_KEY,
-      JSON.stringify(value),
-    );
-  } catch (_error) {
-    // The in-memory fence remains active for this page.
-  }
+  return (
+    writeUiAvailable
+    && typeof writeToken === "string"
+    && writeToken.length >= 16
+    && !pendingRecoveryBlocked
+  );
 }
 
 function validPendingEntry(entry) {
@@ -528,6 +517,15 @@ function validPendingEntry(entry) {
   if (!["POST", "PATCH", "DELETE"].includes(entry.method)) return false;
   if (!entry.path.startsWith("/api/write/")) return false;
   if (
+    entry.payload !== null
+    && (
+      typeof entry.payload !== "object"
+      || Array.isArray(entry.payload)
+    )
+  ) {
+    return false;
+  }
+  if (
     entry.adId !== null
     && entry.adId !== undefined
     && (typeof entry.adId !== "string" || !/^[0-9]{1,32}$/.test(entry.adId))
@@ -537,38 +535,70 @@ function validPendingEntry(entry) {
   return true;
 }
 
-function restorePendingWrites() {
-  pendingWrites.clear();
-  if (typeof writeToken !== "string") return;
+async function acknowledgePendingWrite(entry) {
+  const response = await fetch("/api/dashboard/pending-writes/ack", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Mark-Dashboard-Write": "1",
+      "X-Mark-Dashboard-Token": writeToken,
+    },
+    body: JSON.stringify({
+      scope: entry.scope,
+      idempotency_key: entry.key,
+    }),
+    cache: "no-store",
+  });
+  const text = await response.text();
+  let payload;
   try {
-    const raw = window.sessionStorage.getItem(PENDING_WRITES_STORAGE_KEY);
-    if (!raw) return;
-    const parsed = JSON.parse(raw);
+    payload = text ? JSON.parse(text) : {};
+  } catch (_error) {
+    throw new Error("pending recovery acknowledgement invalid");
+  }
+  if (!response.ok || payload.acknowledged !== true) {
+    throw new Error(payload.error ?? "pending recovery acknowledgement failed");
+  }
+}
+
+async function refreshPendingWrites() {
+  pendingWrites.clear();
+  pendingRecoveryBlocked = false;
+  if (
+    !writeUiAvailable
+    || typeof writeToken !== "string"
+    || writeToken.length < 16
+  ) {
+    return;
+  }
+  try {
+    const response = await fetch("/api/dashboard/pending-writes", {
+      headers: {
+        "X-Mark-Dashboard-Write": "1",
+        "X-Mark-Dashboard-Token": writeToken,
+      },
+      cache: "no-store",
+    });
+    const text = await response.text();
+    const payload = text ? JSON.parse(text) : {};
     if (
-      !parsed
-      || parsed.token !== writeToken
-      || !Array.isArray(parsed.entries)
-      || parsed.entries.length > 64
-      || parsed.entries.some((entry) => !validPendingEntry(entry))
+      !response.ok
+      || !payload
+      || !Array.isArray(payload.pending_writes)
+      || payload.pending_writes.length > 64
+      || payload.pending_writes.some((entry) => !validPendingEntry(entry))
     ) {
-      window.sessionStorage.removeItem(PENDING_WRITES_STORAGE_KEY);
-      return;
+      throw new Error("pending recovery unavailable");
     }
-    for (const entry of parsed.entries) {
+    for (const entry of payload.pending_writes) {
       if (pendingWrites.has(entry.scope)) {
-        pendingWrites.clear();
-        window.sessionStorage.removeItem(PENDING_WRITES_STORAGE_KEY);
-        return;
+        throw new Error("duplicate pending scope");
       }
       pendingWrites.set(entry.scope, entry);
     }
   } catch (_error) {
     pendingWrites.clear();
-    try {
-      window.sessionStorage.removeItem(PENDING_WRITES_STORAGE_KEY);
-    } catch (_ignored) {
-      // Nothing else can be done without weakening the in-memory fence.
-    }
+    pendingRecoveryBlocked = true;
   }
 }
 
@@ -582,6 +612,17 @@ function renderWriteAvailability() {
   byId("write-panel").hidden = !writeUiAvailable;
   byId("write-unavailable").hidden = writeUiAvailable;
   if (!writeUiAvailable) return;
+  if (pendingRecoveryBlocked) {
+    byId("write-session-note").hidden = true;
+    for (const element of document.querySelectorAll("[data-write-control]")) {
+      element.disabled = true;
+    }
+    setWriteStatus(
+      "Der persistente Recovery-Status früherer Write-Anfragen ist nicht sicher lesbar. Neue Writes bleiben fail-closed gesperrt.",
+      "error",
+    );
+    return;
+  }
   const ready = writeUiReady();
   byId("write-session-note").hidden = ready;
   for (const element of document.querySelectorAll("[data-write-control]")) {
@@ -822,11 +863,10 @@ function canClearPendingAfterError(response, payload) {
   return response.status >= 400 && response.status < 500;
 }
 
-function canClearCompletedWrite(_response, payload) {
-  // The Write API only emits operation_receipt after the idempotent response
-  // has been persisted. HTTP 202 can therefore be terminal even when the
-  // platform outcome itself remains ambiguous.
-  return Boolean(payload && payload.operation_receipt);
+function canClearCompletedWrite(_response, _payload) {
+  // completedWriteResponse already established the exact persisted
+  // Idempotency-Key returned by the Write API.
+  return true;
 }
 
 function describeWriteResult(response, payload) {
@@ -854,6 +894,7 @@ function describeWriteResult(response, payload) {
 
 async function runPlatformWrite(scope, method, path, payload, {adId = null} = {}) {
   let entry = pendingWrites.get(scope);
+  const retryingPending = entry !== undefined;
   if (entry === undefined) {
     entry = {
       scope,
@@ -864,7 +905,6 @@ async function runPlatformWrite(scope, method, path, payload, {adId = null} = {}
       adId,
     };
     pendingWrites.set(scope, entry);
-    persistPendingWrites();
   }
 
   try {
@@ -883,15 +923,34 @@ async function runPlatformWrite(scope, method, path, payload, {adId = null} = {}
 
     if (completedWriteResponse(entry, responsePayload)) {
       if (canClearCompletedWrite(response, responsePayload)) {
+        try {
+          await acknowledgePendingWrite(entry);
+        } catch (error) {
+          setWriteStatus(
+            `Write-Ergebnis ist terminal, aber der lokale Recovery-ACK ist fehlgeschlagen: ${error.message}. Derselbe Request/Key bleibt gebunden.`,
+            "warning",
+          );
+          return {response, payload: responsePayload};
+        }
         pendingWrites.delete(scope);
       }
-      persistPendingWrites();
       await load();
-    } else if (canClearPendingAfterError(response, responsePayload)) {
+    } else if (responsePayload.error === "dashboard_pending_write_conflict") {
+      await load();
+    } else if (
+      !retryingPending
+      && canClearPendingAfterError(response, responsePayload)
+    ) {
+      try {
+        await acknowledgePendingWrite(entry);
+      } catch (error) {
+        setWriteStatus(
+          `Lokaler Recovery-ACK fehlgeschlagen: ${error.message}. Der Request bleibt vorsorglich gebunden.`,
+          "warning",
+        );
+        return {response, payload: responsePayload};
+      }
       pendingWrites.delete(scope);
-      persistPendingWrites();
-    } else {
-      persistPendingWrites();
     }
     return {response, payload: responsePayload};
   } catch (error) {
@@ -931,28 +990,70 @@ function mediaContentType(file) {
   return null;
 }
 
+async function discardStagedMedia(refs) {
+  if (refs.length === 0) return;
+  const {response, payload} = await proxyRequest(
+    "POST",
+    "/api/write/media/discard",
+    {
+      body: JSON.stringify({media_refs: refs}),
+      contentType: "application/json",
+    },
+  );
+  if (!response.ok || payload.discarded !== refs.length) {
+    throw new Error(payload.error ?? `Media-Cleanup HTTP ${response.status}`);
+  }
+}
+
 async function stageSelectedMedia(files) {
-  const refs = [];
+  if (files.length > 32) {
+    throw new Error("Höchstens 32 Bilder können pro Create gestaged werden.");
+  }
+  let totalBytes = 0;
   for (const file of files) {
     const contentType = mediaContentType(file);
     if (contentType === null) {
       throw new Error(`Nicht unterstützter Bildtyp: ${file.name}`);
     }
-    const {response, payload} = await proxyRequest(
-      "POST",
-      "/api/write/media/stage",
-      {
-        body: file,
-        contentType,
-        filename: file.name,
-      },
-    );
-    if (!response.ok || typeof payload.media_ref !== "string") {
-      throw new Error(payload.error ?? `Media-Staging HTTP ${response.status}`);
+    if (!Number.isSafeInteger(file.size) || file.size <= 0 || file.size > 25 * 1024 * 1024) {
+      throw new Error(`Ungültige Bildgröße: ${file.name}`);
     }
-    refs.push(payload.media_ref);
+    totalBytes += file.size;
+    if (totalBytes > 100 * 1024 * 1024) {
+      throw new Error("Die ausgewählten Bilder überschreiten zusammen 100 MiB.");
+    }
   }
-  return refs;
+
+  const refs = [];
+  try {
+    for (const file of files) {
+      const {response, payload} = await proxyRequest(
+        "POST",
+        "/api/write/media/stage",
+        {
+          body: file,
+          contentType: mediaContentType(file),
+          filename: file.name,
+        },
+      );
+      if (!response.ok || typeof payload.media_ref !== "string") {
+        throw new Error(payload.error ?? `Media-Staging HTTP ${response.status}`);
+      }
+      refs.push(payload.media_ref);
+    }
+    return refs;
+  } catch (error) {
+    if (refs.length > 0) {
+      try {
+        await discardStagedMedia(refs);
+      } catch (cleanupError) {
+        throw new Error(
+          `${error.message}; lokale Media-Cleanup fehlgeschlagen: ${cleanupError.message}. Launcher neu starten, bevor erneut Bilder gestaged werden.`,
+        );
+      }
+    }
+    throw error;
+  }
 }
 
 async function submitCreate(event) {
@@ -1089,6 +1190,7 @@ async function load() {
     byId("replies").textContent =
       `${summary.replies_total_known} / ${summary.replies_observed_ads} Ads`;
     writeUiAvailable = dashboardConfig.write_ui_available === true;
+    await refreshPendingWrites();
     renderWriteAvailability();
     renderAds(ads);
     renderAnalyticsContract(contract);
@@ -1131,7 +1233,6 @@ byId("manage-activate").addEventListener(
 );
 byId("manage-delete").addEventListener("click", deleteManagedAd);
 consumeWriteToken();
-restorePendingWrites();
 load();
 """
 
@@ -1170,6 +1271,8 @@ def _dashboard_write_route(path: str, method: str) -> str | None:
         return "json"
     if parts == ["api", "write", "media", "stage"] and method == "POST":
         return "media"
+    if parts == ["api", "write", "media", "discard"] and method == "POST":
+        return "local_json"
     if parts == ["api", "write", "media", "ads"] and method == "POST":
         return "json"
     if len(parts) == 4 and parts[:3] == ["api", "write", "ads"]:
@@ -1190,7 +1293,44 @@ def _dashboard_write_route(path: str, method: str) -> str | None:
     return None
 
 
+def _dashboard_pending_identity(
+    path: str,
+    method: str,
+) -> tuple[str, str, str | None] | None:
+    target = urlsplit(path)
+    if target.query:
+        return None
+    parts = [unquote(item) for item in target.path.split("/") if item]
+    if parts == ["api", "write", "ads"] and method == "POST":
+        return ("create", "create", None)
+    if parts == ["api", "write", "media", "ads"] and method == "POST":
+        return ("create-media", "create", None)
+    if len(parts) == 4 and parts[:3] == ["api", "write", "ads"]:
+        ad_id = parts[3]
+        if not _valid_ad_id(ad_id):
+            return None
+        if method == "PATCH":
+            return (f"ad:{ad_id}:update", f"ad:{ad_id}", ad_id)
+        if method == "DELETE":
+            return (f"ad:{ad_id}:delete", f"ad:{ad_id}", ad_id)
+    if (
+        len(parts) == 5
+        and parts[:3] == ["api", "write", "ads"]
+        and _valid_ad_id(parts[3])
+        and parts[4] in {"pause", "activate"}
+        and method == "POST"
+    ):
+        ad_id = parts[3]
+        return (
+            f"ad:{ad_id}:{parts[4]}",
+            f"ad:{ad_id}",
+            ad_id,
+        )
+    return None
+
+
 def _handler_factory(
+    store: SnapshotStore,
     query: MarkQueryService,
     analytics: AnalyticsService,
     write_proxy: DashboardWriteProxy | None,
@@ -1264,7 +1404,7 @@ def _handler_factory(
                 },
             )
 
-        def _write_session_authorized(self) -> bool:
+        def _write_token_authorized(self, *, require_origin: bool) -> bool:
             if write_proxy is None:
                 return False
             marker = self.headers.get_all(_DASHBOARD_WRITE_MARKER_HEADER) or []
@@ -1278,20 +1418,24 @@ def _handler_factory(
                 return False
             if self.headers.get("Authorization") is not None:
                 return False
-            origins = self.headers.get_all("Origin") or []
-            server_host, server_port = self.server.server_address
-            expected_origin = f"http://{server_host}:{server_port}"
-            if (
-                len(origins) != 1
-                or not hmac.compare_digest(origins[0], expected_origin)
-            ):
-                return False
+            if require_origin:
+                origins = self.headers.get_all("Origin") or []
+                server_host, server_port = self.server.server_address
+                expected_origin = f"http://{server_host}:{server_port}"
+                if (
+                    len(origins) != 1
+                    or not hmac.compare_digest(origins[0], expected_origin)
+                ):
+                    return False
             fetch_sites = self.headers.get_all("Sec-Fetch-Site") or []
             if fetch_sites and (
                 len(fetch_sites) != 1 or fetch_sites[0] != "same-origin"
             ):
                 return False
             return True
+
+        def _write_session_authorized(self) -> bool:
+            return self._write_token_authorized(require_origin=True)
 
         def _content_length(self, *, max_bytes: int) -> int:
             if self.headers.get("Transfer-Encoding") is not None:
@@ -1317,7 +1461,7 @@ def _handler_factory(
                     raise ValueError("request_body_not_allowed")
                 return b"", headers
 
-            if body_kind == "json":
+            if body_kind in {"json", "local_json"}:
                 content_type = self.headers.get("Content-Type", "")
                 if content_type.split(";", 1)[0].strip().lower() != "application/json":
                     raise ValueError("content_type_must_be_json")
@@ -1382,7 +1526,9 @@ def _handler_factory(
             headers: dict[str, str] = {
                 "Authorization": f"Bearer {write_proxy.bearer_token}",
             }
-            if body_kind != "media":
+            platform_write = body_kind in {"json", "empty"}
+            idempotency_key: str | None = None
+            if platform_write:
                 values = self.headers.get_all("Idempotency-Key") or []
                 if (
                     len(values) != 1
@@ -1396,12 +1542,13 @@ def _handler_factory(
                         },
                     )
                     return
-                headers["Idempotency-Key"] = values[0]
+                idempotency_key = values[0]
+                headers["Idempotency-Key"] = idempotency_key
             elif self.headers.get("Idempotency-Key") is not None:
                 self._send_json(
                     400,
                     {
-                        "error": "idempotency_key_not_allowed_for_media_stage",
+                        "error": "idempotency_key_not_allowed_for_local_media_operation",
                         "platform_retry_authorized": False,
                     },
                 )
@@ -1420,6 +1567,74 @@ def _handler_factory(
                 return
             headers.update(body_headers)
             headers["Content-Length"] = str(len(body))
+
+            pending_scope: str | None = None
+            if platform_write:
+                assert idempotency_key is not None
+                identity = _dashboard_pending_identity(self.path, method)
+                if identity is None:
+                    self._send_json(
+                        500,
+                        {
+                            "error": "dashboard_pending_identity_error",
+                            "platform_retry_authorized": False,
+                        },
+                    )
+                    return
+                pending_scope, resource_key, pending_ad_id = identity
+                pending_payload_json: str | None = None
+                if body_kind == "json":
+                    try:
+                        pending_payload = json.loads(body)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        self._send_json(
+                            400,
+                            {
+                                "error": "invalid_json",
+                                "platform_retry_authorized": False,
+                            },
+                        )
+                        return
+                    if not isinstance(pending_payload, dict):
+                        self._send_json(
+                            400,
+                            {
+                                "error": "json_body_must_be_object",
+                                "platform_retry_authorized": False,
+                            },
+                        )
+                        return
+                    pending_payload_json = _json_bytes(
+                        pending_payload
+                    ).decode("utf-8")
+                try:
+                    store.claim_dashboard_pending_write(
+                        scope=pending_scope,
+                        resource_key=resource_key,
+                        idempotency_key=idempotency_key,
+                        method=method,
+                        path=urlsplit(self.path).path,
+                        payload_json=pending_payload_json,
+                        ad_id=pending_ad_id,
+                    )
+                except ValueError:
+                    self._send_json(
+                        409,
+                        {
+                            "error": "dashboard_pending_write_conflict",
+                            "platform_retry_authorized": False,
+                        },
+                    )
+                    return
+                except Exception:
+                    self._send_json(
+                        500,
+                        {
+                            "error": "dashboard_pending_store_error",
+                            "platform_retry_authorized": False,
+                        },
+                    )
+                    return
 
             connection = http.client.HTTPConnection(
                 write_proxy.host,
@@ -1443,6 +1658,14 @@ def _handler_factory(
                         raise ValueError("write_proxy_response_too_large")
                     content_type = response.getheader("Content-Type", "")
                     if not content_type.lower().startswith("application/json"):
+                        raise ValueError("write_proxy_response_not_json")
+                    try:
+                        response_payload = json.loads(response_body)
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise ValueError(
+                            "write_proxy_response_not_json"
+                        ) from exc
+                    if not isinstance(response_payload, dict):
                         raise ValueError("write_proxy_response_not_json")
                     replayed = (
                         response.getheader("Idempotency-Replayed") == "true"
@@ -1501,6 +1724,50 @@ def _handler_factory(
                 self._send_json(
                     200,
                     {"write_ui_available": write_proxy is not None},
+                )
+                return
+            if path == "/api/dashboard/pending-writes":
+                if write_proxy is None:
+                    self._send_json(404, {"error": "not_found"})
+                    return
+                if not self._write_token_authorized(require_origin=False):
+                    self._send_json(
+                        403,
+                        {
+                            "error": "write_session_required",
+                            "platform_retry_authorized": False,
+                        },
+                    )
+                    return
+                try:
+                    records = store.dashboard_pending_writes()
+                    pending_rows = [
+                        {
+                            "scope": record.scope,
+                            "key": record.idempotency_key,
+                            "method": record.method,
+                            "path": record.path,
+                            "payload": (
+                                json.loads(record.payload_json)
+                                if record.payload_json is not None
+                                else None
+                            ),
+                            "adId": record.ad_id,
+                        }
+                        for record in records
+                    ]
+                except Exception:
+                    self._send_json(
+                        500,
+                        {
+                            "error": "dashboard_pending_store_error",
+                            "platform_retry_authorized": False,
+                        },
+                    )
+                    return
+                self._send_json(
+                    200,
+                    {"pending_writes": pending_rows},
                 )
                 return
             if path == "/api/summary":
@@ -1619,7 +1886,70 @@ def _handler_factory(
         def do_HEAD(self) -> None:
             self._method_not_allowed()
 
+        def _ack_dashboard_pending_write(self) -> None:
+            target = urlsplit(self.path)
+            if target.path != "/api/dashboard/pending-writes/ack" or target.query:
+                self._send_json(404, {"error": "not_found"})
+                return
+            if write_proxy is None:
+                self._send_json(404, {"error": "not_found"})
+                return
+            if not self._write_session_authorized():
+                self._send_json(
+                    403,
+                    {
+                        "error": "write_session_required",
+                        "platform_retry_authorized": False,
+                    },
+                )
+                return
+            if self.headers.get("Idempotency-Key") is not None:
+                self._send_json(
+                    400,
+                    {
+                        "error": "idempotency_key_not_allowed_for_pending_ack",
+                        "platform_retry_authorized": False,
+                    },
+                )
+                return
+            try:
+                body, _ = self._read_proxy_body("local_json")
+                payload = json.loads(body)
+                if (
+                    not isinstance(payload, dict)
+                    or set(payload) != {"scope", "idempotency_key"}
+                    or not isinstance(payload["scope"], str)
+                    or not isinstance(payload["idempotency_key"], str)
+                ):
+                    raise ValueError("invalid_pending_ack")
+                store.clear_dashboard_pending_write(
+                    scope=payload["scope"],
+                    idempotency_key=payload["idempotency_key"],
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                self._send_json(
+                    409,
+                    {
+                        "error": "dashboard_pending_write_conflict",
+                        "platform_retry_authorized": False,
+                    },
+                )
+                return
+            except Exception:
+                self._send_json(
+                    500,
+                    {
+                        "error": "dashboard_pending_store_error",
+                        "platform_retry_authorized": False,
+                    },
+                )
+                return
+            self._send_json(200, {"acknowledged": True})
+
         def do_POST(self) -> None:
+            if urlsplit(self.path).path == "/api/dashboard/pending-writes/ack":
+                self._ack_dashboard_pending_write()
+                return
             self._proxy_write("POST")
 
         def do_PUT(self) -> None:
@@ -1665,7 +1995,7 @@ def create_server(
     analytics = AnalyticsService(store, contract=analytics_contract)
     return LoopbackDashboardServer(
         (host, port),
-        _handler_factory(query, analytics, write_proxy),
+        _handler_factory(store, query, analytics, write_proxy),
     )
 
 

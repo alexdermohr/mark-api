@@ -356,10 +356,14 @@ class MisboundCreateService(FakeWriteService):
 class FakeMediaStager:
     def __init__(self) -> None:
         self.calls: list[tuple[str, bytes]] = []
+        self.discarded: list[tuple[str, ...]] = []
 
     def stage_media(self, filename: str, data: bytes) -> str:
         self.calls.append((filename, data))
         return "media_generated_handle"
+
+    def discard(self, media_refs: tuple[str, ...]) -> None:
+        self.discarded.append(media_refs)
 
 
 
@@ -626,6 +630,32 @@ class WriteApiTests(unittest.TestCase):
                 self.assertEqual(response.status, 201)
         self.assertEqual(body, {"media_ref": "media_generated_handle"})
         self.assertEqual(stager.calls, [("photo.jpg", b"\xff\xd8\xffjpeg")])
+        self.assertIsNone(self.store.write_api_request("request-1"))
+
+    def test_media_discard_is_local_idempotent_and_does_not_claim_platform_write(self) -> None:
+        service = FakeWriteService()
+        media_service = FakeMediaWriteService()
+        stager = FakeMediaStager()
+        with self.server(
+            service,
+            media_service=media_service,
+            media_stager=stager,
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+            writes_enabled=False,
+        ) as server:
+            status, _, body = self.request(
+                server,
+                "POST",
+                "/api/write/media/discard",
+                payload={"media_refs": ["media_one", "media_two"]},
+                idempotency_key=None,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"discarded": 2})
+        self.assertEqual(stager.discarded, [("media_one", "media_two")])
+        self.assertEqual(service.calls, [])
+        self.assertEqual(media_service.calls, [])
         self.assertIsNone(self.store.write_api_request("request-1"))
 
     def test_stalled_media_body_times_out_without_staging(self) -> None:

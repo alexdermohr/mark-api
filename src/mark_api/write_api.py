@@ -103,6 +103,9 @@ class _MediaStager(Protocol):
     def stage_media(self, filename: str, data: bytes) -> str:
         ...
 
+    def discard(self, media_refs: tuple[str, ...]) -> None:
+        ...
+
 
 
 class _WriteService(Protocol):
@@ -615,6 +618,15 @@ def _handler_factory(
                     )
                 return ("method_not_allowed", "POST", None)
 
+            if parts == ["api", "write", "media", "discard"]:
+                if method == "POST":
+                    return (
+                        "discard_media",
+                        None,
+                        WriteCapability.CREATE_MEDIA,
+                    )
+                return ("method_not_allowed", "POST", None)
+
             if parts == ["api", "write", "media", "ads"]:
                 if method == "POST":
                     return (
@@ -712,6 +724,45 @@ def _handler_factory(
                     self._error(500, "media_staging_error")
                     return
                 self._send_json(201, {"media_ref": media_ref})
+                return
+
+            if action == "discard_media":
+                # Discard is local-only cleanup for opaque handles returned by
+                # stage_media. It is idempotent and never authorizes or retries
+                # a platform write.
+                if media_stager is None:
+                    self._error(503, "media_staging_unavailable")
+                    return
+                try:
+                    payload = self._read_json_object()
+                    if set(payload) != {"media_refs"}:
+                        raise ValueError("invalid_media_refs")
+                    raw_media_refs = payload["media_refs"]
+                    if (
+                        not isinstance(raw_media_refs, list)
+                        or not raw_media_refs
+                        or len(raw_media_refs) > 32
+                        or any(
+                            not isinstance(ref, str)
+                            or _MEDIA_REF_RE.fullmatch(ref) is None
+                            for ref in raw_media_refs
+                        )
+                        or len(set(raw_media_refs)) != len(raw_media_refs)
+                    ):
+                        raise ValueError("invalid_media_refs")
+                    media_refs_to_discard = tuple(raw_media_refs)
+                    with media_staging_lock:
+                        media_stager.discard(media_refs_to_discard)
+                except ValueError as exc:
+                    self._error(400, str(exc))
+                    return
+                except Exception:
+                    self._error(500, "media_discard_error")
+                    return
+                self._send_json(
+                    200,
+                    {"discarded": len(media_refs_to_discard)},
+                )
                 return
 
             if not access.writes_enabled:
