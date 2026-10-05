@@ -459,6 +459,7 @@ const pendingWrites = new Map();
 let writeUiAvailable = false;
 let writeToken = null;
 let pendingRecoveryBlocked = false;
+let createMediaInFlight = false;
 let latestAdsById = new Map();
 
 function consumeWriteToken() {
@@ -1160,6 +1161,11 @@ async function submitCreate(event) {
     return;
   }
 
+  if (createMediaInFlight) {
+    setWriteStatus("Media-Create läuft bereits. Es wird kein zweiter Batch gestaged.", "warning");
+    return;
+  }
+  createMediaInFlight = true;
   setWriteStatus("Bilder werden ausschließlich lokal gestaged …", "warning");
   try {
     const mediaRefs = await stageSelectedMedia(files);
@@ -1174,6 +1180,8 @@ async function submitCreate(event) {
       `Media-Staging fehlgeschlagen: ${error.message}. Es wurde kein neuer Plattform-Create gestartet.`,
       "error",
     );
+  } finally {
+    createMediaInFlight = false;
   }
 }
 

@@ -1846,6 +1846,20 @@ setCreate({
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_blocks_concurrent_media_create_staging(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition('byId("reload").addEventListener')
+        self.assertTrue(marker)
+        self.assertIn("let createMediaInFlight = false;", definitions)
+        self.assertIn("if (createMediaInFlight)", definitions)
+        self.assertIn("createMediaInFlight = true;", definitions)
+        self.assertIn("createMediaInFlight = false;", definitions)
+        self.assertLess(
+            definitions.index("createMediaInFlight = true;"),
+            definitions.index("const mediaRefs = await stageSelectedMedia(files);"),
+        )
+
     def test_write_runtime_exposes_absent_pending_recovery_without_new_writes(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
