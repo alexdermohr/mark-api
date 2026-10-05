@@ -822,13 +822,11 @@ function canClearPendingAfterError(response, payload) {
   return response.status >= 400 && response.status < 500;
 }
 
-function canClearCompletedWrite(response, payload) {
-  if (!payload || !payload.operation_receipt) return false;
-  if (response.status === 200) return true;
-  return (
-    response.status === 409
-    && payload.operation_receipt.outcome === "precondition_failed"
-  );
+function canClearCompletedWrite(_response, payload) {
+  // The Write API only emits operation_receipt after the idempotent response
+  // has been persisted. HTTP 202 can therefore be terminal even when the
+  // platform outcome itself remains ambiguous.
+  return Boolean(payload && payload.operation_receipt);
 }
 
 function describeWriteResult(response, payload) {

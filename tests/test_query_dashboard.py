@@ -1134,6 +1134,78 @@ assert.equal(groupChart.children[0].children[2].textContent, "12.00 (n=1)");
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_clears_bound_terminal_202_receipt(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+let loadCalls = 0;
+load = async () => { loadCalls += 1; };
+const calls = [];
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  return {
+    status: 202,
+    ok: true,
+    async text() {
+      return JSON.stringify({
+        idempotency_key: options.headers["Idempotency-Key"],
+        operation_receipt: {outcome: "ambiguous"},
+        platform_retry_authorized: false,
+      });
+    },
+  };
+};
+
+(async () => {
+  await runPlatformWrite(
+    "ad:2:pause",
+    "POST",
+    "/api/write/ads/2/pause",
+    null,
+    {adId: "2"},
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(pendingWrites.has("ad:2:pause"), false);
+  assert.equal(pendingForAd("2"), null);
+  assert.equal(loadCalls, 1);
+  assert.match(writeStatus.textContent, /Ausgang unklar/i);
+  assert.match(writeStatus.textContent, /Kein automatischer Plattform-Retry/i);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_write_runtime_reuses_same_idempotency_request_after_transport_unknown(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
