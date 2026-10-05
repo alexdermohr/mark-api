@@ -1590,6 +1590,99 @@ globalThis.fetch = async (path, options) => {
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_acks_deterministic_validation_failure_on_recovery(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+const original = {
+  scope: "ad:2:update",
+  key: "ui:invalid-update-recovery",
+  method: "PATCH",
+  path: "/api/write/ads/2",
+  payload: {title: null},
+  adId: "2",
+};
+pendingWrites.set(original.scope, original);
+
+const calls = [];
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  if (path === "/api/dashboard/pending-writes/ack") {
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  assert.equal(path, original.path);
+  assert.equal(options.method, original.method);
+  assert.equal(options.headers["Idempotency-Key"], original.key);
+  assert.deepEqual(JSON.parse(options.body), original.payload);
+  return {
+    status: 400,
+    ok: false,
+    async text() {
+      return JSON.stringify({
+        error: "title_must_be_string",
+        platform_retry_authorized: false,
+      });
+    },
+  };
+};
+
+(async () => {
+  await runPlatformWrite(
+    original.scope,
+    "PATCH",
+    "/api/write/ads/999",
+    {title: "must not replace persisted request"},
+    {adId: "999"},
+  );
+
+  assert.deepEqual(
+    calls.map((item) => item.path),
+    [original.path, "/api/dashboard/pending-writes/ack"],
+  );
+  assert.equal(pendingWrites.has(original.scope), false);
+  assert.match(writeStatus.textContent, /title_must_be_string/i);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_write_runtime_reuses_same_idempotency_request_after_transport_unknown(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")

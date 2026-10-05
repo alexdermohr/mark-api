@@ -852,7 +852,17 @@ function completedWriteResponse(entry, payload) {
   return payload && payload.idempotency_key === entry.key;
 }
 
-function canClearPendingAfterError(response, payload) {
+const DETERMINISTIC_PRE_EXECUTION_ERRORS = new Set([
+  "invalid_create_request",
+  "invalid_media_create_request",
+  "invalid_media_refs",
+  "invalid_content_fields",
+  "title_must_be_string",
+  "description_must_be_string",
+  "invalid_unicode_text",
+]);
+
+function canClearPendingAfterError(response, payload, retryingPending = false) {
   if (!payload || typeof payload.error !== "string") return false;
   if (
     payload.error === "idempotency_in_progress"
@@ -861,7 +871,12 @@ function canClearPendingAfterError(response, payload) {
   ) {
     return false;
   }
-  return response.status >= 400 && response.status < 500;
+  if (response.status < 400 || response.status >= 500) return false;
+  if (!retryingPending) return true;
+  return (
+    response.status === 400
+    && DETERMINISTIC_PRE_EXECUTION_ERRORS.has(payload.error)
+  );
 }
 
 function canClearCompletedWrite(_response, _payload) {
@@ -939,8 +954,11 @@ async function runPlatformWrite(scope, method, path, payload, {adId = null} = {}
     } else if (responsePayload.error === "dashboard_pending_write_conflict") {
       await load();
     } else if (
-      !retryingPending
-      && canClearPendingAfterError(response, responsePayload)
+      canClearPendingAfterError(
+        response,
+        responsePayload,
+        retryingPending,
+      )
     ) {
       try {
         await acknowledgePendingWrite(entry);
