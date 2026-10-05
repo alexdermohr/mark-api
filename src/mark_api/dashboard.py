@@ -586,7 +586,6 @@ async function refreshPendingWrites() {
       !response.ok
       || !payload
       || !Array.isArray(payload.pending_writes)
-      || payload.pending_writes.length > 64
       || payload.pending_writes.some((entry) => !validPendingEntry(entry))
     ) {
       throw new Error("pending recovery unavailable");
@@ -1169,12 +1168,30 @@ async function submitCreate(event) {
   setWriteStatus("Bilder werden ausschließlich lokal gestaged …", "warning");
   try {
     const mediaRefs = await stageSelectedMedia(files);
-    await runPlatformWrite(
+    const result = await runPlatformWrite(
       "create-media",
       "POST",
       "/api/write/media/ads",
       {...payload, media_refs: mediaRefs},
     );
+    if (
+      result !== null
+      && result.payload?.error === "dashboard_pending_write_conflict"
+    ) {
+      try {
+        await discardStagedMedia(mediaRefs);
+      } catch (cleanupError) {
+        setWriteStatus(
+          `Konkurrierender Create wurde nicht weitergeleitet, aber lokale Media-Cleanup fehlgeschlagen: ${cleanupError.message}.`,
+          "error",
+        );
+        return;
+      }
+      setWriteStatus(
+        "Konkurrierender Create wurde nicht weitergeleitet; dessen lokal gestagte Bilder wurden verworfen. Die bereits gebundene Anfrage bleibt maßgeblich.",
+        "warning",
+      );
+    }
   } catch (error) {
     setWriteStatus(
       `Media-Staging fehlgeschlagen: ${error.message}. Es wurde kein neuer Plattform-Create gestartet.`,

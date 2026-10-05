@@ -1444,6 +1444,68 @@ globalThis.fetch = async (path, options) => {
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_restores_more_than_64_pending_entries(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+const records = Array.from({length: 65}, (_unused, index) => {
+  const adId = String(index + 1);
+  return {
+    scope: `ad:${adId}:pause`,
+    key: `ui:pending-${adId}`,
+    method: "POST",
+    path: `/api/write/ads/${adId}/pause`,
+    payload: null,
+    adId,
+  };
+});
+globalThis.fetch = async (path, options) => {
+  assert.equal(path, "/api/dashboard/pending-writes");
+  assert.equal(
+    options.headers["X-Mark-Dashboard-Token"],
+    "dashboard-write-token-00000001",
+  );
+  return {
+    status: 200,
+    ok: true,
+    async text() {
+      return JSON.stringify({pending_writes: records});
+    },
+  };
+};
+
+(async () => {
+  await refreshPendingWrites();
+  assert.equal(pendingRecoveryBlocked, false);
+  assert.equal(pendingWrites.size, 65);
+  assert.equal(writeUiReady(), true);
+  assert.deepEqual(pendingWrites.get("ad:65:pause"), records[64]);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_write_runtime_clears_bound_terminal_202_receipt(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
@@ -1957,6 +2019,142 @@ globalThis.fetch = async (path, options) => {
   assert.equal(mediaCreateCalls, 2);
   assert.equal(ackCalls, 2);
   assert.equal(createMediaInFlight, false);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+    def test_write_runtime_discards_media_when_cross_tab_create_loses_claim(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+const fields = new Map([
+  ["create-category", {value: "A > B"}],
+  ["create-title", {value: "Valid title"}],
+  ["create-description", {value: "Valid description"}],
+  ["create-price", {value: "1"}],
+  ["create-media", {
+    files: [{name: "loser.jpg", type: "image/jpeg", size: 10}],
+  }],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    if (fields.has(id)) return fields.get(id);
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+const winner = {
+  scope: "create-media",
+  key: "ui:winner",
+  method: "POST",
+  path: "/api/write/media/ads",
+  payload: {
+    category_path: ["A", "B"],
+    title: "Winner",
+    description: "Winner description",
+    price_eur: 1,
+    media_refs: ["media_winner"],
+  },
+  adId: null,
+};
+let loadCalls = 0;
+load = async () => {
+  loadCalls += 1;
+  pendingWrites.clear();
+  pendingWrites.set(winner.scope, winner);
+};
+
+const calls = [];
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  if (path === "/api/write/media/stage") {
+    return {
+      status: 201,
+      ok: true,
+      async text() {
+        return JSON.stringify({media_ref: "media_loser"});
+      },
+    };
+  }
+  if (path === "/api/write/media/ads") {
+    return {
+      status: 409,
+      ok: false,
+      async text() {
+        return JSON.stringify({
+          error: "dashboard_pending_write_conflict",
+          platform_retry_authorized: false,
+        });
+      },
+    };
+  }
+  if (path === "/api/write/media/discard") {
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({discarded: 1});
+      },
+    };
+  }
+  throw new Error("unexpected path: " + path);
+};
+
+(async () => {
+  await submitCreate({preventDefault() {}});
+
+  assert.deepEqual(
+    calls.map((item) => item.path),
+    [
+      "/api/write/media/stage",
+      "/api/write/media/ads",
+      "/api/write/media/discard",
+    ],
+  );
+  assert.deepEqual(
+    JSON.parse(calls[1].options.body).media_refs,
+    ["media_loser"],
+  );
+  assert.equal(
+    calls[1].options.headers["Idempotency-Key"].startsWith("ui:"),
+    true,
+  );
+  assert.deepEqual(
+    JSON.parse(calls[2].options.body),
+    {media_refs: ["media_loser"]},
+  );
+  assert.equal(calls[2].options.headers["Idempotency-Key"], undefined);
+  assert.equal(loadCalls, 1);
+  assert.equal(pendingWrites.get("create-media"), winner);
+  assert.equal(createMediaInFlight, false);
+  assert.match(writeStatus.textContent, /nicht weitergeleitet/i);
+  assert.match(writeStatus.textContent, /verworfen/i);
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
