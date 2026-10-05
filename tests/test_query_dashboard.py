@@ -2266,6 +2266,145 @@ globalThis.fetch = async (path, options) => {
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_omits_unknown_unchanged_content_fields(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+
+class Element {
+  constructor() {
+    this.value = "";
+    this.textContent = "";
+    this.className = "";
+  }
+  scrollIntoView() {}
+}
+
+const elements = new Map([
+  ["manage-ad-id", new Element()],
+  ["manage-title", new Element()],
+  ["manage-description", new Element()],
+  ["manage-state", new Element()],
+  ["manage-form", new Element()],
+  ["write-status", new Element()],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (!elements.has(id)) throw new Error("unexpected element: " + id);
+    return elements.get(id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+load = async () => {};
+
+const calls = [];
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  if (path === "/api/dashboard/pending-writes/ack") {
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  return {
+    status: 200,
+    ok: true,
+    async text() {
+      return JSON.stringify({
+        idempotency_key: options.headers["Idempotency-Key"],
+        operation_receipt: {outcome: "confirmed"},
+        platform_retry_authorized: false,
+      });
+    },
+  };
+};
+
+function select(ad) {
+  latestAdsById = new Map([[ad.ad_id, ad]]);
+  populateManageForm(ad);
+}
+
+const unknownDescription = {
+  ad_id: "2",
+  title: "Old title",
+  description: null,
+  lifecycle_state: "active",
+  present: true,
+};
+
+(async () => {
+  select(unknownDescription);
+  assert.equal(elements.get("manage-description").value, "");
+  await saveManagedAd();
+  assert.equal(calls.length, 0);
+  assert.match(elements.get("write-status").textContent, /Keine Content-Änderungen/i);
+
+  elements.get("manage-title").value = "New title";
+  await saveManagedAd();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].path, "/api/write/ads/2");
+  assert.equal(calls[0].options.method, "PATCH");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {title: "New title"});
+  assert.equal(calls[1].path, "/api/dashboard/pending-writes/ack");
+
+  calls.length = 0;
+  select({...unknownDescription, title: "New title"});
+  elements.get("manage-description").value = "Explicit description";
+  await saveManagedAd();
+  assert.equal(calls.length, 2);
+  assert.deepEqual(
+    JSON.parse(calls[0].options.body),
+    {description: "Explicit description"},
+  );
+
+  calls.length = 0;
+  select({...unknownDescription, title: "New title"});
+  const persisted = {
+    scope: "ad:2:update",
+    key: "ui:persisted-update",
+    method: "PATCH",
+    path: "/api/write/ads/2",
+    payload: {description: "Persisted description"},
+    adId: "2",
+  };
+  pendingWrites.set(persisted.scope, persisted);
+  await saveManagedAd();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].path, persisted.path);
+  assert.equal(calls[0].options.method, persisted.method);
+  assert.equal(calls[0].options.headers["Idempotency-Key"], persisted.key);
+  assert.deepEqual(JSON.parse(calls[0].options.body), persisted.payload);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_write_runtime_exposes_absent_pending_recovery_without_new_writes(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")

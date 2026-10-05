@@ -461,6 +461,7 @@ let writeToken = null;
 let pendingRecoveryBlocked = false;
 let createMediaInFlight = false;
 let latestAdsById = new Map();
+let managedAdBaseline = null;
 
 function consumeWriteToken() {
   const hashParams = new URLSearchParams(window.location.hash.slice(1));
@@ -652,11 +653,44 @@ function td(value, className = "") {
 }
 
 function populateManageForm(ad) {
+  const titleKnown = typeof ad.title === "string";
+  const descriptionKnown = typeof ad.description === "string";
+  managedAdBaseline = {
+    adId: ad.ad_id,
+    titleKnown,
+    title: titleKnown ? ad.title : null,
+    descriptionKnown,
+    description: descriptionKnown ? ad.description : null,
+  };
   byId("manage-ad-id").value = ad.ad_id;
-  byId("manage-title").value = ad.title ?? "";
-  byId("manage-description").value = ad.description ?? "";
+  byId("manage-title").value = titleKnown ? ad.title : "";
+  byId("manage-description").value = descriptionKnown ? ad.description : "";
   byId("manage-state").textContent = ad.lifecycle_state ?? "—";
   byId("manage-form").scrollIntoView({behavior: "smooth", block: "nearest"});
+}
+
+function managedContentChanges(adId) {
+  if (managedAdBaseline === null || managedAdBaseline.adId !== adId) {
+    throw new Error("Management-Ausgangswerte sind nicht mehr eindeutig gebunden.");
+  }
+  const payload = {};
+  const title = byId("manage-title").value;
+  const description = byId("manage-description").value;
+  if (
+    managedAdBaseline.titleKnown
+      ? title !== managedAdBaseline.title
+      : title !== ""
+  ) {
+    payload.title = title;
+  }
+  if (
+    managedAdBaseline.descriptionKnown
+      ? description !== managedAdBaseline.description
+      : description !== ""
+  ) {
+    payload.description = description;
+  }
+  return payload;
 }
 
 function renderAds(ads) {
@@ -1259,15 +1293,27 @@ async function runAdAction(action, method, suffix, payload = null) {
 }
 
 async function saveManagedAd() {
-  await runAdAction(
-    "update",
-    "PATCH",
-    "",
-    {
-      title: byId("manage-title").value,
-      description: byId("manage-description").value,
-    },
-  );
+  const adId = selectedAdId();
+  if (adId === null) return;
+
+  const existing = pendingForAd(adId);
+  if (existing !== null) {
+    await runAdAction("update", "PATCH", "", {});
+    return;
+  }
+
+  let payload;
+  try {
+    payload = managedContentChanges(adId);
+  } catch (error) {
+    setWriteStatus(error.message, "error");
+    return;
+  }
+  if (Object.keys(payload).length === 0) {
+    setWriteStatus("Keine Content-Änderungen zum Speichern.", "warning");
+    return;
+  }
+  await runAdAction("update", "PATCH", "", payload);
 }
 
 async function deleteManagedAd() {
