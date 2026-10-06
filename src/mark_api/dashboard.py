@@ -699,11 +699,27 @@ function populateManageForm(ad) {
   byId("manage-form").scrollIntoView({behavior: "smooth", block: "nearest"});
 }
 
-function rebaseManagedBaseline(adId) {
+function rebaseManagedBaseline(adId, payload) {
   if (byId("manage-ad-id").value !== adId) return;
-  const refreshed = latestAdsById.get(adId);
-  if (refreshed === undefined) return;
-  managedAdBaseline = managedBaselineFor(refreshed);
+  if (managedAdBaseline === null || managedAdBaseline.adId !== adId) return;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return;
+
+  const next = {...managedAdBaseline};
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "title")
+    && typeof payload.title === "string"
+  ) {
+    next.titleKnown = true;
+    next.title = payload.title;
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(payload, "description")
+    && typeof payload.description === "string"
+  ) {
+    next.descriptionKnown = true;
+    next.description = payload.description;
+  }
+  managedAdBaseline = next;
 }
 
 function managedContentChanges(adId) {
@@ -956,6 +972,25 @@ function canClearCompletedWrite(_response, _payload) {
   return true;
 }
 
+function confirmedWriteResult(result) {
+  return (
+    result !== null
+    && result.response.status === 200
+    && result.payload?.operation_receipt?.outcome === "confirmed"
+  );
+}
+
+async function refreshAfterSettledWrite() {
+  try {
+    await load();
+  } catch (error) {
+    setWriteStatus(
+      `Write-Ergebnis ist geklärt, aber Dashboard-Aktualisierung fehlgeschlagen: ${error.message}`,
+      "warning",
+    );
+  }
+}
+
 function describeWriteResult(response, payload) {
   if (payload.operation_receipt) {
     const outcome = payload.operation_receipt.outcome ?? "unknown";
@@ -1021,9 +1056,9 @@ async function runPlatformWrite(scope, method, path, payload, {adId = null} = {}
         }
         pendingWrites.delete(scope);
       }
-      await load();
+      await refreshAfterSettledWrite();
     } else if (responsePayload.error === "dashboard_pending_write_conflict") {
-      await load();
+      await refreshAfterSettledWrite();
     } else if (
       canClearPendingAfterError(
         response,
@@ -1344,8 +1379,8 @@ async function saveManagedAd() {
   const existing = pendingForAd(adId);
   if (existing !== null) {
     const result = await runAdAction("update", "PATCH", "", {});
-    if (result !== null && pendingForAd(adId) === null) {
-      rebaseManagedBaseline(adId);
+    if (confirmedWriteResult(result) && pendingForAd(adId) === null) {
+      rebaseManagedBaseline(adId, existing.payload);
     }
     return;
   }
@@ -1362,8 +1397,8 @@ async function saveManagedAd() {
     return;
   }
   const result = await runAdAction("update", "PATCH", "", payload);
-  if (result !== null && pendingForAd(adId) === null) {
-    rebaseManagedBaseline(adId);
+  if (confirmedWriteResult(result) && pendingForAd(adId) === null) {
+    rebaseManagedBaseline(adId, payload);
   }
 }
 

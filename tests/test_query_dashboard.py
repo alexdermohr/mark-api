@@ -2662,12 +2662,9 @@ writeUiAvailable = true;
 writeToken = "dashboard-write-token-00000001";
 
 const calls = [];
-let refreshedAd = null;
 let editDuringPatch = null;
 load = async () => {
-  if (refreshedAd !== null) {
-    latestAdsById = new Map([[refreshedAd.ad_id, refreshedAd]]);
-  }
+  throw new Error("refresh failed");
 };
 globalThis.fetch = async (path, options) => {
   calls.push({path, options});
@@ -2709,13 +2706,16 @@ const original = {
   latestAdsById = new Map([[original.ad_id, original]]);
   populateManageForm(original);
   elements.get("manage-title").value = "New title";
-  refreshedAd = {...original, title: "New title"};
 
   await saveManagedAd();
   assert.equal(calls.length, 2);
   assert.deepEqual(JSON.parse(calls[0].options.body), {title: "New title"});
   assert.equal(managedAdBaseline.title, "New title");
   assert.equal(elements.get("manage-title").value, "New title");
+  assert.match(
+    elements.get("write-status").textContent,
+    /Dashboard-Aktualisierung fehlgeschlagen/i,
+  );
 
   calls.length = 0;
   await saveManagedAd();
@@ -2723,14 +2723,12 @@ const original = {
   assert.match(elements.get("write-status").textContent, /Keine Content-Änderungen/i);
 
   elements.get("manage-title").value = "Saved server title";
-  refreshedAd = {...original, title: "Saved server title"};
   editDuringPatch = "Later local edit";
   await saveManagedAd();
   assert.equal(managedAdBaseline.title, "Saved server title");
   assert.equal(elements.get("manage-title").value, "Later local edit");
 
   calls.length = 0;
-  refreshedAd = {...original, title: "Later local edit"};
   await saveManagedAd();
   assert.equal(calls.length, 2);
   assert.deepEqual(JSON.parse(calls[0].options.body), {title: "Later local edit"});

@@ -269,6 +269,78 @@ class PrivateWebMediaContractTests(unittest.TestCase):
             finally:
                 second.close()
 
+    def test_media_handle_store_recovers_unprotected_incomplete_persistent_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            temp_ref = "media_interrupted_temp"
+            temp_path = directory / f".{temp_ref}.jpg.tmp"
+            temp_path.write_bytes(b"")
+            orphan_ref = "media_interrupted_final"
+            orphan_path = directory / f"{orphan_ref}.jpg"
+            orphan_path.write_bytes(b"")
+
+            store = PrivateWebMediaHandleStore(
+                directory=directory,
+                protected_refs=lambda: frozenset(),
+            )
+            try:
+                self.assertFalse(temp_path.exists())
+                self.assertFalse(orphan_path.exists())
+                self.assertEqual(store._sources, {})
+
+                ref = store.stage_media(
+                    "replacement.jpg",
+                    b"\xff\xd8\xffreplacement",
+                )
+                (source,) = store.resolve((ref,))
+                self.assertTrue(Path(source.path).exists())
+                self.assertFalse(
+                    any(
+                        entry.name.endswith(".tmp")
+                        for entry in directory.iterdir()
+                    )
+                )
+            finally:
+                store.close()
+
+    def test_media_handle_store_fails_closed_for_incomplete_protected_handle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            protected_ref = "media_protected_pending"
+            protected_path = directory / f"{protected_ref}.jpg"
+            protected_path.write_bytes(b"")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "persistent media handle is invalid",
+            ):
+                PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset({protected_ref}),
+                )
+
+            self.assertTrue(protected_path.exists())
+
+    def test_media_handle_store_rejects_ambiguous_temp_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            ambiguous = directory / ".media_bad!.jpg.tmp"
+            ambiguous.write_bytes(b"partial")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "persistent media handle directory is invalid",
+            ):
+                PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+
+            self.assertTrue(ambiguous.exists())
+
     def test_media_handle_store_enforces_total_byte_quota_before_writing(self) -> None:
         store = PrivateWebMediaHandleStore()
         try:

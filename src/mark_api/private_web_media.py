@@ -511,62 +511,99 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         wall_now = float(self._wall_clock())
         total_bytes = 0
         loaded_refs: set[str] = set()
-        for entry in os.scandir(self._directory_path):
-            if not entry.is_file(follow_symlinks=False):
-                raise RuntimeError("persistent media handle directory is invalid")
-            name = entry.name
-            extension = next(
-                (
-                    suffix
-                    for suffix in (".jpg", ".png", ".webp")
-                    if name.endswith(suffix)
-                ),
-                None,
-            )
-            if extension is None:
-                raise RuntimeError("persistent media handle directory is invalid")
-            ref = name[: -len(extension)]
-            if (
-                _MEDIA_REF_RE.fullmatch(ref) is None
-                or ref in loaded_refs
-            ):
-                raise RuntimeError("persistent media handle directory is invalid")
-            file_stat = entry.stat(follow_symlinks=False)
-            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size <= 0:
-                raise RuntimeError("persistent media handle is invalid")
-            fd = os.open(
-                entry.path,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            )
-            try:
-                prefix = os.read(fd, 12)
-            finally:
-                os.close(fd)
-            try:
-                detected_extension = self._extension(name, prefix)
-            except ValueError:
-                raise RuntimeError("persistent media handle is invalid") from None
-            if detected_extension != extension:
-                raise RuntimeError("persistent media handle is invalid")
-            expires_wall = (
-                float(file_stat.st_mtime) + self._STAGED_HANDLE_TTL_SECONDS
-            )
-            if expires_wall <= wall_now and ref not in protected:
+        with os.scandir(self._directory_path) as entries:
+            for entry in entries:
+                if not entry.is_file(follow_symlinks=False):
+                    raise RuntimeError("persistent media handle directory is invalid")
+                name = entry.name
+                temp_extension = next(
+                    (
+                        suffix
+                        for suffix in (".jpg", ".png", ".webp")
+                        if name.endswith(suffix + ".tmp")
+                    ),
+                    None,
+                )
+                if name.startswith(".") and temp_extension is not None:
+                    temp_ref = name[1 : -(len(temp_extension) + len(".tmp"))]
+                    if _MEDIA_REF_RE.fullmatch(temp_ref) is not None:
+                        try:
+                            os.unlink(entry.path)
+                        except FileNotFoundError:
+                            pass
+                        continue
+                extension = next(
+                    (
+                        suffix
+                        for suffix in (".jpg", ".png", ".webp")
+                        if name.endswith(suffix)
+                    ),
+                    None,
+                )
+                if extension is None:
+                    raise RuntimeError("persistent media handle directory is invalid")
+                ref = name[: -len(extension)]
+                if (
+                    _MEDIA_REF_RE.fullmatch(ref) is None
+                    or ref in loaded_refs
+                ):
+                    raise RuntimeError("persistent media handle directory is invalid")
+                file_stat = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise RuntimeError("persistent media handle is invalid")
+                if file_stat.st_size <= 0:
+                    if ref in protected:
+                        raise RuntimeError("persistent media handle is invalid")
+                    try:
+                        os.unlink(entry.path)
+                    except FileNotFoundError:
+                        pass
+                    continue
+                fd = os.open(
+                    entry.path,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
                 try:
-                    os.unlink(entry.path)
-                except FileNotFoundError:
-                    pass
-                continue
-            if (
-                len(loaded_refs) >= self._MAX_STAGED_HANDLES
-                or total_bytes + int(file_stat.st_size) > self._MAX_STAGED_BYTES
-            ):
-                raise RuntimeError("persistent media staging quota exceeded")
-            loaded_refs.add(ref)
-            total_bytes += int(file_stat.st_size)
-            self._sources[ref] = PrivateWebMediaSource(entry.path)
-            self._sizes[ref] = int(file_stat.st_size)
-            self._expires_at[ref] = now + max(0.0, expires_wall - wall_now)
+                    prefix = os.read(fd, 12)
+                finally:
+                    os.close(fd)
+                try:
+                    detected_extension = self._extension(name, prefix)
+                except ValueError:
+                    if ref in protected:
+                        raise RuntimeError("persistent media handle is invalid") from None
+                    try:
+                        os.unlink(entry.path)
+                    except FileNotFoundError:
+                        pass
+                    continue
+                if detected_extension != extension:
+                    if ref in protected:
+                        raise RuntimeError("persistent media handle is invalid")
+                    try:
+                        os.unlink(entry.path)
+                    except FileNotFoundError:
+                        pass
+                    continue
+                expires_wall = (
+                    float(file_stat.st_mtime) + self._STAGED_HANDLE_TTL_SECONDS
+                )
+                if expires_wall <= wall_now and ref not in protected:
+                    try:
+                        os.unlink(entry.path)
+                    except FileNotFoundError:
+                        pass
+                    continue
+                if (
+                    len(loaded_refs) >= self._MAX_STAGED_HANDLES
+                    or total_bytes + int(file_stat.st_size) > self._MAX_STAGED_BYTES
+                ):
+                    raise RuntimeError("persistent media staging quota exceeded")
+                loaded_refs.add(ref)
+                total_bytes += int(file_stat.st_size)
+                self._sources[ref] = PrivateWebMediaSource(entry.path)
+                self._sizes[ref] = int(file_stat.st_size)
+                self._expires_at[ref] = now + max(0.0, expires_wall - wall_now)
         self._staged_bytes = total_bytes
 
     @staticmethod
@@ -654,7 +691,15 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 if _MEDIA_REF_RE.fullmatch(ref) is not None and ref not in self._sources:
                     break
             path = os.path.join(self._directory_path, ref + extension)
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            temp_path = os.path.join(
+                self._directory_path,
+                "." + ref + extension + ".tmp",
+            )
+            fd = os.open(
+                temp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
             try:
                 view = memoryview(data)
                 written = 0
@@ -666,7 +711,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 os.fsync(fd)
             except Exception:
                 try:
-                    os.unlink(path)
+                    os.unlink(temp_path)
                 except OSError:
                     pass
                 raise
@@ -675,13 +720,14 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             try:
                 staged_at = float(self._wall_clock())
                 os.utime(
-                    path,
+                    temp_path,
                     (staged_at, staged_at),
                     follow_symlinks=False,
                 )
+                os.replace(temp_path, path)
             except Exception:
                 try:
-                    os.unlink(path)
+                    os.unlink(temp_path)
                 except OSError:
                     pass
                 raise
