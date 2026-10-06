@@ -335,6 +335,32 @@ class SnapshotStoreTests(unittest.TestCase):
             ("api-owner", "write-api:create-legacy", "not_read", 0),
         )
 
+    def test_dashboard_pending_write_claim_uses_coordination_guard(self) -> None:
+        store = self.make_store()
+        events: list[str] = []
+
+        class Guard:
+            def __enter__(self):
+                events.append("enter")
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                events.append("exit")
+
+        store._dashboard_pending_write_lock = Guard()
+        created = store.claim_dashboard_pending_write(
+            scope="create-media",
+            resource_key="create",
+            idempotency_key="ui:guarded-claim",
+            method="POST",
+            path="/api/write/media/ads",
+            payload_json='{"media_refs":["media_guarded"]}',
+            ad_id=None,
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(events, ["enter", "exit"])
+
     def test_dashboard_pending_write_acknowledgement_is_two_phase(self) -> None:
         store = self.make_store()
         created = store.claim_dashboard_pending_write(

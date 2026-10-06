@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Iterable, Mapping
 
 from .domain import (
@@ -76,12 +78,18 @@ class SnapshotStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._dashboard_pending_write_lock = RLock()
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def dashboard_pending_write_guard(self) -> AbstractContextManager[None]:
+        """Serialize pending-write protection changes with media pruning."""
+
+        return self._dashboard_pending_write_lock
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -1251,7 +1259,7 @@ class SnapshotStore:
             ad_id=ad_id,
             acknowledged=False,
         )
-        with self._connect() as connection:
+        with self.dashboard_pending_write_guard(), self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """

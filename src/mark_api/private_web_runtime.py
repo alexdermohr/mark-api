@@ -1523,6 +1523,7 @@ def build_private_web_write_api_runtime(
                         store.path.name + ".media-handles"
                     ),
                     protected_refs=lambda: _pending_dashboard_media_refs(store),
+                    protected_refs_guard=store.dashboard_pending_write_guard,
                 )
                 media_resolver = media_handle_store
             else:

@@ -213,6 +213,66 @@ class PrivateWebMediaContractTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_media_handle_store_serializes_protected_snapshot_and_pruning(self) -> None:
+        now = [100.0]
+        protected_refs: set[str] = set()
+
+        class Guard:
+            def __init__(self) -> None:
+                self.active = False
+
+            def __enter__(self):
+                self.active = True
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                self.active = False
+
+        guard = Guard()
+
+        def protected_snapshot() -> frozenset[str]:
+            self.assertTrue(guard.active)
+            return frozenset(protected_refs)
+
+        store = PrivateWebMediaHandleStore(
+            clock=lambda: now[0],
+            protected_refs=protected_snapshot,
+            protected_refs_guard=lambda: guard,
+        )
+        try:
+            store._STAGED_HANDLE_TTL_SECONDS = 10
+            protected = store.stage_media(
+                "protected.jpg",
+                b"\xff\xd8\xffprotected",
+            )
+            (protected_source,) = store.resolve((protected,))
+
+            original_prune = store._prune_expired_locked
+
+            def guarded_prune(
+                current: float,
+                preserve: frozenset[str] = frozenset(),
+            ) -> None:
+                self.assertTrue(guard.active)
+                original_prune(current, preserve)
+
+            store._prune_expired_locked = guarded_prune
+
+            now[0] = 110.0
+            protected_refs.add(protected)
+            replacement = store.stage_media(
+                "replacement.jpg",
+                b"\xff\xd8\xffreplacement",
+            )
+
+            self.assertTrue(Path(protected_source.path).exists())
+            self.assertEqual(
+                set(store._sources),
+                {protected, replacement},
+            )
+        finally:
+            store.close()
+
     def test_media_handle_store_rehydrates_only_protected_expired_refs(self) -> None:
         monotonic_now = [100.0]
         wall_now = [1_000.0]

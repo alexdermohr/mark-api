@@ -4,6 +4,7 @@ import os
 import re
 import stat
 import tempfile
+from contextlib import AbstractContextManager, nullcontext
 from secrets import token_urlsafe
 from threading import Lock
 from time import monotonic, time
@@ -448,6 +449,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         wall_clock: Callable[[], float] = time,
         directory: str | os.PathLike[str] | None = None,
         protected_refs: Callable[[], frozenset[str]] | None = None,
+        protected_refs_guard: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         if not callable(clock):
             raise TypeError("media handle store clock must be callable")
@@ -455,6 +457,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             raise TypeError("media handle store wall clock must be callable")
         if protected_refs is not None and not callable(protected_refs):
             raise TypeError("protected media refs provider must be callable")
+        if protected_refs_guard is not None and not callable(protected_refs_guard):
+            raise TypeError("protected media refs guard must be callable")
         super().__init__({})
         self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
         if directory is None:
@@ -485,6 +489,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         self._clock = clock
         self._wall_clock = wall_clock
         self._protected_refs = protected_refs
+        self._protected_refs_guard = protected_refs_guard
         self._sizes: dict[str, int] = {}
         self._expires_at: dict[str, float] = {}
         if self._persistent:
@@ -504,6 +509,15 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         ):
             raise RuntimeError("protected media refs are invalid")
         return refs
+
+    def _protected_refs_guard_context(self) -> AbstractContextManager[None]:
+        provider = self._protected_refs_guard
+        if provider is None:
+            return nullcontext()
+        try:
+            return provider()
+        except Exception:
+            raise RuntimeError("protected media refs guard is unavailable") from None
 
     def _rehydrate_persistent_handles(self) -> None:
         protected = self._protected_refs_snapshot()
@@ -673,8 +687,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         if not isinstance(data, bytes) or not data:
             raise ValueError("media bytes are required")
         extension = self._extension(filename, data)
-        protected = self._protected_refs_snapshot()
-        with self._lock:
+        with self._protected_refs_guard_context(), self._lock:
+            protected = self._protected_refs_snapshot()
             if self._closed:
                 raise RuntimeError("media handle store is closed")
             self._prune_expired_locked(
@@ -749,8 +763,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             and all(isinstance(ref, str) for ref in media_refs)
             else frozenset()
         )
-        preserve = requested | self._protected_refs_snapshot()
-        with self._lock:
+        with self._protected_refs_guard_context(), self._lock:
+            preserve = requested | self._protected_refs_snapshot()
             if self._closed:
                 raise PrivateWebWriteNotAttemptedError("resolve_media_refs")
             self._prune_expired_locked(
@@ -768,12 +782,12 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         with self._lock:
             if self._closed:
                 return
-        protected = (
-            self._protected_refs_snapshot()
-            if self._persistent
-            else frozenset()
-        )
-        with self._lock:
+        with self._protected_refs_guard_context(), self._lock:
+            protected = (
+                self._protected_refs_snapshot()
+                if self._persistent
+                else frozenset()
+            )
             if self._closed:
                 return
             orphan_refs = tuple(
