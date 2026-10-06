@@ -676,21 +676,34 @@ function td(value, className = "") {
   return element;
 }
 
-function populateManageForm(ad) {
+function managedBaselineFor(ad) {
   const titleKnown = typeof ad.title === "string";
   const descriptionKnown = typeof ad.description === "string";
-  managedAdBaseline = {
+  return {
     adId: ad.ad_id,
     titleKnown,
     title: titleKnown ? ad.title : null,
     descriptionKnown,
     description: descriptionKnown ? ad.description : null,
   };
+}
+
+function populateManageForm(ad) {
+  managedAdBaseline = managedBaselineFor(ad);
   byId("manage-ad-id").value = ad.ad_id;
-  byId("manage-title").value = titleKnown ? ad.title : "";
-  byId("manage-description").value = descriptionKnown ? ad.description : "";
+  byId("manage-title").value = managedAdBaseline.titleKnown ? managedAdBaseline.title : "";
+  byId("manage-description").value = managedAdBaseline.descriptionKnown
+    ? managedAdBaseline.description
+    : "";
   byId("manage-state").textContent = ad.lifecycle_state ?? "—";
   byId("manage-form").scrollIntoView({behavior: "smooth", block: "nearest"});
+}
+
+function rebaseManagedBaseline(adId) {
+  if (byId("manage-ad-id").value !== adId) return;
+  const refreshed = latestAdsById.get(adId);
+  if (refreshed === undefined) return;
+  managedAdBaseline = managedBaselineFor(refreshed);
 }
 
 function managedContentChanges(adId) {
@@ -1315,7 +1328,7 @@ async function runAdAction(action, method, suffix, payload = null) {
     );
     return;
   }
-  await runPlatformWrite(
+  return await runPlatformWrite(
     scope,
     method,
     `/api/write/ads/${encodeURIComponent(adId)}${suffix}`,
@@ -1330,7 +1343,10 @@ async function saveManagedAd() {
 
   const existing = pendingForAd(adId);
   if (existing !== null) {
-    await runAdAction("update", "PATCH", "", {});
+    const result = await runAdAction("update", "PATCH", "", {});
+    if (result !== null && pendingForAd(adId) === null) {
+      rebaseManagedBaseline(adId);
+    }
     return;
   }
 
@@ -1345,7 +1361,10 @@ async function saveManagedAd() {
     setWriteStatus("Keine Content-Änderungen zum Speichern.", "warning");
     return;
   }
-  await runAdAction("update", "PATCH", "", payload);
+  const result = await runAdAction("update", "PATCH", "", payload);
+  if (result !== null && pendingForAd(adId) === null) {
+    rebaseManagedBaseline(adId);
+  }
 }
 
 async function deleteManagedAd() {

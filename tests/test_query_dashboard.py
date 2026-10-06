@@ -2621,6 +2621,137 @@ const unknownDescription = {
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_rebases_managed_content_after_completed_update(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+
+class Element {
+  constructor() {
+    this.value = "";
+    this.textContent = "";
+    this.className = "";
+  }
+  scrollIntoView() {}
+}
+
+const elements = new Map([
+  ["manage-ad-id", new Element()],
+  ["manage-title", new Element()],
+  ["manage-description", new Element()],
+  ["manage-state", new Element()],
+  ["manage-form", new Element()],
+  ["write-status", new Element()],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (!elements.has(id)) throw new Error("unexpected element: " + id);
+    return elements.get(id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+
+const calls = [];
+let refreshedAd = null;
+let editDuringPatch = null;
+load = async () => {
+  if (refreshedAd !== null) {
+    latestAdsById = new Map([[refreshedAd.ad_id, refreshedAd]]);
+  }
+};
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  if (path === "/api/dashboard/pending-writes/ack") {
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  if (editDuringPatch !== null) {
+    elements.get("manage-title").value = editDuringPatch;
+    editDuringPatch = null;
+  }
+  return {
+    status: 200,
+    ok: true,
+    async text() {
+      return JSON.stringify({
+        idempotency_key: options.headers["Idempotency-Key"],
+        operation_receipt: {outcome: "confirmed"},
+        platform_retry_authorized: false,
+      });
+    },
+  };
+};
+
+const original = {
+  ad_id: "2",
+  title: "Old title",
+  description: "Description",
+  lifecycle_state: "active",
+  present: true,
+};
+
+(async () => {
+  latestAdsById = new Map([[original.ad_id, original]]);
+  populateManageForm(original);
+  elements.get("manage-title").value = "New title";
+  refreshedAd = {...original, title: "New title"};
+
+  await saveManagedAd();
+  assert.equal(calls.length, 2);
+  assert.deepEqual(JSON.parse(calls[0].options.body), {title: "New title"});
+  assert.equal(managedAdBaseline.title, "New title");
+  assert.equal(elements.get("manage-title").value, "New title");
+
+  calls.length = 0;
+  await saveManagedAd();
+  assert.equal(calls.length, 0);
+  assert.match(elements.get("write-status").textContent, /Keine Content-Änderungen/i);
+
+  elements.get("manage-title").value = "Saved server title";
+  refreshedAd = {...original, title: "Saved server title"};
+  editDuringPatch = "Later local edit";
+  await saveManagedAd();
+  assert.equal(managedAdBaseline.title, "Saved server title");
+  assert.equal(elements.get("manage-title").value, "Later local edit");
+
+  calls.length = 0;
+  refreshedAd = {...original, title: "Later local edit"};
+  await saveManagedAd();
+  assert.equal(calls.length, 2);
+  assert.deepEqual(JSON.parse(calls[0].options.body), {title: "Later local edit"});
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_write_runtime_exposes_absent_pending_recovery_without_new_writes(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
