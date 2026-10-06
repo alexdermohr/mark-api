@@ -418,6 +418,49 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
             f"Bearer {self.BACKEND_TOKEN}",
         )
 
+    def test_proxy_media_stage_blocks_existing_create_recovery(self) -> None:
+        self.store.claim_dashboard_pending_write(
+            scope="create-media",
+            resource_key="create",
+            idempotency_key="ui:pending-media-create",
+            method="POST",
+            path="/api/write/media/ads",
+            payload_json=json.dumps(
+                {
+                    "category_path": ["A", "B"],
+                    "title": "Alt",
+                    "description": "Recovery",
+                    "price_eur": 1,
+                    "media_refs": ["media_existing"],
+                }
+            ),
+            ad_id=None,
+        )
+        media = b"\\x89PNG\\r\\n\\x1a\\nnew-local-test"
+        request = Request(
+            self.base + "/api/write/media/stage",
+            data=media,
+            method="POST",
+            headers={
+                **self.write_headers(content_type="image/png"),
+                "X-Mark-Media-Filename": "upload.png",
+            },
+        )
+
+        with self.assertRaises(HTTPError) as error:
+            urlopen(request, timeout=2)
+
+        self.assertEqual(error.exception.code, 409)
+        self.assertEqual(
+            json.loads(error.exception.read()),
+            {
+                "error": "dashboard_pending_write_conflict",
+                "platform_retry_authorized": False,
+            },
+        )
+        self.assertEqual(self.backend.requests, [])
+        self.assertEqual(len(self.store.dashboard_pending_writes()), 1)
+
     def test_proxy_media_discard_is_allowlisted_without_platform_idempotency(self) -> None:
         body = json.dumps({"media_refs": ["staged-ref-1"]}).encode("utf-8")
         request = Request(

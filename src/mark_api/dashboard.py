@@ -1725,6 +1725,31 @@ def _handler_factory(
                 )
                 return
 
+            if urlsplit(self.path).path == "/api/write/media/stage":
+                try:
+                    create_recovery_pending = any(
+                        record.resource_key == "create"
+                        for record in store.dashboard_pending_writes()
+                    )
+                except Exception:
+                    self._send_json(
+                        500,
+                        {
+                            "error": "dashboard_pending_store_error",
+                            "platform_retry_authorized": False,
+                        },
+                    )
+                    return
+                if create_recovery_pending:
+                    self._send_json(
+                        409,
+                        {
+                            "error": "dashboard_pending_write_conflict",
+                            "platform_retry_authorized": False,
+                        },
+                    )
+                    return
+
             headers: dict[str, str] = {
                 "Authorization": f"Bearer {write_proxy.bearer_token}",
             }
