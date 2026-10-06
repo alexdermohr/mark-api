@@ -722,6 +722,16 @@ function rebaseManagedBaseline(adId, payload) {
   managedAdBaseline = next;
 }
 
+function retireManagedBaseline(adId) {
+  if (byId("manage-ad-id").value !== adId) return;
+  if (managedAdBaseline === null || managedAdBaseline.adId !== adId) return;
+  managedAdBaseline = null;
+  setWriteStatus(
+    "Ausgang des Content-Updates ist unklar. Derselbe Inhalt wird nicht mit einem neuen Idempotency-Key erneut gesendet. Anzeige über „Verwalten“ neu auswählen, bevor ein neuer Content-Write gestartet wird.",
+    "warning",
+  );
+}
+
 function managedContentChanges(adId) {
   if (managedAdBaseline === null || managedAdBaseline.adId !== adId) {
     throw new Error("Management-Ausgangswerte sind nicht mehr eindeutig gebunden.");
@@ -980,11 +990,27 @@ function confirmedWriteResult(result) {
   );
 }
 
-function ambiguousTerminalWriteResult(result) {
+function ambiguousTerminalWriteResult(result, scope) {
   return (
     result !== null
     && result.response.status === 202
     && result.payload?.operation_receipt?.outcome === "ambiguous"
+    && !pendingWrites.has(scope)
+  );
+}
+
+function terminalCreateRetirementResult(result, scope) {
+  const outcome = result?.payload?.operation_receipt?.outcome;
+  return (
+    result !== null
+    && !pendingWrites.has(scope)
+    && (
+      (result.response.status === 200 && outcome === "confirmed")
+      || (
+        result.response.status === 202
+        && (outcome === "ambiguous" || outcome === "confirmed")
+      )
+    )
   );
 }
 
@@ -1293,12 +1319,12 @@ async function submitCreate(event) {
   try {
     if (pendingWrites.has("create-media")) {
       const result = await runPlatformWrite("create-media", "", "", null);
-      if (ambiguousTerminalWriteResult(result)) retireCreateDraft();
+      if (terminalCreateRetirementResult(result, "create-media")) retireCreateDraft();
       return;
     }
     if (pendingWrites.has("create")) {
       const result = await runPlatformWrite("create", "", "", null);
-      if (ambiguousTerminalWriteResult(result)) retireCreateDraft();
+      if (terminalCreateRetirementResult(result, "create")) retireCreateDraft();
       return;
     }
 
@@ -1318,7 +1344,7 @@ async function submitCreate(event) {
         "/api/write/ads",
         payload,
       );
-      if (ambiguousTerminalWriteResult(result)) retireCreateDraft();
+      if (terminalCreateRetirementResult(result, "create")) retireCreateDraft();
       return;
     }
 
@@ -1331,7 +1357,7 @@ async function submitCreate(event) {
         "/api/write/media/ads",
         {...payload, media_refs: mediaRefs},
       );
-      if (ambiguousTerminalWriteResult(result)) retireCreateDraft();
+      if (terminalCreateRetirementResult(result, "create-media")) retireCreateDraft();
       if (
         result !== null
         && result.payload?.error === "dashboard_pending_write_conflict"
@@ -1408,8 +1434,11 @@ async function saveManagedAd() {
   const existing = pendingForAd(adId);
   if (existing !== null) {
     const result = await runAdAction("update", "PATCH", "", {});
-    if (confirmedWriteResult(result) && pendingForAd(adId) === null) {
+    const scope = `ad:${adId}:update`;
+    if (confirmedWriteResult(result) && !pendingWrites.has(scope)) {
       rebaseManagedBaseline(adId, existing.payload);
+    } else if (ambiguousTerminalWriteResult(result, scope)) {
+      retireManagedBaseline(adId);
     }
     return;
   }
@@ -1426,8 +1455,11 @@ async function saveManagedAd() {
     return;
   }
   const result = await runAdAction("update", "PATCH", "", payload);
-  if (confirmedWriteResult(result) && pendingForAd(adId) === null) {
+  const scope = `ad:${adId}:update`;
+  if (confirmedWriteResult(result) && !pendingWrites.has(scope)) {
     rebaseManagedBaseline(adId, payload);
+  } else if (ambiguousTerminalWriteResult(result, scope)) {
+    retireManagedBaseline(adId);
   }
 }
 
