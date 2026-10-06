@@ -56,6 +56,7 @@ class DashboardPendingWrite:
     path: str
     payload_json: str | None
     ad_id: str | None
+    acknowledged: bool
 
 
 def _validated_write_api_claim_owner(value: str) -> str:
@@ -241,11 +242,26 @@ class SnapshotStore:
                         CHECK (method IN ('POST', 'PATCH', 'DELETE')),
                     path TEXT NOT NULL,
                     payload_json TEXT,
-                    ad_id TEXT
+                    ad_id TEXT,
+                    acknowledged INTEGER NOT NULL DEFAULT 0
+                        CHECK (acknowledged IN (0, 1))
                 );
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
+            dashboard_pending_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(dashboard_pending_writes)"
+                ).fetchall()
+            }
+            if "acknowledged" not in dashboard_pending_columns:
+                connection.execute(
+                    "ALTER TABLE dashboard_pending_writes "
+                    "ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (acknowledged IN (0, 1))"
+                )
+
             create_receipt_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -1161,6 +1177,7 @@ class SnapshotStore:
                 if row["ad_id"] is not None
                 else None
             ),
+            acknowledged=bool(row["acknowledged"]),
         )
 
     def dashboard_pending_writes(self) -> tuple[DashboardPendingWrite, ...]:
@@ -1168,7 +1185,7 @@ class SnapshotStore:
             rows = connection.execute(
                 """
                 SELECT scope, resource_key, idempotency_key, method, path,
-                       payload_json, ad_id
+                       payload_json, ad_id, acknowledged
                 FROM dashboard_pending_writes
                 ORDER BY scope
                 """
@@ -1232,13 +1249,14 @@ class SnapshotStore:
             path=path,
             payload_json=payload_json,
             ad_id=ad_id,
+            acknowledged=False,
         )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """
                 SELECT scope, resource_key, idempotency_key, method, path,
-                       payload_json, ad_id
+                       payload_json, ad_id, acknowledged
                 FROM dashboard_pending_writes
                 WHERE scope = ?
                    OR resource_key = ?
@@ -1274,12 +1292,12 @@ class SnapshotStore:
             )
         return True
 
-    def clear_dashboard_pending_write(
+    def acknowledge_dashboard_pending_write(
         self,
         *,
         scope: str,
         idempotency_key: str,
-    ) -> bool:
+    ) -> str:
         if not isinstance(scope, str) or not scope:
             raise ValueError("scope is invalid")
         if not isinstance(idempotency_key, str) or not idempotency_key:
@@ -1288,28 +1306,48 @@ class SnapshotStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT idempotency_key
+                SELECT idempotency_key, acknowledged
                 FROM dashboard_pending_writes
                 WHERE scope = ?
                 """,
                 (scope,),
             ).fetchone()
             if row is None:
-                return False
+                return "missing"
             if str(row["idempotency_key"]) != idempotency_key:
                 raise ValueError(
                     "dashboard pending write conflicts with existing recovery state"
                 )
+            if not bool(row["acknowledged"]):
+                updated = connection.execute(
+                    """
+                    UPDATE dashboard_pending_writes
+                    SET acknowledged = 1
+                    WHERE scope = ?
+                      AND idempotency_key = ?
+                      AND acknowledged = 0
+                    """,
+                    (scope, idempotency_key),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        "dashboard pending write acknowledgement lost exact record"
+                    )
+                return "acknowledged"
             deleted = connection.execute(
                 """
                 DELETE FROM dashboard_pending_writes
-                WHERE scope = ? AND idempotency_key = ?
+                WHERE scope = ?
+                  AND idempotency_key = ?
+                  AND acknowledged = 1
                 """,
                 (scope, idempotency_key),
             )
-        if deleted.rowcount != 1:
-            raise RuntimeError("dashboard pending write clear lost exact record")
-        return True
+            if deleted.rowcount != 1:
+                raise RuntimeError(
+                    "dashboard pending write finalization lost exact record"
+                )
+            return "finalized"
 
     def append_inventory_result(
         self,

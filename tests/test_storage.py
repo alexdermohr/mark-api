@@ -335,6 +335,102 @@ class SnapshotStoreTests(unittest.TestCase):
             ("api-owner", "write-api:create-legacy", "not_read", 0),
         )
 
+    def test_dashboard_pending_write_acknowledgement_is_two_phase(self) -> None:
+        store = self.make_store()
+        created = store.claim_dashboard_pending_write(
+            scope="create",
+            resource_key="create",
+            idempotency_key="ui:two-phase",
+            method="POST",
+            path="/api/write/ads",
+            payload_json='{"title":"first"}',
+            ad_id=None,
+        )
+        self.assertTrue(created)
+        self.assertFalse(store.dashboard_pending_writes()[0].acknowledged)
+
+        self.assertEqual(
+            store.acknowledge_dashboard_pending_write(
+                scope="create",
+                idempotency_key="ui:two-phase",
+            ),
+            "acknowledged",
+        )
+        acknowledged = store.dashboard_pending_writes()
+        self.assertEqual(len(acknowledged), 1)
+        self.assertTrue(acknowledged[0].acknowledged)
+
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            store.acknowledge_dashboard_pending_write(
+                scope="create",
+                idempotency_key="ui:wrong-key",
+            )
+
+        self.assertEqual(
+            store.acknowledge_dashboard_pending_write(
+                scope="create",
+                idempotency_key="ui:two-phase",
+            ),
+            "finalized",
+        )
+        self.assertEqual(store.dashboard_pending_writes(), ())
+        self.assertEqual(
+            store.acknowledge_dashboard_pending_write(
+                scope="create",
+                idempotency_key="ui:two-phase",
+            ),
+            "missing",
+        )
+
+    def test_dashboard_pending_write_schema_migrates_acknowledged_column(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "mark.sqlite"
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE dashboard_pending_writes (
+                    scope TEXT PRIMARY KEY,
+                    resource_key TEXT NOT NULL UNIQUE,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    payload_json TEXT,
+                    ad_id TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO dashboard_pending_writes (
+                    scope, resource_key, idempotency_key, method, path,
+                    payload_json, ad_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "create",
+                    "create",
+                    "ui:legacy-pending",
+                    "POST",
+                    "/api/write/ads",
+                    '{"title":"legacy"}',
+                    None,
+                ),
+            )
+
+        store = SnapshotStore(db_path)
+        with sqlite3.connect(db_path) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(dashboard_pending_writes)"
+                ).fetchall()
+            }
+        self.assertIn("acknowledged", columns)
+        records = store.dashboard_pending_writes()
+        self.assertEqual(len(records), 1)
+        self.assertFalse(records[0].acknowledged)
+
     def test_write_api_claim_owner_takeover_stops_at_execution_barrier(self) -> None:
         store = self.make_store()
         fingerprint = "a" * 64

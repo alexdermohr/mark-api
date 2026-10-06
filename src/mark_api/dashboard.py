@@ -534,6 +534,12 @@ function validPendingEntry(entry) {
   ) {
     return false;
   }
+  if (
+    entry.acknowledged !== undefined
+    && typeof entry.acknowledged !== "boolean"
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -591,11 +597,25 @@ async function refreshPendingWrites() {
     ) {
       throw new Error("pending recovery unavailable");
     }
+    const acknowledgedEntries = [];
     for (const entry of payload.pending_writes) {
+      if (entry.acknowledged === true) {
+        acknowledgedEntries.push(entry);
+        continue;
+      }
       if (pendingWrites.has(entry.scope)) {
         throw new Error("duplicate pending scope");
       }
       pendingWrites.set(entry.scope, entry);
+    }
+    for (const entry of acknowledgedEntries) {
+      try {
+        await acknowledgePendingWrite(entry);
+      } catch (_error) {
+        // This GET already proved that a previous browser observed the terminal
+        // write result and durably acknowledged it. If tombstone cleanup did not
+        // reach the server, its retained row still blocks a fresh platform key.
+      }
     }
   } catch (_error) {
     pendingWrites.clear();
@@ -1119,6 +1139,14 @@ function mediaContentType(file) {
   return null;
 }
 
+function mediaStageFilename(file) {
+  const contentType = mediaContentType(file);
+  if (contentType === "image/jpeg") return "upload.jpg";
+  if (contentType === "image/png") return "upload.png";
+  if (contentType === "image/webp") return "upload.webp";
+  throw new Error(`Nicht unterstützter Bildtyp: ${file.name}`);
+}
+
 async function discardStagedMedia(refs) {
   if (refs.length === 0) return;
   const {response, payload} = await proxyRequest(
@@ -1162,7 +1190,7 @@ async function stageSelectedMedia(files) {
         {
           body: file,
           contentType: mediaContentType(file),
-          filename: file.name,
+          filename: mediaStageFilename(file),
         },
       );
       if (!response.ok || typeof payload.media_ref !== "string") {
@@ -1927,6 +1955,7 @@ def _handler_factory(
                                 else None
                             ),
                             "adId": record.ad_id,
+                            "acknowledged": record.acknowledged,
                         }
                         for record in records
                     ]
@@ -2096,10 +2125,12 @@ def _handler_factory(
                     or not isinstance(payload["idempotency_key"], str)
                 ):
                     raise ValueError("invalid_pending_ack")
-                store.clear_dashboard_pending_write(
+                phase = store.acknowledge_dashboard_pending_write(
                     scope=payload["scope"],
                     idempotency_key=payload["idempotency_key"],
                 )
+                if phase == "missing":
+                    raise ValueError("dashboard pending write is missing")
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 self._send_json(
                     409,
@@ -2118,7 +2149,13 @@ def _handler_factory(
                     },
                 )
                 return
-            self._send_json(200, {"acknowledged": True})
+            self._send_json(
+                200,
+                {
+                    "acknowledged": True,
+                    "finalized": phase == "finalized",
+                },
+            )
 
         def do_POST(self) -> None:
             if urlsplit(self.path).path == "/api/dashboard/pending-writes/ack":

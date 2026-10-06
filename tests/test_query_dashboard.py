@@ -379,7 +379,16 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
         with urlopen(ack, timeout=2) as response:
             self.assertEqual(
                 json.loads(response.read()),
-                {"acknowledged": True},
+                {"acknowledged": True, "finalized": False},
+            )
+        pending_after_ack = self.store.dashboard_pending_writes()
+        self.assertEqual(len(pending_after_ack), 1)
+        self.assertTrue(pending_after_ack[0].acknowledged)
+
+        with urlopen(ack, timeout=2) as response:
+            self.assertEqual(
+                json.loads(response.read()),
+                {"acknowledged": True, "finalized": True},
             )
         self.assertEqual(self.store.dashboard_pending_writes(), ())
 
@@ -538,6 +547,7 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
                         "path": "/api/write/ads/2",
                         "payload": {"title": "Neu"},
                         "adId": "2",
+                        "acknowledged": False,
                     }
                 ]
             },
@@ -587,7 +597,16 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
         with urlopen(ack, timeout=2) as response:
             self.assertEqual(
                 json.loads(response.read()),
-                {"acknowledged": True},
+                {"acknowledged": True, "finalized": False},
+            )
+        pending_after_ack = self.store.dashboard_pending_writes()
+        self.assertEqual(len(pending_after_ack), 1)
+        self.assertTrue(pending_after_ack[0].acknowledged)
+
+        with urlopen(ack, timeout=2) as response:
+            self.assertEqual(
+                json.loads(response.read()),
+                {"acknowledged": True, "finalized": True},
             )
         self.assertEqual(self.store.dashboard_pending_writes(), ())
 
@@ -1444,6 +1463,87 @@ globalThis.fetch = async (path, options) => {
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_finalizes_observed_ack_tombstone_without_platform_retry(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+writeUiAvailable = true;
+writeToken = "abcdefghijklmnop";
+const tombstone = {
+  scope: "create",
+  key: "ui:acked-create",
+  method: "POST",
+  path: "/api/write/ads",
+  payload: {
+    category_path: ["A", "B"],
+    title: "first",
+    description: "one",
+    price_eur: 1,
+  },
+  adId: null,
+  acknowledged: true,
+};
+const calls = [];
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  if (path === "/api/dashboard/pending-writes") {
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({pending_writes: [tombstone]});
+      },
+    };
+  }
+  if (path === "/api/dashboard/pending-writes/ack") {
+    assert.deepEqual(
+      JSON.parse(options.body),
+      {scope: tombstone.scope, idempotency_key: tombstone.key},
+    );
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true, finalized: true});
+      },
+    };
+  }
+  throw new Error("unexpected platform request: " + path);
+};
+
+(async () => {
+  await refreshPendingWrites();
+  assert.equal(pendingRecoveryBlocked, false);
+  assert.equal(pendingWrites.size, 0);
+  assert.equal(writeUiReady(), true);
+  assert.deepEqual(
+    calls.map((item) => item.path),
+    ["/api/dashboard/pending-writes", "/api/dashboard/pending-writes/ack"],
+  );
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_write_runtime_restores_more_than_64_pending_entries(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
@@ -1787,6 +1887,69 @@ globalThis.fetch = async (path, options) => {
   assert.deepEqual(JSON.parse(calls[2].options.body), original);
   assert.equal(pendingWrites.has("create"), false);
   assert.equal(loadCalls, 1);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+    def test_write_runtime_uses_ascii_safe_media_stage_filenames(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+const calls = [];
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  return {
+    status: 201,
+    ok: true,
+    async text() {
+      return JSON.stringify({media_ref: "media_" + calls.length});
+    },
+  };
+};
+
+const files = [
+  {name: "图片.jpg", type: "image/jpeg", size: 10},
+  {name: "urlaub-😀.png", type: "image/png", size: 10},
+  {name: "überraschung.webp", type: "image/webp", size: 10},
+];
+
+(async () => {
+  const refs = await stageSelectedMedia(files);
+  assert.deepEqual(refs, ["media_1", "media_2", "media_3"]);
+  assert.deepEqual(
+    calls.map((item) => item.options.headers["X-Mark-Media-Filename"]),
+    ["upload.jpg", "upload.png", "upload.webp"],
+  );
+  for (const call of calls) {
+    const value = call.options.headers["X-Mark-Media-Filename"];
+    assert.match(value, /^[\x20-\x7e]+$/);
+  }
+  assert.deepEqual(
+    calls.map((item) => item.options.headers["Content-Type"]),
+    ["image/jpeg", "image/png", "image/webp"],
+  );
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
