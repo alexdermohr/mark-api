@@ -463,7 +463,7 @@ const pendingWrites = new Map();
 let writeUiAvailable = false;
 let writeToken = null;
 let pendingRecoveryBlocked = false;
-let createMediaInFlight = false;
+let createInFlight = false;
 let latestAdsById = new Map();
 let managedAdBaseline = null;
 
@@ -980,6 +980,22 @@ function confirmedWriteResult(result) {
   );
 }
 
+function ambiguousTerminalWriteResult(result) {
+  return (
+    result !== null
+    && result.response.status === 202
+    && result.payload?.operation_receipt?.outcome === "ambiguous"
+  );
+}
+
+function retireCreateDraft() {
+  byId("create-category").value = "";
+  byId("create-title").value = "";
+  byId("create-description").value = "";
+  byId("create-price").value = "";
+  byId("create-media").value = "";
+}
+
 async function refreshAfterSettledWrite() {
   try {
     await load();
@@ -1269,68 +1285,81 @@ async function submitCreate(event) {
   event.preventDefault();
   if (!writeUiReady()) return;
 
-  if (pendingWrites.has("create-media")) {
-    await runPlatformWrite("create-media", "", "", null);
+  if (createInFlight) {
+    setWriteStatus("Create läuft bereits. Es wird kein zweiter Auftrag gestartet.", "warning");
     return;
   }
-  if (pendingWrites.has("create")) {
-    await runPlatformWrite("create", "", "", null);
-    return;
-  }
-
-  let payload;
+  createInFlight = true;
   try {
-    payload = createPayload();
-  } catch (error) {
-    setWriteStatus(error.message, "error");
-    return;
-  }
+    if (pendingWrites.has("create-media")) {
+      const result = await runPlatformWrite("create-media", "", "", null);
+      if (ambiguousTerminalWriteResult(result)) retireCreateDraft();
+      return;
+    }
+    if (pendingWrites.has("create")) {
+      const result = await runPlatformWrite("create", "", "", null);
+      if (ambiguousTerminalWriteResult(result)) retireCreateDraft();
+      return;
+    }
 
-  const files = Array.from(byId("create-media").files ?? []);
-  if (files.length === 0) {
-    await runPlatformWrite("create", "POST", "/api/write/ads", payload);
-    return;
-  }
+    let payload;
+    try {
+      payload = createPayload();
+    } catch (error) {
+      setWriteStatus(error.message, "error");
+      return;
+    }
 
-  if (createMediaInFlight) {
-    setWriteStatus("Media-Create läuft bereits. Es wird kein zweiter Batch gestaged.", "warning");
-    return;
-  }
-  createMediaInFlight = true;
-  setWriteStatus("Bilder werden ausschließlich lokal gestaged …", "warning");
-  try {
-    const mediaRefs = await stageSelectedMedia(files);
-    const result = await runPlatformWrite(
-      "create-media",
-      "POST",
-      "/api/write/media/ads",
-      {...payload, media_refs: mediaRefs},
-    );
-    if (
-      result !== null
-      && result.payload?.error === "dashboard_pending_write_conflict"
-    ) {
-      try {
-        await discardStagedMedia(mediaRefs);
-      } catch (cleanupError) {
+    const files = Array.from(byId("create-media").files ?? []);
+    if (files.length === 0) {
+      const result = await runPlatformWrite(
+        "create",
+        "POST",
+        "/api/write/ads",
+        payload,
+      );
+      if (ambiguousTerminalWriteResult(result)) retireCreateDraft();
+      return;
+    }
+
+    setWriteStatus("Bilder werden ausschließlich lokal gestaged …", "warning");
+    try {
+      const mediaRefs = await stageSelectedMedia(files);
+      const result = await runPlatformWrite(
+        "create-media",
+        "POST",
+        "/api/write/media/ads",
+        {...payload, media_refs: mediaRefs},
+      );
+      if (ambiguousTerminalWriteResult(result)) retireCreateDraft();
+      if (
+        result !== null
+        && result.payload?.error === "dashboard_pending_write_conflict"
+      ) {
+        try {
+          await discardStagedMedia(mediaRefs);
+        } catch (cleanupError) {
+          setWriteStatus(
+            "Konkurrierender Create wurde nicht weitergeleitet, aber lokale Media-Cleanup fehlgeschlagen: "
+              + cleanupError.message + ".",
+            "error",
+          );
+          return;
+        }
         setWriteStatus(
-          `Konkurrierender Create wurde nicht weitergeleitet, aber lokale Media-Cleanup fehlgeschlagen: ${cleanupError.message}.`,
-          "error",
+          "Konkurrierender Create wurde nicht weitergeleitet; dessen lokal gestagte Bilder wurden verworfen. Die bereits gebundene Anfrage bleibt maßgeblich.",
+          "warning",
         );
-        return;
       }
+    } catch (error) {
       setWriteStatus(
-        "Konkurrierender Create wurde nicht weitergeleitet; dessen lokal gestagte Bilder wurden verworfen. Die bereits gebundene Anfrage bleibt maßgeblich.",
-        "warning",
+        "Media-Staging fehlgeschlagen: " + error.message
+          + ". Es wurde kein neuer Plattform-Create gestartet.",
+        "error",
       );
     }
-  } catch (error) {
-    setWriteStatus(
-      `Media-Staging fehlgeschlagen: ${error.message}. Es wurde kein neuer Plattform-Create gestartet.`,
-      "error",
-    );
   } finally {
-    createMediaInFlight = false;
+    createInFlight = false;
   }
 }
 

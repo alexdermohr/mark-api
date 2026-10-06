@@ -1743,6 +1743,343 @@ globalThis.fetch = async (path, options) => {
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_retires_ambiguous_create_draft_without_media(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+const fields = new Map([
+  ["create-category", {value: "A > B"}],
+  ["create-title", {value: "Ambiguous title"}],
+  ["create-description", {value: "Ambiguous description"}],
+  ["create-price", {value: "1"}],
+  ["create-media", {files: [], value: ""}],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    if (fields.has(id)) return fields.get(id);
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+let loadCalls = 0;
+load = async () => { loadCalls += 1; };
+let createCalls = 0;
+let ackCalls = 0;
+globalThis.fetch = async (path, options) => {
+  if (path === "/api/write/ads") {
+    createCalls += 1;
+    return {
+      status: 202,
+      ok: true,
+      async text() {
+        return JSON.stringify({
+          idempotency_key: options.headers["Idempotency-Key"],
+          operation_receipt: {outcome: "ambiguous"},
+          platform_retry_authorized: false,
+        });
+      },
+    };
+  }
+  if (path === "/api/dashboard/pending-writes/ack") {
+    ackCalls += 1;
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  throw new Error("unexpected path: " + path);
+};
+
+(async () => {
+  await submitCreate({preventDefault() {}});
+  assert.equal(createCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.equal(loadCalls, 1);
+  assert.equal(pendingWrites.size, 0);
+  assert.equal(createInFlight, false);
+  assert.equal(fields.get("create-category").value, "");
+  assert.equal(fields.get("create-title").value, "");
+  assert.equal(fields.get("create-description").value, "");
+  assert.equal(fields.get("create-price").value, "");
+
+  await submitCreate({preventDefault() {}});
+  assert.equal(createCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.match(writeStatus.textContent, /Kategoriepfad/i);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+    def test_write_runtime_retires_ambiguous_create_draft_with_media(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+const mediaInput = {
+  files: [{name: "one.jpg", type: "image/jpeg", size: 10}],
+  _value: "C:\\fakepath\\one.jpg",
+  get value() { return this._value; },
+  set value(next) {
+    this._value = next;
+    if (next === "") this.files = [];
+  },
+};
+const fields = new Map([
+  ["create-category", {value: "A > B"}],
+  ["create-title", {value: "Ambiguous media title"}],
+  ["create-description", {value: "Ambiguous media description"}],
+  ["create-price", {value: "1"}],
+  ["create-media", mediaInput],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    if (fields.has(id)) return fields.get(id);
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+load = async () => {};
+let stageCalls = 0;
+let createCalls = 0;
+let ackCalls = 0;
+globalThis.fetch = async (path, options) => {
+  if (path === "/api/write/media/stage") {
+    stageCalls += 1;
+    return {
+      status: 201,
+      ok: true,
+      async text() {
+        return JSON.stringify({media_ref: "media_ambiguous"});
+      },
+    };
+  }
+  if (path === "/api/write/media/ads") {
+    createCalls += 1;
+    return {
+      status: 202,
+      ok: true,
+      async text() {
+        return JSON.stringify({
+          idempotency_key: options.headers["Idempotency-Key"],
+          operation_receipt: {outcome: "ambiguous"},
+          platform_retry_authorized: false,
+        });
+      },
+    };
+  }
+  if (path === "/api/dashboard/pending-writes/ack") {
+    ackCalls += 1;
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  throw new Error("unexpected path: " + path);
+};
+
+(async () => {
+  await submitCreate({preventDefault() {}});
+  assert.equal(stageCalls, 1);
+  assert.equal(createCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.equal(pendingWrites.size, 0);
+  assert.equal(createInFlight, false);
+  assert.equal(mediaInput.value, "");
+  assert.equal(mediaInput.files.length, 0);
+  assert.equal(fields.get("create-category").value, "");
+
+  await submitCreate({preventDefault() {}});
+  assert.equal(stageCalls, 1);
+  assert.equal(createCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.match(writeStatus.textContent, /Kategoriepfad/i);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+    def test_write_runtime_retires_ambiguous_media_create_recovery_draft(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+const mediaInput = {
+  files: [{name: "new-selection.jpg", type: "image/jpeg", size: 10}],
+  _value: "C:\\fakepath\\new-selection.jpg",
+  get value() { return this._value; },
+  set value(next) {
+    this._value = next;
+    if (next === "") this.files = [];
+  },
+};
+const fields = new Map([
+  ["create-category", {value: "A > B"}],
+  ["create-title", {value: "Visible draft"}],
+  ["create-description", {value: "Visible description"}],
+  ["create-price", {value: "1"}],
+  ["create-media", mediaInput],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    if (fields.has(id)) return fields.get(id);
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+load = async () => {};
+const pending = {
+  scope: "create-media",
+  key: "ui:ambiguous-media-recovery",
+  method: "POST",
+  path: "/api/write/media/ads",
+  payload: {
+    category_path: ["A", "B"],
+    title: "Persisted title",
+    description: "Persisted description",
+    price_eur: 1,
+    media_refs: ["media_persisted"],
+  },
+  adId: null,
+};
+pendingWrites.set(pending.scope, pending);
+let stageCalls = 0;
+let createCalls = 0;
+let ackCalls = 0;
+globalThis.fetch = async (path, options) => {
+  if (path === "/api/write/media/stage") {
+    stageCalls += 1;
+    throw new Error("recovery must not restage media");
+  }
+  if (path === "/api/write/media/ads") {
+    createCalls += 1;
+    assert.equal(options.headers["Idempotency-Key"], pending.key);
+    assert.deepEqual(JSON.parse(options.body), pending.payload);
+    return {
+      status: 202,
+      ok: true,
+      async text() {
+        return JSON.stringify({
+          idempotency_key: pending.key,
+          operation_receipt: {outcome: "ambiguous"},
+          platform_retry_authorized: false,
+        });
+      },
+    };
+  }
+  if (path === "/api/dashboard/pending-writes/ack") {
+    ackCalls += 1;
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  throw new Error("unexpected path: " + path);
+};
+
+(async () => {
+  await submitCreate({preventDefault() {}});
+  assert.equal(stageCalls, 0);
+  assert.equal(createCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.equal(pendingWrites.size, 0);
+  assert.equal(createInFlight, false);
+  assert.equal(mediaInput.value, "");
+  assert.equal(mediaInput.files.length, 0);
+  assert.equal(fields.get("create-category").value, "");
+
+  await submitCreate({preventDefault() {}});
+  assert.equal(stageCalls, 0);
+  assert.equal(createCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.match(writeStatus.textContent, /Kategoriepfad/i);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_write_runtime_acks_deterministic_validation_failure_on_recovery(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
@@ -2309,11 +2646,13 @@ globalThis.fetch = async (path, options) => {
   const first = submitCreate({preventDefault() {}});
   await firstStageStarted;
   assert.equal(stageCalls, 1);
-  assert.equal(createMediaInFlight, true);
+  assert.equal(createInFlight, true);
 
+  fields.get("create-media").files = [];
   await submitCreate({preventDefault() {}});
   assert.equal(stageCalls, 1);
   assert.equal(mediaCreateCalls, 0);
+  assert.equal(ackCalls, 0);
   assert.match(writeStatus.textContent, /läuft bereits/i);
 
   releaseFirstStage();
@@ -2321,13 +2660,16 @@ globalThis.fetch = async (path, options) => {
   assert.equal(stageCalls, 1);
   assert.equal(mediaCreateCalls, 1);
   assert.equal(ackCalls, 1);
-  assert.equal(createMediaInFlight, false);
+  assert.equal(createInFlight, false);
 
+  fields.get("create-media").files = [
+    {name: "one.jpg", type: "image/jpeg", size: 10},
+  ];
   await submitCreate({preventDefault() {}});
   assert.equal(stageCalls, 2);
   assert.equal(mediaCreateCalls, 2);
   assert.equal(ackCalls, 2);
-  assert.equal(createMediaInFlight, false);
+  assert.equal(createInFlight, false);
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
@@ -2461,7 +2803,7 @@ globalThis.fetch = async (path, options) => {
   assert.equal(calls[2].options.headers["Idempotency-Key"], undefined);
   assert.equal(loadCalls, 1);
   assert.equal(pendingWrites.get("create-media"), winner);
-  assert.equal(createMediaInFlight, false);
+  assert.equal(createInFlight, false);
   assert.match(writeStatus.textContent, /nicht weitergeleitet/i);
   assert.match(writeStatus.textContent, /verworfen/i);
 })().catch((error) => {
