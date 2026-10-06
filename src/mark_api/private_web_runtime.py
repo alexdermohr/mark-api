@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -82,6 +83,33 @@ def _utc_now() -> datetime:
 
 
 _MEDIA_PERSISTENCE_VERIFY_TIMEOUT_SECONDS = 10.0
+
+
+def _pending_dashboard_media_refs(store: SnapshotStore) -> frozenset[str]:
+    refs: set[str] = set()
+    for record in store.dashboard_pending_writes():
+        if (
+            record.resource_key != "create"
+            or record.path != "/api/write/media/ads"
+        ):
+            continue
+        if record.payload_json is None:
+            raise RuntimeError("pending media recovery state is invalid")
+        try:
+            payload = json.loads(record.payload_json)
+        except json.JSONDecodeError:
+            raise RuntimeError("pending media recovery state is invalid") from None
+        raw_refs = payload.get("media_refs") if isinstance(payload, dict) else None
+        if (
+            not isinstance(raw_refs, list)
+            or not raw_refs
+            or len(raw_refs) > 32
+            or any(not isinstance(ref, str) for ref in raw_refs)
+            or len(set(raw_refs)) != len(raw_refs)
+        ):
+            raise RuntimeError("pending media recovery state is invalid")
+        refs.update(raw_refs)
+    return frozenset(refs)
 
 
 class PrivateWebRuntimeDependencyError(RuntimeError):
@@ -1490,7 +1518,12 @@ def build_private_web_write_api_runtime(
         media_resolver = None
         if media_capability:
             if media_bindings is None:
-                media_handle_store = PrivateWebMediaHandleStore()
+                media_handle_store = PrivateWebMediaHandleStore(
+                    directory=store.path.with_name(
+                        store.path.name + ".media-handles"
+                    ),
+                    protected_refs=lambda: _pending_dashboard_media_refs(store),
+                )
                 media_resolver = media_handle_store
             else:
                 media_resolver = PrivateWebMediaRefResolver(media_bindings)

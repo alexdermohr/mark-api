@@ -213,6 +213,62 @@ class PrivateWebMediaContractTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_media_handle_store_rehydrates_only_protected_expired_refs(self) -> None:
+        monotonic_now = [100.0]
+        wall_now = [1_000.0]
+        protected_refs: set[str] = set()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            first = PrivateWebMediaHandleStore(
+                clock=lambda: monotonic_now[0],
+                wall_clock=lambda: wall_now[0],
+                directory=directory,
+                protected_refs=lambda: frozenset(protected_refs),
+            )
+            protected = first.stage_media(
+                "protected.jpg",
+                b"\xff\xd8\xffprotected",
+            )
+            orphan = first.stage_media(
+                "orphan.jpg",
+                b"\xff\xd8\xfforphan",
+            )
+            protected_path = Path(first.resolve((protected,))[0].path)
+            orphan_path = Path(first.resolve((orphan,))[0].path)
+            protected_refs.add(protected)
+            first.close()
+
+            self.assertTrue(protected_path.exists())
+            self.assertFalse(orphan_path.exists())
+
+            monotonic_now[0] = 2_000.0
+            wall_now[0] = 2_000.0
+            second = PrivateWebMediaHandleStore(
+                clock=lambda: monotonic_now[0],
+                wall_clock=lambda: wall_now[0],
+                directory=directory,
+                protected_refs=lambda: frozenset(protected_refs),
+            )
+            try:
+                self.assertEqual(
+                    Path(second.resolve((protected,))[0].path),
+                    protected_path,
+                )
+                self.assertTrue(protected_path.exists())
+                self.assertFalse(orphan_path.exists())
+
+                protected_refs.clear()
+                replacement = second.stage_media(
+                    "replacement.jpg",
+                    b"\xff\xd8\xffreplacement",
+                )
+                self.assertFalse(protected_path.exists())
+                with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                    second.resolve((protected,))
+                second.discard((replacement,))
+            finally:
+                second.close()
+
     def test_media_handle_store_enforces_total_byte_quota_before_writing(self) -> None:
         store = PrivateWebMediaHandleStore()
         try:

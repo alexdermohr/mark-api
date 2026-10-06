@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 from mark_api.analytics import ANALYTICS_METRICS, REACTION_METRICS, AnalyticsContract
 from mark_api.classification_cli import main as classification_main
-from mark_api.dashboard import DashboardWriteProxy, create_server
+from mark_api.dashboard import DashboardWriteProxy, _dashboard_http_origin, create_server
 from mark_api.email_import import import_kleinanzeigen_email_files
 from mark_api.domain import (
     AdClassification,
@@ -202,6 +202,16 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
         return headers
+
+    def test_dashboard_origin_omits_default_http_port(self) -> None:
+        self.assertEqual(
+            _dashboard_http_origin("127.0.0.1", 80),
+            "http://127.0.0.1",
+        )
+        self.assertEqual(
+            _dashboard_http_origin("127.0.0.1", 8765),
+            "http://127.0.0.1:8765",
+        )
 
     def test_proxy_requires_dashboard_secret_and_same_origin(self) -> None:
         body = b'{"title":"Neu"}'

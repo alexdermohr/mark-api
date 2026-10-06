@@ -44,6 +44,10 @@ _DASHBOARD_WRITE_MARKER_VALUE = "1"
 _DASHBOARD_WRITE_TOKEN_HEADER = "X-Mark-Dashboard-Token"
 
 
+def _dashboard_http_origin(host: str, port: int) -> str:
+    return f"http://{host}" if port == 80 else f"http://{host}:{port}"
+
+
 @dataclass(frozen=True, slots=True)
 class DashboardWriteProxy:
     """Narrow same-origin gateway to the existing loopback Write API."""
@@ -1623,7 +1627,9 @@ def _handler_factory(
             if require_origin:
                 origins = self.headers.get_all("Origin") or []
                 server_host, server_port = self.server.server_address
-                expected_origin = f"http://{server_host}:{server_port}"
+                expected_origin = _dashboard_http_origin(
+                    str(server_host), int(server_port)
+                )
                 if (
                     len(origins) != 1
                     or not hmac.compare_digest(origins[0], expected_origin)
