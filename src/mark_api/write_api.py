@@ -397,6 +397,13 @@ class _WriteApiStoreLock:
         self._descriptor = None
 
 
+def acquire_write_api_store_lock(store: SnapshotStore) -> _WriteApiStoreLock:
+    """Acquire the exclusive runtime lease before touching shared write state."""
+    if not isinstance(store, SnapshotStore):
+        raise TypeError("store must be SnapshotStore")
+    return _WriteApiStoreLock.acquire(store.path)
+
+
 def _receipt_status(
     receipt: OperationReceipt | CreateOperationReceipt,
 ) -> int:
@@ -1184,6 +1191,7 @@ def create_write_api_server(
     clock: Callable[[], datetime] = _utc_now,
     body_read_timeout_seconds: float = _BODY_READ_TIMEOUT_SECONDS,
     execution_lock: ContextManager[object] | None = None,
+    _store_lock: _WriteApiStoreLock | None = None,
 ) -> LoopbackWriteApiServer:
     if host != "127.0.0.1":
         raise ValueError("write API must bind to 127.0.0.1")
@@ -1209,8 +1217,15 @@ def create_write_api_server(
             "create_media capability requires media_service"
         )
 
+    if _store_lock is not None and not isinstance(_store_lock, _WriteApiStoreLock):
+        raise TypeError("_store_lock must be _WriteApiStoreLock or None")
+
     claim_owner = f"write-api-{secrets.token_hex(16)}"
-    store_lock = _WriteApiStoreLock.acquire(store.path)
+    store_lock = (
+        acquire_write_api_store_lock(store)
+        if _store_lock is None
+        else _store_lock
+    )
     try:
         server = LoopbackWriteApiServer(
             (host, port),

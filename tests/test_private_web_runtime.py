@@ -3117,6 +3117,13 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 b"\xff\xd8\xffrestart",
             )
             (first_source,) = first._media_handle_store.resolve((media_ref,))
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                build_runtime([])
+            self.assertTrue(Path(first_source.path).exists())
+            self.assertEqual(
+                Path(first_source.path).read_bytes(),
+                b"\xff\xd8\xffrestart",
+            )
             store.claim_dashboard_pending_write(
                 scope="create-media",
                 resource_key="create",
