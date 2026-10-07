@@ -746,6 +746,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 raise
             finally:
                 os.close(fd)
+            published = False
             try:
                 staged_at = float(self._wall_clock())
                 os.utime(
@@ -754,13 +755,20 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                     follow_symlinks=False,
                 )
                 os.replace(temp_path, path)
+                published = True
                 if self._persistent:
                     _fsync_directory(self._directory_path)
             except Exception:
+                cleanup_path = path if published else temp_path
                 try:
-                    os.unlink(temp_path)
+                    os.unlink(cleanup_path)
                 except OSError:
                     pass
+                if published and self._persistent:
+                    try:
+                        _fsync_directory(self._directory_path)
+                    except OSError:
+                        pass
                 raise
             self._sources[ref] = PrivateWebMediaSource(path)
             self._sizes[ref] = len(data)

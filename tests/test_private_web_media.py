@@ -306,6 +306,44 @@ class PrivateWebMediaContractTests(unittest.TestCase):
                 [directory, directory.parent, directory],
             )
 
+    def test_persistent_media_handle_store_removes_published_file_when_directory_fsync_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            real_fsync_directory = private_web_media._fsync_directory
+            calls: list[Path] = []
+
+            def fsync_directory(path: str) -> None:
+                calls.append(Path(path))
+                if len(calls) == 3:
+                    raise OSError("directory fsync failed")
+                real_fsync_directory(path)
+
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                side_effect=fsync_directory,
+            ):
+                store = PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+                try:
+                    with self.assertRaisesRegex(OSError, "directory fsync failed"):
+                        store.stage_media(
+                            "photo.jpg",
+                            b"\xff\xd8\xffdurable",
+                        )
+                    self.assertEqual(store._sources, {})
+                    self.assertEqual(store._staged_bytes, 0)
+                    self.assertEqual(list(directory.iterdir()), [])
+                finally:
+                    store.close()
+
+            self.assertEqual(
+                calls,
+                [directory, directory.parent, directory, directory],
+            )
+
     def test_persistent_media_handle_store_fsyncs_existing_directory_and_parent_on_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp) / "handles"
