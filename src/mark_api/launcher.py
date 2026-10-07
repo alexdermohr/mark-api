@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread, current_thread
 from typing import Protocol
+from urllib.parse import quote
 
 from .analytics import (
     ANALYTICS_METRICS,
@@ -186,9 +187,10 @@ class ProductLauncherRuntime:
     @property
     def dashboard_url(self) -> str:
         host, port = self.server_address
+        encoded_write_token = quote(self._dashboard_write_token, safe="")
         return (
             f"http://{host}:{port}/"
-            f"#write_token={self._dashboard_write_token}"
+            f"#write_token={encoded_write_token}"
         )
 
     @property

@@ -244,6 +244,38 @@ class ProductLauncherTests(unittest.TestCase):
             f"#write_token={self.DASHBOARD_TOKEN}",
         )
 
+    def test_dashboard_url_percent_encodes_write_token_fragment(self) -> None:
+        _tmp, db = self.make_db()
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        server = DashboardServer()
+        dashboard_token = "abcdefghijklmnop&x=y#z"
+        captured = {}
+
+        def dashboard_factory(*args, **kwargs):
+            captured["write_proxy"] = kwargs["write_proxy"]
+            return server
+
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            dashboard_port=0,
+            write_port=0,
+            timeout_seconds=3.5,
+            analytics_contract=AnalyticsContract(),
+            runtime_factory=lambda **kwargs: inventory,
+            dashboard_factory=dashboard_factory,
+            dashboard_token_factory=lambda: dashboard_token,
+            clock=lambda: NOW,
+        )
+        self.addCleanup(launcher.close)
+
+        self.assertEqual(captured["write_proxy"].ui_token, dashboard_token)
+        self.assertEqual(
+            launcher.dashboard_url,
+            "http://127.0.0.1:18765/"
+            "#write_token=abcdefghijklmnop%26x%3Dy%23z",
+        )
+
     def test_build_syncs_inventory_marks_missing_tracked_ads_absent(self) -> None:
         _tmp, db = self.make_db()
         store = SnapshotStore(db)
