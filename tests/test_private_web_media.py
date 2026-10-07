@@ -7,6 +7,9 @@ import tempfile
 import unittest
 from dataclasses import fields
 from pathlib import Path
+from unittest.mock import patch
+
+import mark_api.private_web_media as private_web_media
 
 from mark_api.domain import AdCreateRequest
 from mark_api.private_web import (
@@ -272,6 +275,36 @@ class PrivateWebMediaContractTests(unittest.TestCase):
             )
         finally:
             store.close()
+
+    def test_persistent_media_handle_store_fsyncs_directory_creation_and_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                wraps=private_web_media._fsync_directory,
+            ) as fsync_directory:
+                store = PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+                try:
+                    ref = store.stage_media(
+                        "photo.jpg",
+                        b"\xff\xd8\xffdurable",
+                    )
+                    self.assertEqual(
+                        Path(store.resolve((ref,))[0].path).parent,
+                        directory,
+                    )
+                finally:
+                    store.close()
+
+            synced_paths = [Path(call.args[0]) for call in fsync_directory.call_args_list]
+            self.assertEqual(
+                synced_paths,
+                [directory, directory.parent, directory],
+            )
 
     def test_media_handle_store_rehydrates_only_protected_expired_refs(self) -> None:
         monotonic_now = [100.0]

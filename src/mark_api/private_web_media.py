@@ -435,6 +435,19 @@ class PrivateWebMediaRefResolver:
             ) from None
 
 
+def _fsync_directory(path: str) -> None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
     """Own bounded private media copies behind generated opaque handles."""
 
@@ -481,6 +494,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             if not stat.S_ISDIR(directory_stat.st_mode):
                 raise ValueError("media handle directory is invalid")
             os.chmod(directory_path, 0o700)
+            _fsync_directory(directory_path)
+            _fsync_directory(os.path.dirname(directory_path))
             self._directory_path = directory_path
             self._persistent = True
         self._lock = Lock()
@@ -739,6 +754,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                     follow_symlinks=False,
                 )
                 os.replace(temp_path, path)
+                if self._persistent:
+                    _fsync_directory(self._directory_path)
             except Exception:
                 try:
                     os.unlink(temp_path)
