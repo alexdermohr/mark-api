@@ -489,17 +489,33 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             ):
                 raise ValueError("media handle directory is invalid")
             directory_path = os.path.abspath(raw_directory)
-            os.makedirs(directory_path, mode=0o700, exist_ok=True)
+            parent_path = os.path.dirname(directory_path)
+            try:
+                parent_stat = os.stat(parent_path)
+            except OSError as exc:
+                raise ValueError(
+                    "media handle parent directory is invalid"
+                ) from exc
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                raise ValueError("media handle parent directory is invalid")
+            created_directory = False
+            try:
+                os.mkdir(directory_path, 0o700)
+                created_directory = True
+            except FileExistsError:
+                pass
             directory_stat = os.stat(directory_path, follow_symlinks=False)
             if not stat.S_ISDIR(directory_stat.st_mode):
                 raise ValueError("media handle directory is invalid")
             os.chmod(directory_path, 0o700)
             _fsync_directory(directory_path)
-            _fsync_directory(os.path.dirname(directory_path))
+            if created_directory:
+                _fsync_directory(parent_path)
             self._directory_path = directory_path
             self._persistent = True
         self._lock = Lock()
         self._closed = False
+        self._cleanup_required = False
         self._staged_bytes = 0
         self._clock = clock
         self._wall_clock = wall_clock
@@ -706,6 +722,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             protected = self._protected_refs_snapshot()
             if self._closed:
                 raise RuntimeError("media handle store is closed")
+            if self._cleanup_required:
+                raise RuntimeError("media handle store cleanup required")
             self._prune_expired_locked(
                 float(self._clock()),
                 preserve=protected,
@@ -760,15 +778,26 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                     _fsync_directory(self._directory_path)
             except Exception:
                 cleanup_path = path if published else temp_path
+                cleanup_unlink_failed = False
                 try:
                     os.unlink(cleanup_path)
-                except OSError:
+                except FileNotFoundError:
                     pass
-                if published and self._persistent:
+                except OSError:
+                    cleanup_unlink_failed = True
+                cleanup_sync_failed = False
+                if published and self._persistent and not cleanup_unlink_failed:
                     try:
                         _fsync_directory(self._directory_path)
                     except OSError:
-                        pass
+                        cleanup_sync_failed = True
+                if published and cleanup_unlink_failed:
+                    self._sources[ref] = PrivateWebMediaSource(path)
+                    self._sizes[ref] = len(data)
+                    self._expires_at[ref] = float("inf")
+                    self._staged_bytes += len(data)
+                if cleanup_unlink_failed or cleanup_sync_failed:
+                    self._cleanup_required = True
                 raise
             self._sources[ref] = PrivateWebMediaSource(path)
             self._sizes[ref] = len(data)
@@ -818,13 +847,25 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             orphan_refs = tuple(
                 ref for ref in self._sources if ref not in protected
             )
-            orphan_sources = self._pop_handles_locked(orphan_refs)
+            orphan_sources = tuple(
+                self._sources[ref]
+                for ref in orphan_refs
+                if ref in self._sources
+            )
+            try:
+                self._unlink_sources(orphan_sources)
+                if self._persistent and (orphan_sources or self._cleanup_required):
+                    _fsync_directory(self._directory_path)
+            except Exception:
+                self._cleanup_required = True
+                raise
+            self._pop_handles_locked(orphan_refs)
+            self._cleanup_required = False
             self._closed = True
             self._sources.clear()
             self._sizes.clear()
             self._expires_at.clear()
             self._staged_bytes = 0
-        self._unlink_sources(orphan_sources)
         if self._temporary_directory is not None:
             self._temporary_directory.cleanup()
 
