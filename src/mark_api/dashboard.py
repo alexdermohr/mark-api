@@ -990,25 +990,35 @@ function confirmedWriteResult(result) {
   );
 }
 
-function ambiguousTerminalWriteResult(result, scope) {
+function unknownEffectTerminalWriteResult(result) {
   return (
     result !== null
-    && result.response.status === 202
-    && result.payload?.operation_receipt?.outcome === "ambiguous"
-    && !pendingWrites.has(scope)
+    && (
+      (
+        result.response.status === 202
+        && result.payload?.operation_receipt?.outcome === "ambiguous"
+      )
+      || (
+        result.response.status === 500
+        && result.payload?.error === "write_execution_error"
+      )
+    )
   );
 }
 
-function terminalCreateRetirementResult(result, scope) {
+function terminalCreateRetirementResult(result) {
   const outcome = result?.payload?.operation_receipt?.outcome;
   return (
     result !== null
-    && !pendingWrites.has(scope)
     && (
       (result.response.status === 200 && outcome === "confirmed")
       || (
         result.response.status === 202
         && (outcome === "ambiguous" || outcome === "confirmed")
+      )
+      || (
+        result.response.status === 500
+        && result.payload?.error === "write_execution_error"
       )
     )
   );
@@ -1020,6 +1030,18 @@ function retireCreateDraft() {
   byId("create-description").value = "";
   byId("create-price").value = "";
   byId("create-media").value = "";
+}
+
+function retireCreateBeforeAcknowledge(result) {
+  if (terminalCreateRetirementResult(result)) retireCreateDraft();
+}
+
+function settleManagedUpdateBeforeAcknowledge(adId, payload, result) {
+  if (confirmedWriteResult(result)) {
+    rebaseManagedBaseline(adId, payload);
+  } else if (unknownEffectTerminalWriteResult(result)) {
+    retireManagedBaseline(adId);
+  }
 }
 
 async function refreshAfterSettledWrite() {
@@ -1056,7 +1078,13 @@ function describeWriteResult(response, payload) {
   return {kind: response.ok ? "success" : "error", text: `HTTP ${response.status}.`};
 }
 
-async function runPlatformWrite(scope, method, path, payload, {adId = null} = {}) {
+async function runPlatformWrite(
+  scope,
+  method,
+  path,
+  payload,
+  {adId = null, beforeAcknowledge = null} = {},
+) {
   let entry = pendingWrites.get(scope);
   const retryingPending = entry !== undefined;
   if (entry === undefined) {
@@ -1087,6 +1115,19 @@ async function runPlatformWrite(scope, method, path, payload, {adId = null} = {}
 
     if (completedWriteResponse(entry, responsePayload)) {
       if (canClearCompletedWrite(response, responsePayload)) {
+        const completedResult = {response, payload: responsePayload};
+        if (beforeAcknowledge !== null) {
+          try {
+            beforeAcknowledge(completedResult, entry);
+          } catch (error) {
+            setWriteStatus(
+              "Write-Ergebnis ist terminal, aber lokales UI-Fencing ist fehlgeschlagen: "
+                + error.message + ". Derselbe Request/Key bleibt gebunden.",
+              "warning",
+            );
+            return completedResult;
+          }
+        }
         try {
           await acknowledgePendingWrite(entry);
         } catch (error) {
@@ -1318,13 +1359,23 @@ async function submitCreate(event) {
   createInFlight = true;
   try {
     if (pendingWrites.has("create-media")) {
-      const result = await runPlatformWrite("create-media", "", "", null);
-      if (terminalCreateRetirementResult(result, "create-media")) retireCreateDraft();
+      await runPlatformWrite(
+        "create-media",
+        "",
+        "",
+        null,
+        {beforeAcknowledge: retireCreateBeforeAcknowledge},
+      );
       return;
     }
     if (pendingWrites.has("create")) {
-      const result = await runPlatformWrite("create", "", "", null);
-      if (terminalCreateRetirementResult(result, "create")) retireCreateDraft();
+      await runPlatformWrite(
+        "create",
+        "",
+        "",
+        null,
+        {beforeAcknowledge: retireCreateBeforeAcknowledge},
+      );
       return;
     }
 
@@ -1338,13 +1389,13 @@ async function submitCreate(event) {
 
     const files = Array.from(byId("create-media").files ?? []);
     if (files.length === 0) {
-      const result = await runPlatformWrite(
+      await runPlatformWrite(
         "create",
         "POST",
         "/api/write/ads",
         payload,
+        {beforeAcknowledge: retireCreateBeforeAcknowledge},
       );
-      if (terminalCreateRetirementResult(result, "create")) retireCreateDraft();
       return;
     }
 
@@ -1356,8 +1407,8 @@ async function submitCreate(event) {
         "POST",
         "/api/write/media/ads",
         {...payload, media_refs: mediaRefs},
+        {beforeAcknowledge: retireCreateBeforeAcknowledge},
       );
-      if (terminalCreateRetirementResult(result, "create-media")) retireCreateDraft();
       if (
         result !== null
         && result.payload?.error === "dashboard_pending_write_conflict"
@@ -1406,7 +1457,13 @@ function selectedAdId() {
   return adId;
 }
 
-async function runAdAction(action, method, suffix, payload = null) {
+async function runAdAction(
+  action,
+  method,
+  suffix,
+  payload = null,
+  {beforeAcknowledge = null} = {},
+) {
   const adId = selectedAdId();
   if (adId === null) return;
   const existing = pendingForAd(adId);
@@ -1423,7 +1480,7 @@ async function runAdAction(action, method, suffix, payload = null) {
     method,
     `/api/write/ads/${encodeURIComponent(adId)}${suffix}`,
     payload,
-    {adId},
+    {adId, beforeAcknowledge},
   );
 }
 
@@ -1433,13 +1490,17 @@ async function saveManagedAd() {
 
   const existing = pendingForAd(adId);
   if (existing !== null) {
-    const result = await runAdAction("update", "PATCH", "", {});
-    const scope = `ad:${adId}:update`;
-    if (confirmedWriteResult(result) && !pendingWrites.has(scope)) {
-      rebaseManagedBaseline(adId, existing.payload);
-    } else if (ambiguousTerminalWriteResult(result, scope)) {
-      retireManagedBaseline(adId);
-    }
+    await runAdAction(
+      "update",
+      "PATCH",
+      "",
+      {},
+      {
+        beforeAcknowledge: (result) => {
+          settleManagedUpdateBeforeAcknowledge(adId, existing.payload, result);
+        },
+      },
+    );
     return;
   }
 
@@ -1454,13 +1515,17 @@ async function saveManagedAd() {
     setWriteStatus("Keine Content-Änderungen zum Speichern.", "warning");
     return;
   }
-  const result = await runAdAction("update", "PATCH", "", payload);
-  const scope = `ad:${adId}:update`;
-  if (confirmedWriteResult(result) && !pendingWrites.has(scope)) {
-    rebaseManagedBaseline(adId, payload);
-  } else if (ambiguousTerminalWriteResult(result, scope)) {
-    retireManagedBaseline(adId);
-  }
+  await runAdAction(
+    "update",
+    "PATCH",
+    "",
+    payload,
+    {
+      beforeAcknowledge: (result) => {
+        settleManagedUpdateBeforeAcknowledge(adId, payload, result);
+      },
+    },
+  );
 }
 
 async function deleteManagedAd() {

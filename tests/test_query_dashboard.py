@@ -2047,7 +2047,7 @@ globalThis.fetch = async (path, options) => {
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
-    def test_write_runtime_keeps_create_draft_when_terminal_ack_fails(self) -> None:
+    def test_write_runtime_retires_create_draft_before_terminal_ack(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
         definitions, marker, _ = javascript.partition(
@@ -2101,6 +2101,8 @@ globalThis.fetch = async (path, options) => {
   }
   if (path === "/api/dashboard/pending-writes/ack") {
     ackCalls += 1;
+    assert.equal(fields.get("create-title").value, "");
+    assert.equal(fields.get("create-category").value, "");
     if (ackFails) {
       return {
         status: 500,
@@ -2126,7 +2128,7 @@ globalThis.fetch = async (path, options) => {
   assert.equal(createCalls, 1);
   assert.equal(ackCalls, 1);
   assert.equal(pendingWrites.has("create"), true);
-  assert.equal(fields.get("create-title").value, "Confirmed content title");
+  assert.equal(fields.get("create-title").value, "");
   const pendingKey = pendingWrites.get("create").key;
   assert.equal(keys[0], pendingKey);
   assert.match(writeStatus.textContent, /Recovery-ACK ist fehlgeschlagen/i);
@@ -2142,6 +2144,102 @@ globalThis.fetch = async (path, options) => {
   assert.equal(fields.get("create-description").value, "");
   assert.equal(fields.get("create-price").value, "");
   assert.equal(createInFlight, false);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+
+    def test_write_runtime_retires_create_after_keyed_execution_error(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+const fields = new Map([
+  ["create-category", {value: "A > B"}],
+  ["create-title", {value: "Possibly created title"}],
+  ["create-description", {value: "Possibly created description"}],
+  ["create-price", {value: "1"}],
+  ["create-media", {files: [], value: ""}],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    if (fields.has(id)) return fields.get(id);
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+load = async () => {};
+
+let createCalls = 0;
+let ackCalls = 0;
+globalThis.fetch = async (path, options) => {
+  if (path === "/api/write/ads") {
+    createCalls += 1;
+    return {
+      status: 500,
+      ok: false,
+      async text() {
+        return JSON.stringify({
+          error: "write_execution_error",
+          idempotency_key: options.headers["Idempotency-Key"],
+          platform_retry_authorized: false,
+        });
+      },
+    };
+  }
+  if (path === "/api/dashboard/pending-writes/ack") {
+    ackCalls += 1;
+    assert.equal(fields.get("create-title").value, "");
+    assert.equal(fields.get("create-category").value, "");
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  throw new Error("unexpected path: " + path);
+};
+
+(async () => {
+  await submitCreate({preventDefault() {}});
+  assert.equal(createCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.equal(pendingWrites.has("create"), false);
+  assert.equal(fields.get("create-title").value, "");
+  assert.equal(fields.get("create-description").value, "");
+  assert.equal(fields.get("create-price").value, "");
+
+  await submitCreate({preventDefault() {}});
+  assert.equal(createCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.match(writeStatus.textContent, /Kategoriepfad/i);
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
@@ -3222,6 +3320,10 @@ load = async () => {
 globalThis.fetch = async (path, options) => {
   calls.push({path, options});
   if (path === "/api/dashboard/pending-writes/ack") {
+    const submitted = JSON.parse(calls[calls.length - 2].options.body);
+    if (Object.prototype.hasOwnProperty.call(submitted, "title")) {
+      assert.equal(managedAdBaseline.title, submitted.title);
+    }
     return {
       status: 200,
       ok: true,
@@ -3348,6 +3450,7 @@ const calls = [];
 globalThis.fetch = async (path, options) => {
   calls.push({path, options});
   if (path === "/api/dashboard/pending-writes/ack") {
+    assert.equal(managedAdBaseline, null);
     return {
       status: 200,
       ok: true,
