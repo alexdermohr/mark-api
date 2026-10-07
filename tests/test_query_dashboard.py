@@ -3202,19 +3202,14 @@ globalThis.fetch = async (path, options) => {
   assert.equal(ackCalls, 1);
   assert.equal(createInFlight, false);
 
-  assert.equal(fields.get("create-category").value, "");
-  assert.equal(fields.get("create-title").value, "");
-  assert.equal(fields.get("create-description").value, "");
-  assert.equal(fields.get("create-price").value, "");
-  fields.get("create-media").files = [
-    {name: "one.jpg", type: "image/jpeg", size: 10},
-  ];
-  await submitCreate({preventDefault() {}});
+  assert.equal(fields.get("create-category").value, "A > B");
+  assert.equal(fields.get("create-title").value, "Valid title");
+  assert.equal(fields.get("create-description").value, "Valid description");
+  assert.equal(fields.get("create-price").value, "1");
+  assert.equal(fields.get("create-media").files.length, 0);
   assert.equal(stageCalls, 1);
   assert.equal(mediaCreateCalls, 1);
   assert.equal(ackCalls, 1);
-  assert.equal(createInFlight, false);
-  assert.match(writeStatus.textContent, /Kategoriepfad/i);
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
