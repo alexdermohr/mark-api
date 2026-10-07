@@ -2047,6 +2047,244 @@ globalThis.fetch = async (path, options) => {
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_write_runtime_preserves_new_draft_while_prior_media_create_finishes(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+const oldFile = {name: "old.jpg", type: "image/jpeg", size: 10};
+const newFile = {name: "new.jpg", type: "image/jpeg", size: 11};
+const mediaInput = {
+  files: [oldFile],
+  _value: "C:\\fakepath\\old.jpg",
+  get value() { return this._value; },
+  set value(next) {
+    this._value = next;
+    if (next === "") this.files = [];
+  },
+};
+const fields = new Map([
+  ["create-category", {value: "A > B"}],
+  ["create-title", {value: "First title"}],
+  ["create-description", {value: "First description"}],
+  ["create-price", {value: "1"}],
+  ["create-media", mediaInput],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    if (fields.has(id)) return fields.get(id);
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+load = async () => {};
+
+let resolveStarted;
+const started = new Promise((resolve) => { resolveStarted = resolve; });
+let unblockCreate;
+const createGate = new Promise((resolve) => { unblockCreate = resolve; });
+let stageCalls = 0;
+let createCalls = 0;
+let ackCalls = 0;
+globalThis.fetch = async (path, options) => {
+  if (path === "/api/write/media/stage") {
+    stageCalls += 1;
+    return {
+      status: 201,
+      ok: true,
+      async text() {
+        return JSON.stringify({media_ref: "media_old"});
+      },
+    };
+  }
+  if (path === "/api/write/media/ads") {
+    createCalls += 1;
+    resolveStarted();
+    await createGate;
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({
+          idempotency_key: options.headers["Idempotency-Key"],
+          operation_receipt: {outcome: "confirmed"},
+          platform_retry_authorized: false,
+        });
+      },
+    };
+  }
+  if (path === "/api/dashboard/pending-writes/ack") {
+    ackCalls += 1;
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  throw new Error("unexpected path: " + path);
+};
+
+(async () => {
+  const submitting = submitCreate({preventDefault() {}});
+  await started;
+
+  fields.get("create-category").value = "C > D";
+  fields.get("create-title").value = "Next title";
+  fields.get("create-description").value = "Next description";
+  fields.get("create-price").value = "2";
+  mediaInput.files = [newFile];
+  mediaInput._value = "C:\\fakepath\\new.jpg";
+
+  unblockCreate();
+  await submitting;
+
+  assert.equal(stageCalls, 1);
+  assert.equal(createCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.equal(pendingWrites.size, 0);
+  assert.equal(createInFlight, false);
+  assert.equal(fields.get("create-category").value, "C > D");
+  assert.equal(fields.get("create-title").value, "Next title");
+  assert.equal(fields.get("create-description").value, "Next description");
+  assert.equal(fields.get("create-price").value, "2");
+  assert.equal(mediaInput.value, "C:\\fakepath\\new.jpg");
+  assert.equal(mediaInput.files.length, 1);
+  assert.equal(mediaInput.files[0], newFile);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+    def test_write_runtime_preserves_new_draft_when_replaying_pending_create(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+const fields = new Map([
+  ["create-category", {value: "C > D"}],
+  ["create-title", {value: "Next title"}],
+  ["create-description", {value: "Next description"}],
+  ["create-price", {value: "2"}],
+  ["create-media", {files: [], value: ""}],
+]);
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    if (fields.has(id)) return fields.get(id);
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+load = async () => {};
+pendingWrites.set("create", {
+  scope: "create",
+  key: "ui:pending-old",
+  method: "POST",
+  path: "/api/write/ads",
+  payload: {
+    category_path: ["A", "B"],
+    title: "First title",
+    description: "First description",
+    price_eur: 1,
+  },
+  adId: null,
+});
+
+let createCalls = 0;
+let ackCalls = 0;
+globalThis.fetch = async (path, options) => {
+  if (path === "/api/write/ads") {
+    createCalls += 1;
+    assert.equal(options.headers["Idempotency-Key"], "ui:pending-old");
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({
+          idempotency_key: "ui:pending-old",
+          operation_receipt: {outcome: "confirmed"},
+          platform_retry_authorized: false,
+        });
+      },
+    };
+  }
+  if (path === "/api/dashboard/pending-writes/ack") {
+    ackCalls += 1;
+    return {
+      status: 200,
+      ok: true,
+      async text() {
+        return JSON.stringify({acknowledged: true});
+      },
+    };
+  }
+  throw new Error("unexpected path: " + path);
+};
+
+(async () => {
+  await submitCreate({preventDefault() {}});
+
+  assert.equal(createCalls, 1);
+  assert.equal(ackCalls, 1);
+  assert.equal(pendingWrites.has("create"), false);
+  assert.equal(fields.get("create-category").value, "C > D");
+  assert.equal(fields.get("create-title").value, "Next title");
+  assert.equal(fields.get("create-description").value, "Next description");
+  assert.equal(fields.get("create-price").value, "2");
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_write_runtime_retires_create_draft_before_terminal_ack(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
@@ -2258,7 +2496,7 @@ globalThis.fetch = async (path, options) => {
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
-    def test_write_runtime_retires_ambiguous_media_create_recovery_draft(self) -> None:
+    def test_write_runtime_preserves_new_draft_during_ambiguous_media_create_recovery(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
         definitions, marker, _ = javascript.partition(
@@ -2357,15 +2595,13 @@ globalThis.fetch = async (path, options) => {
   assert.equal(ackCalls, 1);
   assert.equal(pendingWrites.size, 0);
   assert.equal(createInFlight, false);
-  assert.equal(mediaInput.value, "");
-  assert.equal(mediaInput.files.length, 0);
-  assert.equal(fields.get("create-category").value, "");
-
-  await submitCreate({preventDefault() {}});
-  assert.equal(stageCalls, 0);
-  assert.equal(createCalls, 1);
-  assert.equal(ackCalls, 1);
-  assert.match(writeStatus.textContent, /Kategoriepfad/i);
+  assert.equal(mediaInput.value, "C:\\fakepath\\new-selection.jpg");
+  assert.equal(mediaInput.files.length, 1);
+  assert.equal(mediaInput.files[0].name, "new-selection.jpg");
+  assert.equal(fields.get("create-category").value, "A > B");
+  assert.equal(fields.get("create-title").value, "Visible draft");
+  assert.equal(fields.get("create-description").value, "Visible description");
+  assert.equal(fields.get("create-price").value, "1");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

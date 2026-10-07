@@ -1024,6 +1024,67 @@ function terminalCreateRetirementResult(result) {
   );
 }
 
+function captureCreateDraft(files = null) {
+  return {
+    category: byId("create-category").value,
+    title: byId("create-title").value,
+    description: byId("create-description").value,
+    price: byId("create-price").value,
+    files: Array.from(files ?? byId("create-media").files ?? []),
+  };
+}
+
+function createDraftMatchesSnapshot(snapshot) {
+  if (snapshot === null || typeof snapshot !== "object") return false;
+  if (
+    byId("create-category").value !== snapshot.category
+    || byId("create-title").value !== snapshot.title
+    || byId("create-description").value !== snapshot.description
+    || byId("create-price").value !== snapshot.price
+    || !Array.isArray(snapshot.files)
+  ) {
+    return false;
+  }
+  const currentFiles = Array.from(byId("create-media").files ?? []);
+  return (
+    currentFiles.length === snapshot.files.length
+    && currentFiles.every((file, index) => file === snapshot.files[index])
+  );
+}
+
+function createDraftMatchesPendingEntry(entry) {
+  if (
+    entry === null
+    || typeof entry !== "object"
+    || !["create", "create-media"].includes(entry.scope)
+    || entry.payload === null
+    || typeof entry.payload !== "object"
+    || Array.isArray(entry.payload)
+  ) {
+    return false;
+  }
+  let currentPayload;
+  try {
+    currentPayload = createPayload();
+  } catch (_error) {
+    return false;
+  }
+  const expected = entry.payload;
+  if (
+    !Array.isArray(expected.category_path)
+    || currentPayload.category_path.length !== expected.category_path.length
+    || currentPayload.category_path.some(
+      (label, index) => label !== expected.category_path[index],
+    )
+    || currentPayload.title !== expected.title
+    || currentPayload.description !== expected.description
+    || currentPayload.price_eur !== expected.price_eur
+  ) {
+    return false;
+  }
+  return Array.from(byId("create-media").files ?? []).length === 0;
+}
+
 function retireCreateDraft() {
   byId("create-category").value = "";
   byId("create-title").value = "";
@@ -1032,8 +1093,14 @@ function retireCreateDraft() {
   byId("create-media").value = "";
 }
 
-function retireCreateBeforeAcknowledge(result) {
-  if (terminalCreateRetirementResult(result)) retireCreateDraft();
+function retireCreateBeforeAcknowledge(result, entry) {
+  if (!terminalCreateRetirementResult(result)) return;
+  const draftStillSubmitted = (
+    entry?.createDraftSnapshot !== undefined
+      ? createDraftMatchesSnapshot(entry.createDraftSnapshot)
+      : createDraftMatchesPendingEntry(entry)
+  );
+  if (draftStillSubmitted) retireCreateDraft();
 }
 
 function settleManagedUpdateBeforeAcknowledge(adId, payload, result) {
@@ -1083,7 +1150,7 @@ async function runPlatformWrite(
   method,
   path,
   payload,
-  {adId = null, beforeAcknowledge = null} = {},
+  {adId = null, beforeAcknowledge = null, createDraftSnapshot = null} = {},
 ) {
   let entry = pendingWrites.get(scope);
   const retryingPending = entry !== undefined;
@@ -1096,6 +1163,9 @@ async function runPlatformWrite(
       payload,
       adId,
     };
+    if (createDraftSnapshot !== null) {
+      entry.createDraftSnapshot = createDraftSnapshot;
+    }
     pendingWrites.set(scope, entry);
   }
 
@@ -1388,13 +1458,17 @@ async function submitCreate(event) {
     }
 
     const files = Array.from(byId("create-media").files ?? []);
+    const createDraftSnapshot = captureCreateDraft(files);
     if (files.length === 0) {
       await runPlatformWrite(
         "create",
         "POST",
         "/api/write/ads",
         payload,
-        {beforeAcknowledge: retireCreateBeforeAcknowledge},
+        {
+          beforeAcknowledge: retireCreateBeforeAcknowledge,
+          createDraftSnapshot,
+        },
       );
       return;
     }
@@ -1407,7 +1481,10 @@ async function submitCreate(event) {
         "POST",
         "/api/write/media/ads",
         {...payload, media_refs: mediaRefs},
-        {beforeAcknowledge: retireCreateBeforeAcknowledge},
+        {
+          beforeAcknowledge: retireCreateBeforeAcknowledge,
+          createDraftSnapshot,
+        },
       );
       if (
         result !== null
