@@ -1127,6 +1127,7 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
         self._active_handler_count = 0
         self._serve_loop_active = False
         self._socket_close_succeeded = False
+        self._store_lock_release_deferred = False
         super().__init__(*args, **kwargs)
 
     def _release_store_lock_if_quiesced(self) -> None:
@@ -1136,12 +1137,22 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
                 self._socket_close_succeeded
                 and not self._serve_loop_active
                 and self._active_handler_count == 0
+                and not self._store_lock_release_deferred
                 and self._store_lock is not None
             ):
                 lock = self._store_lock
                 self._store_lock = None
         if lock is not None:
             lock.close()
+
+    def retain_store_lock_until_explicit_release(self) -> None:
+        with self._store_lock_guard:
+            self._store_lock_release_deferred = True
+
+    def release_retained_store_lock(self) -> None:
+        with self._store_lock_guard:
+            self._store_lock_release_deferred = False
+        self._release_store_lock_if_quiesced()
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
         with self._store_lock_guard:

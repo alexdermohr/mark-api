@@ -1216,6 +1216,13 @@ class PrivateWebWriteApiRuntime:
                         self._runtime_cleanup_failed = True
                         cleanup_failed = True
 
+            if not cleanup_failed:
+                try:
+                    self._server.release_retained_store_lock()
+                except Exception:
+                    self._runtime_cleanup_failed = True
+                    cleanup_failed = True
+
             if cleanup_failed:
                 raise PrivateWebRuntimeSetupError(
                     "private Web write API runtime cleanup failed"
@@ -1397,6 +1404,10 @@ def compose_private_web_write_api_runtime(
         execution_lock=operation_lock,
         _store_lock=_store_lock,
     )
+    # This composition owns state beyond the HTTP server. Keep the exclusive
+    # store lease across server_close() until owned runtimes are fully settled
+    # and cleaned up; SubmitUnknown reconciliation intentionally retains it.
+    server.retain_store_lock_until_explicit_release()
     # The generic Write API keeps daemon request threads for its standalone
     # use. This composition owns browser runtimes, so close must drain every
     # accepted handler before those runtimes can be released.
@@ -1418,6 +1429,11 @@ def compose_private_web_write_api_runtime(
             server.server_close()
         except Exception:
             pass
+        else:
+            try:
+                server.release_retained_store_lock()
+            except Exception:
+                pass
         raise
 
 

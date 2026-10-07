@@ -62,7 +62,11 @@ from mark_api.private_web_media import (
 )
 from mark_api.results import ReadResult, ReadStatus
 from mark_api.storage import SnapshotStore
-from mark_api.write_api import WriteApiAccess, WriteCapability
+from mark_api.write_api import (
+    WriteApiAccess,
+    WriteCapability,
+    acquire_write_api_store_lock,
+)
 
 
 AD_ID = "3524046688"
@@ -3901,6 +3905,8 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 "media_runtime_close_unsettled",
             ):
                 runtime.close()
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                acquire_write_api_store_lock(store)
             self.assertTrue(runtime.media_reconciliation_required)
             self.assertEqual(close_events, [])
             with self.assertRaisesRegex(
@@ -3914,6 +3920,8 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             self.assertEqual(pending.closed, 1)
             runtime.close()
             self.assertEqual(close_events, ["content"])
+            replacement_lock = acquire_write_api_store_lock(store)
+            replacement_lock.close()
 
 
 
