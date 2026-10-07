@@ -306,6 +306,26 @@ class PrivateWebMediaContractTests(unittest.TestCase):
                 [directory, directory.parent, directory],
             )
 
+    def test_persistent_media_handle_store_fsyncs_existing_directory_and_parent_on_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                wraps=private_web_media._fsync_directory,
+            ) as fsync_directory:
+                store = PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+                store.close()
+
+            self.assertEqual(
+                [Path(call.args[0]) for call in fsync_directory.call_args_list],
+                [directory, directory.parent],
+            )
+
     def test_media_handle_store_rehydrates_only_protected_expired_refs(self) -> None:
         monotonic_now = [100.0]
         wall_now = [1_000.0]
