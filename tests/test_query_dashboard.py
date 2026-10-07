@@ -203,6 +203,29 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
             headers["Idempotency-Key"] = idempotency_key
         return headers
 
+    def test_proxy_rejects_dashboard_tokens_that_are_not_header_safe_ascii(self) -> None:
+        for token in (
+            "abcdefghijklmnop😀",
+            "abcdefghijklmnop",
+            "abcdefghijklmnop",
+        ):
+            with self.subTest(token=repr(token)):
+                with self.assertRaisesRegex(ValueError, "ui_token is invalid"):
+                    DashboardWriteProxy(
+                        host="127.0.0.1",
+                        port=1,
+                        bearer_token=self.BACKEND_TOKEN,
+                        ui_token=token,
+                    )
+
+        proxy = DashboardWriteProxy(
+            host="127.0.0.1",
+            port=1,
+            bearer_token=self.BACKEND_TOKEN,
+            ui_token="abcdefghijklmnop&x=y#z",
+        )
+        self.assertEqual(proxy.ui_token, "abcdefghijklmnop&x=y#z")
+
     def test_dashboard_origin_omits_default_http_port(self) -> None:
         self.assertEqual(
             _dashboard_http_origin("127.0.0.1", 80),
