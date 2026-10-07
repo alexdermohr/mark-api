@@ -4,9 +4,11 @@ import os
 import re
 import stat
 import tempfile
+from contextlib import AbstractContextManager, nullcontext
 from secrets import token_urlsafe
 from threading import Lock
-from collections.abc import Mapping
+from time import monotonic, time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
@@ -434,19 +436,227 @@ class PrivateWebMediaRefResolver:
 
 
 class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
-    """Own bounded ephemeral private media copies behind generated opaque handles."""
+    """Own bounded private media copies behind generated opaque handles."""
 
     _MAX_STAGED_HANDLES = 32
     _MAX_STAGED_BYTES = 100 * 1024 * 1024
+    _STAGED_HANDLE_TTL_SECONDS = 15 * 60
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = monotonic,
+        wall_clock: Callable[[], float] = time,
+        directory: str | os.PathLike[str] | None = None,
+        protected_refs: Callable[[], frozenset[str]] | None = None,
+        protected_refs_guard: Callable[[], AbstractContextManager[None]] | None = None,
+    ) -> None:
+        if not callable(clock):
+            raise TypeError("media handle store clock must be callable")
+        if not callable(wall_clock):
+            raise TypeError("media handle store wall clock must be callable")
+        if protected_refs is not None and not callable(protected_refs):
+            raise TypeError("protected media refs provider must be callable")
+        if protected_refs_guard is not None and not callable(protected_refs_guard):
+            raise TypeError("protected media refs guard must be callable")
         super().__init__({})
-        self._directory = tempfile.TemporaryDirectory(
-            prefix="mark-private-web-media-handles-"
-        )
+        self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+        if directory is None:
+            self._temporary_directory = tempfile.TemporaryDirectory(
+                prefix="mark-private-web-media-handles-"
+            )
+            self._directory_path = self._temporary_directory.name
+            self._persistent = False
+        else:
+            raw_directory = os.fspath(directory)
+            if (
+                not isinstance(raw_directory, str)
+                or not raw_directory
+                or "\x00" in raw_directory
+            ):
+                raise ValueError("media handle directory is invalid")
+            directory_path = os.path.abspath(raw_directory)
+            os.makedirs(directory_path, mode=0o700, exist_ok=True)
+            directory_stat = os.stat(directory_path, follow_symlinks=False)
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise ValueError("media handle directory is invalid")
+            os.chmod(directory_path, 0o700)
+            self._directory_path = directory_path
+            self._persistent = True
         self._lock = Lock()
         self._closed = False
         self._staged_bytes = 0
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._protected_refs = protected_refs
+        self._protected_refs_guard = protected_refs_guard
+        self._sizes: dict[str, int] = {}
+        self._expires_at: dict[str, float] = {}
+        if self._persistent:
+            self._rehydrate_persistent_handles()
+
+    def _protected_refs_snapshot(self) -> frozenset[str]:
+        provider = self._protected_refs
+        if provider is None:
+            return frozenset()
+        try:
+            refs = frozenset(provider())
+        except Exception:
+            raise RuntimeError("protected media refs are unavailable") from None
+        if any(
+            not isinstance(ref, str) or _MEDIA_REF_RE.fullmatch(ref) is None
+            for ref in refs
+        ):
+            raise RuntimeError("protected media refs are invalid")
+        return refs
+
+    def _protected_refs_guard_context(self) -> AbstractContextManager[None]:
+        provider = self._protected_refs_guard
+        if provider is None:
+            return nullcontext()
+        try:
+            return provider()
+        except Exception:
+            raise RuntimeError("protected media refs guard is unavailable") from None
+
+    def _rehydrate_persistent_handles(self) -> None:
+        protected = self._protected_refs_snapshot()
+        now = float(self._clock())
+        wall_now = float(self._wall_clock())
+        total_bytes = 0
+        loaded_refs: set[str] = set()
+        with os.scandir(self._directory_path) as entries:
+            for entry in entries:
+                if not entry.is_file(follow_symlinks=False):
+                    raise RuntimeError("persistent media handle directory is invalid")
+                name = entry.name
+                temp_extension = next(
+                    (
+                        suffix
+                        for suffix in (".jpg", ".png", ".webp")
+                        if name.endswith(suffix + ".tmp")
+                    ),
+                    None,
+                )
+                if name.startswith(".") and temp_extension is not None:
+                    temp_ref = name[1 : -(len(temp_extension) + len(".tmp"))]
+                    if _MEDIA_REF_RE.fullmatch(temp_ref) is not None:
+                        try:
+                            os.unlink(entry.path)
+                        except FileNotFoundError:
+                            pass
+                        continue
+                extension = next(
+                    (
+                        suffix
+                        for suffix in (".jpg", ".png", ".webp")
+                        if name.endswith(suffix)
+                    ),
+                    None,
+                )
+                if extension is None:
+                    raise RuntimeError("persistent media handle directory is invalid")
+                ref = name[: -len(extension)]
+                if (
+                    _MEDIA_REF_RE.fullmatch(ref) is None
+                    or ref in loaded_refs
+                ):
+                    raise RuntimeError("persistent media handle directory is invalid")
+                file_stat = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise RuntimeError("persistent media handle is invalid")
+                if file_stat.st_size <= 0:
+                    if ref in protected:
+                        raise RuntimeError("persistent media handle is invalid")
+                    try:
+                        os.unlink(entry.path)
+                    except FileNotFoundError:
+                        pass
+                    continue
+                fd = os.open(
+                    entry.path,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    prefix = os.read(fd, 12)
+                finally:
+                    os.close(fd)
+                try:
+                    detected_extension = self._extension(name, prefix)
+                except ValueError:
+                    if ref in protected:
+                        raise RuntimeError("persistent media handle is invalid") from None
+                    try:
+                        os.unlink(entry.path)
+                    except FileNotFoundError:
+                        pass
+                    continue
+                if detected_extension != extension:
+                    if ref in protected:
+                        raise RuntimeError("persistent media handle is invalid")
+                    try:
+                        os.unlink(entry.path)
+                    except FileNotFoundError:
+                        pass
+                    continue
+                expires_wall = (
+                    float(file_stat.st_mtime) + self._STAGED_HANDLE_TTL_SECONDS
+                )
+                if expires_wall <= wall_now and ref not in protected:
+                    try:
+                        os.unlink(entry.path)
+                    except FileNotFoundError:
+                        pass
+                    continue
+                if (
+                    len(loaded_refs) >= self._MAX_STAGED_HANDLES
+                    or total_bytes + int(file_stat.st_size) > self._MAX_STAGED_BYTES
+                ):
+                    raise RuntimeError("persistent media staging quota exceeded")
+                loaded_refs.add(ref)
+                total_bytes += int(file_stat.st_size)
+                self._sources[ref] = PrivateWebMediaSource(entry.path)
+                self._sizes[ref] = int(file_stat.st_size)
+                self._expires_at[ref] = now + max(0.0, expires_wall - wall_now)
+        self._staged_bytes = total_bytes
+
+    @staticmethod
+    def _unlink_sources(
+        sources: tuple[PrivateWebMediaSource, ...],
+    ) -> None:
+        for source in sources:
+            try:
+                os.unlink(source.path)
+            except FileNotFoundError:
+                pass
+
+    def _pop_handles_locked(
+        self,
+        media_refs: tuple[str, ...],
+    ) -> tuple[PrivateWebMediaSource, ...]:
+        sources: list[PrivateWebMediaSource] = []
+        released_bytes = 0
+        for ref in media_refs:
+            source = self._sources.pop(ref, None)
+            released_bytes += self._sizes.pop(ref, 0)
+            self._expires_at.pop(ref, None)
+            if source is not None:
+                sources.append(source)
+        self._staged_bytes = max(0, self._staged_bytes - released_bytes)
+        return tuple(sources)
+
+    def _prune_expired_locked(
+        self,
+        now: float,
+        preserve: frozenset[str] = frozenset(),
+    ) -> None:
+        expired = tuple(
+            ref
+            for ref, expires_at in self._expires_at.items()
+            if expires_at <= now and ref not in preserve
+        )
+        if expired:
+            self._unlink_sources(self._pop_handles_locked(expired))
 
     @staticmethod
     def _extension(filename: str, data: bytes) -> str:
@@ -477,9 +687,14 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         if not isinstance(data, bytes) or not data:
             raise ValueError("media bytes are required")
         extension = self._extension(filename, data)
-        with self._lock:
+        with self._protected_refs_guard_context(), self._lock:
+            protected = self._protected_refs_snapshot()
             if self._closed:
                 raise RuntimeError("media handle store is closed")
+            self._prune_expired_locked(
+                float(self._clock()),
+                preserve=protected,
+            )
             if (
                 len(self._sources) >= self._MAX_STAGED_HANDLES
                 or self._staged_bytes + len(data) > self._MAX_STAGED_BYTES
@@ -489,8 +704,16 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 ref = "media_" + token_urlsafe(18)
                 if _MEDIA_REF_RE.fullmatch(ref) is not None and ref not in self._sources:
                     break
-            path = os.path.join(self._directory.name, ref + extension)
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            path = os.path.join(self._directory_path, ref + extension)
+            temp_path = os.path.join(
+                self._directory_path,
+                "." + ref + extension + ".tmp",
+            )
+            fd = os.open(
+                temp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
             try:
                 view = memoryview(data)
                 written = 0
@@ -502,13 +725,31 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 os.fsync(fd)
             except Exception:
                 try:
-                    os.unlink(path)
+                    os.unlink(temp_path)
                 except OSError:
                     pass
                 raise
             finally:
                 os.close(fd)
+            try:
+                staged_at = float(self._wall_clock())
+                os.utime(
+                    temp_path,
+                    (staged_at, staged_at),
+                    follow_symlinks=False,
+                )
+                os.replace(temp_path, path)
+            except Exception:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
             self._sources[ref] = PrivateWebMediaSource(path)
+            self._sizes[ref] = len(data)
+            self._expires_at[ref] = (
+                float(self._clock()) + self._STAGED_HANDLE_TTL_SECONDS
+            )
             self._staged_bytes += len(data)
             return ref
 
@@ -516,37 +757,51 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         self,
         media_refs: tuple[str, ...],
     ) -> tuple[PrivateWebMediaSource, ...]:
-        with self._lock:
+        requested = (
+            frozenset(media_refs)
+            if isinstance(media_refs, tuple)
+            and all(isinstance(ref, str) for ref in media_refs)
+            else frozenset()
+        )
+        with self._protected_refs_guard_context(), self._lock:
+            preserve = requested | self._protected_refs_snapshot()
             if self._closed:
                 raise PrivateWebWriteNotAttemptedError("resolve_media_refs")
+            self._prune_expired_locked(
+                float(self._clock()),
+                preserve=preserve,
+            )
             return super().resolve(media_refs)
 
     def discard(self, media_refs: tuple[str, ...]) -> None:
         with self._lock:
-            sources = [self._sources.pop(ref, None) for ref in media_refs]
-            released_bytes = 0
-            for source in sources:
-                if source is not None:
-                    try:
-                        released_bytes += os.path.getsize(source.path)
-                    except FileNotFoundError:
-                        pass
-            self._staged_bytes = max(0, self._staged_bytes - released_bytes)
-        for source in sources:
-            if source is not None:
-                try:
-                    os.unlink(source.path)
-                except FileNotFoundError:
-                    pass
+            sources = self._pop_handles_locked(media_refs)
+        self._unlink_sources(sources)
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
+        with self._protected_refs_guard_context(), self._lock:
+            protected = (
+                self._protected_refs_snapshot()
+                if self._persistent
+                else frozenset()
+            )
+            if self._closed:
+                return
+            orphan_refs = tuple(
+                ref for ref in self._sources if ref not in protected
+            )
+            orphan_sources = self._pop_handles_locked(orphan_refs)
             self._closed = True
             self._sources.clear()
+            self._sizes.clear()
+            self._expires_at.clear()
             self._staged_bytes = 0
-        self._directory.cleanup()
+        self._unlink_sources(orphan_sources)
+        if self._temporary_directory is not None:
+            self._temporary_directory.cleanup()
 
 
 

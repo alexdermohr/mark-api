@@ -44,6 +44,7 @@ from mark_api.private_web_runtime import (
     PrivateWebWriteApiRuntime,
     _NoRedirectManagementTransport,
     _RejectManagementRedirectHandler,
+    _pending_dashboard_media_refs,
     build_private_web_content_runtime,
     build_private_web_inventory_runtime,
     build_private_web_media_create_runtime,
@@ -61,7 +62,11 @@ from mark_api.private_web_media import (
 )
 from mark_api.results import ReadResult, ReadStatus
 from mark_api.storage import SnapshotStore
-from mark_api.write_api import WriteApiAccess, WriteCapability
+from mark_api.write_api import (
+    WriteApiAccess,
+    WriteCapability,
+    acquire_write_api_store_lock,
+)
 
 
 AD_ID = "3524046688"
@@ -1053,7 +1058,9 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             title=self.request.title,
             description=self.request.description,
         )
-        handles = PrivateWebMediaHandleStore()
+        now = [100.0]
+        handles = PrivateWebMediaHandleStore(clock=lambda: now[0])
+        handles._STAGED_HANDLE_TTL_SECONDS = 10
         ref = handles.stage_media("photo.jpg", b"\xff\xd8\xffjpeg")
         service = PrivateWebMediaCreateService(
             runtime=runtime,
@@ -1073,6 +1080,7 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
             writes_enabled=True,
         )
 
+        now[0] = 110.0
         receipt = service.create_with_media(self.request, (ref,))
 
         self.assertEqual(receipt.outcome, OperationOutcome.CONFIRMED)
@@ -3033,6 +3041,130 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                             )
                         builder.assert_not_called()
 
+    def test_pending_dashboard_media_refs_selects_persisted_media_create(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            store.claim_dashboard_pending_write(
+                scope="create-media",
+                resource_key="create",
+                idempotency_key="ui:pending-media",
+                method="POST",
+                path="/api/write/media/ads",
+                payload_json=json.dumps(
+                    {
+                        "category_path": ["A", "B"],
+                        "title": "Pending",
+                        "description": "Recovery",
+                        "price_eur": 1,
+                        "media_refs": ["media_one", "media_two"],
+                    }
+                ),
+                ad_id=None,
+            )
+            store.claim_dashboard_pending_write(
+                scope="ad:123:pause",
+                resource_key="ad:123",
+                idempotency_key="ui:pending-pause",
+                method="POST",
+                path="/api/write/ads/123/pause",
+                payload_json=None,
+                ad_id="123",
+            )
+
+            self.assertEqual(
+                _pending_dashboard_media_refs(store),
+                frozenset({"media_one", "media_two"}),
+            )
+
+    def test_builder_restores_pending_media_handle_across_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            access = WriteApiAccess(
+                principal="runtime-test",
+                bearer_token=self.TOKEN,
+                capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                writes_enabled=True,
+            )
+
+            def build_runtime(close_events: list[str]):
+                content_runtime = self._content_runtime(
+                    OwnerReader(ReadResult.success_empty(())),
+                    close_events,
+                )
+                media_runtime = PrivateWebMediaCreateRuntime(
+                    page_factory=lambda: (_ for _ in ()).throw(
+                        AssertionError("media page must stay lazy")
+                    )
+                )
+                with (
+                    patch(
+                        "mark_api.private_web_runtime.build_private_web_content_runtime",
+                        return_value=content_runtime,
+                    ),
+                    patch(
+                        "mark_api.private_web_runtime.build_private_web_media_create_runtime",
+                        return_value=media_runtime,
+                    ),
+                ):
+                    return build_private_web_write_api_runtime(
+                        cdp_port=19610,
+                        store=store,
+                        access=access,
+                        media_writes_enabled=True,
+                    )
+
+            first_close_events: list[str] = []
+            first = build_runtime(first_close_events)
+            assert first._media_handle_store is not None
+            media_ref = first._media_handle_store.stage_media(
+                "upload.jpg",
+                b"\xff\xd8\xffrestart",
+            )
+            (first_source,) = first._media_handle_store.resolve((media_ref,))
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                build_runtime([])
+            self.assertTrue(Path(first_source.path).exists())
+            self.assertEqual(
+                Path(first_source.path).read_bytes(),
+                b"\xff\xd8\xffrestart",
+            )
+            store.claim_dashboard_pending_write(
+                scope="create-media",
+                resource_key="create",
+                idempotency_key="ui:restart-media-create",
+                method="POST",
+                path="/api/write/media/ads",
+                payload_json=json.dumps(
+                    {
+                        "category_path": ["A", "B"],
+                        "title": "Restart",
+                        "description": "Recovery",
+                        "price_eur": 1,
+                        "media_refs": [media_ref],
+                    }
+                ),
+                ad_id=None,
+            )
+            first.close()
+            self.assertEqual(first_close_events, ["content"])
+            self.assertTrue(Path(first_source.path).exists())
+
+            second_close_events: list[str] = []
+            second = build_runtime(second_close_events)
+            try:
+                assert second._media_handle_store is not None
+                (restored,) = second._media_handle_store.resolve((media_ref,))
+                self.assertEqual(restored.path, first_source.path)
+                self.assertEqual(
+                    Path(restored.path).read_bytes(),
+                    b"\xff\xd8\xffrestart",
+                )
+                second._media_handle_store.discard((media_ref,))
+                self.assertFalse(Path(restored.path).exists())
+            finally:
+                second.close()
+            self.assertEqual(second_close_events, ["content"])
+
     def test_builder_creates_product_media_stager_without_caller_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SnapshotStore(Path(tmp) / "runtime.sqlite")
@@ -3773,6 +3905,8 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 "media_runtime_close_unsettled",
             ):
                 runtime.close()
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                acquire_write_api_store_lock(store)
             self.assertTrue(runtime.media_reconciliation_required)
             self.assertEqual(close_events, [])
             with self.assertRaisesRegex(
@@ -3786,6 +3920,8 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             self.assertEqual(pending.closed, 1)
             runtime.close()
             self.assertEqual(close_events, ["content"])
+            replacement_lock = acquire_write_api_store_lock(store)
+            replacement_lock.close()
 
 
 

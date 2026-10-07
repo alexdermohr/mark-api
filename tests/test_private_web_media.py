@@ -158,6 +158,249 @@ class PrivateWebMediaContractTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_media_handle_store_expires_abandoned_handle_and_recovers_quota(self) -> None:
+        now = [100.0]
+        store = PrivateWebMediaHandleStore(clock=lambda: now[0])
+        try:
+            store._MAX_STAGED_HANDLES = 1
+            store._STAGED_HANDLE_TTL_SECONDS = 10
+            abandoned = store.stage_media("one.jpg", b"\xff\xd8\xffone")
+            (source,) = store.resolve((abandoned,))
+
+            now[0] = 109.999
+            self.assertEqual(store.resolve((abandoned,)), (source,))
+            self.assertTrue(Path(source.path).exists())
+
+            now[0] = 110.0
+            replacement = store.stage_media("two.jpg", b"\xff\xd8\xfftwo")
+            self.assertNotEqual(replacement, abandoned)
+            self.assertFalse(Path(source.path).exists())
+            self.assertEqual(len(store._sources), 1)
+            self.assertEqual(store._staged_bytes, len(b"\xff\xd8\xfftwo"))
+            with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                store.resolve((abandoned,))
+        finally:
+            store.close()
+
+    def test_media_handle_store_preserves_only_requested_expired_refs(self) -> None:
+        now = [100.0]
+        store = PrivateWebMediaHandleStore(clock=lambda: now[0])
+        try:
+            store._MAX_STAGED_HANDLES = 2
+            store._STAGED_HANDLE_TTL_SECONDS = 10
+            protected = store.stage_media("protected.jpg", b"\xff\xd8\xffone")
+            orphan = store.stage_media("orphan.jpg", b"\xff\xd8\xfftwo")
+            (protected_source,) = store.resolve((protected,))
+            (orphan_source,) = store.resolve((orphan,))
+
+            now[0] = 110.0
+            self.assertEqual(store.resolve((protected,)), (protected_source,))
+            self.assertTrue(Path(protected_source.path).exists())
+            self.assertFalse(Path(orphan_source.path).exists())
+            self.assertEqual(set(store._sources), {protected})
+            self.assertEqual(store._staged_bytes, len(b"\xff\xd8\xffone"))
+
+            with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                store.resolve((orphan,))
+            with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                store.resolve(("media_missing",))
+
+            store.discard((protected,))
+            store.discard((protected,))
+            self.assertFalse(Path(protected_source.path).exists())
+            with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                store.resolve((protected,))
+        finally:
+            store.close()
+
+    def test_media_handle_store_serializes_protected_snapshot_and_pruning(self) -> None:
+        now = [100.0]
+        protected_refs: set[str] = set()
+
+        class Guard:
+            def __init__(self) -> None:
+                self.active = False
+
+            def __enter__(self):
+                self.active = True
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                self.active = False
+
+        guard = Guard()
+
+        def protected_snapshot() -> frozenset[str]:
+            self.assertTrue(guard.active)
+            return frozenset(protected_refs)
+
+        store = PrivateWebMediaHandleStore(
+            clock=lambda: now[0],
+            protected_refs=protected_snapshot,
+            protected_refs_guard=lambda: guard,
+        )
+        try:
+            store._STAGED_HANDLE_TTL_SECONDS = 10
+            protected = store.stage_media(
+                "protected.jpg",
+                b"\xff\xd8\xffprotected",
+            )
+            (protected_source,) = store.resolve((protected,))
+
+            original_prune = store._prune_expired_locked
+
+            def guarded_prune(
+                current: float,
+                preserve: frozenset[str] = frozenset(),
+            ) -> None:
+                self.assertTrue(guard.active)
+                original_prune(current, preserve)
+
+            store._prune_expired_locked = guarded_prune
+
+            now[0] = 110.0
+            protected_refs.add(protected)
+            replacement = store.stage_media(
+                "replacement.jpg",
+                b"\xff\xd8\xffreplacement",
+            )
+
+            self.assertTrue(Path(protected_source.path).exists())
+            self.assertEqual(
+                set(store._sources),
+                {protected, replacement},
+            )
+        finally:
+            store.close()
+
+    def test_media_handle_store_rehydrates_only_protected_expired_refs(self) -> None:
+        monotonic_now = [100.0]
+        wall_now = [1_000.0]
+        protected_refs: set[str] = set()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            first = PrivateWebMediaHandleStore(
+                clock=lambda: monotonic_now[0],
+                wall_clock=lambda: wall_now[0],
+                directory=directory,
+                protected_refs=lambda: frozenset(protected_refs),
+            )
+            protected = first.stage_media(
+                "protected.jpg",
+                b"\xff\xd8\xffprotected",
+            )
+            orphan = first.stage_media(
+                "orphan.jpg",
+                b"\xff\xd8\xfforphan",
+            )
+            protected_path = Path(first.resolve((protected,))[0].path)
+            orphan_path = Path(first.resolve((orphan,))[0].path)
+            protected_refs.add(protected)
+            first.close()
+
+            self.assertTrue(protected_path.exists())
+            self.assertFalse(orphan_path.exists())
+
+            monotonic_now[0] = 2_000.0
+            wall_now[0] = 2_000.0
+            second = PrivateWebMediaHandleStore(
+                clock=lambda: monotonic_now[0],
+                wall_clock=lambda: wall_now[0],
+                directory=directory,
+                protected_refs=lambda: frozenset(protected_refs),
+            )
+            try:
+                self.assertEqual(
+                    Path(second.resolve((protected,))[0].path),
+                    protected_path,
+                )
+                self.assertTrue(protected_path.exists())
+                self.assertFalse(orphan_path.exists())
+
+                protected_refs.clear()
+                replacement = second.stage_media(
+                    "replacement.jpg",
+                    b"\xff\xd8\xffreplacement",
+                )
+                self.assertFalse(protected_path.exists())
+                with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                    second.resolve((protected,))
+                second.discard((replacement,))
+            finally:
+                second.close()
+
+    def test_media_handle_store_recovers_unprotected_incomplete_persistent_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            temp_ref = "media_interrupted_temp"
+            temp_path = directory / f".{temp_ref}.jpg.tmp"
+            temp_path.write_bytes(b"")
+            orphan_ref = "media_interrupted_final"
+            orphan_path = directory / f"{orphan_ref}.jpg"
+            orphan_path.write_bytes(b"")
+
+            store = PrivateWebMediaHandleStore(
+                directory=directory,
+                protected_refs=lambda: frozenset(),
+            )
+            try:
+                self.assertFalse(temp_path.exists())
+                self.assertFalse(orphan_path.exists())
+                self.assertEqual(store._sources, {})
+
+                ref = store.stage_media(
+                    "replacement.jpg",
+                    b"\xff\xd8\xffreplacement",
+                )
+                (source,) = store.resolve((ref,))
+                self.assertTrue(Path(source.path).exists())
+                self.assertFalse(
+                    any(
+                        entry.name.endswith(".tmp")
+                        for entry in directory.iterdir()
+                    )
+                )
+            finally:
+                store.close()
+
+    def test_media_handle_store_fails_closed_for_incomplete_protected_handle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            protected_ref = "media_protected_pending"
+            protected_path = directory / f"{protected_ref}.jpg"
+            protected_path.write_bytes(b"")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "persistent media handle is invalid",
+            ):
+                PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset({protected_ref}),
+                )
+
+            self.assertTrue(protected_path.exists())
+
+    def test_media_handle_store_rejects_ambiguous_temp_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            ambiguous = directory / ".media_bad!.jpg.tmp"
+            ambiguous.write_bytes(b"partial")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "persistent media handle directory is invalid",
+            ):
+                PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+
+            self.assertTrue(ambiguous.exists())
+
     def test_media_handle_store_enforces_total_byte_quota_before_writing(self) -> None:
         store = PrivateWebMediaHandleStore()
         try:

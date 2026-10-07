@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -73,6 +74,8 @@ from .write_api import (
     LoopbackWriteApiServer,
     WriteApiAccess,
     WriteCapability,
+    _WriteApiStoreLock,
+    acquire_write_api_store_lock,
     create_write_api_server,
 )
 
@@ -82,6 +85,33 @@ def _utc_now() -> datetime:
 
 
 _MEDIA_PERSISTENCE_VERIFY_TIMEOUT_SECONDS = 10.0
+
+
+def _pending_dashboard_media_refs(store: SnapshotStore) -> frozenset[str]:
+    refs: set[str] = set()
+    for record in store.dashboard_pending_writes():
+        if (
+            record.resource_key != "create"
+            or record.path != "/api/write/media/ads"
+        ):
+            continue
+        if record.payload_json is None:
+            raise RuntimeError("pending media recovery state is invalid")
+        try:
+            payload = json.loads(record.payload_json)
+        except json.JSONDecodeError:
+            raise RuntimeError("pending media recovery state is invalid") from None
+        raw_refs = payload.get("media_refs") if isinstance(payload, dict) else None
+        if (
+            not isinstance(raw_refs, list)
+            or not raw_refs
+            or len(raw_refs) > 32
+            or any(not isinstance(ref, str) for ref in raw_refs)
+            or len(set(raw_refs)) != len(raw_refs)
+        ):
+            raise RuntimeError("pending media recovery state is invalid")
+        refs.update(raw_refs)
+    return frozenset(refs)
 
 
 class PrivateWebRuntimeDependencyError(RuntimeError):
@@ -1186,6 +1216,13 @@ class PrivateWebWriteApiRuntime:
                         self._runtime_cleanup_failed = True
                         cleanup_failed = True
 
+            if not cleanup_failed:
+                try:
+                    self._server.release_retained_store_lock()
+                except Exception:
+                    self._runtime_cleanup_failed = True
+                    cleanup_failed = True
+
             if cleanup_failed:
                 raise PrivateWebRuntimeSetupError(
                     "private Web write API runtime cleanup failed"
@@ -1264,6 +1301,7 @@ def compose_private_web_write_api_runtime(
     media_writes_enabled: bool = False,
     port: int = 0,
     clock: Callable[[], datetime] | None = None,
+    _store_lock: _WriteApiStoreLock | None = None,
 ) -> PrivateWebWriteApiRuntime:
     """Compose already-built PrivateWeb runtimes behind one loopback Write API.
 
@@ -1364,7 +1402,12 @@ def compose_private_web_write_api_runtime(
         port=port,
         clock=runtime_clock,
         execution_lock=operation_lock,
+        _store_lock=_store_lock,
     )
+    # This composition owns state beyond the HTTP server. Keep the exclusive
+    # store lease across server_close() until owned runtimes are fully settled
+    # and cleaned up; SubmitUnknown reconciliation intentionally retains it.
+    server.retain_store_lock_until_explicit_release()
     # The generic Write API keeps daemon request threads for its standalone
     # use. This composition owns browser runtimes, so close must drain every
     # accepted handler before those runtimes can be released.
@@ -1386,6 +1429,11 @@ def compose_private_web_write_api_runtime(
             server.server_close()
         except Exception:
             pass
+        else:
+            try:
+                server.release_retained_store_lock()
+            except Exception:
+                pass
         raise
 
 
@@ -1477,11 +1525,16 @@ def build_private_web_write_api_runtime(
     content_runtime: PrivateWebContentRuntime | None = None
     media_runtime: PrivateWebMediaCreateRuntime | None = None
     media_handle_store: PrivateWebMediaHandleStore | None = None
+    store_lock: _WriteApiStoreLock | None = None
     if media_capability and media_persistence_verifier is None:
         media_persistence_verifier = (
             PrivateWebPublicMediaPersistenceVerifier()
         )
     try:
+        # Reserve the write runtime before constructing the persistent media
+        # handle store. A competing launcher must fail before it can rehydrate
+        # or clean files owned by the active runtime.
+        store_lock = acquire_write_api_store_lock(store)
         content_runtime = build_private_web_content_runtime(
             cdp_port=cdp_port,
             timeout_seconds=float(timeout_seconds),
@@ -1490,7 +1543,13 @@ def build_private_web_write_api_runtime(
         media_resolver = None
         if media_capability:
             if media_bindings is None:
-                media_handle_store = PrivateWebMediaHandleStore()
+                media_handle_store = PrivateWebMediaHandleStore(
+                    directory=store.path.with_name(
+                        store.path.name + ".media-handles"
+                    ),
+                    protected_refs=lambda: _pending_dashboard_media_refs(store),
+                    protected_refs_guard=store.dashboard_pending_write_guard,
+                )
                 media_resolver = media_handle_store
             else:
                 media_resolver = PrivateWebMediaRefResolver(media_bindings)
@@ -1498,7 +1557,7 @@ def build_private_web_write_api_runtime(
                 cdp_port=cdp_port,
                 timeout_seconds=float(timeout_seconds),
             )
-        return compose_private_web_write_api_runtime(
+        runtime = compose_private_web_write_api_runtime(
             content_runtime=content_runtime,
             confirmation_runtime=confirmation_runtime,
             media_runtime=media_runtime,
@@ -1510,7 +1569,10 @@ def build_private_web_write_api_runtime(
             media_writes_enabled=media_writes_enabled,
             port=port,
             clock=clock,
+            _store_lock=store_lock,
         )
+        store_lock = None
+        return runtime
     except Exception:
         if media_handle_store is not None:
             try:
@@ -1525,6 +1587,11 @@ def build_private_web_write_api_runtime(
         if content_runtime is not None:
             try:
                 content_runtime.close()
+            except Exception:
+                pass
+        if store_lock is not None:
+            try:
+                store_lock.close()
             except Exception:
                 pass
         raise

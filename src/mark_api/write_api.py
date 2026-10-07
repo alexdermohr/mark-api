@@ -103,6 +103,9 @@ class _MediaStager(Protocol):
     def stage_media(self, filename: str, data: bytes) -> str:
         ...
 
+    def discard(self, media_refs: tuple[str, ...]) -> None:
+        ...
+
 
 
 class _WriteService(Protocol):
@@ -394,6 +397,13 @@ class _WriteApiStoreLock:
         self._descriptor = None
 
 
+def acquire_write_api_store_lock(store: SnapshotStore) -> _WriteApiStoreLock:
+    """Acquire the exclusive runtime lease before touching shared write state."""
+    if not isinstance(store, SnapshotStore):
+        raise TypeError("store must be SnapshotStore")
+    return _WriteApiStoreLock.acquire(store.path)
+
+
 def _receipt_status(
     receipt: OperationReceipt | CreateOperationReceipt,
 ) -> int:
@@ -615,6 +625,15 @@ def _handler_factory(
                     )
                 return ("method_not_allowed", "POST", None)
 
+            if parts == ["api", "write", "media", "discard"]:
+                if method == "POST":
+                    return (
+                        "discard_media",
+                        None,
+                        WriteCapability.CREATE_MEDIA,
+                    )
+                return ("method_not_allowed", "POST", None)
+
             if parts == ["api", "write", "media", "ads"]:
                 if method == "POST":
                     return (
@@ -712,6 +731,45 @@ def _handler_factory(
                     self._error(500, "media_staging_error")
                     return
                 self._send_json(201, {"media_ref": media_ref})
+                return
+
+            if action == "discard_media":
+                # Discard is local-only cleanup for opaque handles returned by
+                # stage_media. It is idempotent and never authorizes or retries
+                # a platform write.
+                if media_stager is None:
+                    self._error(503, "media_staging_unavailable")
+                    return
+                try:
+                    payload = self._read_json_object()
+                    if set(payload) != {"media_refs"}:
+                        raise ValueError("invalid_media_refs")
+                    raw_media_refs = payload["media_refs"]
+                    if (
+                        not isinstance(raw_media_refs, list)
+                        or not raw_media_refs
+                        or len(raw_media_refs) > 32
+                        or any(
+                            not isinstance(ref, str)
+                            or _MEDIA_REF_RE.fullmatch(ref) is None
+                            for ref in raw_media_refs
+                        )
+                        or len(set(raw_media_refs)) != len(raw_media_refs)
+                    ):
+                        raise ValueError("invalid_media_refs")
+                    media_refs_to_discard = tuple(raw_media_refs)
+                    with media_staging_lock:
+                        media_stager.discard(media_refs_to_discard)
+                except ValueError as exc:
+                    self._error(400, str(exc))
+                    return
+                except Exception:
+                    self._error(500, "media_discard_error")
+                    return
+                self._send_json(
+                    200,
+                    {"discarded": len(media_refs_to_discard)},
+                )
                 return
 
             if not access.writes_enabled:
@@ -1069,6 +1127,7 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
         self._active_handler_count = 0
         self._serve_loop_active = False
         self._socket_close_succeeded = False
+        self._store_lock_release_deferred = False
         super().__init__(*args, **kwargs)
 
     def _release_store_lock_if_quiesced(self) -> None:
@@ -1078,12 +1137,22 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
                 self._socket_close_succeeded
                 and not self._serve_loop_active
                 and self._active_handler_count == 0
+                and not self._store_lock_release_deferred
                 and self._store_lock is not None
             ):
                 lock = self._store_lock
                 self._store_lock = None
         if lock is not None:
             lock.close()
+
+    def retain_store_lock_until_explicit_release(self) -> None:
+        with self._store_lock_guard:
+            self._store_lock_release_deferred = True
+
+    def release_retained_store_lock(self) -> None:
+        with self._store_lock_guard:
+            self._store_lock_release_deferred = False
+        self._release_store_lock_if_quiesced()
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
         with self._store_lock_guard:
@@ -1133,6 +1202,7 @@ def create_write_api_server(
     clock: Callable[[], datetime] = _utc_now,
     body_read_timeout_seconds: float = _BODY_READ_TIMEOUT_SECONDS,
     execution_lock: ContextManager[object] | None = None,
+    _store_lock: _WriteApiStoreLock | None = None,
 ) -> LoopbackWriteApiServer:
     if host != "127.0.0.1":
         raise ValueError("write API must bind to 127.0.0.1")
@@ -1158,8 +1228,15 @@ def create_write_api_server(
             "create_media capability requires media_service"
         )
 
+    if _store_lock is not None and not isinstance(_store_lock, _WriteApiStoreLock):
+        raise TypeError("_store_lock must be _WriteApiStoreLock or None")
+
     claim_owner = f"write-api-{secrets.token_hex(16)}"
-    store_lock = _WriteApiStoreLock.acquire(store.path)
+    store_lock = (
+        acquire_write_api_store_lock(store)
+        if _store_lock is None
+        else _store_lock
+    )
     try:
         server = LoopbackWriteApiServer(
             (host, port),

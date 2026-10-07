@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Iterable, Mapping
 
 from .domain import (
@@ -47,6 +49,18 @@ class WriteApiRequestClaim:
     record: WriteApiRequestRecord
 
 
+@dataclass(frozen=True, slots=True)
+class DashboardPendingWrite:
+    scope: str
+    resource_key: str
+    idempotency_key: str
+    method: str
+    path: str
+    payload_json: str | None
+    ad_id: str | None
+    acknowledged: bool
+
+
 def _validated_write_api_claim_owner(value: str) -> str:
     if (
         not isinstance(value, str)
@@ -64,12 +78,18 @@ class SnapshotStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._dashboard_pending_write_lock = RLock()
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def dashboard_pending_write_guard(self) -> AbstractContextManager[None]:
+        """Serialize pending-write protection changes with media pruning."""
+
+        return self._dashboard_pending_write_lock
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -221,9 +241,35 @@ class SnapshotStore:
                         )
                     )
                 );
+
+                CREATE TABLE IF NOT EXISTS dashboard_pending_writes (
+                    scope TEXT PRIMARY KEY,
+                    resource_key TEXT NOT NULL UNIQUE,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    method TEXT NOT NULL
+                        CHECK (method IN ('POST', 'PATCH', 'DELETE')),
+                    path TEXT NOT NULL,
+                    payload_json TEXT,
+                    ad_id TEXT,
+                    acknowledged INTEGER NOT NULL DEFAULT 0
+                        CHECK (acknowledged IN (0, 1))
+                );
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
+            dashboard_pending_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(dashboard_pending_writes)"
+                ).fetchall()
+            }
+            if "acknowledged" not in dashboard_pending_columns:
+                connection.execute(
+                    "ALTER TABLE dashboard_pending_writes "
+                    "ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (acknowledged IN (0, 1))"
+                )
+
             create_receipt_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -1118,6 +1164,198 @@ class SnapshotStore:
             ).fetchone()
             assert row is not None
             return self._write_api_request_record(row)
+
+    @staticmethod
+    def _dashboard_pending_write_record(
+        row: sqlite3.Row,
+    ) -> DashboardPendingWrite:
+        return DashboardPendingWrite(
+            scope=str(row["scope"]),
+            resource_key=str(row["resource_key"]),
+            idempotency_key=str(row["idempotency_key"]),
+            method=str(row["method"]),
+            path=str(row["path"]),
+            payload_json=(
+                str(row["payload_json"])
+                if row["payload_json"] is not None
+                else None
+            ),
+            ad_id=(
+                str(row["ad_id"])
+                if row["ad_id"] is not None
+                else None
+            ),
+            acknowledged=bool(row["acknowledged"]),
+        )
+
+    def dashboard_pending_writes(self) -> tuple[DashboardPendingWrite, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT scope, resource_key, idempotency_key, method, path,
+                       payload_json, ad_id, acknowledged
+                FROM dashboard_pending_writes
+                ORDER BY scope
+                """
+            ).fetchall()
+        return tuple(
+            self._dashboard_pending_write_record(row)
+            for row in rows
+        )
+
+    def claim_dashboard_pending_write(
+        self,
+        *,
+        scope: str,
+        resource_key: str,
+        idempotency_key: str,
+        method: str,
+        path: str,
+        payload_json: str | None,
+        ad_id: str | None,
+    ) -> bool:
+        for name, value, maximum in (
+            ("scope", scope, 128),
+            ("resource_key", resource_key, 128),
+            ("idempotency_key", idempotency_key, 128),
+            ("path", path, 512),
+        ):
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > maximum
+                or any(character.isspace() for character in value)
+            ):
+                raise ValueError(f"{name} is invalid")
+        if method not in {"POST", "PATCH", "DELETE"}:
+            raise ValueError("method is invalid")
+        if not path.startswith("/api/write/") or "?" in path or "#" in path:
+            raise ValueError("path is invalid")
+        if payload_json is not None:
+            if not isinstance(payload_json, str) or len(payload_json) > 64 * 1024:
+                raise ValueError("payload_json is invalid")
+            try:
+                payload = json.loads(payload_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError("payload_json is invalid") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("payload_json is invalid")
+        if ad_id is not None and (
+            not isinstance(ad_id, str)
+            or not ad_id
+            or len(ad_id) > 32
+            or not ad_id.isascii()
+            or not ad_id.isdigit()
+        ):
+            raise ValueError("ad_id is invalid")
+
+        expected = DashboardPendingWrite(
+            scope=scope,
+            resource_key=resource_key,
+            idempotency_key=idempotency_key,
+            method=method,
+            path=path,
+            payload_json=payload_json,
+            ad_id=ad_id,
+            acknowledged=False,
+        )
+        with self.dashboard_pending_write_guard(), self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT scope, resource_key, idempotency_key, method, path,
+                       payload_json, ad_id, acknowledged
+                FROM dashboard_pending_writes
+                WHERE scope = ?
+                   OR resource_key = ?
+                   OR idempotency_key = ?
+                """,
+                (scope, resource_key, idempotency_key),
+            ).fetchall()
+            if rows:
+                records = [
+                    self._dashboard_pending_write_record(row)
+                    for row in rows
+                ]
+                if len(records) == 1 and records[0] == expected:
+                    return False
+                raise ValueError("dashboard pending write conflicts with existing recovery state")
+
+            connection.execute(
+                """
+                INSERT INTO dashboard_pending_writes (
+                    scope, resource_key, idempotency_key, method, path,
+                    payload_json, ad_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope,
+                    resource_key,
+                    idempotency_key,
+                    method,
+                    path,
+                    payload_json,
+                    ad_id,
+                ),
+            )
+        return True
+
+    def acknowledge_dashboard_pending_write(
+        self,
+        *,
+        scope: str,
+        idempotency_key: str,
+    ) -> str:
+        if not isinstance(scope, str) or not scope:
+            raise ValueError("scope is invalid")
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValueError("idempotency_key is invalid")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT idempotency_key, acknowledged
+                FROM dashboard_pending_writes
+                WHERE scope = ?
+                """,
+                (scope,),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            if str(row["idempotency_key"]) != idempotency_key:
+                raise ValueError(
+                    "dashboard pending write conflicts with existing recovery state"
+                )
+            if not bool(row["acknowledged"]):
+                updated = connection.execute(
+                    """
+                    UPDATE dashboard_pending_writes
+                    SET acknowledged = 1
+                    WHERE scope = ?
+                      AND idempotency_key = ?
+                      AND acknowledged = 0
+                    """,
+                    (scope, idempotency_key),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        "dashboard pending write acknowledgement lost exact record"
+                    )
+                return "acknowledged"
+            deleted = connection.execute(
+                """
+                DELETE FROM dashboard_pending_writes
+                WHERE scope = ?
+                  AND idempotency_key = ?
+                  AND acknowledged = 1
+                """,
+                (scope, idempotency_key),
+            )
+            if deleted.rowcount != 1:
+                raise RuntimeError(
+                    "dashboard pending write finalization lost exact record"
+                )
+            return "finalized"
 
     def append_inventory_result(
         self,

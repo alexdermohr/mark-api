@@ -14,6 +14,7 @@ from unittest.mock import patch
 from urllib.request import ProxyHandler, build_opener
 
 from mark_api.analytics import AnalyticsContract
+from mark_api.dashboard import DashboardWriteProxy
 from mark_api.domain import AdSnapshot, LifecycleState
 from mark_api.email_import import EmailImportReport
 from mark_api.launcher import (
@@ -151,6 +152,7 @@ class WriteRuntime:
 
 class ProductLauncherTests(unittest.TestCase):
     TOKEN = "fake-launcher-test-token-0001"
+    DASHBOARD_TOKEN = "fake-dashboard-write-token-0001"
 
     def setUp(self) -> None:
         self.write_runtime = WriteRuntime()
@@ -168,6 +170,13 @@ class ProductLauncherTests(unittest.TestCase):
         token_patch.start()
         self.addCleanup(token_patch.stop)
 
+        dashboard_token_patch = patch(
+            "mark_api.launcher._default_dashboard_write_token",
+            return_value=self.DASHBOARD_TOKEN,
+        )
+        dashboard_token_patch.start()
+        self.addCleanup(dashboard_token_patch.stop)
+
     def make_db(self) -> tuple[tempfile.TemporaryDirectory, Path]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -179,6 +188,12 @@ class ProductLauncherTests(unittest.TestCase):
         server = DashboardServer()
         clock = lambda: NOW
 
+        dashboard_calls = []
+
+        def dashboard_factory(*args, **kwargs):
+            dashboard_calls.append((args, kwargs))
+            return server
+
         launcher = build_product_launcher(
             db_path=db,
             cdp_port=9222,
@@ -187,7 +202,7 @@ class ProductLauncherTests(unittest.TestCase):
             timeout_seconds=3.5,
             analytics_contract=AnalyticsContract(),
             runtime_factory=lambda **kwargs: inventory,
-            dashboard_factory=lambda *args, **kwargs: server,
+            dashboard_factory=dashboard_factory,
             clock=clock,
         )
         self.addCleanup(launcher.close)
@@ -213,6 +228,53 @@ class ProductLauncherTests(unittest.TestCase):
         self.assertEqual(access.bearer_token, self.TOKEN)
         self.assertEqual(access.capabilities, frozenset(WriteCapability))
         self.assertTrue(access.writes_enabled)
+
+        self.assertEqual(len(dashboard_calls), 1)
+        dashboard_kwargs = dashboard_calls[0][1]
+        proxy = dashboard_kwargs["write_proxy"]
+        self.assertIsInstance(proxy, DashboardWriteProxy)
+        self.assertEqual(proxy.host, "127.0.0.1")
+        self.assertEqual(proxy.port, 18766)
+        self.assertEqual(proxy.bearer_token, self.TOKEN)
+        self.assertEqual(proxy.ui_token, self.DASHBOARD_TOKEN)
+        self.assertEqual(proxy.timeout_seconds, 42.0)
+        self.assertEqual(
+            launcher.dashboard_url,
+            "http://127.0.0.1:18765/"
+            f"#write_token={self.DASHBOARD_TOKEN}",
+        )
+
+    def test_dashboard_url_percent_encodes_write_token_fragment(self) -> None:
+        _tmp, db = self.make_db()
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        server = DashboardServer()
+        dashboard_token = "abcdefghijklmnop&x=y#z"
+        captured = {}
+
+        def dashboard_factory(*args, **kwargs):
+            captured["write_proxy"] = kwargs["write_proxy"]
+            return server
+
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            dashboard_port=0,
+            write_port=0,
+            timeout_seconds=3.5,
+            analytics_contract=AnalyticsContract(),
+            runtime_factory=lambda **kwargs: inventory,
+            dashboard_factory=dashboard_factory,
+            dashboard_token_factory=lambda: dashboard_token,
+            clock=lambda: NOW,
+        )
+        self.addCleanup(launcher.close)
+
+        self.assertEqual(captured["write_proxy"].ui_token, dashboard_token)
+        self.assertEqual(
+            launcher.dashboard_url,
+            "http://127.0.0.1:18765/"
+            "#write_token=abcdefghijklmnop%26x%3Dy%23z",
+        )
 
     def test_build_syncs_inventory_marks_missing_tracked_ads_absent(self) -> None:
         _tmp, db = self.make_db()
@@ -590,13 +652,20 @@ class ProductLauncherTests(unittest.TestCase):
             )
 
         self.assertTrue(inventory.closed)
-        self.write_factory.assert_not_called()
+        self.assertEqual(self.write_runtime.start_calls, 1)
+        self.assertEqual(self.write_runtime.close_calls, 1)
+        self.assertTrue(self.write_runtime.closed)
 
-    def test_write_runtime_start_failure_closes_dashboard_and_inventory(self) -> None:
+    def test_write_runtime_start_failure_skips_dashboard_and_closes_inventory(self) -> None:
         _tmp, db = self.make_db()
         inventory = InventoryRuntime(ReadResult.success_empty(()))
-        server = DashboardServer()
         self.write_runtime.start_error = OSError("write server failed")
+        dashboard_calls = 0
+
+        def dashboard_factory(*args, **kwargs):
+            nonlocal dashboard_calls
+            dashboard_calls += 1
+            return DashboardServer()
 
         with self.assertRaisesRegex(
             ProductLauncherError,
@@ -606,13 +675,13 @@ class ProductLauncherTests(unittest.TestCase):
                 db_path=db,
                 cdp_port=9222,
                 runtime_factory=lambda **kwargs: inventory,
-                dashboard_factory=lambda *args, **kwargs: server,
+                dashboard_factory=dashboard_factory,
                 clock=lambda: NOW,
             )
 
         self.assertEqual(self.write_runtime.start_calls, 1)
         self.assertEqual(self.write_runtime.close_calls, 1)
-        self.assertTrue(server.closed)
+        self.assertEqual(dashboard_calls, 0)
         self.assertTrue(inventory.closed)
 
     def test_close_shuts_down_active_serving_loop_before_cleanup(self) -> None:
@@ -828,6 +897,10 @@ class ProductLauncherTests(unittest.TestCase):
     def test_main_reports_dashboard_and_closes_on_keyboard_interrupt(self) -> None:
         class Launcher:
             server_address = ("127.0.0.1", 18765)
+            dashboard_url = (
+                "http://127.0.0.1:18765/"
+                "#write_token=fake-dashboard-write-token-0001"
+            )
             write_server_address = ("127.0.0.1", 18766)
             write_bearer_token = self.TOKEN
             startup_inventory_count = 2
@@ -882,7 +955,8 @@ class ProductLauncherTests(unittest.TestCase):
         self.assertTrue(launcher.closed)
         self.assertEqual(stderr.getvalue(), "")
         self.assertIn(
-            "Mark dashboard: http://127.0.0.1:18765/",
+            "Mark dashboard: http://127.0.0.1:18765/"
+            "#write_token=fake-dashboard-write-token-0001",
             stdout.getvalue(),
         )
         self.assertIn(
@@ -914,6 +988,10 @@ class ProductLauncherTests(unittest.TestCase):
     def test_main_reconciles_unknown_media_before_clean_exit(self) -> None:
         class Launcher:
             server_address = ("127.0.0.1", 18765)
+            dashboard_url = (
+                "http://127.0.0.1:18765/"
+                "#write_token=runtime-dashboard-token-0001"
+            )
             write_server_address = ("127.0.0.1", 18766)
             write_bearer_token = "runtime-token-0000001"
             startup_inventory_count = 0
