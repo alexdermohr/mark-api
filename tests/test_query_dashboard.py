@@ -226,6 +226,29 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
         )
         self.assertEqual(proxy.ui_token, "abcdefghijklmnop&x=y#z")
 
+    def test_proxy_rejects_bearer_tokens_that_are_not_header_safe_ascii(self) -> None:
+        for token in (
+            "abcdefghijklmnop😀",
+            "abcdefghijklmnop\u0001",
+            "abcdefghijklmnop\u007f",
+        ):
+            with self.subTest(token=repr(token)):
+                with self.assertRaisesRegex(ValueError, "bearer_token is invalid"):
+                    DashboardWriteProxy(
+                        host="127.0.0.1",
+                        port=1,
+                        bearer_token=token,
+                        ui_token=self.UI_TOKEN,
+                    )
+
+        proxy = DashboardWriteProxy(
+            host="127.0.0.1",
+            port=1,
+            bearer_token="abcdefghijklmnop&x=y#z",
+            ui_token=self.UI_TOKEN,
+        )
+        self.assertEqual(proxy.bearer_token, "abcdefghijklmnop&x=y#z")
+
     def test_dashboard_origin_omits_default_http_port(self) -> None:
         self.assertEqual(
             _dashboard_http_origin("127.0.0.1", 80),

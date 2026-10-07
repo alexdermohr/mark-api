@@ -76,13 +76,12 @@ class DashboardWriteProxy:
                 or len(value) < 16
                 or len(value) > 512
                 or any(character.isspace() for character in value)
+                or any(
+                    not 0x21 <= ord(character) <= 0x7E
+                    for character in value
+                )
             ):
                 raise ValueError(f"{name} is invalid")
-        if any(
-            not 0x21 <= ord(character) <= 0x7E
-            for character in self.ui_token
-        ):
-            raise ValueError("ui_token is invalid")
         if (
             isinstance(self.timeout_seconds, bool)
             or not isinstance(self.timeout_seconds, (int, float))
