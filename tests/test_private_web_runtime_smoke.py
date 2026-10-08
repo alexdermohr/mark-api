@@ -108,6 +108,28 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
         self.assertTrue(report.write_route_absent)
         self.assertFalse(report.platform_writes_enabled)
 
+    def test_smoke_uses_authoritative_metric_source_for_enriched_inventory(self) -> None:
+        for source, metric_source in (
+            ("management+mobile", "management"),
+            ("legacy+opaque", None),
+        ):
+            with self.subTest(source=source):
+                runtime = FakeInventoryRuntime(ReadResult.success_nonempty((
+                    AdSnapshot(
+                        ad_id="1234567890", observed_at=NOW,
+                        source=source, metric_source=metric_source,
+                        lifecycle_state=LifecycleState.ACTIVE,
+                        title="Owned", views=0, watch_count=2, reply_count=1,
+                    ),
+                )))
+                report = run_private_web_runtime_smoke(
+                    19610, runtime_factory=lambda **_kwargs: runtime,
+                )
+                self.assertEqual(report.inventory_count, 1)
+                self.assertEqual(report.analytics_ranked_ads, 1)
+                self.assertFalse(report.platform_writes_enabled)
+                self.assertEqual(runtime.close_calls, 1)
+
     def test_smoke_rejects_corrupted_dashboard_summary(self) -> None:
         original_json_get = runtime_smoke._json_get
 

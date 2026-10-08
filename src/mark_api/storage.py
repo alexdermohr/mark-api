@@ -44,6 +44,7 @@ _REQUIRED_STORE_COLUMNS: dict[str, tuple[str, ...]] = {
         "views",
         "watch_count",
         "reply_count",
+        "metric_source",
     ),
     "reaction_snapshots": (
         "id",
@@ -156,6 +157,7 @@ _REQUIRED_STORE_COLUMNS: dict[str, tuple[str, ...]] = {
 
 # Only these missing historical columns may be added to an otherwise complete store.
 _LEGACY_ADDABLE_COLUMNS: dict[str, frozenset[str]] = {
+    "ad_snapshots": frozenset(("metric_source",)),
     "create_operation_receipts": frozenset((
         "authorization_by", "authorization_reference",
         "media_post_read_status", "media_persistence_confirmed",
@@ -211,55 +213,6 @@ def _validated_write_api_claim_owner(value: str) -> str:
     ):
         raise ValueError("claim_owner must contain 1..128 safe characters")
     return value
-
-
-_AD_SOURCE_META_PREFIX = "mark:source-v1:"
-
-
-def _encode_ad_source(snapshot: AdSnapshot) -> str:
-    """Persist optional metric provenance without migrating legacy SQLite tables.
-
-    Original snapshot.source remains losslessly readable through ad_history;
-    only the non-legacy extra metric_source is wrapped in a tagged JSON value.
-    Literal sources with the same reserved prefix are escaped as well.
-    """
-    if (
-        snapshot.metric_source is None
-        and not snapshot.source.startswith(_AD_SOURCE_META_PREFIX)
-    ):
-        return snapshot.source
-    return _AD_SOURCE_META_PREFIX + json.dumps(
-        {"source": snapshot.source, "metric_source": snapshot.metric_source},
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def _decode_ad_source(value: str) -> tuple[str, str | None]:
-    if not isinstance(value, str) or not value:
-        raise sqlite3.DatabaseError("invalid stored snapshot source")
-    if not value.startswith(_AD_SOURCE_META_PREFIX):
-        return value, None
-    try:
-        decoded = json.loads(value[len(_AD_SOURCE_META_PREFIX):])
-    except (json.JSONDecodeError, ValueError):
-        raise sqlite3.DatabaseError("invalid stored snapshot source metadata") from None
-    if (
-        not isinstance(decoded, dict)
-        or set(decoded) != {"source", "metric_source"}
-        or not isinstance(decoded["source"], str)
-        or not decoded["source"].strip()
-        or (
-            decoded["metric_source"] is not None
-            and (
-                not isinstance(decoded["metric_source"], str)
-                or not decoded["metric_source"].strip()
-            )
-        )
-    ):
-        raise sqlite3.DatabaseError("invalid stored snapshot source metadata")
-    return decoded["source"], decoded["metric_source"]
 
 
 class SnapshotStore:
@@ -380,7 +333,11 @@ class SnapshotStore:
                     description TEXT,
                     views INTEGER,
                     watch_count INTEGER,
-                    reply_count INTEGER
+                    reply_count INTEGER,
+                    metric_source TEXT CHECK (
+                        metric_source IS NULL OR
+                        (typeof(metric_source) = 'text' AND length(trim(metric_source)) > 0)
+                    )
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_ad_snapshots_ad_id_observed
@@ -532,6 +489,21 @@ class SnapshotStore:
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
+            # Existing stores are pre-validated, including write-recovery fences,
+            # before this strictly additive data-only column upgrade.
+            metric_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(ad_snapshots)"
+                ).fetchall()
+            }
+            if "metric_source" not in metric_columns:
+                connection.execute(
+                    "ALTER TABLE ad_snapshots ADD COLUMN metric_source TEXT "
+                    "CHECK (metric_source IS NULL OR "
+                    "(typeof(metric_source) = 'text' "
+                    "AND length(trim(metric_source)) > 0))"
+                )
             dashboard_pending_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -601,19 +573,20 @@ class SnapshotStore:
             """
             INSERT INTO ad_snapshots (
                 ad_id, observed_at, source, lifecycle_state, title, description,
-                views, watch_count, reply_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                views, watch_count, reply_count, metric_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.ad_id,
                 snapshot.observed_at.isoformat(),
-                _encode_ad_source(snapshot),
+                snapshot.source,
                 snapshot.lifecycle_state.value,
                 snapshot.title,
                 snapshot.description,
                 snapshot.views,
                 snapshot.watch_count,
                 snapshot.reply_count,
+                snapshot.metric_source,
             ),
         )
 
@@ -1681,7 +1654,7 @@ class SnapshotStore:
             rows = connection.execute(
                 """
                 SELECT id, ad_id, observed_at, source, lifecycle_state, title,
-                       description, views, watch_count, reply_count
+                       description, views, watch_count, reply_count, metric_source
                 FROM ad_snapshots
                 WHERE ad_id = ?
                 """,
@@ -1698,8 +1671,8 @@ class SnapshotStore:
             AdSnapshot(
                 ad_id=row["ad_id"],
                 observed_at=datetime.fromisoformat(row["observed_at"]),
-                source=_decode_ad_source(row["source"])[0],
-                metric_source=_decode_ad_source(row["source"])[1],
+                source=row["source"],
+                metric_source=row["metric_source"],
                 lifecycle_state=LifecycleState(row["lifecycle_state"]),
                 title=row["title"],
                 description=row["description"],

@@ -104,7 +104,14 @@ def _expected_inventory_metric_evidence(
         return None
     return {
         "observed_at": snapshot.observed_at.isoformat(),
-        "source": snapshot.source,
+        "source": (
+            snapshot.metric_source
+            if snapshot.metric_source is not None
+            else (
+                "unattributed_legacy_composite"
+                if "+" in snapshot.source else snapshot.source
+            )
+        ),
         "last_known": False,
     }
 
