@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import errno
 import gc
+import io
 import stat
 import subprocess
 import tempfile
 import unittest
 from dataclasses import fields
 from pathlib import Path
+from unittest.mock import Mock, patch
+
+import mark_api.private_web_media as private_web_media
 
 from mark_api.domain import AdCreateRequest
 from mark_api.private_web import (
@@ -114,6 +119,14 @@ class FakeClient:
 
     def close(self) -> None:
         self.closed = True
+
+
+def persistent_media_files(directory: Path) -> list[Path]:
+    return [
+        path
+        for path in directory.iterdir()
+        if path.name != PrivateWebMediaHandleStore._DURABLE_DIRECTORY_MARKER
+    ]
 
 
 class PrivateWebMediaContractTests(unittest.TestCase):
@@ -273,6 +286,513 @@ class PrivateWebMediaContractTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_persistent_media_handle_store_fsyncs_directory_creation_and_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                wraps=private_web_media._fsync_directory,
+            ) as fsync_directory:
+                store = PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+                try:
+                    ref = store.stage_media(
+                        "photo.jpg",
+                        b"\xff\xd8\xffdurable",
+                    )
+                    self.assertEqual(
+                        Path(store.resolve((ref,))[0].path).parent,
+                        directory,
+                    )
+                finally:
+                    store.close()
+
+            synced_paths = [Path(call.args[0]) for call in fsync_directory.call_args_list]
+            self.assertEqual(
+                synced_paths,
+                [directory, directory.parent, directory, directory, directory],
+            )
+
+    def test_persistent_media_handle_store_removes_published_file_when_directory_fsync_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            real_fsync_directory = private_web_media._fsync_directory
+            calls: list[Path] = []
+
+            def fsync_directory(path: str) -> None:
+                calls.append(Path(path))
+                if len(calls) == 4:
+                    raise OSError("directory fsync failed")
+                real_fsync_directory(path)
+
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                side_effect=fsync_directory,
+            ):
+                store = PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+                try:
+                    with self.assertRaisesRegex(OSError, "directory fsync failed"):
+                        store.stage_media(
+                            "photo.jpg",
+                            b"\xff\xd8\xffdurable",
+                        )
+                    self.assertEqual(store._sources, {})
+                    self.assertEqual(store._staged_bytes, 0)
+                    self.assertEqual(persistent_media_files(directory), [])
+                finally:
+                    store.close()
+
+            self.assertEqual(
+                calls,
+                [directory, directory.parent, directory, directory, directory],
+            )
+
+    def test_persistent_media_handle_store_tracks_failed_cleanup_and_blocks_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            real_fsync_directory = private_web_media._fsync_directory
+            real_unlink = private_web_media.os.unlink
+            fsync_calls: list[Path] = []
+
+            def fsync_directory(path: str) -> None:
+                fsync_calls.append(Path(path))
+                if len(fsync_calls) == 4:
+                    raise OSError("directory fsync failed")
+                real_fsync_directory(path)
+
+            def unlink(path: str) -> None:
+                if Path(path).parent == directory and not Path(path).name.startswith("."):
+                    raise OSError("cleanup unlink failed")
+                real_unlink(path)
+
+            store = None
+            with (
+                patch.object(
+                    private_web_media,
+                    "_fsync_directory",
+                    side_effect=fsync_directory,
+                ),
+                patch.object(private_web_media.os, "unlink", side_effect=unlink),
+            ):
+                store = PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+                with self.assertRaisesRegex(OSError, "directory fsync failed"):
+                    store.stage_media(
+                        "photo.jpg",
+                        b"\xff\xd8\xffdurable",
+                    )
+                self.assertTrue(store._cleanup_required)
+                self.assertEqual(len(store._sources), 1)
+                self.assertEqual(store._staged_bytes, len(b"\xff\xd8\xffdurable"))
+                self.assertEqual(len(persistent_media_files(directory)), 1)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "media handle store cleanup required",
+                ):
+                    store.stage_media(
+                        "second.jpg",
+                        b"\xff\xd8\xffsecond",
+                    )
+
+            assert store is not None
+            store.close()
+            self.assertEqual(persistent_media_files(directory), [])
+
+    def test_persistent_media_handle_store_init_fsync_failure_retries_parent_sync(self) -> None:
+        real_fsync_directory = private_web_media._fsync_directory
+        for failing_level in ("handle", "parent"):
+            with self.subTest(failing_level=failing_level):
+                with tempfile.TemporaryDirectory() as tmp:
+                    directory = Path(tmp) / "handles"
+                    failing_path = directory if failing_level == "handle" else directory.parent
+                    failed = False
+
+                    def fsync_directory(path: str) -> None:
+                        nonlocal failed
+                        if Path(path) == failing_path and not failed:
+                            failed = True
+                            raise OSError("initial directory fsync failed")
+                        real_fsync_directory(path)
+
+                    with patch.object(
+                        private_web_media,
+                        "_fsync_directory",
+                        side_effect=fsync_directory,
+                    ):
+                        with self.assertRaisesRegex(
+                            OSError, "initial directory fsync failed"
+                        ):
+                            PrivateWebMediaHandleStore(
+                                directory=directory,
+                                protected_refs=lambda: frozenset(),
+                            )
+                    self.assertTrue(failed)
+                    self.assertFalse(directory.exists())
+
+                    with patch.object(
+                        private_web_media,
+                        "_fsync_directory",
+                        wraps=real_fsync_directory,
+                    ) as synced:
+                        store = PrivateWebMediaHandleStore(
+                            directory=directory,
+                            protected_refs=lambda: frozenset(),
+                        )
+                        try:
+                            ref = store.stage_media(
+                                "photo.jpg", b"\xff\xd8\xffdurable"
+                            )
+                            self.assertTrue(Path(store.resolve((ref,))[0].path).exists())
+                        finally:
+                            store.close()
+                    self.assertIn(
+                        directory.parent,
+                        [Path(call.args[0]) for call in synced.call_args_list],
+                    )
+
+    def test_persistent_media_handle_store_retries_failed_temp_cleanup_on_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            store = PrivateWebMediaHandleStore(
+                directory=directory,
+                protected_refs=lambda: frozenset(),
+            )
+            real_unlink = private_web_media.os.unlink
+
+            def unlink(path: str, *args: object, **kwargs: object) -> None:
+                if Path(path).parent == directory and Path(path).name.endswith(".tmp"):
+                    raise OSError("temporary cleanup denied")
+                real_unlink(path, *args, **kwargs)
+
+            with (
+                patch.object(
+                    private_web_media.os, "utime",
+                    side_effect=OSError("pre-publication failure"),
+                ),
+                patch.object(private_web_media.os, "unlink", side_effect=unlink),
+            ):
+                with self.assertRaisesRegex(OSError, "pre-publication failure"):
+                    store.stage_media("photo.jpg", b"\xff\xd8\xffdurable")
+                self.assertTrue(store._cleanup_required)
+                self.assertEqual(store._sources, {})
+                self.assertEqual(store._staged_bytes, 0)
+                self.assertEqual(len(persistent_media_files(directory)), 1)
+                with self.assertRaisesRegex(
+                    RuntimeError, "media handle store cleanup required"
+                ):
+                    store.stage_media("second.jpg", b"\xff\xd8\xffsecond")
+                with self.assertRaisesRegex(OSError, "temporary cleanup denied"):
+                    store.close()
+                self.assertFalse(store._closed)
+
+            store.close()
+            self.assertEqual(persistent_media_files(directory), [])
+
+    def test_unmarked_legacy_directory_with_execute_only_parent_uses_checked_syncfs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            marker = directory / PrivateWebMediaHandleStore._DURABLE_DIRECTORY_MARKER
+            real_sync = private_web_media._fsync_directory
+            syncfs_paths: list[Path] = []
+
+            def fsync_directory(path: str) -> None:
+                if Path(path) == directory.parent:
+                    raise PermissionError(13, "parent is execute-only")
+                real_sync(path)
+
+            def syncfs_directory(path: str, parent_device: int) -> None:
+                self.assertEqual(Path(path), directory)
+                self.assertEqual(parent_device, directory.parent.stat().st_dev)
+                self.assertFalse(marker.exists())
+                syncfs_paths.append(Path(path))
+
+            with (
+                patch.object(
+                    private_web_media,
+                    "_fsync_directory",
+                    side_effect=fsync_directory,
+                ),
+                patch.object(
+                    private_web_media,
+                    "_sync_filesystem_directory",
+                    side_effect=syncfs_directory,
+                    create=True,
+                ),
+            ):
+                store = PrivateWebMediaHandleStore(
+                    directory=directory, protected_refs=lambda: frozenset()
+                )
+                try:
+                    ref = store.stage_media("photo.jpg", b"\xff\xd8\xffdurable")
+                    self.assertTrue(Path(store.resolve((ref,))[0].path).exists())
+                finally:
+                    store.close()
+            self.assertEqual(syncfs_paths, [directory])
+            self.assertTrue(marker.is_file())
+
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                side_effect=fsync_directory,
+            ):
+                reopened = PrivateWebMediaHandleStore(
+                    directory=directory, protected_refs=lambda: frozenset()
+                )
+                reopened.close()
+
+    def test_readiness_marker_fifo_is_rejected_without_blocking_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            marker = directory / PrivateWebMediaHandleStore._DURABLE_DIRECTORY_MARKER
+            private_web_media.os.mkfifo(marker)
+            real_open = private_web_media.os.open
+
+            def open_nonblocking(path: str, flags: int, *args: object) -> int:
+                if str(path) == str(marker):
+                    self.assertTrue(
+                        flags & private_web_media.os.O_NONBLOCK,
+                        "readiness marker open could block on FIFO",
+                    )
+                return real_open(path, flags, *args)
+
+            with patch.object(
+                private_web_media.os, "open", side_effect=open_nonblocking
+            ):
+                with self.assertRaisesRegex(ValueError, "readiness marker is invalid"):
+                    PrivateWebMediaHandleStore(
+                        directory=directory, protected_refs=lambda: frozenset()
+                    )
+
+    @unittest.skipUnless(private_web_media.sys.platform.startswith("linux"), "Linux only")
+    def test_linux_syncfs_rejects_unsupported_filesystems_and_old_kernels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            device = directory.stat().st_dev
+            major = private_web_media.os.major(device)
+            minor = private_web_media.os.minor(device)
+            for filesystem, release in (("fuse.sshfs", "6.10.0"), ("ext4", "4.18.0")):
+                with self.subTest(filesystem=filesystem, release=release):
+                    mountinfo = f"1 0 {major}:{minor} / / rw - {filesystem} dev rw\n"
+                    fake_libc = type("Libc", (), {"syncfs": Mock(return_value=0)})()
+                    with (
+                        patch("builtins.open", return_value=io.StringIO(mountinfo)),
+                        patch.object(
+                            private_web_media.os,
+                            "uname",
+                            return_value=type("Uname", (), {"release": release})(),
+                        ),
+                        patch.object(private_web_media.ctypes, "CDLL", return_value=fake_libc),
+                    ):
+                        with self.assertRaises(OSError) as raised:
+                            private_web_media._sync_filesystem_directory(str(directory), device)
+                        self.assertIn(
+                            raised.exception.errno, (errno.ENOTSUP, errno.EOPNOTSUPP)
+                        )
+                        fake_libc.syncfs.assert_not_called()
+
+    @unittest.skipUnless(private_web_media.sys.platform.startswith("linux"), "Linux only")
+    def test_linux_syncfs_propagates_writeback_errors_and_mount_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            device = directory.stat().st_dev
+            major = private_web_media.os.major(device)
+            minor = private_web_media.os.minor(device)
+            with self.assertRaises(OSError) as mismatch:
+                private_web_media._sync_filesystem_directory(str(directory), device + 1)
+            self.assertEqual(mismatch.exception.errno, errno.EXDEV)
+
+            mountinfo = f"1 0 {major}:{minor} / / rw - ext4 dev rw\n"
+            fake_libc = type("Libc", (), {"syncfs": Mock(return_value=-1)})()
+            with (
+                patch("builtins.open", return_value=io.StringIO(mountinfo)),
+                patch.object(private_web_media.ctypes, "CDLL", return_value=fake_libc),
+                patch.object(private_web_media.ctypes, "get_errno", return_value=errno.EIO),
+            ):
+                with self.assertRaises(OSError) as error:
+                    private_web_media._sync_filesystem_directory(str(directory), device)
+                self.assertEqual(error.exception.errno, errno.EIO)
+                fake_libc.syncfs.assert_called_once()
+
+    def test_unmarked_legacy_directory_syncfs_error_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            real_sync = private_web_media._fsync_directory
+
+            def fsync_directory(path: str) -> None:
+                if Path(path) == directory.parent:
+                    raise PermissionError(13, "parent is execute-only")
+                real_sync(path)
+
+            with (
+                patch.object(
+                    private_web_media,
+                    "_fsync_directory",
+                    side_effect=fsync_directory,
+                ),
+                patch.object(
+                    private_web_media,
+                    "_sync_filesystem_directory",
+                    side_effect=OSError("filesystem sync failed"),
+                    create=True,
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "filesystem sync failed"):
+                    PrivateWebMediaHandleStore(
+                        directory=directory, protected_refs=lambda: frozenset()
+                    )
+            self.assertFalse(
+                (directory / PrivateWebMediaHandleStore._DURABLE_DIRECTORY_MARKER).exists()
+            )
+
+    def test_existing_unmarked_directory_requires_parent_sync_after_interrupted_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()  # Simulates a crash before parent fsync.
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                wraps=private_web_media._fsync_directory,
+            ) as synced:
+                store = PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+                try:
+                    ref = store.stage_media("photo.jpg", b"\xff\xd8\xffdurable")
+                    self.assertTrue(Path(store.resolve((ref,))[0].path).exists())
+                finally:
+                    store.close()
+            self.assertIn(
+                directory.parent,
+                [Path(call.args[0]) for call in synced.call_args_list],
+            )
+
+    def test_failed_first_parent_sync_and_failed_rmdir_do_not_bypass_retry_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            real_fsync = private_web_media._fsync_directory
+            failed = False
+
+            def sync(path: str) -> None:
+                nonlocal failed
+                if Path(path) == directory.parent and not failed:
+                    failed = True
+                    raise OSError("parent durability unavailable")
+                real_fsync(path)
+
+            with (
+                patch.object(private_web_media, "_fsync_directory", side_effect=sync),
+                patch.object(private_web_media.os, "rmdir", side_effect=OSError("rmdir failed")),
+            ):
+                with self.assertRaisesRegex(OSError, "parent durability unavailable"):
+                    PrivateWebMediaHandleStore(
+                        directory=directory, protected_refs=lambda: frozenset()
+                    )
+            self.assertTrue(failed)
+            self.assertTrue(directory.exists())
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                wraps=real_fsync,
+            ) as synced:
+                store = PrivateWebMediaHandleStore(
+                    directory=directory, protected_refs=lambda: frozenset()
+                )
+                try:
+                    store.stage_media("photo.jpg", b"\xff\xd8\xffdurable")
+                finally:
+                    store.close()
+            self.assertIn(
+                directory.parent,
+                [Path(call.args[0]) for call in synced.call_args_list],
+            )
+
+    def test_failed_partial_close_rejects_resolve_until_cleanup_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            store = PrivateWebMediaHandleStore(
+                directory=directory, protected_refs=lambda: frozenset()
+            )
+            first = store.stage_media("first.jpg", b"\xff\xd8\xfffirst")
+            second = store.stage_media("second.jpg", b"\xff\xd8\xffsecond")
+            second_path = Path(store.resolve((second,))[0].path)
+            first_path = Path(store.resolve((first,))[0].path)
+            real_unlink = private_web_media.os.unlink
+
+            def unlink(path: str, *args: object, **kwargs: object) -> None:
+                if str(path) == str(second_path):
+                    raise OSError("later cleanup failed")
+                real_unlink(path, *args, **kwargs)
+
+            with patch.object(private_web_media.os, "unlink", side_effect=unlink):
+                with self.assertRaisesRegex(OSError, "later cleanup failed"):
+                    store.close()
+                self.assertFalse(first_path.exists())
+                self.assertTrue(second_path.exists())
+                self.assertTrue(store._cleanup_required)
+                with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                    store.resolve((first,))
+                with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                    store.resolve((second,))
+            store.close()
+            self.assertFalse(first_path.exists())
+            self.assertFalse(second_path.exists())
+
+    def test_persistent_media_handle_store_reopen_does_not_require_parent_fsync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            initial_store = PrivateWebMediaHandleStore(
+                directory=directory, protected_refs=lambda: frozenset()
+            )
+            initial_store.close()
+            real_fsync_directory = private_web_media._fsync_directory
+
+            def fsync_directory(path: str) -> None:
+                if Path(path) == directory.parent:
+                    raise AssertionError("reopen must not fsync parent")
+                real_fsync_directory(path)
+
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                side_effect=fsync_directory,
+            ) as fsync_directory_mock:
+                store = PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+                store.close()
+
+            self.assertEqual(
+                [Path(call.args[0]) for call in fsync_directory_mock.call_args_list],
+                [directory],
+            )
+
+    def test_persistent_media_handle_store_requires_preexisting_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "missing-parent" / "handles"
+            with self.assertRaisesRegex(
+                ValueError,
+                "media handle parent directory is invalid",
+            ):
+                PrivateWebMediaHandleStore(
+                    directory=directory,
+                    protected_refs=lambda: frozenset(),
+                )
+            self.assertFalse(directory.exists())
+
     def test_media_handle_store_rehydrates_only_protected_expired_refs(self) -> None:
         monotonic_now = [100.0]
         wall_now = [1_000.0]
@@ -400,6 +920,127 @@ class PrivateWebMediaContractTests(unittest.TestCase):
                 )
 
             self.assertTrue(ambiguous.exists())
+
+    def test_discard_after_failed_partial_close_keeps_cleanup_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            store = PrivateWebMediaHandleStore(
+                directory=directory, protected_refs=lambda: frozenset()
+            )
+            first = store.stage_media("first.jpg", b"\xff\xd8\xfffirst")
+            second = store.stage_media("second.jpg", b"\xff\xd8\xffsecond")
+            first_path = Path(store.resolve((first,))[0].path)
+            second_path = Path(store.resolve((second,))[0].path)
+            remaining_bytes = store._staged_bytes
+            real_unlink = private_web_media.os.unlink
+            attempts = [0]
+
+            def fail_second(target: str, *args: object, **kwargs: object) -> None:
+                if str(target) == str(second_path):
+                    attempts[0] += 1
+                    raise OSError("cleanup still failing")
+                real_unlink(target, *args, **kwargs)
+
+            with patch.object(private_web_media.os, "unlink", side_effect=fail_second):
+                with self.assertRaisesRegex(OSError, "cleanup still failing"):
+                    store.close()
+                self.assertFalse(first_path.exists())
+                self.assertTrue(second_path.exists())
+                with self.assertRaisesRegex(OSError, "cleanup still failing"):
+                    store.discard((second,))
+                self.assertGreaterEqual(attempts[0], 2)
+                self.assertTrue(store._cleanup_required)
+                self.assertIn(second, store._sources)
+                self.assertEqual(store._staged_bytes, remaining_bytes)
+                with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                    store.resolve((second,))
+
+            store.close()
+            self.assertFalse(second_path.exists())
+            self.assertEqual(persistent_media_files(directory), [])
+
+    def test_persistent_discard_unlink_failure_preserves_quota_and_close_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            store = PrivateWebMediaHandleStore(
+                directory=directory, protected_refs=lambda: frozenset()
+            )
+            store._MAX_STAGED_HANDLES = 1
+            data = b"\xff\xd8\xffkept"
+            ref = store.stage_media("first.jpg", data)
+            path = Path(store.resolve((ref,))[0].path)
+            real_unlink = private_web_media.os.unlink
+
+            def fail_unlink(target: str, *args: object, **kwargs: object) -> None:
+                if str(target) == str(path):
+                    raise OSError("discard unlink failed")
+                real_unlink(target, *args, **kwargs)
+
+            with patch.object(private_web_media.os, "unlink", side_effect=fail_unlink):
+                with self.assertRaisesRegex(OSError, "discard unlink failed"):
+                    store.discard((ref,))
+                self.assertTrue(path.exists())
+                self.assertEqual(store._staged_bytes, len(data))
+                self.assertIn(ref, store._sources)
+                self.assertTrue(store._cleanup_required)
+                with self.assertRaisesRegex(RuntimeError, "cleanup required"):
+                    store.stage_media("second.jpg", b"\xff\xd8\xffnew")
+                with self.assertRaises(PrivateWebWriteNotAttemptedError):
+                    store.resolve((ref,))
+            store.close()
+            self.assertFalse(path.exists())
+
+    def test_persistent_prune_unlink_failure_cannot_lose_handle_accounting(self) -> None:
+        now = [0.0]
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            store = PrivateWebMediaHandleStore(
+                clock=lambda: now[0],
+                directory=directory,
+                protected_refs=lambda: frozenset(),
+            )
+            data = b"\xff\xd8\xffkept"
+            ref = store.stage_media("first.jpg", data)
+            path = Path(store.resolve((ref,))[0].path)
+            now[0] = store._STAGED_HANDLE_TTL_SECONDS + 1.0
+            real_unlink = private_web_media.os.unlink
+
+            def fail_unlink(target: str, *args: object, **kwargs: object) -> None:
+                if str(target) == str(path):
+                    raise OSError("prune unlink failed")
+                real_unlink(target, *args, **kwargs)
+
+            with patch.object(private_web_media.os, "unlink", side_effect=fail_unlink):
+                with self.assertRaisesRegex(OSError, "prune unlink failed"):
+                    store.stage_media("second.jpg", b"\xff\xd8\xffnew")
+                self.assertEqual(store._staged_bytes, len(data))
+                self.assertIn(ref, store._sources)
+                self.assertTrue(store._cleanup_required)
+            store.close()
+            self.assertFalse(path.exists())
+
+    def test_persistent_discard_directory_sync_failure_retains_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            store = PrivateWebMediaHandleStore(
+                directory=directory, protected_refs=lambda: frozenset()
+            )
+            data = b"\xff\xd8\xffkept"
+            ref = store.stage_media("first.jpg", data)
+            path = Path(store.resolve((ref,))[0].path)
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                side_effect=OSError("discard durability failed"),
+            ):
+                with self.assertRaisesRegex(OSError, "discard durability failed"):
+                    store.discard((ref,))
+                self.assertFalse(path.exists())
+                self.assertEqual(store._staged_bytes, len(data))
+                self.assertIn(ref, store._sources)
+                self.assertTrue(store._cleanup_required)
+            store.close()
+            self.assertEqual(store._staged_bytes, 0)
 
     def test_media_handle_store_enforces_total_byte_quota_before_writing(self) -> None:
         store = PrivateWebMediaHandleStore()

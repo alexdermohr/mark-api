@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import re
+import sys
 import stat
 import tempfile
 from contextlib import AbstractContextManager, nullcontext
@@ -435,9 +438,75 @@ class PrivateWebMediaRefResolver:
             ) from None
 
 
+def _fsync_directory(path: str) -> None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_filesystem_directory(path: str, parent_device: int) -> None:
+    """Durably sync a same-filesystem parent when it is not readable (Linux)."""
+    if not sys.platform.startswith("linux"):
+        raise OSError(errno.ENOSYS, "filesystem sync is not supported")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        device = os.fstat(descriptor).st_dev
+        if device != parent_device:
+            raise OSError(errno.EXDEV, "media handle directory is on another filesystem")
+        # syncfs on FUSE/stacked filesystems can return success without
+        # syncing the parent's directory entry. Older kernels also do not
+        # report writeback errors. Never certify a marker on those paths.
+        kernel_parts = os.uname().release.split(".")
+        try:
+            kernel_version = (int(kernel_parts[0]), int(kernel_parts[1]))
+        except (IndexError, ValueError) as exc:
+            raise OSError(errno.ENOTSUP, "filesystem sync kernel is unverified") from exc
+        if kernel_version < (5, 8):
+            raise OSError(errno.ENOTSUP, "filesystem sync kernel is too old")
+        device_key = f"{os.major(device)}:{os.minor(device)}"
+        types: set[str] = set()
+        with open("/proc/self/mountinfo", encoding="utf-8") as mounts:
+            for line in mounts:
+                parts = line.split(" - ", 1)
+                if len(parts) != 2:
+                    continue
+                mount = parts[0].split()
+                filesystem = parts[1].split()
+                if len(mount) >= 3 and mount[2] == device_key and filesystem:
+                    types.add(filesystem[0])
+        if not types or not types.issubset({"ext4", "xfs", "btrfs", "f2fs"}):
+            raise OSError(errno.ENOTSUP, "filesystem sync durability is unverified")
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            syncfs = libc.syncfs
+        except AttributeError as exc:
+            raise OSError(errno.ENOSYS, "filesystem sync is unavailable") from exc
+        syncfs.argtypes = [ctypes.c_int]
+        syncfs.restype = ctypes.c_int
+        if syncfs(descriptor) != 0:
+            error = ctypes.get_errno() or errno.EIO
+            raise OSError(error, os.strerror(error))
+    finally:
+        os.close(descriptor)
+
+
 class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
     """Own bounded private media copies behind generated opaque handles."""
 
+    _DURABLE_DIRECTORY_MARKER = ".mark-private-media-ready-v1"
     _MAX_STAGED_HANDLES = 32
     _MAX_STAGED_BYTES = 100 * 1024 * 1024
     _STAGED_HANDLE_TTL_SECONDS = 15 * 60
@@ -476,15 +545,96 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             ):
                 raise ValueError("media handle directory is invalid")
             directory_path = os.path.abspath(raw_directory)
-            os.makedirs(directory_path, mode=0o700, exist_ok=True)
-            directory_stat = os.stat(directory_path, follow_symlinks=False)
-            if not stat.S_ISDIR(directory_stat.st_mode):
-                raise ValueError("media handle directory is invalid")
-            os.chmod(directory_path, 0o700)
+            parent_path = os.path.dirname(directory_path)
+            try:
+                parent_stat = os.stat(parent_path)
+            except OSError as exc:
+                raise ValueError(
+                    "media handle parent directory is invalid"
+                ) from exc
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                raise ValueError("media handle parent directory is invalid")
+            created_directory = False
+            try:
+                os.mkdir(directory_path, 0o700)
+                created_directory = True
+            except FileExistsError:
+                pass
+            marker_path = os.path.join(
+                directory_path, self._DURABLE_DIRECTORY_MARKER
+            )
+            try:
+                directory_stat = os.stat(directory_path, follow_symlinks=False)
+                if not stat.S_ISDIR(directory_stat.st_mode):
+                    raise ValueError("media handle directory is invalid")
+                os.chmod(directory_path, 0o700)
+                _fsync_directory(directory_path)
+                try:
+                    marker_fd = os.open(
+                        marker_path,
+                        os.O_RDONLY
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | os.O_NONBLOCK,
+                    )
+                except FileNotFoundError:
+                    # An existing directory might be left by a crash after mkdir,
+                    # before its parent entry was durable. Only a completed
+                    # parent fsync authorizes publishing the readiness marker.
+                    try:
+                        _fsync_directory(parent_path)
+                    except PermissionError as exc:
+                        if exc.errno != errno.EACCES:
+                            raise
+                        # syncfs flushes all metadata on the same Linux filesystem,
+                        # including the unreadable parent's new directory entry.
+                        _sync_filesystem_directory(
+                            directory_path, parent_stat.st_dev
+                        )
+                    marker_fd = os.open(
+                        marker_path,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                    )
+                    try:
+                        os.fsync(marker_fd)
+                    finally:
+                        os.close(marker_fd)
+                    _fsync_directory(directory_path)
+                else:
+                    try:
+                        marker_stat = os.fstat(marker_fd)
+                        if (
+                            not stat.S_ISREG(marker_stat.st_mode)
+                            or marker_stat.st_uid != os.getuid()
+                            or marker_stat.st_nlink != 1
+                            or marker_stat.st_size != 0
+                            or stat.S_IMODE(marker_stat.st_mode) & 0o077
+                        ):
+                            raise ValueError(
+                                "media handle directory readiness marker is invalid"
+                            )
+                    finally:
+                        os.close(marker_fd)
+            except Exception:
+                if created_directory:
+                    try:
+                        os.rmdir(directory_path)
+                    except OSError:
+                        # Failed rollback never certifies an incomplete directory.
+                        # Its missing marker forces parent fsync on next startup.
+                        pass
+                raise
             self._directory_path = directory_path
             self._persistent = True
         self._lock = Lock()
         self._closed = False
+        self._cleanup_required = False
+        self._pending_cleanup_paths: set[str] = set()
         self._staged_bytes = 0
         self._clock = clock
         self._wall_clock = wall_clock
@@ -530,6 +680,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 if not entry.is_file(follow_symlinks=False):
                     raise RuntimeError("persistent media handle directory is invalid")
                 name = entry.name
+                if name == self._DURABLE_DIRECTORY_MARKER:
+                    continue
                 temp_extension = next(
                     (
                         suffix
@@ -645,6 +797,23 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         self._staged_bytes = max(0, self._staged_bytes - released_bytes)
         return tuple(sources)
 
+    def _retire_handles_locked(self, media_refs: tuple[str, ...]) -> None:
+        sources = tuple(
+            self._sources[ref] for ref in media_refs if ref in self._sources
+        )
+        if not sources:
+            return
+        try:
+            self._unlink_sources(sources)
+            if self._persistent:
+                _fsync_directory(self._directory_path)
+        except Exception:
+            # Keep all affected refs and their quota until durable cleanup
+            # completes; close() can retry partial removals safely.
+            self._cleanup_required = True
+            raise
+        self._pop_handles_locked(media_refs)
+
     def _prune_expired_locked(
         self,
         now: float,
@@ -656,7 +825,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             if expires_at <= now and ref not in preserve
         )
         if expired:
-            self._unlink_sources(self._pop_handles_locked(expired))
+            self._retire_handles_locked(expired)
 
     @staticmethod
     def _extension(filename: str, data: bytes) -> str:
@@ -691,6 +860,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             protected = self._protected_refs_snapshot()
             if self._closed:
                 raise RuntimeError("media handle store is closed")
+            if self._cleanup_required:
+                raise RuntimeError("media handle store cleanup required")
             self._prune_expired_locked(
                 float(self._clock()),
                 preserve=protected,
@@ -727,10 +898,12 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 try:
                     os.unlink(temp_path)
                 except OSError:
-                    pass
+                    self._pending_cleanup_paths.add(temp_path)
+                    self._cleanup_required = True
                 raise
             finally:
                 os.close(fd)
+            published = False
             try:
                 staged_at = float(self._wall_clock())
                 os.utime(
@@ -739,11 +912,34 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                     follow_symlinks=False,
                 )
                 os.replace(temp_path, path)
+                published = True
+                if self._persistent:
+                    _fsync_directory(self._directory_path)
             except Exception:
+                cleanup_path = path if published else temp_path
+                cleanup_unlink_failed = False
                 try:
-                    os.unlink(temp_path)
-                except OSError:
+                    os.unlink(cleanup_path)
+                except FileNotFoundError:
                     pass
+                except OSError:
+                    cleanup_unlink_failed = True
+                cleanup_sync_failed = False
+                if published and self._persistent and not cleanup_unlink_failed:
+                    try:
+                        _fsync_directory(self._directory_path)
+                    except OSError:
+                        cleanup_sync_failed = True
+                if cleanup_unlink_failed:
+                    if published:
+                        self._sources[ref] = PrivateWebMediaSource(path)
+                        self._sizes[ref] = len(data)
+                        self._expires_at[ref] = float("inf")
+                        self._staged_bytes += len(data)
+                    else:
+                        self._pending_cleanup_paths.add(temp_path)
+                if cleanup_unlink_failed or cleanup_sync_failed:
+                    self._cleanup_required = True
                 raise
             self._sources[ref] = PrivateWebMediaSource(path)
             self._sizes[ref] = len(data)
@@ -765,7 +961,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         )
         with self._protected_refs_guard_context(), self._lock:
             preserve = requested | self._protected_refs_snapshot()
-            if self._closed:
+            if self._closed or self._cleanup_required:
                 raise PrivateWebWriteNotAttemptedError("resolve_media_refs")
             self._prune_expired_locked(
                 float(self._clock()),
@@ -775,8 +971,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
 
     def discard(self, media_refs: tuple[str, ...]) -> None:
         with self._lock:
-            sources = self._pop_handles_locked(media_refs)
-        self._unlink_sources(sources)
+            self._retire_handles_locked(media_refs)
 
     def close(self) -> None:
         with self._lock:
@@ -793,13 +988,29 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             orphan_refs = tuple(
                 ref for ref in self._sources if ref not in protected
             )
-            orphan_sources = self._pop_handles_locked(orphan_refs)
+            orphan_sources = tuple(
+                self._sources[ref]
+                for ref in orphan_refs
+                if ref in self._sources
+            )
+            cleanup_sources = orphan_sources + tuple(
+                PrivateWebMediaSource(path) for path in self._pending_cleanup_paths
+            )
+            try:
+                self._unlink_sources(cleanup_sources)
+                if self._persistent and (cleanup_sources or self._cleanup_required):
+                    _fsync_directory(self._directory_path)
+            except Exception:
+                self._cleanup_required = True
+                raise
+            self._pop_handles_locked(orphan_refs)
+            self._pending_cleanup_paths.clear()
+            self._cleanup_required = False
             self._closed = True
             self._sources.clear()
             self._sizes.clear()
             self._expires_at.clear()
             self._staged_bytes = 0
-        self._unlink_sources(orphan_sources)
         if self._temporary_directory is not None:
             self._temporary_directory.cleanup()
 
