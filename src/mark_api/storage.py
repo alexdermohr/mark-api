@@ -287,7 +287,9 @@ class SnapshotStore:
                 for index in connection.execute(
                     f"PRAGMA index_list({table})"
                 ).fetchall():
-                    if not index["unique"]:
+                    # A partial UNIQUE index only protects rows matching its
+                    # WHERE predicate and is not a global recovery-key fence.
+                    if not index["unique"] or index["partial"]:
                         continue
                     # Index names are database data, not trusted SQL strings.
                     index_name = str(index["name"]).replace('"', '""')

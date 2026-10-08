@@ -160,6 +160,113 @@ class SnapshotStoreTests(unittest.TestCase):
                             },
                         )
 
+    def test_partial_unique_write_key_is_not_full_recovery_uniqueness(self) -> None:
+        store = self.make_store()
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("DROP TABLE write_api_requests")
+            connection.execute(
+                """
+                CREATE TABLE write_api_requests (
+                    idempotency_key TEXT NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    claim_owner TEXT,
+                    execution_started_at TEXT,
+                    completed_at TEXT,
+                    response_status INTEGER,
+                    response_json TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX partial_write_key "
+                "ON write_api_requests(idempotency_key) WHERE state = 'never'"
+            )
+            for _ in range(2):
+                connection.execute(
+                    "INSERT INTO write_api_requests "
+                    "(idempotency_key, request_sha256, state, requested_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("ui:duplicate", "a" * 64, "in_progress", NOW.isoformat()),
+                )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM write_api_requests "
+                    "WHERE idempotency_key='ui:duplicate'"
+                ).fetchone()[0],
+                2,
+            )
+
+        self.assertFalse(store.is_ready())
+        for initialize in (False, True):
+            with self.subTest(initialize=initialize):
+                with self.assertRaises(sqlite3.DatabaseError):
+                    SnapshotStore(store.path, create_if_missing=initialize)
+        with self.assertRaises(sqlite3.DatabaseError):
+            store.claim_write_api_request(
+                idempotency_key="ui:new-key",
+                request_sha256="b" * 64,
+                requested_at=NOW,
+                claim_owner="runtime-owner",
+            )
+
+    def test_partial_unique_pending_resource_cannot_authorize_claim(self) -> None:
+        store = self.make_store()
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("DROP TABLE dashboard_pending_writes")
+            connection.execute(
+                """
+                CREATE TABLE dashboard_pending_writes (
+                    scope TEXT PRIMARY KEY,
+                    resource_key TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    payload_json TEXT,
+                    ad_id TEXT,
+                    acknowledged INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX partial_pending_resource "
+                "ON dashboard_pending_writes(resource_key) WHERE method = 'never'"
+            )
+            for scope in ("ad:2:pause", "ad:2:activate"):
+                connection.execute(
+                    "INSERT INTO dashboard_pending_writes "
+                    "(scope, resource_key, idempotency_key, method, path) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        scope, "ad:2", "ui:" + scope, "POST",
+                        "/api/write/ads/2/pause",
+                    ),
+                )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dashboard_pending_writes "
+                    "WHERE resource_key='ad:2'"
+                ).fetchone()[0],
+                2,
+            )
+
+        self.assertFalse(store.is_ready())
+        for initialize in (False, True):
+            with self.subTest(initialize=initialize):
+                with self.assertRaises(sqlite3.DatabaseError):
+                    SnapshotStore(store.path, create_if_missing=initialize)
+        with self.assertRaises(sqlite3.DatabaseError):
+            store.claim_dashboard_pending_write(
+                scope="ad:3:pause",
+                resource_key="ad:3",
+                idempotency_key="ui:new-pending",
+                method="POST",
+                path="/api/write/ads/3/pause",
+                payload_json=None,
+                ad_id="3",
+            )
+
     def test_missing_uniqueness_blocks_live_pending_claim(self) -> None:
         store = self.make_store()
         with sqlite3.connect(store.path) as connection:
