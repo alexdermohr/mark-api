@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 import tempfile
 import threading
 import tomllib
@@ -180,7 +181,125 @@ class ProductLauncherTests(unittest.TestCase):
     def make_db(self) -> tuple[tempfile.TemporaryDirectory, Path]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        return tmp, Path(tmp.name) / "mark.sqlite"
+        path = Path(tmp.name) / "mark.sqlite"
+        # Normal product startup opens an explicitly initialized store.
+        SnapshotStore(path)
+        return tmp, path
+
+    def test_wrong_database_path_fails_before_inventory_or_write_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "typo" / "mark.sqlite"
+            inventory_created = False
+
+            def runtime_factory(**kwargs):
+                nonlocal inventory_created
+                inventory_created = True
+                return InventoryRuntime(ReadResult.success_empty(()))
+
+            with self.assertRaisesRegex(
+                ProductLauncherError, "local snapshot store startup failed"
+            ):
+                build_product_launcher(
+                    db_path=missing,
+                    cdp_port=9222,
+                    runtime_factory=runtime_factory,
+                )
+            self.assertFalse(inventory_created)
+            self.assertEqual(self.write_runtime.start_calls, 0)
+            self.assertFalse(missing.exists())
+            self.assertFalse(missing.parent.exists())
+
+    def test_missing_write_request_table_prevents_launch_and_recreation(self) -> None:
+        _tmp, db = self.make_db()
+        with sqlite3.connect(db) as connection:
+            connection.execute("DROP TABLE write_api_requests")
+        inventory_called = False
+
+        def runtime_factory(**kwargs):
+            nonlocal inventory_called
+            inventory_called = True
+            return InventoryRuntime(ReadResult.success_empty(()))
+
+        with self.assertRaisesRegex(
+            ProductLauncherError, "local snapshot store startup failed"
+        ):
+            build_product_launcher(
+                db_path=db,
+                cdp_port=9222,
+                runtime_factory=runtime_factory,
+            )
+        self.assertFalse(inventory_called)
+        self.assertEqual(self.write_runtime.start_calls, 0)
+        with sqlite3.connect(db) as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='write_api_requests'"
+                ).fetchone()
+            )
+
+    def test_corrupted_database_fails_before_inventory_or_writes(self) -> None:
+        _tmp, db = self.make_db()
+        db.write_bytes(b"corrupted local sqlite store")
+        inventory_called = False
+
+        def runtime_factory(**kwargs):
+            nonlocal inventory_called
+            inventory_called = True
+            return InventoryRuntime(ReadResult.success_empty(()))
+
+        with self.assertRaisesRegex(
+            ProductLauncherError, "local snapshot store startup failed"
+        ):
+            build_product_launcher(
+                db_path=db,
+                cdp_port=9222,
+                runtime_factory=runtime_factory,
+            )
+        self.assertFalse(inventory_called)
+        self.assertEqual(self.write_runtime.start_calls, 0)
+
+    def test_explicit_initialization_creates_store_then_normal_restart_opens_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "new" / "mark.sqlite"
+            inventory = InventoryRuntime(ReadResult.success_empty(()))
+            launcher = build_product_launcher(
+                db_path=db,
+                cdp_port=9222,
+                initialize_db=True,
+                runtime_factory=lambda **kwargs: inventory,
+                dashboard_factory=lambda *args, **kwargs: DashboardServer(),
+            )
+            launcher.close()
+            self.assertTrue(db.is_file())
+            self.assertTrue(SnapshotStore(db, create_if_missing=False).is_ready())
+            reopened = build_product_launcher(
+                db_path=db,
+                cdp_port=9222,
+                runtime_factory=lambda **kwargs: InventoryRuntime(
+                    ReadResult.success_empty(())
+                ),
+                dashboard_factory=lambda *args, **kwargs: DashboardServer(),
+            )
+            reopened.close()
+            self.assertEqual(self.write_runtime.start_calls, 2)
+
+    def test_main_forwarding_initialization_is_explicit(self) -> None:
+        with patch(
+            "mark_api.launcher.build_product_launcher",
+            side_effect=ProductLauncherError("local snapshot store startup failed"),
+        ) as builder, patch("sys.stderr", io.StringIO()):
+            status = main(
+                [
+                    "--db",
+                    "/tmp/nonexistent-a4-mark.sqlite",
+                    "--cdp-port",
+                    "9222",
+                    "--init-db",
+                ]
+            )
+        self.assertEqual(status, 2)
+        self.assertIs(builder.call_args.kwargs["initialize_db"], True)
 
     def test_default_write_runtime_is_composed_started_and_exposed(self) -> None:
         _tmp, db = self.make_db()

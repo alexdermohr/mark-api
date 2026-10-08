@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Iterable, Mapping
+from urllib.parse import quote
 
 from .domain import (
     AdClassification,
@@ -27,6 +28,18 @@ _CLASSIFICATION_FIELDS = (
     "city",
     "text_type",
     "title_type",
+)
+
+_REQUIRED_STORE_TABLES = (
+    "ad_snapshots",
+    "reaction_snapshots",
+    "inbound_message_events",
+    "ad_classifications",
+    "operation_receipts",
+    "create_operation_receipts",
+    "create_operation_checkpoints",
+    "write_api_requests",
+    "dashboard_pending_writes",
 )
 
 
@@ -75,16 +88,52 @@ def _validated_write_api_claim_owner(value: str) -> str:
 class SnapshotStore:
     """Append-only SQLite storage for normalized observations and write receipts."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, create_if_missing: bool = True) -> None:
+        if not isinstance(create_if_missing, bool):
+            raise TypeError("create_if_missing must be bool")
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Each post-start connection must refuse to create a replacement file
+        # if the original store is unlinked or temporarily unavailable.
+        self._existing_uri = (
+            "file:" + quote(str(self.path.absolute()), safe="/") + "?mode=rw"
+        )
+        if create_if_missing:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Creating the database is a separate constructor-time action.
+            # No later reader or write receipt path is allowed to create one.
+            initial_uri = self._existing_uri.replace("?mode=rw", "?mode=rwc")
+            connection = sqlite3.connect(initial_uri, uri=True)
+            connection.close()
+        else:
+            # Never heal a lost write-recovery table as an empty table:
+            # existing stores must have every table before column migrations.
+            with self._connect() as connection:
+                result = connection.execute("PRAGMA quick_check(1)").fetchone()
+                if result is None or result[0] != "ok":
+                    raise sqlite3.DatabaseError("database integrity check failed")
+                for table in _REQUIRED_STORE_TABLES:
+                    connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
         self._dashboard_pending_write_lock = RLock()
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self._existing_uri, uri=True)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def is_ready(self) -> bool:
+        """Observe usable schema/data without creating or repairing a store."""
+        try:
+            with self._connect() as connection:
+                integrity = connection.execute("PRAGMA quick_check(1)").fetchone()
+                if integrity is None or integrity[0] != "ok":
+                    return False
+                # All data, operation and write-recovery surfaces are mandatory.
+                for table in _REQUIRED_STORE_TABLES:
+                    connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+        except sqlite3.Error:
+            return False
+        return True
 
     def dashboard_pending_write_guard(self) -> AbstractContextManager[None]:
         """Serialize pending-write protection changes with media pruning."""

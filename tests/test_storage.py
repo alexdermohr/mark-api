@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -31,6 +32,99 @@ class SnapshotStoreTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         return SnapshotStore(Path(tmp.name) / "mark.sqlite")
+
+    def test_missing_store_is_rejected_without_creating_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "wrong" / "mark.sqlite"
+            with self.assertRaises(sqlite3.OperationalError):
+                SnapshotStore(missing, create_if_missing=False)
+            self.assertFalse(missing.exists())
+            self.assertFalse(missing.parent.exists())
+
+    def test_existing_only_rejects_uninitialized_sqlite_without_migrating(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            foreign = Path(tmp) / "foreign.sqlite"
+            sqlite3.connect(foreign).close()
+            with self.assertRaises(sqlite3.Error):
+                SnapshotStore(foreign, create_if_missing=False)
+            with sqlite3.connect(foreign) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall(),
+                    [],
+                )
+
+    def test_lost_corrupt_restored_store_does_not_regenerate_or_lose_data(self) -> None:
+        store = self.make_store()
+        store.append_ad_snapshot(
+            AdSnapshot(
+                ad_id="123",
+                observed_at=NOW,
+                source="audit",
+                lifecycle_state=LifecycleState.ACTIVE,
+                views=7,
+            )
+        )
+        backup = store.path.with_name("mark-backup.sqlite")
+        shutil.copyfile(store.path, backup)
+        self.assertTrue(store.is_ready())
+
+        store.path.unlink()
+        self.assertFalse(store.is_ready())
+        with self.assertRaises(sqlite3.OperationalError):
+            store.tracked_ad_ids()
+        with self.assertRaises(sqlite3.OperationalError):
+            SnapshotStore(store.path, create_if_missing=False)
+        self.assertFalse(store.path.exists())
+
+        store.path.write_bytes(b"corrupt sqlite database")
+        self.assertFalse(store.is_ready())
+        with self.assertRaises(sqlite3.DatabaseError):
+            store.tracked_ad_ids()
+        with self.assertRaises(sqlite3.DatabaseError):
+            SnapshotStore(store.path, create_if_missing=False)
+
+        shutil.copyfile(backup, store.path)
+        self.assertTrue(store.is_ready())
+        reopened = SnapshotStore(store.path, create_if_missing=False)
+        self.assertEqual(reopened.tracked_ad_ids(), ("123",))
+        self.assertEqual(reopened.latest_ad_snapshot("123").views, 7)
+
+    def test_readiness_requires_write_recovery_tables(self) -> None:
+        store = self.make_store()
+        self.assertTrue(store.is_ready())
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("DROP TABLE dashboard_pending_writes")
+        self.assertFalse(store.is_ready())
+        with self.assertRaises(sqlite3.OperationalError):
+            SnapshotStore(store.path, create_if_missing=False)
+        with sqlite3.connect(store.path) as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='dashboard_pending_writes'"
+                ).fetchone()
+            )
+
+    def test_readiness_requires_analytics_schema_too(self) -> None:
+        store = self.make_store()
+        self.assertTrue(store.is_ready())
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("DROP TABLE reaction_snapshots")
+        self.assertFalse(store.is_ready())
+        with self.assertRaises(sqlite3.OperationalError):
+            SnapshotStore(store.path, create_if_missing=False)
+
+    def test_sqlite_uri_preserves_encoded_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "SQLite #? percent%.sqlite"
+            store = SnapshotStore(path)
+            self.assertTrue(store.is_ready())
+            self.assertEqual(
+                SnapshotStore(path, create_if_missing=False).tracked_ad_ids(),
+                (),
+            )
 
     def test_failed_inventory_read_does_not_create_absent_snapshot(self) -> None:
         store = self.make_store()

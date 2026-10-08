@@ -33,6 +33,16 @@ Installation mit dem benötigten Private-Web-Extra:
 python -m pip install -e '.[private-web]'
 ```
 
+**SQLite-Erstinitialisierung:** Bei der ersten Einrichtung muss die Datenbank bewusst angelegt werden. Nur hierfür einmal `--init-db` ergänzen:
+
+```bash
+mark-api-launch --init-db --db /pfad/mark.sqlite --cdp-port 9222
+```
+
+Danach normal **ohne** `--init-db` starten. Ein vertippter Pfad darf sonst niemals stillschweigend einen leeren SQLite-Store erzeugen. Den Bootstrap-Schalter nicht dauerhaft in Dienst- oder Autostart-Konfigurationen belassen; er ist keine zusätzliche Freigabe für Plattformwrites. Beim regulären Produktstart werden vorhandene Datenbank, Integrität und Mark-Schema geprüft. Auch `mark-api-dashboard` und `mark-api-import-mail` unterstützen `--init-db` ausschließlich für eine ausdrückliche Neueinrichtung; `mark-api-classify` benötigt stets einen bestehenden Store.
+
+**Betriebs-Readiness:** `GET /healthz` zeigt nur HTTP-Liveness. `GET /readyz` prüft die tatsächliche SQLite-Erreichbarkeit, Integrität und kritische Tabellen für Owner-Daten und Write-Recovery (HTTP 200 `{"status":"ready"}` oder HTTP 503 `{"status":"unavailable","error":"database_unavailable"}`). Bei Datenbankverlust oder Beschädigung antworten datenlesende Dashboard-APIs mit HTTP 503 `{"error":"database_unavailable"}` statt die Verbindung abzubrechen. Nach dem Start kann eine fehlende Datenbankdatei nicht automatisch neu entstehen. Erst eine gültige Wiederherstellung gibt die Datenversorgung frei; unsichere Write-Idempotenz-Fences berechtigen niemals zu einem blinden Plattform-Retry.
+
 Beispielstart:
 
 ```bash

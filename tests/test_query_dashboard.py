@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import subprocess
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 from email import policy
@@ -17,7 +18,12 @@ from urllib.request import Request, urlopen
 
 from mark_api.analytics import ANALYTICS_METRICS, REACTION_METRICS, AnalyticsContract
 from mark_api.classification_cli import main as classification_main
-from mark_api.dashboard import DashboardWriteProxy, _dashboard_http_origin, create_server
+from mark_api.dashboard import (
+    DashboardWriteProxy,
+    _dashboard_http_origin,
+    create_server,
+    main as dashboard_main,
+)
 from mark_api.email_import import import_kleinanzeigen_email_files
 from mark_api.domain import (
     AdClassification,
@@ -369,6 +375,48 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
             urlopen(blocked, timeout=2)
         self.assertEqual(error.exception.code, 404)
         self.assertEqual(self.backend.requests, [])
+
+    def test_lost_database_blocks_platform_write_before_pending_claim(self) -> None:
+        backup = self.store.path.with_name("db-backup.sqlite")
+        shutil.copyfile(self.store.path, backup)
+        request = Request(
+            self.base + "/api/write/ads/2",
+            data=b'{"title":"no write without sqlite"}',
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:db-missing-no-write",
+            ),
+        )
+
+        self.store.path.unlink()
+        for state in ("missing", "corrupt"):
+            with self.subTest(database=state):
+                if state == "corrupt":
+                    self.store.path.write_bytes(b"corrupted database")
+                with self.assertRaises(HTTPError) as failed:
+                    urlopen(request, timeout=2)
+                self.assertEqual(failed.exception.code, 500)
+                self.assertEqual(
+                    json.loads(failed.exception.read()),
+                    {
+                        "error": "dashboard_pending_store_error",
+                        "platform_retry_authorized": False,
+                    },
+                )
+                self.assertEqual(self.backend.requests, [])
+                if state == "missing":
+                    self.assertFalse(self.store.path.exists())
+
+        # An explicit later request after restoring genuine records may proceed.
+        shutil.copyfile(backup, self.store.path)
+        with urlopen(request, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+        self.assertEqual(len(self.backend.requests), 1)
+        self.assertEqual(
+            self.backend.requests[0]["idempotency_key"],
+            "ui:db-missing-no-write",
+        )
 
     def test_proxy_forwards_exact_write_contract_and_hides_ui_secret(self) -> None:
         payload = {"title": "Neu", "description": "Beschreibung"}
@@ -957,6 +1005,17 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
                 response.read(),
             )
 
+    def test_standalone_dashboard_rejects_mistyped_database_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "typo" / "mark.sqlite"
+            errors = io.StringIO()
+            with redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+                dashboard_main(["--db", str(missing), "--port", "0"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("SQLite database unavailable", errors.getvalue())
+            self.assertNotIn(str(missing), errors.getvalue())
+            self.assertFalse(missing.parent.exists())
+
     def test_health_summary_and_ads_endpoints(self) -> None:
         status, headers, body = self.get("/healthz")
         self.assertEqual(status, 200)
@@ -976,6 +1035,58 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertEqual(ads[0]["ad_id"], "1")
         self.assertEqual(ads[0]["lifecycle_state"], "absent")
         self.assertEqual(ads[0]["views"], 15)
+
+    def test_readiness_loss_corruption_and_restore_return_sanitized_json(self) -> None:
+        status, _, body = self.get("/readyz")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"status": "ready"})
+        _, _, before = self.get("/api/summary")
+        expected = json.loads(before)
+
+        backup = self.store.path.with_name("backup.sqlite")
+        shutil.copyfile(self.store.path, backup)
+        self.store.path.unlink()
+
+        # Liveness is not a claim that persistent owner data is available.
+        self.assertEqual(json.loads(self.get("/healthz")[2]), {"status": "ok"})
+        failing_paths = (
+            "/readyz",
+            "/api/summary",
+            "/api/ads",
+            "/api/analytics/groups?dimension=city&metric=views",
+            "/api/ads/1/history",
+        )
+        for path in failing_paths:
+            with self.subTest(path=path):
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(self.base + path, timeout=2)
+                error = caught.exception
+                self.assertEqual(error.code, 503)
+                self.assertEqual(error.headers["Cache-Control"], "no-store")
+                payload = json.loads(error.read())
+                if path == "/readyz":
+                    self.assertEqual(
+                        payload,
+                        {"status": "unavailable", "error": "database_unavailable"},
+                    )
+                else:
+                    self.assertEqual(payload, {"error": "database_unavailable"})
+                self.assertNotIn(str(self.store.path), json.dumps(payload))
+        self.assertFalse(self.store.path.exists())
+
+        self.store.path.write_bytes(b"not a SQLite database")
+        for path in ("/readyz", "/api/summary"):
+            with self.subTest(corrupt_path=path):
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(self.base + path, timeout=2)
+                self.assertEqual(caught.exception.code, 503)
+                self.assertNotIn(
+                    str(self.store.path), caught.exception.read().decode("utf-8")
+                )
+
+        shutil.copyfile(backup, self.store.path)
+        self.assertEqual(json.loads(self.get("/readyz")[2]), {"status": "ready"})
+        self.assertEqual(json.loads(self.get("/api/summary")[2]), expected)
 
     def test_history_and_reactions_endpoints(self) -> None:
         _, _, history_body = self.get("/api/ads/1/history")
