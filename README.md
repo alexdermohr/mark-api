@@ -65,6 +65,32 @@ Für jede Plattformaktion erzeugt die Browser-UX genau einen Idempotency-Key. Vo
 
 CDP, Dashboard und Write API bleiben auf Loopback begrenzt. Ein zusätzlicher Write-Opt-in ist im normalen Produktpfad nicht erforderlich. Schlägt Initial-Read oder expliziter Mail-Import fehl, startet keine HTTP-Surface. Kann die Write API nicht starten, wird das Dashboard nicht konstruiert; scheitert die spätere Dashboard-Konstruktion, wird die bereits gestartete Write-Runtime geschlossen. Der Launcher führt weiterhin **keine periodische Synchronisation** aus; Freshness/Recovery folgen separat.
 
+## Historische SQLite-Datenbanken sicher übernehmen
+
+Eine ältere Mark-Datenbank kann 3, 4, 5, 6, 7 oder 8 der heute 9 Tabellen enthalten. Beim normalen Start und auch mit `--init-db` werden fehlende Tabellen **nicht** automatisch nachgebaut: Die alten Dateien besitzen keinen verlässlichen Schema-Versionsmarker. Eine historisch noch nicht angelegte Recovery-Tabelle lässt sich deshalb nicht sicher von einem nach einem Plattformwrite verlorenen Idempotenz-Fence unterscheiden.
+
+Nach unabhängiger Klärung der **alten** Plattformwrites ist ein einmaliger, vollständig lokaler Offline-Import möglich:
+
+1. Alle Mark-Prozesse und anderen SQLite-Benutzer der Originaldatei beenden. Vorher offene/unklare Plattformoperationen anhand vorhandener Owner- und Recovery-Evidenz abschließen. Bei Ungewissheit **nicht** migrieren; eine vertrauenswürdige Sicherung wiederherstellen oder den Einzelfall klären.
+2. Einmalige Recovery-Bestätigung nur dann erteilen, wenn keine ungeklärten alten Plattformwrites mehr bestehen. Neue und getrennte Backup- und Zieldateien angeben:
+
+```bash
+mark-api-migrate-legacy \
+  --db /pfad/alter-mark.sqlite \
+  --backup /pfad/archiv/alter-mark.backup.sqlite \
+  --output-db /pfad/neuer-mark.sqlite \
+  --confirm-no-unresolved-writes
+```
+
+3. Die ausgegebene Schema-Stufe, Tabellen-/Zeilenzahlen und den Backup-SHA-256 prüfen und ausschließlich die neue Datenbank beim normalen Produktstart verwenden:
+
+```bash
+mark-api-launch --db /pfad/neuer-mark.sqlite --cdp-port 9222
+```
+
+Der Import erkennt nur belegte historische Schema-Stufen, prüft Integrität, Spalten und Recovery-Schlüssel und verweigert offene Write-API-Requests, Create-Checkpoints sowie mehrdeutige Write-Receipts. Bereits abgeschlossene Idempotenzbelege werden mit ihren Schlüsseln und Antworten bewahrt. SQLite erstellt eine eigenständige private Sicherung; die historischen Datensätze samt IDs werden in einer neuen Datenbank übernommen und deren Readiness geprüft. Die alte Datei sowie bestehende Backup- oder Zielpfade werden niemals überschrieben. Bei Fehlschlag kann ein Backup zurückbleiben; vor jedem weiteren Versuch den tatsächlichen Dateistand prüfen.
+
+**Keine Plattformaktion wird während des Imports ausgelöst oder automatisch wiederholt.** Die historische Tabellenform ist ausdrücklich *kein* Beweis für das Ausbleiben früherer Writes; die Bestätigung der geklärten Recovery-Lage ist eine Sicherheitsgrenze. Für die reguläre, vollständig migrierte Produktdatenbank bleiben die vorgesehenen Write-Funktionen ohne zusätzlichen Opt-in default-on.
 ## Lokale Klassifikationspflege
 
 Die Analytics-Gruppierung verwendet explizite Labels für `image_type`, `city`, `text_type` und `title_type`. Die Klassifikationspflege bleibt bewusst eine lokale, append-only CLI-Funktion; die neue Product-Launcher Write UX betrifft ausschließlich die bereits vorhandenen Anzeigen-Write-Routen und erteilt Email-only-IDs keine Write-Autorität. Labels werden über den separaten CLI-Entrypoint gepflegt:
