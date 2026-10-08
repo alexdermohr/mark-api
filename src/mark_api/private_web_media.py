@@ -451,6 +451,7 @@ def _fsync_directory(path: str) -> None:
 class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
     """Own bounded private media copies behind generated opaque handles."""
 
+    _DURABLE_DIRECTORY_MARKER = ".mark-private-media-ready-v1"
     _MAX_STAGED_HANDLES = 32
     _MAX_STAGED_BYTES = 100 * 1024 * 1024
     _STAGED_HANDLE_TTL_SECONDS = 15 * 60
@@ -504,17 +505,64 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 created_directory = True
             except FileExistsError:
                 pass
+            marker_path = os.path.join(
+                directory_path, self._DURABLE_DIRECTORY_MARKER
+            )
             try:
                 directory_stat = os.stat(directory_path, follow_symlinks=False)
                 if not stat.S_ISDIR(directory_stat.st_mode):
                     raise ValueError("media handle directory is invalid")
                 os.chmod(directory_path, 0o700)
                 _fsync_directory(directory_path)
-                if created_directory:
+                try:
+                    marker_fd = os.open(
+                        marker_path,
+                        os.O_RDONLY
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                    )
+                except FileNotFoundError:
+                    # An existing directory might be left by a crash after mkdir,
+                    # before its parent entry was durable. Only a completed
+                    # parent fsync authorizes publishing the readiness marker.
                     _fsync_directory(parent_path)
+                    marker_fd = os.open(
+                        marker_path,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                    )
+                    try:
+                        os.fsync(marker_fd)
+                    finally:
+                        os.close(marker_fd)
+                    _fsync_directory(directory_path)
+                else:
+                    try:
+                        marker_stat = os.fstat(marker_fd)
+                        if (
+                            not stat.S_ISREG(marker_stat.st_mode)
+                            or marker_stat.st_uid != os.getuid()
+                            or marker_stat.st_nlink != 1
+                            or marker_stat.st_size != 0
+                            or stat.S_IMODE(marker_stat.st_mode) & 0o077
+                        ):
+                            raise ValueError(
+                                "media handle directory readiness marker is invalid"
+                            )
+                    finally:
+                        os.close(marker_fd)
             except Exception:
                 if created_directory:
-                    os.rmdir(directory_path)
+                    try:
+                        os.rmdir(directory_path)
+                    except OSError:
+                        # Failed rollback never certifies an incomplete directory.
+                        # Its missing marker forces parent fsync on next startup.
+                        pass
                 raise
             self._directory_path = directory_path
             self._persistent = True
@@ -567,6 +615,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 if not entry.is_file(follow_symlinks=False):
                     raise RuntimeError("persistent media handle directory is invalid")
                 name = entry.name
+                if name == self._DURABLE_DIRECTORY_MARKER:
+                    continue
                 temp_extension = next(
                     (
                         suffix
@@ -829,7 +879,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         )
         with self._protected_refs_guard_context(), self._lock:
             preserve = requested | self._protected_refs_snapshot()
-            if self._closed:
+            if self._closed or self._cleanup_required:
                 raise PrivateWebWriteNotAttemptedError("resolve_media_refs")
             self._prune_expired_locked(
                 float(self._clock()),
