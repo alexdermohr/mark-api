@@ -380,6 +380,67 @@ class LegacyMigrationTests(unittest.TestCase):
                     self.assertFalse(backup.exists())
                     self.assertFalse(out.exists())
 
+    def test_nullable_historical_write_fields_require_reconciliation_before_backup(self) -> None:
+        # A matching historical column-name set is not proof of NOT NULL
+        # constraints. SQLite's <> predicate ignores NULL in a WHERE clause.
+        for table, field, stage in (
+            ("operation_receipts", "outcome", STAGES[0]),
+            ("create_operation_receipts", "outcome", STAGES[3]),
+            ("write_api_requests", "state", STAGES[4]),
+        ):
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source, backup, output = (
+                    root / "legacy.sqlite", root / "backup.sqlite",
+                    root / "upgraded.sqlite",
+                )
+                self.build_stage(source, stage)
+                with sqlite3.connect(source) as connection:
+                    original_ddl = connection.execute(
+                        "SELECT sql FROM sqlite_master "
+                        "WHERE type='table' AND name=?", (table,)
+                    ).fetchone()[0]
+                    declaration = field + " TEXT NOT NULL"
+                    self.assertIn(declaration, original_ddl)
+                    connection.execute(f"DROP TABLE {table}")
+                    connection.execute(
+                        original_ddl.replace(declaration, field + " TEXT", 1)
+                    )
+                    if table == "operation_receipts":
+                        connection.execute(
+                            "INSERT INTO operation_receipts "
+                            "(operation,ad_id,started_at,completed_at,outcome,"
+                            "pre_read_status,writer_invoked) VALUES (?,?,?,?,?,?,?)",
+                            ("delete", "42", NOW, NOW, None, "success", 1),
+                        )
+                    elif table == "create_operation_receipts":
+                        connection.execute(
+                            "INSERT INTO create_operation_receipts "
+                            "(operation,started_at,completed_at,outcome,"
+                            "pre_read_status,confirmation_pre_read_status,"
+                            "writer_invoked) VALUES (?,?,?,?,?,?,?)",
+                            ("create", NOW, NOW, None, "success", "success", 1),
+                        )
+                    else:
+                        connection.execute(
+                            "INSERT INTO write_api_requests "
+                            "(idempotency_key,request_sha256,state,requested_at,"
+                            "completed_at,response_status,response_json) "
+                            "VALUES (?,?,?,?,?,?,?)",
+                            ("uncertain", "a" * 64, None, NOW, NOW, 200, "{}"),
+                        )
+                with self.assertRaisesRegex(
+                    LegacyMigrationError, "reconciliation"
+                ):
+                    migrate_legacy_store(
+                        source, backup_db=backup, output_db=output,
+                        confirm_no_unresolved_writes=True,
+                    )
+                # Never defer an unknown platform-write interpretation until
+                # after a new backup or target has already been created.
+                self.assertFalse(backup.exists())
+                self.assertFalse(output.exists())
+
     def test_unsettled_media_create_checkpoint_blocks_import(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -154,7 +154,7 @@ def _inspect_historical_store(
     # import; unknown/in-progress operations cannot be safely reconstructed.
     if "write_api_requests" in tables and connection.execute(
         "SELECT 1 FROM write_api_requests "
-        "WHERE state <> 'completed' OR completed_at IS NULL "
+        "WHERE state IS NOT 'completed' OR completed_at IS NULL "
         "OR response_status IS NULL OR response_json IS NULL LIMIT 1"
     ).fetchone() is not None:
         raise LegacyMigrationError("legacy write reconciliation is required")
@@ -165,7 +165,7 @@ def _inspect_historical_store(
     for table in ("operation_receipts", "create_operation_receipts"):
         if table in tables and connection.execute(
             f"SELECT 1 FROM {_quote_identifier(table)} "
-            "WHERE writer_invoked <> 0 AND outcome <> 'confirmed' LIMIT 1"
+            "WHERE writer_invoked <> 0 AND outcome IS NOT 'confirmed' LIMIT 1"
         ).fetchone() is not None:
             raise LegacyMigrationError("legacy write reconciliation is required")
 
