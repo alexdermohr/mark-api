@@ -671,6 +671,9 @@ class LegacyMigrationTests(unittest.TestCase):
                 attempted = []
 
                 def competing_at_link(stage: Path, target: Path) -> None:
+                    if target != output:
+                        real_link(stage, target)
+                        return
                     with sqlite3.connect(source, timeout=0.05) as other:
                         try:
                             other.execute(
@@ -729,10 +732,11 @@ class LegacyMigrationTests(unittest.TestCase):
                 original_fsync(fd)
 
             def guard_publication(stage: Path, target: Path) -> None:
-                self.assertTrue(
-                    synced_backup_parent,
-                    "backup directory entry not synced before target publication",
-                )
+                if target == output:
+                    self.assertTrue(
+                        synced_backup_parent,
+                        "backup directory entry not synced before target publication",
+                    )
                 original_link(stage, target)
 
             with (
@@ -943,6 +947,106 @@ class LegacyMigrationTests(unittest.TestCase):
                 os.umask(previous_umask)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o400)
+
+    def test_backup_never_reopens_public_path_as_sqlite(self) -> None:
+        # A public backup pathname can be renamed after O_EXCL creation.
+        # The SQLite backup/read connections must use a private pinned stage.
+        from mark_api import legacy_migration
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, backup, output = (
+                root / "old.sqlite", root / "published-backup.sqlite",
+                root / "new.sqlite",
+            )
+            self.build_stage(source, STAGES[0])
+            original_connect = sqlite3.connect
+            public_uri = legacy_migration._uri(backup, "rw").split("?")[0]
+            public_opens = []
+
+            def connect_only_private(db, *args, **kwargs):
+                if isinstance(db, str) and db.startswith(public_uri + "?"):
+                    public_opens.append(db)
+                    raise AssertionError("public backup path reopened for SQLite")
+                return original_connect(db, *args, **kwargs)
+
+            with patch(
+                "mark_api.legacy_migration.sqlite3.connect",
+                side_effect=connect_only_private,
+            ):
+                migrate_legacy_store(
+                    source, backup_db=backup, output_db=output,
+                    confirm_no_unresolved_writes=True,
+                )
+            self.assertEqual(public_opens, [])
+            self.assertTrue(backup.is_file())
+            self.assertTrue(SnapshotStore(output, create_if_missing=False).is_ready())
+
+    def test_backup_publication_refuses_racing_symlink_and_hardlink(self) -> None:
+        for link_kind in ("symlink", "hardlink"):
+            with self.subTest(kind=link_kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source, backup, output, victim = (
+                    root / "old.sqlite", root / "backup.sqlite",
+                    root / "new.sqlite", root / "unrelated.txt",
+                )
+                self.build_stage(source, STAGES[0])
+                victim.write_bytes(b"unrelated original content")
+                original_link = os.link
+                attempted = []
+
+                def competing_name_before_backup_link(src: Path, dst: Path) -> None:
+                    if dst == backup:
+                        attempted.append(True)
+                        if link_kind == "symlink":
+                            os.symlink(victim, backup)
+                        else:
+                            original_link(victim, backup)
+                    original_link(src, dst)
+
+                with patch(
+                    "mark_api.legacy_migration.os.link",
+                    side_effect=competing_name_before_backup_link,
+                ):
+                    with self.assertRaises(FileExistsError):
+                        migrate_legacy_store(
+                            source, backup_db=backup, output_db=output,
+                            confirm_no_unresolved_writes=True,
+                        )
+                self.assertEqual(attempted, [True])
+                self.assertEqual(victim.read_bytes(), b"unrelated original content")
+                self.assertFalse(output.exists())
+
+    def test_replaced_backup_name_before_output_publication_is_rejected(self) -> None:
+        from mark_api import legacy_migration
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, backup, output, victim = (
+                root / "old.sqlite", root / "backup.sqlite",
+                root / "new.sqlite", root / "unrelated.sqlite",
+            )
+            self.build_stage(source, STAGES[0])
+            self.build_stage(victim, STAGES[0])
+            victim_bytes = victim.read_bytes()
+            original_copy = legacy_migration._copy_historical_rows
+
+            def replace_published_backup(*args, **kwargs):
+                original_copy(*args, **kwargs)
+                backup.unlink()
+                backup.symlink_to(victim)
+
+            with patch(
+                "mark_api.legacy_migration._copy_historical_rows",
+                side_effect=replace_published_backup,
+            ):
+                with self.assertRaisesRegex(LegacyMigrationError, "backup path"):
+                    migrate_legacy_store(
+                        source, backup_db=backup, output_db=output,
+                        confirm_no_unresolved_writes=True,
+                    )
+            self.assertFalse(output.exists())
+            self.assertEqual(victim.read_bytes(), victim_bytes)
 
     def test_installed_product_exposes_offline_migration_cli(self) -> None:
         with (Path.cwd() / "pyproject.toml").open("rb") as stream:

@@ -223,6 +223,19 @@ def _require_source_identity(source: Path, expected: os.stat_result) -> None:
         raise LegacyMigrationError("source path identity changed during migration")
 
 
+def _require_backup_identity(staged_backup: Path, backup: Path) -> None:
+    # The public backup name must still resolve to the private staged inode.
+    staged = staged_backup.lstat()
+    published = backup.lstat()
+    if (
+        not stat.S_ISREG(published.st_mode)
+        or (published.st_dev, published.st_ino)
+        != (staged.st_dev, staged.st_ino)
+        or published.st_nlink < 2
+    ):
+        raise LegacyMigrationError("backup path identity changed during migration")
+
+
 @contextmanager
 def _source_writer_fence(source: Path, expected: os.stat_result):
     # SQLite's own write transaction excludes other SQLite commits, including
@@ -357,28 +370,35 @@ def migrate_legacy_store(
         else:
             raise LegacyMigrationError("backup/output already exists")
 
-    with _source_writer_fence(source, metadata), closing(
-        sqlite3.connect(_uri(source, "ro"), uri=True, timeout=3)
-    ) as original:
+    with (
+        _source_writer_fence(source, metadata),
+        closing(sqlite3.connect(_uri(source, "ro"), uri=True, timeout=3)) as original,
+        tempfile.TemporaryDirectory(
+            prefix=".mark-legacy-backup-", dir=backup.parent
+        ) as backup_directory,
+    ):
         original.row_factory = sqlite3.Row
         names, counts = _inspect_historical_store(original)
         version_before = int(original.execute("PRAGMA data_version").fetchone()[0])
         # The independent original is never modified: SQLite's online backup
         # captures a consistent snapshot including committed WAL data.
-        _create_private_file(backup)
-        with closing(sqlite3.connect(_uri(backup, "rw"), uri=True)) as copy:
+        # SQLite may only open the private staging pathname: a public backup
+        # pathname could be replaced after O_EXCL and before an SQLite open.
+        staged_backup = Path(backup_directory) / "mark.sqlite"
+        _create_private_file(staged_backup)
+        with closing(sqlite3.connect(_uri(staged_backup, "rw"), uri=True)) as copy:
             original.backup(copy)
-        os.chmod(backup, 0o400)
-        # Both file contents/permissions and the new name must survive a crash
-        # before the upgraded destination is published, including cross-dir.
-        _fsync_file(backup)
+        os.chmod(staged_backup, 0o400)
+        _fsync_file(staged_backup)
+        # Atomic no-clobber backup publication, then durable parent entry.
+        os.link(staged_backup, backup)
         _fsync_directory(backup.parent)
         version_after = int(original.execute("PRAGMA data_version").fetchone()[0])
         if version_after != version_before:
             raise LegacyMigrationError("source changed during backup")
 
-        backup_sha = _file_sha256(backup)
-        with closing(sqlite3.connect(_uri(backup, "ro"), uri=True)) as frozen:
+        backup_sha = _file_sha256(staged_backup)
+        with closing(sqlite3.connect(_uri(staged_backup, "ro"), uri=True)) as frozen:
             frozen.row_factory = sqlite3.Row
             backed_names, backed_counts = _inspect_historical_store(frozen)
             if backed_names != names or backed_counts != counts:
@@ -394,6 +414,7 @@ def migrate_legacy_store(
                 if int(original.execute("PRAGMA data_version").fetchone()[0]) != version_before:
                     raise LegacyMigrationError("source changed during migration")
                 _require_source_identity(source, metadata)
+                _require_backup_identity(staged_backup, backup)
                 os.link(stage, output)
                 _fsync_directory(output.parent)
 
