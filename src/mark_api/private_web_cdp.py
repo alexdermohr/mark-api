@@ -3526,6 +3526,10 @@ class CdpPrivateWebOwnerReader:
             title=editor.title,
             description=editor.description,
             source=f"{target.source}+private-web",
+            metric_source=(
+                target.metric_source
+                if target.metric_source is not None else target.source
+            ),
         )
         result = list(snapshots)
         result[index] = enriched
