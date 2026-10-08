@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -31,6 +32,317 @@ class SnapshotStoreTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         return SnapshotStore(Path(tmp.name) / "mark.sqlite")
+
+    def test_missing_store_is_rejected_without_creating_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "wrong" / "mark.sqlite"
+            with self.assertRaises(sqlite3.OperationalError):
+                SnapshotStore(missing, create_if_missing=False)
+            self.assertFalse(missing.exists())
+            self.assertFalse(missing.parent.exists())
+
+    def test_existing_only_rejects_uninitialized_sqlite_without_migrating(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            foreign = Path(tmp) / "foreign.sqlite"
+            sqlite3.connect(foreign).close()
+            with self.assertRaises(sqlite3.Error):
+                SnapshotStore(foreign, create_if_missing=False)
+            with sqlite3.connect(foreign) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall(),
+                    [],
+                )
+
+    def test_lost_corrupt_restored_store_does_not_regenerate_or_lose_data(self) -> None:
+        store = self.make_store()
+        store.append_ad_snapshot(
+            AdSnapshot(
+                ad_id="123",
+                observed_at=NOW,
+                source="audit",
+                lifecycle_state=LifecycleState.ACTIVE,
+                views=7,
+            )
+        )
+        backup = store.path.with_name("mark-backup.sqlite")
+        shutil.copyfile(store.path, backup)
+        self.assertTrue(store.is_ready())
+
+        store.path.unlink()
+        self.assertFalse(store.is_ready())
+        with self.assertRaises(sqlite3.OperationalError):
+            store.tracked_ad_ids()
+        with self.assertRaises(sqlite3.OperationalError):
+            SnapshotStore(store.path, create_if_missing=False)
+        self.assertFalse(store.path.exists())
+
+        store.path.write_bytes(b"corrupt sqlite database")
+        self.assertFalse(store.is_ready())
+        with self.assertRaises(sqlite3.DatabaseError):
+            store.tracked_ad_ids()
+        with self.assertRaises(sqlite3.DatabaseError):
+            SnapshotStore(store.path, create_if_missing=False)
+
+        shutil.copyfile(backup, store.path)
+        self.assertTrue(store.is_ready())
+        reopened = SnapshotStore(store.path, create_if_missing=False)
+        self.assertEqual(reopened.tracked_ad_ids(), ("123",))
+        self.assertEqual(reopened.latest_ad_snapshot("123").views, 7)
+
+    def test_readiness_requires_write_recovery_tables(self) -> None:
+        store = self.make_store()
+        self.assertTrue(store.is_ready())
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("DROP TABLE dashboard_pending_writes")
+        self.assertFalse(store.is_ready())
+        with self.assertRaises(sqlite3.DatabaseError):
+            SnapshotStore(store.path, create_if_missing=False)
+        with sqlite3.connect(store.path) as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='dashboard_pending_writes'"
+                ).fetchone()
+            )
+
+    def test_explicit_init_cannot_repair_existing_missing_write_fences(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for table in ("write_api_requests", "dashboard_pending_writes"):
+                with self.subTest(table=table):
+                    path = Path(tmp) / (table + ".sqlite")
+                    store = SnapshotStore(path)
+                    self.assertTrue(store.is_ready())
+                    with sqlite3.connect(path) as connection:
+                        connection.execute(f"DROP TABLE {table}")
+                    with self.assertRaises(sqlite3.DatabaseError):
+                        SnapshotStore(path, create_if_missing=True)
+                    with sqlite3.connect(path) as connection:
+                        self.assertIsNone(
+                            connection.execute(
+                                "SELECT name FROM sqlite_master "
+                                "WHERE type='table' AND name=?",
+                                (table,),
+                            ).fetchone()
+                        )
+
+    def test_malformed_recovery_columns_fail_before_migrations_and_on_readyz(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for table, columns in (
+                ("write_api_requests", "idempotency_key TEXT PRIMARY KEY"),
+                (
+                    "dashboard_pending_writes",
+                    "scope TEXT PRIMARY KEY, resource_key TEXT UNIQUE, "
+                    "idempotency_key TEXT UNIQUE",
+                ),
+            ):
+                with self.subTest(table=table):
+                    path = Path(tmp) / (table + ".sqlite")
+                    store = SnapshotStore(path)
+                    self.assertTrue(store.is_ready())
+                    with sqlite3.connect(path) as connection:
+                        connection.execute(f"DROP TABLE {table}")
+                        connection.execute(f"CREATE TABLE {table} ({columns})")
+                    self.assertFalse(store.is_ready())
+                    for initialize in (False, True):
+                        with self.assertRaises(sqlite3.DatabaseError):
+                            SnapshotStore(path, create_if_missing=initialize)
+                    with sqlite3.connect(path) as connection:
+                        self.assertEqual(
+                            {row[1] for row in connection.execute(
+                                f"PRAGMA table_info({table})"
+                            ).fetchall()},
+                            {
+                                "idempotency_key"
+                            } if table == "write_api_requests" else {
+                                "scope", "resource_key", "idempotency_key"
+                            },
+                        )
+
+    def test_partial_unique_write_key_is_not_full_recovery_uniqueness(self) -> None:
+        store = self.make_store()
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("DROP TABLE write_api_requests")
+            connection.execute(
+                """
+                CREATE TABLE write_api_requests (
+                    idempotency_key TEXT NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    claim_owner TEXT,
+                    execution_started_at TEXT,
+                    completed_at TEXT,
+                    response_status INTEGER,
+                    response_json TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX partial_write_key "
+                "ON write_api_requests(idempotency_key) WHERE state = 'never'"
+            )
+            for _ in range(2):
+                connection.execute(
+                    "INSERT INTO write_api_requests "
+                    "(idempotency_key, request_sha256, state, requested_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("ui:duplicate", "a" * 64, "in_progress", NOW.isoformat()),
+                )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM write_api_requests "
+                    "WHERE idempotency_key='ui:duplicate'"
+                ).fetchone()[0],
+                2,
+            )
+
+        self.assertFalse(store.is_ready())
+        for initialize in (False, True):
+            with self.subTest(initialize=initialize):
+                with self.assertRaises(sqlite3.DatabaseError):
+                    SnapshotStore(store.path, create_if_missing=initialize)
+        with self.assertRaises(sqlite3.DatabaseError):
+            store.claim_write_api_request(
+                idempotency_key="ui:new-key",
+                request_sha256="b" * 64,
+                requested_at=NOW,
+                claim_owner="runtime-owner",
+            )
+
+    def test_partial_unique_pending_resource_cannot_authorize_claim(self) -> None:
+        store = self.make_store()
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("DROP TABLE dashboard_pending_writes")
+            connection.execute(
+                """
+                CREATE TABLE dashboard_pending_writes (
+                    scope TEXT PRIMARY KEY,
+                    resource_key TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    payload_json TEXT,
+                    ad_id TEXT,
+                    acknowledged INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX partial_pending_resource "
+                "ON dashboard_pending_writes(resource_key) WHERE method = 'never'"
+            )
+            for scope in ("ad:2:pause", "ad:2:activate"):
+                connection.execute(
+                    "INSERT INTO dashboard_pending_writes "
+                    "(scope, resource_key, idempotency_key, method, path) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        scope, "ad:2", "ui:" + scope, "POST",
+                        "/api/write/ads/2/pause",
+                    ),
+                )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dashboard_pending_writes "
+                    "WHERE resource_key='ad:2'"
+                ).fetchone()[0],
+                2,
+            )
+
+        self.assertFalse(store.is_ready())
+        for initialize in (False, True):
+            with self.subTest(initialize=initialize):
+                with self.assertRaises(sqlite3.DatabaseError):
+                    SnapshotStore(store.path, create_if_missing=initialize)
+        with self.assertRaises(sqlite3.DatabaseError):
+            store.claim_dashboard_pending_write(
+                scope="ad:3:pause",
+                resource_key="ad:3",
+                idempotency_key="ui:new-pending",
+                method="POST",
+                path="/api/write/ads/3/pause",
+                payload_json=None,
+                ad_id="3",
+            )
+
+    def test_missing_uniqueness_blocks_live_pending_claim(self) -> None:
+        store = self.make_store()
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("DROP TABLE dashboard_pending_writes")
+            connection.execute(
+                """
+                CREATE TABLE dashboard_pending_writes (
+                    scope TEXT PRIMARY KEY,
+                    resource_key TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    payload_json TEXT,
+                    ad_id TEXT,
+                    acknowledged INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+        self.assertFalse(store.is_ready())
+        with self.assertRaises(sqlite3.DatabaseError):
+            store.claim_dashboard_pending_write(
+                scope="ad:2:pause",
+                resource_key="ad:2",
+                idempotency_key="ui:unique-required",
+                method="POST",
+                path="/api/write/ads/2/pause",
+                payload_json=None,
+                ad_id="2",
+            )
+
+    def test_missing_write_request_primary_key_blocks_live_claim(self) -> None:
+        store = self.make_store()
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("DROP TABLE write_api_requests")
+            connection.execute(
+                """
+                CREATE TABLE write_api_requests (
+                    idempotency_key TEXT NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    claim_owner TEXT,
+                    execution_started_at TEXT,
+                    completed_at TEXT,
+                    response_status INTEGER,
+                    response_json TEXT
+                )
+                """
+            )
+        self.assertFalse(store.is_ready())
+        with self.assertRaises(sqlite3.DatabaseError):
+            store.claim_write_api_request(
+                idempotency_key="ui:unique-required",
+                request_sha256="a" * 64,
+                requested_at=NOW,
+                claim_owner="runtime-owner",
+            )
+
+    def test_readiness_requires_analytics_schema_too(self) -> None:
+        store = self.make_store()
+        self.assertTrue(store.is_ready())
+        with sqlite3.connect(store.path) as connection:
+            connection.execute("DROP TABLE reaction_snapshots")
+        self.assertFalse(store.is_ready())
+        with self.assertRaises(sqlite3.DatabaseError):
+            SnapshotStore(store.path, create_if_missing=False)
+
+    def test_sqlite_uri_preserves_encoded_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "SQLite #? percent%.sqlite"
+            store = SnapshotStore(path)
+            self.assertTrue(store.is_ready())
+            self.assertEqual(
+                SnapshotStore(path, create_if_missing=False).tracked_ad_ids(),
+                (),
+            )
 
     def test_failed_inventory_read_does_not_create_absent_snapshot(self) -> None:
         store = self.make_store()
@@ -269,7 +581,11 @@ class SnapshotStoreTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         db_path = Path(tmp.name) / "mark.sqlite"
+        # Keep the complete store; only this table has the legacy column layout.
+        # Missing write-recovery tables must never be silently restored.
+        SnapshotStore(db_path)
         with sqlite3.connect(db_path) as connection:
+            connection.execute("DROP TABLE create_operation_receipts")
             connection.execute(
                 """
                 CREATE TABLE create_operation_receipts (
@@ -412,7 +728,11 @@ class SnapshotStoreTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         db_path = Path(tmp.name) / "mark.sqlite"
+        # Keep the complete store; only this table has the legacy column layout.
+        # Missing write-recovery tables must never be silently restored.
+        SnapshotStore(db_path)
         with sqlite3.connect(db_path) as connection:
+            connection.execute("DROP TABLE dashboard_pending_writes")
             connection.execute(
                 """
                 CREATE TABLE dashboard_pending_writes (
@@ -551,7 +871,11 @@ class SnapshotStoreTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         db_path = Path(tmp.name) / "mark.sqlite"
         fingerprint = "b" * 64
+        # Keep the complete store; only this table has the legacy column layout.
+        # Missing write-recovery tables must never be silently restored.
+        SnapshotStore(db_path)
         with sqlite3.connect(db_path) as connection:
+            connection.execute("DROP TABLE write_api_requests")
             connection.execute(
                 """
                 CREATE TABLE write_api_requests (

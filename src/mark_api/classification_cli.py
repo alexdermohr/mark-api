@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from collections.abc import Iterable, Mapping
 from datetime import datetime
 from pathlib import Path
@@ -129,7 +130,10 @@ def main(argv: list[str] | None = None) -> int:
     }
     clears = tuple(item.replace("-", "_") for item in args.clear)
 
-    store = SnapshotStore(args.db)
+    try:
+        store = SnapshotStore(args.db, create_if_missing=False)
+    except (OSError, sqlite3.Error):
+        parser.error("SQLite database unavailable or not initialized")
     try:
         classification = update_classification(
             store,

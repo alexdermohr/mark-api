@@ -329,6 +329,7 @@ def build_product_launcher(
     write_runtime_factory: _WriteRuntimeFactory | None = None,
     dashboard_factory: _DashboardFactory = create_server,
     store_factory: _StoreFactory = SnapshotStore,
+    initialize_db: bool = False,
     token_factory: _TokenFactory | None = None,
     dashboard_token_factory: _TokenFactory | None = None,
     clock: _Clock = _utc_now,
@@ -371,6 +372,8 @@ def build_product_launcher(
         raise TypeError("dashboard_factory must be callable")
     if not callable(store_factory):
         raise TypeError("store_factory must be callable")
+    if not isinstance(initialize_db, bool):
+        raise TypeError("initialize_db must be bool")
     if token_factory is not None and not callable(token_factory):
         raise TypeError("token_factory must be callable or None")
     if dashboard_token_factory is not None and not callable(
@@ -395,7 +398,12 @@ def build_product_launcher(
     )
 
     try:
-        store = store_factory(db_path)
+        # User-facing launches must not silently create a new empty database.
+        # Custom factories remain an explicit integration/test injection seam.
+        if store_factory is SnapshotStore:
+            store = SnapshotStore(db_path, create_if_missing=initialize_db)
+        else:
+            store = store_factory(db_path)
         tracked_ids = store.tracked_ad_ids()
     except Exception:
         raise ProductLauncherError("local snapshot store startup failed") from None
@@ -548,6 +556,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Path to the persistent mark-api SQLite database.",
     )
     parser.add_argument(
+        "--init-db",
+        action="store_true",
+        help="Explicitly initialize a new SQLite store; omit on normal starts.",
+    )
+    parser.add_argument(
         "--cdp-port",
         type=int,
         required=True,
@@ -615,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         launcher = build_product_launcher(
             db_path=args.db,
+            initialize_db=args.init_db,
             cdp_port=args.cdp_port,
             dashboard_port=args.dashboard_port,
             write_port=args.write_port,

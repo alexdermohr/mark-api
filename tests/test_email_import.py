@@ -5,7 +5,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from email import policy
 from email.message import EmailMessage
@@ -267,6 +267,26 @@ class KleinanzeigenEmailImportTests(unittest.TestCase):
             import_kleinanzeigen_email_files(store, (valid, invalid))
 
         self.assertEqual(store.inbound_message_history("1234567890"), ())
+
+    def test_mail_cli_requires_explicit_new_database_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "missing" / "mark.sqlite"
+            mail = Path(tmp) / "reaction.eml"
+            mail.write_bytes(notification())
+            errors = io.StringIO()
+            with redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+                main(["--db", str(db), str(mail)])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("SQLite database unavailable", errors.getvalue())
+            self.assertNotIn(str(db), errors.getvalue())
+            self.assertFalse(db.parent.exists())
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                result = main(["--db", str(db), "--init-db", str(mail)])
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(stdout.getvalue())["inserted_events"], 1)
+            self.assertTrue(SnapshotStore(db, create_if_missing=False).is_ready())
 
     def test_cli_outputs_only_safe_import_summary(self) -> None:
         tmp, store = self.make_store()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from pathlib import Path
 
 from .email_import import import_kleinanzeigen_email_files
@@ -22,6 +23,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Path to the local mark-api SQLite database.",
     )
     parser.add_argument(
+        "--init-db",
+        action="store_true",
+        help="Explicitly initialize a new SQLite store; omit on normal imports.",
+    )
+    parser.add_argument(
         "emails",
         type=Path,
         nargs="+",
@@ -34,7 +40,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
 
-    store = SnapshotStore(args.db)
+    try:
+        store = SnapshotStore(args.db, create_if_missing=args.init_db)
+    except (OSError, sqlite3.Error):
+        parser.error("SQLite database unavailable or not initialized")
     try:
         report = import_kleinanzeigen_email_files(store, args.emails)
     except (TypeError, ValueError) as exc:

@@ -4,7 +4,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,6 +38,17 @@ class ClassificationCliTests(unittest.TestCase):
                 lifecycle_state=LifecycleState.ACTIVE,
             )
         )
+
+    def test_missing_database_cli_does_not_create_new_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "mistyped" / "mark.sqlite"
+            errors = io.StringIO()
+            with redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+                main(["--db", str(missing), "--ad-id", "123", "--city", "Berlin"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("SQLite database unavailable", errors.getvalue())
+            self.assertNotIn(str(missing), errors.getvalue())
+            self.assertFalse(missing.parent.exists())
 
     def test_unknown_ad_is_rejected_before_append(self) -> None:
         _, store = self.make_store()

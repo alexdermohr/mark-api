@@ -6,6 +6,7 @@ import http.client
 import json
 import math
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -2202,6 +2203,13 @@ def _handler_factory(
             )
 
         def do_GET(self) -> None:
+            try:
+                self._handle_GET()
+            except sqlite3.Error:
+                # No database error messages, SQL or filesystem paths on HTTP.
+                self._send_json(503, {"error": "database_unavailable"})
+
+        def _handle_GET(self) -> None:
             target = urlsplit(self.path)
             path = target.path
 
@@ -2228,6 +2236,15 @@ def _handler_factory(
                 return
             if path == "/healthz":
                 self._send_json(200, {"status": "ok"})
+                return
+            if path == "/readyz":
+                if store.is_ready():
+                    self._send_json(200, {"status": "ready"})
+                else:
+                    self._send_json(
+                        503,
+                        {"status": "unavailable", "error": "database_unavailable"},
+                    )
                 return
             if path == "/api/dashboard/config":
                 self._send_json(
@@ -2551,9 +2568,17 @@ def main(argv: list[str] | None = None) -> int:
             "unset by default."
         ),
     )
+    parser.add_argument(
+        "--init-db",
+        action="store_true",
+        help="Explicitly initialize a new SQLite store; omit on normal starts.",
+    )
     args = parser.parse_args(argv)
 
-    store = SnapshotStore(args.db)
+    try:
+        store = SnapshotStore(args.db, create_if_missing=args.init_db)
+    except (OSError, sqlite3.Error):
+        parser.error("SQLite database unavailable or not initialized")
     contract = AnalyticsContract(
         reaction_metric=args.reaction_metric,
         objective_metric=args.objective_metric,
