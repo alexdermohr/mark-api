@@ -504,18 +504,24 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 created_directory = True
             except FileExistsError:
                 pass
-            directory_stat = os.stat(directory_path, follow_symlinks=False)
-            if not stat.S_ISDIR(directory_stat.st_mode):
-                raise ValueError("media handle directory is invalid")
-            os.chmod(directory_path, 0o700)
-            _fsync_directory(directory_path)
-            if created_directory:
-                _fsync_directory(parent_path)
+            try:
+                directory_stat = os.stat(directory_path, follow_symlinks=False)
+                if not stat.S_ISDIR(directory_stat.st_mode):
+                    raise ValueError("media handle directory is invalid")
+                os.chmod(directory_path, 0o700)
+                _fsync_directory(directory_path)
+                if created_directory:
+                    _fsync_directory(parent_path)
+            except Exception:
+                if created_directory:
+                    os.rmdir(directory_path)
+                raise
             self._directory_path = directory_path
             self._persistent = True
         self._lock = Lock()
         self._closed = False
         self._cleanup_required = False
+        self._pending_cleanup_paths: set[str] = set()
         self._staged_bytes = 0
         self._clock = clock
         self._wall_clock = wall_clock
@@ -760,7 +766,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 try:
                     os.unlink(temp_path)
                 except OSError:
-                    pass
+                    self._pending_cleanup_paths.add(temp_path)
+                    self._cleanup_required = True
                 raise
             finally:
                 os.close(fd)
@@ -791,11 +798,14 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                         _fsync_directory(self._directory_path)
                     except OSError:
                         cleanup_sync_failed = True
-                if published and cleanup_unlink_failed:
-                    self._sources[ref] = PrivateWebMediaSource(path)
-                    self._sizes[ref] = len(data)
-                    self._expires_at[ref] = float("inf")
-                    self._staged_bytes += len(data)
+                if cleanup_unlink_failed:
+                    if published:
+                        self._sources[ref] = PrivateWebMediaSource(path)
+                        self._sizes[ref] = len(data)
+                        self._expires_at[ref] = float("inf")
+                        self._staged_bytes += len(data)
+                    else:
+                        self._pending_cleanup_paths.add(temp_path)
                 if cleanup_unlink_failed or cleanup_sync_failed:
                     self._cleanup_required = True
                 raise
@@ -852,14 +862,18 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                 for ref in orphan_refs
                 if ref in self._sources
             )
+            cleanup_sources = orphan_sources + tuple(
+                PrivateWebMediaSource(path) for path in self._pending_cleanup_paths
+            )
             try:
-                self._unlink_sources(orphan_sources)
-                if self._persistent and (orphan_sources or self._cleanup_required):
+                self._unlink_sources(cleanup_sources)
+                if self._persistent and (cleanup_sources or self._cleanup_required):
                     _fsync_directory(self._directory_path)
             except Exception:
                 self._cleanup_required = True
                 raise
             self._pop_handles_locked(orphan_refs)
+            self._pending_cleanup_paths.clear()
             self._cleanup_required = False
             self._closed = True
             self._sources.clear()
