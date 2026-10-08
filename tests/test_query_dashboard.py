@@ -912,7 +912,7 @@ class MarkQueryServiceTests(SeededStoreMixin, unittest.TestCase):
         for metric in ("views", "watch_count", "reply_count"):
             self.assertEqual(current["metric_evidence"][metric], {
                 "observed_at": T1.isoformat(),
-                "source": "management+mobile",
+                "source": "unattributed_legacy_composite",
                 "last_known": False,
             })
 
@@ -928,6 +928,27 @@ class MarkQueryServiceTests(SeededStoreMixin, unittest.TestCase):
         self.assertEqual(unknown["metric_evidence"], {
             "views": None, "watch_count": None, "reply_count": None,
         })
+
+    def test_metric_evidence_uses_persisted_origin_not_composite_content_source(self) -> None:
+        store = self.make_store()
+        store.append_ad_snapshot(AdSnapshot(
+            ad_id="81", observed_at=T0,
+            source="management+mobile",
+            metric_source="management",
+            lifecycle_state=LifecycleState.ACTIVE,
+            views=0, watch_count=1, reply_count=3,
+        ))
+        item = {
+            ad.ad_id: ad_view_to_dict(ad)
+            for ad in MarkQueryService(store).latest_ads()
+        }["81"]
+        self.assertEqual(item["source"], "management+mobile")
+        self.assertEqual(item["metric_evidence"]["views"], {
+            "observed_at": T0.isoformat(),
+            "source": "management",
+            "last_known": False,
+        })
+        self.assertEqual(item["views"], 0)
 
     def test_metric_evidence_tracks_observation_order_not_arrival(self) -> None:
         store = self.make_store()

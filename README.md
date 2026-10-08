@@ -31,6 +31,8 @@ Analytics-Reaktionsmetriken verwenden Zeit und Quelle ihres neuesten tatsächlic
 
 Dashboard-Tabellen zeigen Zeit, Quelle und aus der Betrachtungszeit berechnetes Alter pro Metrik. **Diese Zeiten sind keine Sync-Erfolgsnachweise.** Der aktuelle Store besitzt noch kein belastbares separates Journal erfolgreicher und fehlgeschlagener Synchronisationsversuche. Das Dashboard kennzeichnet diesen Sync-Status ausdrücklich als „nicht erfasst“, statt aus vorhandenen historischen Beobachtungen Erfolg oder Fehler zu erfinden. Ein solches separates Sync-Journal bleibt als verbleibender A5-Teil offen; es darf Write-Recovery und alte SQLite-Stores nicht beschädigen.
 
+Für den angereicherten Besitzerbestand bleibt die allgemeine Anzeige-/Inhaltsquelle zusammengesetzt (beispielsweise management+mobile), während die Zählerquelle im Snapshot separat belegt und über einen versionierten, reversiblen Quellen-Wrapper im vorhandenen SQLite-TEXT-Feld persistiert wird. Vorhandene Tabellen und Write-Recovery-Schemata werden dadurch nicht migriert. Historische zusammengesetzte Quellstrings ohne separat persistierte Metrikherkunft gelten als `unattributed_legacy_composite` und werden gerade **nicht** automatisch dem Management-Anteil zugeordnet. Frei wählbare Quellnamen mit Pluszeichen sind kein hinreichender Herkunftsnachweis.
+
 ## Product Launcher
 
 Der installierte Startpfad für den aktuellen Produktstand ist `mark-api-launch`. Er verwendet einen **bereits laufenden, vom Nutzer bereits authentifizierten** lokalen Chrome-/Chromium-Prozess mit loopback-CDP; der Launcher startet keinen Browser und automatisiert weder Login noch MFA/CAPTCHA.

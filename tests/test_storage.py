@@ -91,6 +91,35 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(reopened.tracked_ad_ids(), ("123",))
         self.assertEqual(reopened.latest_ad_snapshot("123").views, 7)
 
+    def test_encoded_metric_origin_and_reserved_source_roundtrip_without_schema_migration(self) -> None:
+        store = self.make_store()
+        value = AdSnapshot(
+            ad_id="origin", observed_at=NOW, source="owner+content",
+            lifecycle_state=LifecycleState.ACTIVE,
+            metric_source="management+stats", views=0, watch_count=2,
+        )
+        store.append_ad_snapshot(value)
+        literal = AdSnapshot(
+            ad_id="literal", observed_at=NOW,
+            source="mark:source-v1:literal-legacy-provider",
+            lifecycle_state=LifecycleState.ACTIVE, views=7,
+        )
+        store.append_ad_snapshot(literal)
+        reopened = SnapshotStore(store.path, create_if_missing=False)
+        self.assertEqual(reopened.latest_ad_snapshot("origin"), value)
+        self.assertEqual(reopened.latest_ad_snapshot("literal"), literal)
+        with sqlite3.connect(store.path) as conn:
+            encoded = conn.execute(
+                "SELECT source FROM ad_snapshots WHERE ad_id='origin'"
+            ).fetchone()[0]
+            self.assertTrue(encoded.startswith("mark:source-v1:"))
+            conn.execute(
+                "UPDATE ad_snapshots SET source=? WHERE ad_id='origin'",
+                ("mark:source-v1:{not-json",),
+            )
+        with self.assertRaises(sqlite3.DatabaseError):
+            reopened.ad_history("origin")
+
     def test_readiness_requires_write_recovery_tables(self) -> None:
         store = self.make_store()
         self.assertTrue(store.is_ready())

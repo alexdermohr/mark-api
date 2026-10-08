@@ -78,7 +78,14 @@ def _last_metric_with_evidence(
         if value is not None:
             return value, MetricEvidence(
                 observed_at=snapshot.observed_at,
-                source=snapshot.source,
+                source=(
+                    snapshot.metric_source
+                    if snapshot.metric_source is not None
+                    else (
+                        "unattributed_legacy_composite"
+                        if "+" in snapshot.source else snapshot.source
+                    )
+                ),
                 last_known=position != 0,
             )
     return None, None

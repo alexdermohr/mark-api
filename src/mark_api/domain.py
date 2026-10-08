@@ -147,6 +147,7 @@ class AdSnapshot:
     views: int | None = None
     watch_count: int | None = None
     reply_count: int | None = None
+    metric_source: str | None = None
 
     def __post_init__(self) -> None:
         _require_nonempty(self.ad_id, "ad_id")
@@ -155,6 +156,10 @@ class AdSnapshot:
         _require_counter(self.views, "views")
         _require_counter(self.watch_count, "watch_count")
         _require_counter(self.reply_count, "reply_count")
+        if self.metric_source is not None:
+            if not isinstance(self.metric_source, str):
+                raise TypeError("metric_source must be a string or None")
+            _require_nonempty(self.metric_source, "metric_source")
 
 
 @dataclass(frozen=True, slots=True)

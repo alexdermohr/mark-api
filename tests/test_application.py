@@ -181,6 +181,44 @@ class EnrichedOwnerReaderTests(unittest.TestCase):
         self.assertEqual(item.reply_count, 1)
         self.assertEqual(item.source, "management+mobile")
 
+    def test_enriched_counters_retain_exact_management_source_after_store_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mark.sqlite"
+            store = SnapshotStore(path)
+            management = SequenceAdsReader(ReadResult.success_nonempty((
+                ad("15", state=LifecycleState.ACTIVE, title="owner title",
+                   views=0, watch_count=3, reply_count=2, source="owner+stats"),
+            )))
+            mobile = SequenceAdsReader(ReadResult.success_nonempty((
+                ad("15", title="mobile title", source="mobile+details"),
+            )))
+            reader = EnrichedOwnerReader(
+                management_reader=management, mobile_reader=mobile,
+            )
+            result = reader.read_ads()
+            self.assertTrue(result.is_success)
+            original = result.value[0]
+            self.assertEqual(original.source, "owner+stats+mobile+details")
+            self.assertEqual(original.metric_source, "owner+stats")
+            store.append_inventory_result(
+                result, tracked_ad_ids=(), observed_at=NOW,
+                source="inventory-run",
+            )
+            reopened = SnapshotStore(path, create_if_missing=False)
+            row = reopened.latest_ad_snapshot("15")
+            self.assertEqual(row, original)
+            self.assertEqual(row.title, "mobile title")
+            from mark_api.query import MarkQueryService, ad_view_to_dict
+            view = ad_view_to_dict(MarkQueryService(reopened).latest_ads()[0])
+            self.assertEqual(view["source"], "owner+stats+mobile+details")
+            for metric in ("views", "watch_count", "reply_count"):
+                self.assertEqual(view["metric_evidence"][metric], {
+                    "observed_at": NOW.isoformat(),
+                    "source": "owner+stats",
+                    "last_known": False,
+                })
+            self.assertEqual(view["views"], 0)
+
     def test_missing_mobile_match_preserves_management_snapshot(self) -> None:
         original = ad(
             "1",
