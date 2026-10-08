@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import re
+import sys
 import stat
 import tempfile
 from contextlib import AbstractContextManager, nullcontext
@@ -448,6 +451,34 @@ def _fsync_directory(path: str) -> None:
         os.close(descriptor)
 
 
+def _sync_filesystem_directory(path: str, parent_device: int) -> None:
+    """Durably sync a same-filesystem parent when it is not readable (Linux)."""
+    if not sys.platform.startswith("linux"):
+        raise OSError(errno.ENOSYS, "filesystem sync is not supported")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        if os.fstat(descriptor).st_dev != parent_device:
+            raise OSError(errno.EXDEV, "media handle directory is on another filesystem")
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            syncfs = libc.syncfs
+        except AttributeError as exc:
+            raise OSError(errno.ENOSYS, "filesystem sync is unavailable") from exc
+        syncfs.argtypes = [ctypes.c_int]
+        syncfs.restype = ctypes.c_int
+        if syncfs(descriptor) != 0:
+            error = ctypes.get_errno() or errno.EIO
+            raise OSError(error, os.strerror(error))
+    finally:
+        os.close(descriptor)
+
+
 class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
     """Own bounded private media copies behind generated opaque handles."""
 
@@ -525,7 +556,16 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                     # An existing directory might be left by a crash after mkdir,
                     # before its parent entry was durable. Only a completed
                     # parent fsync authorizes publishing the readiness marker.
-                    _fsync_directory(parent_path)
+                    try:
+                        _fsync_directory(parent_path)
+                    except PermissionError as exc:
+                        if exc.errno != errno.EACCES:
+                            raise
+                        # syncfs flushes all metadata on the same Linux filesystem,
+                        # including the unreadable parent's new directory entry.
+                        _sync_filesystem_directory(
+                            directory_path, parent_stat.st_dev
+                        )
                     marker_fd = os.open(
                         marker_path,
                         os.O_WRONLY

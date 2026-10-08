@@ -495,6 +495,91 @@ class PrivateWebMediaContractTests(unittest.TestCase):
             store.close()
             self.assertEqual(persistent_media_files(directory), [])
 
+    def test_unmarked_legacy_directory_with_execute_only_parent_uses_checked_syncfs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            marker = directory / PrivateWebMediaHandleStore._DURABLE_DIRECTORY_MARKER
+            real_sync = private_web_media._fsync_directory
+            syncfs_paths: list[Path] = []
+
+            def fsync_directory(path: str) -> None:
+                if Path(path) == directory.parent:
+                    raise PermissionError(13, "parent is execute-only")
+                real_sync(path)
+
+            def syncfs_directory(path: str, parent_device: int) -> None:
+                self.assertEqual(Path(path), directory)
+                self.assertEqual(parent_device, directory.parent.stat().st_dev)
+                self.assertFalse(marker.exists())
+                syncfs_paths.append(Path(path))
+
+            with (
+                patch.object(
+                    private_web_media,
+                    "_fsync_directory",
+                    side_effect=fsync_directory,
+                ),
+                patch.object(
+                    private_web_media,
+                    "_sync_filesystem_directory",
+                    side_effect=syncfs_directory,
+                    create=True,
+                ),
+            ):
+                store = PrivateWebMediaHandleStore(
+                    directory=directory, protected_refs=lambda: frozenset()
+                )
+                try:
+                    ref = store.stage_media("photo.jpg", b"\xff\xd8\xffdurable")
+                    self.assertTrue(Path(store.resolve((ref,))[0].path).exists())
+                finally:
+                    store.close()
+            self.assertEqual(syncfs_paths, [directory])
+            self.assertTrue(marker.is_file())
+
+            with patch.object(
+                private_web_media,
+                "_fsync_directory",
+                side_effect=fsync_directory,
+            ):
+                reopened = PrivateWebMediaHandleStore(
+                    directory=directory, protected_refs=lambda: frozenset()
+                )
+                reopened.close()
+
+    def test_unmarked_legacy_directory_syncfs_error_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "handles"
+            directory.mkdir()
+            real_sync = private_web_media._fsync_directory
+
+            def fsync_directory(path: str) -> None:
+                if Path(path) == directory.parent:
+                    raise PermissionError(13, "parent is execute-only")
+                real_sync(path)
+
+            with (
+                patch.object(
+                    private_web_media,
+                    "_fsync_directory",
+                    side_effect=fsync_directory,
+                ),
+                patch.object(
+                    private_web_media,
+                    "_sync_filesystem_directory",
+                    side_effect=OSError("filesystem sync failed"),
+                    create=True,
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "filesystem sync failed"):
+                    PrivateWebMediaHandleStore(
+                        directory=directory, protected_refs=lambda: frozenset()
+                    )
+            self.assertFalse(
+                (directory / PrivateWebMediaHandleStore._DURABLE_DIRECTORY_MARKER).exists()
+            )
+
     def test_existing_unmarked_directory_requires_parent_sync_after_interrupted_creation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp) / "handles"
