@@ -463,8 +463,32 @@ def _sync_filesystem_directory(path: str, parent_device: int) -> None:
     )
     descriptor = os.open(path, flags)
     try:
-        if os.fstat(descriptor).st_dev != parent_device:
+        device = os.fstat(descriptor).st_dev
+        if device != parent_device:
             raise OSError(errno.EXDEV, "media handle directory is on another filesystem")
+        # syncfs on FUSE/stacked filesystems can return success without
+        # syncing the parent's directory entry. Older kernels also do not
+        # report writeback errors. Never certify a marker on those paths.
+        kernel_parts = os.uname().release.split(".")
+        try:
+            kernel_version = (int(kernel_parts[0]), int(kernel_parts[1]))
+        except (IndexError, ValueError) as exc:
+            raise OSError(errno.ENOTSUP, "filesystem sync kernel is unverified") from exc
+        if kernel_version < (5, 8):
+            raise OSError(errno.ENOTSUP, "filesystem sync kernel is too old")
+        device_key = f"{os.major(device)}:{os.minor(device)}"
+        types: set[str] = set()
+        with open("/proc/self/mountinfo", encoding="utf-8") as mounts:
+            for line in mounts:
+                parts = line.split(" - ", 1)
+                if len(parts) != 2:
+                    continue
+                mount = parts[0].split()
+                filesystem = parts[1].split()
+                if len(mount) >= 3 and mount[2] == device_key and filesystem:
+                    types.add(filesystem[0])
+        if not types or not types.issubset({"ext4", "xfs", "btrfs", "f2fs"}):
+            raise OSError(errno.ENOTSUP, "filesystem sync durability is unverified")
         libc = ctypes.CDLL(None, use_errno=True)
         try:
             syncfs = libc.syncfs
@@ -550,7 +574,8 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
                         marker_path,
                         os.O_RDONLY
                         | getattr(os, "O_NOFOLLOW", 0)
-                        | getattr(os, "O_CLOEXEC", 0),
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | os.O_NONBLOCK,
                     )
                 except FileNotFoundError:
                     # An existing directory might be left by a crash after mkdir,
@@ -772,6 +797,23 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
         self._staged_bytes = max(0, self._staged_bytes - released_bytes)
         return tuple(sources)
 
+    def _retire_handles_locked(self, media_refs: tuple[str, ...]) -> None:
+        sources = tuple(
+            self._sources[ref] for ref in media_refs if ref in self._sources
+        )
+        if not sources:
+            return
+        try:
+            self._unlink_sources(sources)
+            if self._persistent:
+                _fsync_directory(self._directory_path)
+        except Exception:
+            # Keep all affected refs and their quota until durable cleanup
+            # completes; close() can retry partial removals safely.
+            self._cleanup_required = True
+            raise
+        self._pop_handles_locked(media_refs)
+
     def _prune_expired_locked(
         self,
         now: float,
@@ -783,7 +825,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
             if expires_at <= now and ref not in preserve
         )
         if expired:
-            self._unlink_sources(self._pop_handles_locked(expired))
+            self._retire_handles_locked(expired)
 
     @staticmethod
     def _extension(filename: str, data: bytes) -> str:
@@ -929,8 +971,7 @@ class PrivateWebMediaHandleStore(PrivateWebMediaRefResolver):
 
     def discard(self, media_refs: tuple[str, ...]) -> None:
         with self._lock:
-            sources = self._pop_handles_locked(media_refs)
-        self._unlink_sources(sources)
+            self._retire_handles_locked(media_refs)
 
     def close(self) -> None:
         with self._lock:
