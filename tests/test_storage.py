@@ -107,6 +107,26 @@ class SnapshotStoreTests(unittest.TestCase):
                 ).fetchone()
             )
 
+    def test_explicit_init_cannot_repair_existing_missing_write_fences(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for table in ("write_api_requests", "dashboard_pending_writes"):
+                with self.subTest(table=table):
+                    path = Path(tmp) / (table + ".sqlite")
+                    store = SnapshotStore(path)
+                    self.assertTrue(store.is_ready())
+                    with sqlite3.connect(path) as connection:
+                        connection.execute(f"DROP TABLE {table}")
+                    with self.assertRaises(sqlite3.OperationalError):
+                        SnapshotStore(path, create_if_missing=True)
+                    with sqlite3.connect(path) as connection:
+                        self.assertIsNone(
+                            connection.execute(
+                                "SELECT name FROM sqlite_master "
+                                "WHERE type='table' AND name=?",
+                                (table,),
+                            ).fetchone()
+                        )
+
     def test_readiness_requires_analytics_schema_too(self) -> None:
         store = self.make_store()
         self.assertTrue(store.is_ready())
@@ -363,7 +383,11 @@ class SnapshotStoreTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         db_path = Path(tmp.name) / "mark.sqlite"
+        # Keep the complete store; only this table has the legacy column layout.
+        # Missing write-recovery tables must never be silently restored.
+        SnapshotStore(db_path)
         with sqlite3.connect(db_path) as connection:
+            connection.execute("DROP TABLE create_operation_receipts")
             connection.execute(
                 """
                 CREATE TABLE create_operation_receipts (
@@ -506,7 +530,11 @@ class SnapshotStoreTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         db_path = Path(tmp.name) / "mark.sqlite"
+        # Keep the complete store; only this table has the legacy column layout.
+        # Missing write-recovery tables must never be silently restored.
+        SnapshotStore(db_path)
         with sqlite3.connect(db_path) as connection:
+            connection.execute("DROP TABLE dashboard_pending_writes")
             connection.execute(
                 """
                 CREATE TABLE dashboard_pending_writes (
@@ -645,7 +673,11 @@ class SnapshotStoreTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         db_path = Path(tmp.name) / "mark.sqlite"
         fingerprint = "b" * 64
+        # Keep the complete store; only this table has the legacy column layout.
+        # Missing write-recovery tables must never be silently restored.
+        SnapshotStore(db_path)
         with sqlite3.connect(db_path) as connection:
+            connection.execute("DROP TABLE write_api_requests")
             connection.execute(
                 """
                 CREATE TABLE write_api_requests (

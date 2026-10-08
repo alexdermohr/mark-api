@@ -220,14 +220,17 @@ class ProductLauncherTests(unittest.TestCase):
             inventory_called = True
             return InventoryRuntime(ReadResult.success_empty(()))
 
-        with self.assertRaisesRegex(
-            ProductLauncherError, "local snapshot store startup failed"
-        ):
-            build_product_launcher(
-                db_path=db,
-                cdp_port=9222,
-                runtime_factory=runtime_factory,
-            )
+        for initialize_db in (False, True):
+            with self.subTest(initialize_db=initialize_db):
+                with self.assertRaisesRegex(
+                    ProductLauncherError, "local snapshot store startup failed"
+                ):
+                    build_product_launcher(
+                        db_path=db,
+                        cdp_port=9222,
+                        initialize_db=initialize_db,
+                        runtime_factory=runtime_factory,
+                    )
         self.assertFalse(inventory_called)
         self.assertEqual(self.write_runtime.start_calls, 0)
         with sqlite3.connect(db) as connection:

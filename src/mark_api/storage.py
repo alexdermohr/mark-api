@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
@@ -97,16 +98,23 @@ class SnapshotStore:
         self._existing_uri = (
             "file:" + quote(str(self.path.absolute()), safe="/") + "?mode=rw"
         )
+        created_new = False
         if create_if_missing:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            # Creating the database is a separate constructor-time action.
-            # No later reader or write receipt path is allowed to create one.
-            initial_uri = self._existing_uri.replace("?mode=rw", "?mode=rwc")
-            connection = sqlite3.connect(initial_uri, uri=True)
-            connection.close()
-        else:
-            # Never heal a lost write-recovery table as an empty table:
-            # existing stores must have every table before column migrations.
+            # Exclusive creation prevents --init-db from ever repairing a
+            # damaged existing database into an empty write-recovery store.
+            try:
+                descriptor = os.open(
+                    self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                )
+            except FileExistsError:
+                pass
+            else:
+                os.close(descriptor)
+                created_new = True
+        if not created_new:
+            # Even explicit initialization must not silently re-create any
+            # missing existing write/idempotency tables or unrelated databases.
             with self._connect() as connection:
                 result = connection.execute("PRAGMA quick_check(1)").fetchone()
                 if result is None or result[0] != "ok":
