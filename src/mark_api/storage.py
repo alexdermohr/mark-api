@@ -31,18 +31,145 @@ _CLASSIFICATION_FIELDS = (
     "title_type",
 )
 
-_REQUIRED_STORE_TABLES = (
-    "ad_snapshots",
-    "reaction_snapshots",
-    "inbound_message_events",
-    "ad_classifications",
-    "operation_receipts",
-    "create_operation_receipts",
-    "create_operation_checkpoints",
-    "write_api_requests",
-    "dashboard_pending_writes",
-)
+# Used for startup validation and read-only readiness checks.
+_REQUIRED_STORE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "ad_snapshots": (
+        "id",
+        "ad_id",
+        "observed_at",
+        "source",
+        "lifecycle_state",
+        "title",
+        "description",
+        "views",
+        "watch_count",
+        "reply_count",
+    ),
+    "reaction_snapshots": (
+        "id",
+        "ad_id",
+        "observed_at",
+        "source",
+        "conversation_count",
+        "unique_buyer_count",
+        "inbound_message_count",
+    ),
+    "inbound_message_events": (
+        "id",
+        "provider_message_id",
+        "ad_id",
+        "conversation_id",
+        "observed_at",
+        "source",
+    ),
+    "ad_classifications": (
+        "id",
+        "ad_id",
+        "observed_at",
+        "source",
+        "image_type",
+        "city",
+        "text_type",
+        "title_type",
+    ),
+    "operation_receipts": (
+        "id",
+        "operation",
+        "ad_id",
+        "started_at",
+        "completed_at",
+        "outcome",
+        "pre_read_status",
+        "post_read_status",
+        "writer_invoked",
+        "authorization_by",
+        "authorization_reference",
+        "writer_error",
+        "pre_snapshot_json",
+        "post_snapshot_json",
+    ),
+    "create_operation_receipts": (
+        "id",
+        "operation",
+        "created_ad_id",
+        "started_at",
+        "completed_at",
+        "outcome",
+        "pre_read_status",
+        "confirmation_pre_read_status",
+        "post_read_status",
+        "confirmation_post_read_status",
+        "content_post_read_status",
+        "writer_invoked",
+        "authorization_by",
+        "authorization_reference",
+        "media_post_read_status",
+        "media_persistence_confirmed",
+        "writer_error",
+        "post_snapshot_json",
+        "confirmation_post_snapshot_json",
+        "content_post_snapshot_json",
+    ),
+    "create_operation_checkpoints": (
+        "id",
+        "checkpoint_kind",
+        "operation",
+        "created_ad_id",
+        "started_at",
+        "completed_at",
+        "outcome",
+        "pre_read_status",
+        "confirmation_pre_read_status",
+        "post_read_status",
+        "confirmation_post_read_status",
+        "content_post_read_status",
+        "writer_invoked",
+        "authorization_by",
+        "authorization_reference",
+        "writer_error",
+        "post_snapshot_json",
+        "confirmation_post_snapshot_json",
+        "content_post_snapshot_json",
+    ),
+    "write_api_requests": (
+        "idempotency_key",
+        "request_sha256",
+        "state",
+        "requested_at",
+        "claim_owner",
+        "execution_started_at",
+        "completed_at",
+        "response_status",
+        "response_json",
+    ),
+    "dashboard_pending_writes": (
+        "scope",
+        "resource_key",
+        "idempotency_key",
+        "method",
+        "path",
+        "payload_json",
+        "ad_id",
+        "acknowledged",
+    ),
+}
 
+# Only these missing historical columns may be added to an otherwise complete store.
+_LEGACY_ADDABLE_COLUMNS: dict[str, frozenset[str]] = {
+    "create_operation_receipts": frozenset((
+        "authorization_by", "authorization_reference",
+        "media_post_read_status", "media_persistence_confirmed",
+    )),
+    "write_api_requests": frozenset(("claim_owner", "execution_started_at")),
+    "dashboard_pending_writes": frozenset(("acknowledged",)),
+}
+
+# Single-column uniqueness prevents duplicate pending keys or buyer event IDs.
+_REQUIRED_SINGLE_COLUMN_UNIQUES: dict[str, tuple[str, ...]] = {
+    "inbound_message_events": ("provider_message_id",),
+    "write_api_requests": ("idempotency_key",),
+    "dashboard_pending_writes": ("scope", "resource_key", "idempotency_key"),
+}
 
 @dataclass(frozen=True, slots=True)
 class WriteApiRequestRecord:
@@ -113,14 +240,12 @@ class SnapshotStore:
                 os.close(descriptor)
                 created_new = True
         if not created_new:
-            # Even explicit initialization must not silently re-create any
-            # missing existing write/idempotency tables or unrelated databases.
+            # Never repair lost recovery schema in an existing store, even
+            # when the caller explicitly passed --init-db.
             with self._connect() as connection:
-                result = connection.execute("PRAGMA quick_check(1)").fetchone()
-                if result is None or result[0] != "ok":
-                    raise sqlite3.DatabaseError("database integrity check failed")
-                for table in _REQUIRED_STORE_TABLES:
-                    connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                self._validate_store_schema(
+                    connection, allow_additive_migrations=True
+                )
         self._dashboard_pending_write_lock = RLock()
         self._initialize()
 
@@ -129,16 +254,58 @@ class SnapshotStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @staticmethod
+    def _validate_store_schema(
+        connection: sqlite3.Connection, *, allow_additive_migrations: bool = False
+    ) -> None:
+        integrity = connection.execute("PRAGMA quick_check(1)").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            raise sqlite3.DatabaseError("database integrity check failed")
+
+        for table, expected in _REQUIRED_STORE_COLUMNS.items():
+            table_type = connection.execute(
+                "SELECT type FROM sqlite_master WHERE name = ?", (table,)
+            ).fetchone()
+            if table_type is None or table_type["type"] != "table":
+                raise sqlite3.DatabaseError("database schema is incomplete")
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            migratable = (
+                _LEGACY_ADDABLE_COLUMNS.get(table, frozenset())
+                if allow_additive_migrations
+                else frozenset()
+            )
+            if not (set(expected) - migratable).issubset(columns):
+                raise sqlite3.DatabaseError("database schema is incomplete")
+
+            if table in _REQUIRED_SINGLE_COLUMN_UNIQUES:
+                unique_columns: set[str] = set()
+                for index in connection.execute(
+                    f"PRAGMA index_list({table})"
+                ).fetchall():
+                    if not index["unique"]:
+                        continue
+                    # Index names are database data, not trusted SQL strings.
+                    index_name = str(index["name"]).replace('"', '""')
+                    fields = connection.execute(
+                        f'PRAGMA index_info("{index_name}")'
+                    ).fetchall()
+                    if len(fields) == 1 and fields[0]["name"] is not None:
+                        unique_columns.add(str(fields[0]["name"]))
+                if not set(_REQUIRED_SINGLE_COLUMN_UNIQUES[table]).issubset(
+                    unique_columns
+                ):
+                    raise sqlite3.DatabaseError("database recovery keys are not unique")
+
     def is_ready(self) -> bool:
-        """Observe usable schema/data without creating or repairing a store."""
+        """Observe complete schema/data without creating or repairing a store."""
         try:
             with self._connect() as connection:
-                integrity = connection.execute("PRAGMA quick_check(1)").fetchone()
-                if integrity is None or integrity[0] != "ok":
-                    return False
-                # All data, operation and write-recovery surfaces are mandatory.
-                for table in _REQUIRED_STORE_TABLES:
-                    connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                self._validate_store_schema(connection)
         except sqlite3.Error:
             return False
         return True
@@ -371,6 +538,8 @@ class SnapshotStore:
                     "ALTER TABLE write_api_requests "
                     "ADD COLUMN execution_started_at TEXT"
                 )
+
+            self._validate_store_schema(connection)
 
     @staticmethod
     def _insert_ad_snapshot(
@@ -961,6 +1130,7 @@ class SnapshotStore:
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._validate_store_schema(connection)
             row = connection.execute(
                 """
                 SELECT idempotency_key, request_sha256, state, requested_at,
@@ -1318,6 +1488,7 @@ class SnapshotStore:
         )
         with self.dashboard_pending_write_guard(), self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._validate_store_schema(connection)
             rows = connection.execute(
                 """
                 SELECT scope, resource_key, idempotency_key, method, path,

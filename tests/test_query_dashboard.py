@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 import shutil
 import subprocess
 import tempfile
@@ -374,6 +375,45 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             urlopen(blocked, timeout=2)
         self.assertEqual(error.exception.code, 404)
+        self.assertEqual(self.backend.requests, [])
+
+    def test_malformed_pending_uniques_block_platform_forwarding(self) -> None:
+        with sqlite3.connect(self.store.path) as connection:
+            connection.execute("DROP TABLE dashboard_pending_writes")
+            connection.execute(
+                """
+                CREATE TABLE dashboard_pending_writes (
+                    scope TEXT PRIMARY KEY,
+                    resource_key TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    payload_json TEXT,
+                    ad_id TEXT,
+                    acknowledged INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+        self.assertFalse(self.store.is_ready())
+        request = Request(
+            self.base + "/api/write/ads/2",
+            data=b'{"title":"must stay local"}',
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:malformed-unique-guard",
+            ),
+        )
+        with self.assertRaises(HTTPError) as failed:
+            urlopen(request, timeout=2)
+        self.assertEqual(failed.exception.code, 500)
+        self.assertEqual(
+            json.loads(failed.exception.read()),
+            {
+                "error": "dashboard_pending_store_error",
+                "platform_retry_authorized": False,
+            },
+        )
         self.assertEqual(self.backend.requests, [])
 
     def test_lost_database_blocks_platform_write_before_pending_claim(self) -> None:
@@ -1035,6 +1075,22 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertEqual(ads[0]["ad_id"], "1")
         self.assertEqual(ads[0]["lifecycle_state"], "absent")
         self.assertEqual(ads[0]["views"], 15)
+
+    def test_readyz_detects_existing_recovery_table_missing_required_columns(self) -> None:
+        self.assertEqual(json.loads(self.get("/readyz")[2]), {"status": "ready"})
+        with sqlite3.connect(self.store.path) as connection:
+            connection.execute("DROP TABLE write_api_requests")
+            connection.execute(
+                "CREATE TABLE write_api_requests (idempotency_key TEXT PRIMARY KEY)"
+            )
+        self.assertEqual(json.loads(self.get("/healthz")[2]), {"status": "ok"})
+        with self.assertRaises(HTTPError) as failed:
+            urlopen(self.base + "/readyz", timeout=2)
+        self.assertEqual(failed.exception.code, 503)
+        self.assertEqual(
+            json.loads(failed.exception.read()),
+            {"status": "unavailable", "error": "database_unavailable"},
+        )
 
     def test_readiness_loss_corruption_and_restore_return_sanitized_json(self) -> None:
         status, _, body = self.get("/readyz")
