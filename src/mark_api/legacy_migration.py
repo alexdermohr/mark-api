@@ -8,7 +8,7 @@ validation/copy steps have succeeded. Normal product startup remains strict.
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import os
@@ -202,6 +202,41 @@ def _fsync_file(path: Path) -> None:
         os.fsync(handle.fileno())
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _require_source_identity(source: Path, expected: os.stat_result) -> None:
+    current = source.lstat()
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino, current.st_nlink)
+        != (expected.st_dev, expected.st_ino, expected.st_nlink)
+    ):
+        raise LegacyMigrationError("source path identity changed during migration")
+
+
+@contextmanager
+def _source_writer_fence(source: Path, expected: os.stat_result):
+    # SQLite's own write transaction excludes other SQLite commits, including
+    # in WAL mode. Hold it through the target directory fsync. An advisory
+    # process/file lock alone would not fence independent SQLite processes.
+    with closing(sqlite3.connect(_uri(source, "rw"), uri=True, timeout=3)) as fence:
+        fence.execute("BEGIN IMMEDIATE")
+        _require_source_identity(source, expected)
+        try:
+            yield
+        finally:
+            fence.rollback()
+
+
 def _copy_historical_rows(
     backup: sqlite3.Connection,
     destination: Path,
@@ -322,7 +357,7 @@ def migrate_legacy_store(
         else:
             raise LegacyMigrationError("backup/output already exists")
 
-    with closing(
+    with _source_writer_fence(source, metadata), closing(
         sqlite3.connect(_uri(source, "ro"), uri=True, timeout=3)
     ) as original:
         original.row_factory = sqlite3.Row
@@ -333,8 +368,11 @@ def migrate_legacy_store(
         _create_private_file(backup)
         with closing(sqlite3.connect(_uri(backup, "rw"), uri=True)) as copy:
             original.backup(copy)
-        _fsync_file(backup)
         os.chmod(backup, 0o400)
+        # Both file contents/permissions and the new name must survive a crash
+        # before the upgraded destination is published, including cross-dir.
+        _fsync_file(backup)
+        _fsync_directory(backup.parent)
         version_after = int(original.execute("PRAGMA data_version").fetchone()[0])
         if version_after != version_before:
             raise LegacyMigrationError("source changed during backup")
@@ -355,12 +393,9 @@ def migrate_legacy_store(
                 # The original and backup are never overwritten.
                 if int(original.execute("PRAGMA data_version").fetchone()[0]) != version_before:
                     raise LegacyMigrationError("source changed during migration")
+                _require_source_identity(source, metadata)
                 os.link(stage, output)
-                parent_fd = os.open(output.parent, os.O_RDONLY)
-                try:
-                    os.fsync(parent_fd)
-                finally:
-                    os.close(parent_fd)
+                _fsync_directory(output.parent)
 
     return LegacyMigrationReceipt(len(names), counts, backup_sha)
 

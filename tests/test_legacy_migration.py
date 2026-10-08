@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import stat
 import tempfile
@@ -540,7 +541,7 @@ class LegacyMigrationTests(unittest.TestCase):
             with sqlite3.connect(backup) as conn:
                 self.assertEqual(table_names(conn), STAGES[0])
 
-    def test_source_change_during_copy_blocks_publication(self) -> None:
+    def test_source_write_during_copy_is_blocked_by_sqlite_fence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source, backup, out = (
@@ -550,42 +551,337 @@ class LegacyMigrationTests(unittest.TestCase):
             from mark_api import legacy_migration
 
             copy_actual = legacy_migration._copy_historical_rows
+            attempts: list[str] = []
 
             def competing_writer(*args, **kwargs):
                 copy_actual(*args, **kwargs)
-                with sqlite3.connect(source) as connection:
-                    connection.execute(
-                        "INSERT INTO ad_snapshots "
-                        "(ad_id,observed_at,source,lifecycle_state) "
-                        "VALUES (?,?,?,?)",
-                        ("43", NOW, "concurrent", "active"),
-                    )
+                try:
+                    with sqlite3.connect(source, timeout=0.05) as connection:
+                        connection.execute(
+                            "INSERT INTO ad_snapshots "
+                            "(ad_id,observed_at,source,lifecycle_state) "
+                            "VALUES (?,?,?,?)",
+                            ("43", NOW, "concurrent", "active"),
+                        )
+                except sqlite3.OperationalError as error:
+                    self.assertIn("locked", str(error))
+                    attempts.append("blocked")
+                else:
+                    attempts.append("committed")
 
             with patch(
                 "mark_api.legacy_migration._copy_historical_rows",
                 side_effect=competing_writer,
             ):
-                with self.assertRaisesRegex(
-                    LegacyMigrationError, "source changed"
+                migrate_legacy_store(
+                    source,
+                    backup_db=backup,
+                    output_db=out,
+                    confirm_no_unresolved_writes=True,
+                )
+            self.assertEqual(attempts, ["blocked"])
+            self.assertTrue(backup.exists())
+            self.assertTrue(out.exists())
+            for path in (source, backup, out):
+                with sqlite3.connect(path) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM ad_snapshots").fetchone()[0],
+                        1,
+                    )
+
+    def test_sqlite_writer_is_fenced_through_publication_in_delete_and_wal(self) -> None:
+        from mark_api import legacy_migration
+
+        for journal_mode in ("DELETE", "WAL"):
+            with self.subTest(journal_mode=journal_mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source, backup, output = (
+                    root / "old.sqlite", root / "backup.sqlite", root / "new.sqlite"
+                )
+                self.build_stage(source, STAGES[0])
+                with sqlite3.connect(source) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "PRAGMA journal_mode=" + journal_mode
+                        ).fetchone()[0].upper(),
+                        journal_mode,
+                    )
+                real_link = os.link
+                attempted = []
+
+                def competing_at_link(stage: Path, target: Path) -> None:
+                    with sqlite3.connect(source, timeout=0.05) as other:
+                        try:
+                            other.execute(
+                                "INSERT INTO ad_snapshots "
+                                "(ad_id,observed_at,source,lifecycle_state) "
+                                "VALUES (?,?,?,?)",
+                                ("late", NOW, "competing", "active"),
+                            )
+                            other.commit()
+                        except sqlite3.OperationalError as error:
+                            self.assertIn("locked", str(error))
+                            attempted.append("blocked")
+                        else:
+                            attempted.append("committed")
+                    real_link(stage, target)
+
+                with patch(
+                    "mark_api.legacy_migration.os.link",
+                    side_effect=competing_at_link,
                 ):
                     migrate_legacy_store(
-                        source,
-                        backup_db=backup,
-                        output_db=out,
+                        source, backup_db=backup, output_db=output,
+                        confirm_no_unresolved_writes=True,
+                    )
+                self.assertEqual(attempted, ["blocked"])
+                with sqlite3.connect(output) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM ad_snapshots").fetchone()[0],
+                        1,
+                    )
+                with sqlite3.connect(source) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM ad_snapshots").fetchone()[0],
+                        1,
+                    )
+
+    def test_backup_parent_must_be_fsynced_before_output_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backup_parent, output_parent = root / "backup", root / "output"
+            backup_parent.mkdir()
+            output_parent.mkdir()
+            source, backup, output = (
+                root / "old.sqlite", backup_parent / "copy.sqlite",
+                output_parent / "new.sqlite"
+            )
+            self.build_stage(source, STAGES[0])
+            backup_id = (backup_parent.stat().st_dev, backup_parent.stat().st_ino)
+            original_fsync, original_link = os.fsync, os.link
+            synced_backup_parent = []
+
+            def observe_fsync(fd: int) -> None:
+                meta = os.fstat(fd)
+                if (meta.st_dev, meta.st_ino) == backup_id:
+                    synced_backup_parent.append(True)
+                original_fsync(fd)
+
+            def guard_publication(stage: Path, target: Path) -> None:
+                self.assertTrue(
+                    synced_backup_parent,
+                    "backup directory entry not synced before target publication",
+                )
+                original_link(stage, target)
+
+            with (
+                patch("mark_api.legacy_migration.os.fsync", side_effect=observe_fsync),
+                patch("mark_api.legacy_migration.os.link", side_effect=guard_publication),
+            ):
+                migrate_legacy_store(
+                    source, backup_db=backup, output_db=output,
+                    confirm_no_unresolved_writes=True,
+                )
+            self.assertTrue(backup.is_file())
+            self.assertTrue(output.is_file())
+
+    def test_failed_backup_directory_fsync_prevents_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backup_parent, output_parent = root / "backup", root / "output"
+            backup_parent.mkdir()
+            output_parent.mkdir()
+            source, backup, output = (
+                root / "old.sqlite", backup_parent / "copy.sqlite",
+                output_parent / "new.sqlite"
+            )
+            self.build_stage(source, STAGES[0])
+            backup_id = (backup_parent.stat().st_dev, backup_parent.stat().st_ino)
+            original_fsync = os.fsync
+
+            def fail_backup_directory(fd: int) -> None:
+                meta = os.fstat(fd)
+                if (meta.st_dev, meta.st_ino) == backup_id:
+                    raise OSError("simulated failed backup directory fsync")
+                original_fsync(fd)
+
+            with patch(
+                "mark_api.legacy_migration.os.fsync", side_effect=fail_backup_directory
+            ):
+                with self.assertRaisesRegex(OSError, "backup directory fsync"):
+                    migrate_legacy_store(
+                        source, backup_db=backup, output_db=output,
+                        confirm_no_unresolved_writes=True,
+                    )
+            self.assertFalse(output.exists())
+            self.assertTrue(backup.is_file())
+
+    def test_source_path_replacement_before_publication_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, replacement_source, backup, output = (
+                root / "old.sqlite", root / "replacement.sqlite",
+                root / "backup.sqlite", root / "new.sqlite"
+            )
+            self.build_stage(source, STAGES[0])
+            self.build_stage(replacement_source, STAGES[0])
+            from mark_api import legacy_migration
+
+            original_copy = legacy_migration._copy_historical_rows
+
+            def replace_original_path(*args, **kwargs):
+                original_copy(*args, **kwargs)
+                os.replace(replacement_source, source)
+
+            with patch(
+                "mark_api.legacy_migration._copy_historical_rows",
+                side_effect=replace_original_path,
+            ):
+                with self.assertRaisesRegex(LegacyMigrationError, "identity changed"):
+                    migrate_legacy_store(
+                        source, backup_db=backup, output_db=output,
+                        confirm_no_unresolved_writes=True,
+                    )
+            self.assertTrue(backup.is_file())
+            self.assertFalse(output.exists())
+
+    def test_sqlite_writer_remains_fenced_through_output_directory_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, backup_parent, output_parent = (
+                root / "old.sqlite", root / "backup", root / "output"
+            )
+            backup_parent.mkdir()
+            output_parent.mkdir()
+            backup, output = backup_parent / "copy.sqlite", output_parent / "new.sqlite"
+            self.build_stage(source, STAGES[0])
+            from mark_api import legacy_migration
+
+            original_sync = legacy_migration._fsync_directory
+            attempts = []
+
+            def probe_sync(path: Path) -> None:
+                if path == output_parent:
+                    with sqlite3.connect(source, timeout=0.05) as other:
+                        with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                            other.execute(
+                                "INSERT INTO ad_snapshots "
+                                "(ad_id,observed_at,source,lifecycle_state) "
+                                "VALUES (?,?,?,?)",
+                                ("44", NOW, "at-fsync", "active"),
+                            )
+                    attempts.append("blocked")
+                original_sync(path)
+
+            with patch(
+                "mark_api.legacy_migration._fsync_directory",
+                side_effect=probe_sync,
+            ):
+                migrate_legacy_store(
+                    source, backup_db=backup, output_db=output,
+                    confirm_no_unresolved_writes=True,
+                )
+            self.assertEqual(attempts, ["blocked"])
+
+    def test_failed_output_directory_sync_requires_inspection_not_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backup_parent, output_parent = root / "backup", root / "output"
+            backup_parent.mkdir()
+            output_parent.mkdir()
+            source, backup, output = (
+                root / "old.sqlite", backup_parent / "copy.sqlite",
+                output_parent / "new.sqlite"
+            )
+            self.build_stage(source, STAGES[0])
+            from mark_api import legacy_migration
+
+            actual_sync = legacy_migration._fsync_directory
+
+            def fail_after_link(path: Path) -> None:
+                if path == output_parent:
+                    raise OSError("simulated failed output directory sync")
+                actual_sync(path)
+
+            with patch(
+                "mark_api.legacy_migration._fsync_directory",
+                side_effect=fail_after_link,
+            ):
+                with self.assertRaisesRegex(OSError, "output directory sync"):
+                    migrate_legacy_store(
+                        source, backup_db=backup, output_db=output,
+                        confirm_no_unresolved_writes=True,
+                    )
+            self.assertTrue(backup.is_file())
+            self.assertTrue(output.is_file())
+            with self.assertRaisesRegex(LegacyMigrationError, "already exists"):
+                migrate_legacy_store(
+                    source, backup_db=backup, output_db=output,
+                    confirm_no_unresolved_writes=True,
+                )
+
+    def test_source_path_replacement_before_publication_is_refused(self) -> None:
+        from mark_api import legacy_migration
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, displaced = root / "original.sqlite", root / "moved.sqlite"
+            replacement, backup, output = (
+                root / "replacement.sqlite", root / "backup.sqlite",
+                root / "published.sqlite",
+            )
+            self.build_stage(source, STAGES[0])
+            self.build_stage(replacement, STAGES[0])
+            with sqlite3.connect(replacement) as conn:
+                conn.execute(
+                    "INSERT INTO ad_snapshots "
+                    "(ad_id,observed_at,source,lifecycle_state) "
+                    "VALUES (?,?,?,?)",
+                    ("replacement", NOW, "owner", "active"),
+                )
+            actual_copy = legacy_migration._copy_historical_rows
+
+            def swap_path_after_copy(*args, **kwargs):
+                actual_copy(*args, **kwargs)
+                source.rename(displaced)
+                replacement.rename(source)
+
+            with patch(
+                "mark_api.legacy_migration._copy_historical_rows",
+                side_effect=swap_path_after_copy,
+            ):
+                with self.assertRaisesRegex(
+                    LegacyMigrationError, r"source path .*identity changed"
+                ):
+                    migrate_legacy_store(
+                        source, backup_db=backup, output_db=output,
                         confirm_no_unresolved_writes=True,
                     )
             self.assertTrue(backup.exists())
-            self.assertFalse(out.exists())
-            with sqlite3.connect(source) as connection:
+            self.assertFalse(output.exists())
+            with sqlite3.connect(source) as conn:
                 self.assertEqual(
-                    connection.execute("SELECT COUNT(*) FROM ad_snapshots").fetchone()[0],
-                    2,
+                    conn.execute("SELECT COUNT(*) FROM ad_snapshots").fetchone()[0], 2
                 )
-            with sqlite3.connect(backup) as connection:
-                self.assertEqual(
-                    connection.execute("SELECT COUNT(*) FROM ad_snapshots").fetchone()[0],
-                    1,
+
+    def test_published_output_remains_private_under_typical_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, backup, output = (
+                root / "original.sqlite", root / "backup.sqlite",
+                root / "published.sqlite",
+            )
+            self.build_stage(source, STAGES[0])
+            previous_umask = os.umask(0o022)
+            try:
+                migrate_legacy_store(
+                    source, backup_db=backup, output_db=output,
+                    confirm_no_unresolved_writes=True,
                 )
+            finally:
+                os.umask(previous_umask)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o400)
 
     def test_installed_product_exposes_offline_migration_cli(self) -> None:
         with (Path.cwd() / "pyproject.toml").open("rb") as stream:
