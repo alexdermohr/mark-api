@@ -197,6 +197,7 @@ _DASHBOARD_HTML = """<!doctype html>
           <select id="dimension-select"></select>
         </label>
       </div>
+      <p id="analytics-status" class="note" role="status" aria-live="polite"></p>
 
       <h3>Gruppen</h3>
       <div id="groups-chart" class="chart" role="list" aria-label="Gruppenvergleich nach Mittelwert" hidden></div>
@@ -1620,19 +1621,33 @@ async function loadAnalytics() {
   const generation = ++analyticsRequestGeneration;
   const metric = byId("metric-select").value;
   const dimension = byId("dimension-select").value;
+  const status = byId("analytics-status");
+
+  // A new selection must never display the previous selection's values.
+  renderGroups([]);
+  renderRanking([]);
+  byId("groups-empty").hidden = true;
+  byId("ranking-empty").hidden = true;
   if (!metric || !dimension) {
-    renderGroups([]);
-    renderRanking([]);
+    status.textContent = !metric ? "Metrik auswählen …" : "Dimension auswählen …";
     return;
   }
 
-  const [groups, ranking] = await Promise.all([
-    getJson(`/api/analytics/groups?dimension=${encodeURIComponent(dimension)}&metric=${encodeURIComponent(metric)}`),
-    getJson(`/api/analytics/ads?metric=${encodeURIComponent(metric)}`),
-  ]);
-  if (generation !== analyticsRequestGeneration) return;
-  renderGroups(groups);
-  renderRanking(ranking);
+  status.textContent = "Lade Analytics …";
+  try {
+    const [groups, ranking] = await Promise.all([
+      getJson(`/api/analytics/groups?dimension=${encodeURIComponent(dimension)}&metric=${encodeURIComponent(metric)}`),
+      getJson(`/api/analytics/ads?metric=${encodeURIComponent(metric)}`),
+    ]);
+    if (generation !== analyticsRequestGeneration) return;
+    renderGroups(groups);
+    renderRanking(ranking);
+    status.textContent = "";
+  } catch (error) {
+    // An older rejection must not overwrite a newer selection's status.
+    if (generation !== analyticsRequestGeneration) return;
+    status.textContent = `Analytics konnten nicht geladen werden: ${error.message}`;
+  }
 }
 
 async function load() {

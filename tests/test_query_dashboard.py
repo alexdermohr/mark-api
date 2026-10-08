@@ -1454,6 +1454,175 @@ assert.equal(groupChart.children[0].children[2].textContent, "12.00 (n=1)");
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
+    def test_analytics_selection_runtime_clears_stale_values_and_recovers(self) -> None:
+        _, _, html_body = self.get("/")
+        self.assertIn(
+            '<p id="analytics-status" class="note" role="status" aria-live="polite"></p>',
+            html_body.decode("utf-8"),
+        )
+        _, _, js_body = self.get("/dashboard.js")
+        javascript = js_body.decode("utf-8")
+        definitions, marker, _ = javascript.partition(
+            "byId(\"reload\").addEventListener",
+        )
+        self.assertTrue(marker)
+        harness = definitions + r"""
+
+const assert = require("node:assert/strict");
+
+class Element {
+  constructor(tagName) {
+    this.tagName = tagName;
+    this.children = [];
+    this.hidden = false;
+    this.textContent = "";
+    this.value = "";
+    this.attributes = {};
+  }
+  replaceChildren(...children) { this.children = children; }
+  append(...children) { this.children.push(...children); }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+}
+const elements = new Map(
+  ["metric-select", "dimension-select", "analytics-status",
+   "groups-body", "groups-empty", "groups-chart",
+   "ranking-body", "ranking-empty", "ranking-chart"].map((id) => [id, new Element("div")]),
+);
+globalThis.document = {
+  getElementById(id) {
+    assert.ok(elements.has(id), "missing DOM mock " + id);
+    return elements.get(id);
+  },
+  createElement(tagName) { return new Element(tagName); },
+};
+const el = (id) => elements.get(id);
+el("metric-select").value = "views";
+el("dimension-select").value = "city";
+
+const requests = [];
+globalThis.fetch = (path, options) => {
+  assert.equal(options.cache, "no-store");
+  return new Promise((resolve, reject) => requests.push({path, resolve, reject}));
+};
+const answer = (index, data) =>
+  requests[index].resolve({ok: true, json: async () => data});
+const fail = (index) =>
+  requests[index].resolve({ok: false, status: 503, statusText: "Service Unavailable"});
+const group = (value) =>
+  [{label: "Dresden", sample_size: 1, metric_sum: value, metric_mean: value}];
+const rank = (value) =>
+  [{ad_id: "1", title: "Anzeige", value, present: true, lifecycle_state: "active"}];
+const visibleRanking = () => el("ranking-body").children[0]?.children[2]?.textContent;
+
+(async () => {
+  // Initial success binds 123 views to the displayed "views" selection.
+  const first = loadAnalytics();
+  assert.equal(el("analytics-status").textContent, "Lade Analytics …");
+  assert.equal(requests[0].path, "/api/analytics/groups?dimension=city&metric=views");
+  assert.equal(requests[1].path, "/api/analytics/ads?metric=views");
+  answer(0, group(123)); answer(1, rank(123));
+  await first;
+  assert.equal(visibleRanking(), "123");
+  assert.equal(el("groups-body").children.length, 1);
+  assert.equal(el("analytics-status").textContent, "");
+
+  // A failed watch-count selection cannot leave views mislabeled as watches.
+  el("metric-select").value = "watch_count";
+  const failing = loadAnalytics();
+  assert.equal(el("ranking-body").children.length, 0);
+  assert.equal(el("groups-body").children.length, 0);
+  assert.equal(el("ranking-chart").hidden, true);
+  assert.equal(el("groups-chart").hidden, true);
+  assert.equal(el("ranking-empty").hidden, true);
+  assert.equal(el("groups-empty").hidden, true);
+  assert.equal(el("analytics-status").textContent, "Lade Analytics …");
+  answer(2, group(4)); fail(3);
+  await failing;
+  assert.match(el("analytics-status").textContent, /503 Service Unavailable/);
+  assert.equal(el("ranking-body").children.length, 0);
+  assert.equal(el("groups-body").children.length, 0);
+
+  // Recovery with the same selection shows the correct current value.
+  const recovering = loadAnalytics();
+  answer(4, group(4)); answer(5, rank(4));
+  await recovering;
+  assert.equal(el("analytics-status").textContent, "");
+  assert.equal(visibleRanking(), "4");
+  assert.equal(el("groups-chart").hidden, false);
+
+  // Old failed request settling after a new success cannot change its UI.
+  el("metric-select").value = "views";
+  const oldFailure = loadAnalytics();
+  el("metric-select").value = "watch_count";
+  el("dimension-select").value = "image_type";
+  const newer = loadAnalytics();
+  assert.equal(el("ranking-body").children.length, 0);
+  answer(8, group(8)); answer(9, rank(8));
+  await newer;
+  answer(6, group(123)); fail(7);
+  await oldFailure;
+  assert.equal(visibleRanking(), "8");
+  assert.equal(el("analytics-status").textContent, "");
+
+  // Old successful results arriving after a newer success must also be ignored.
+  el("metric-select").value = "views";
+  const oldSuccess = loadAnalytics();
+  el("metric-select").value = "watch_count";
+  el("dimension-select").value = "city";
+  const latest = loadAnalytics();
+  answer(12, group(0)); answer(13, rank(0));
+  await latest;
+  answer(10, group(123)); answer(11, rank(123));
+  await oldSuccess;
+  assert.equal(visibleRanking(), "0");
+  assert.equal(el("groups-body").children[0].children[2].textContent, "0");
+  assert.equal(el("analytics-status").textContent, "");
+
+  // Choosing no metric invalidates the previous result but issues no request.
+  const count = requests.length;
+  el("metric-select").value = "";
+  await loadAnalytics();
+  assert.equal(requests.length, count);
+  assert.equal(el("ranking-body").children.length, 0);
+  assert.equal(el("groups-body").children.length, 0);
+  assert.equal(el("ranking-empty").hidden, true);
+  assert.equal(el("analytics-status").textContent, "Metrik auswählen …");
+
+  // An actual empty success, unlike loading/error, displays empty notices.
+  el("metric-select").value = "views";
+  const empty = loadAnalytics();
+  answer(14, []); answer(15, []);
+  await empty;
+  assert.equal(el("groups-empty").hidden, false);
+  assert.equal(el("ranking-empty").hidden, false);
+  assert.equal(el("analytics-status").textContent, "");
+  // Dimension-only network failure must not preserve stale results.
+  el("dimension-select").value = "title_type";
+  const offline = loadAnalytics();
+  assert.equal(el("ranking-body").children.length, 0);
+  answer(16, group(9)); requests[17].reject(new Error("network offline"));
+  await offline;
+  assert.match(el("analytics-status").textContent, /network offline/);
+  assert.equal(el("groups-body").children.length, 0);
+  assert.equal(el("ranking-body").children.length, 0);
+
+  // A later successful request with the same dimension restores the charts.
+  const afterOffline = loadAnalytics();
+  answer(18, group(2)); answer(19, rank(2));
+  await afterOffline;
+  assert.equal(visibleRanking(), "2");
+  assert.equal(el("analytics-status").textContent, "");
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+        completed = subprocess.run(
+            ["node"], input=harness, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_write_runtime_restores_pending_from_server_and_blocks_on_recovery_failure(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
