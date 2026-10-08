@@ -130,6 +130,43 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
                 self.assertFalse(report.platform_writes_enabled)
                 self.assertEqual(runtime.close_calls, 1)
 
+    def test_smoke_preserves_opaque_plus_source_as_observed(self) -> None:
+        source = "provider+v2"
+        runtime = FakeInventoryRuntime(ReadResult.success_nonempty((
+            AdSnapshot(
+                ad_id="1234567890", observed_at=NOW,
+                source=source, lifecycle_state=LifecycleState.ACTIVE,
+                title="Owned", views=0, watch_count=2, reply_count=1,
+            ),
+        )))
+        original_json_get = runtime_smoke._json_get
+        captured: dict[str, object] = {}
+
+        def capture_projection(opener, base: str, path: str):
+            result = original_json_get(opener, base, path)
+            if path in ("/api/ads", "/api/analytics/ads?metric=views"):
+                captured[path] = result
+            return result
+
+        with patch(
+            "mark_api.private_web_runtime_smoke._json_get",
+            side_effect=capture_projection,
+        ):
+            report = run_private_web_runtime_smoke(
+                19610, runtime_factory=lambda **_kwargs: runtime,
+            )
+        self.assertEqual(report.inventory_count, 1)
+        self.assertEqual(runtime.close_calls, 1)
+        self.assertEqual(
+            captured["/api/ads"][0]["metric_evidence"]["views"]["source"],
+            source,
+        )
+        self.assertEqual(
+            captured["/api/analytics/ads?metric=views"][0]
+            ["metric_evidence"]["source"],
+            source,
+        )
+
     def test_smoke_rejects_corrupted_dashboard_summary(self) -> None:
         original_json_get = runtime_smoke._json_get
 

@@ -107,10 +107,7 @@ def _expected_inventory_metric_evidence(
         "source": (
             snapshot.metric_source
             if snapshot.metric_source is not None
-            else (
-                "unattributed_legacy_composite"
-                if "+" in snapshot.source else snapshot.source
-            )
+            else snapshot.source
         ),
         "last_known": False,
     }

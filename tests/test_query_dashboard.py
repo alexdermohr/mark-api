@@ -912,7 +912,7 @@ class MarkQueryServiceTests(SeededStoreMixin, unittest.TestCase):
         for metric in ("views", "watch_count", "reply_count"):
             self.assertEqual(current["metric_evidence"][metric], {
                 "observed_at": T1.isoformat(),
-                "source": "unattributed_legacy_composite",
+                "source": "management+mobile",
                 "last_known": False,
             })
 
@@ -949,6 +949,44 @@ class MarkQueryServiceTests(SeededStoreMixin, unittest.TestCase):
             "last_known": False,
         })
         self.assertEqual(item["views"], 0)
+
+    def test_opaque_sources_with_plus_keep_literal_metric_provenance(self) -> None:
+        from mark_api.analytics import AnalyticsService, ad_metric_ranking_to_dict
+        store = self.make_store()
+        sources = (
+            "provider+v2",
+            "management+mobile",
+            "mark:source-v1:legacy+raw",
+        )
+        for index, source in enumerate(sources, 1):
+            store.append_ad_snapshot(AdSnapshot(
+                ad_id=str(index + 80),
+                observed_at=T0,
+                source=source,
+                lifecycle_state=LifecycleState.ACTIVE,
+                views=0,
+            ))
+        views = {
+            item.ad_id: ad_view_to_dict(item)
+            for item in MarkQueryService(store).latest_ads()
+        }
+        rankings = {
+            item.ad_id: ad_metric_ranking_to_dict(item)
+            for item in AnalyticsService(store).rank_ads("views")
+        }
+        for index, source in enumerate(sources, 1):
+            with self.subTest(source=source):
+                ad_id = str(index + 80)
+                self.assertEqual(views[ad_id]["views"], 0)
+                self.assertEqual(views[ad_id]["source"], source)
+                self.assertEqual(views[ad_id]["metric_evidence"]["views"], {
+                    "observed_at": T0.isoformat(),
+                    "source": source,
+                    "last_known": False,
+                })
+                self.assertEqual(
+                    rankings[ad_id]["metric_evidence"]["source"], source,
+                )
 
     def test_metric_evidence_tracks_observation_order_not_arrival(self) -> None:
         store = self.make_store()
