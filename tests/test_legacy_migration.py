@@ -581,7 +581,7 @@ class LegacyMigrationTests(unittest.TestCase):
                     confirm_no_unresolved_writes=True,
                 )
 
-    def test_failed_import_keeps_backup_but_not_partial_target(self) -> None:
+    def test_failed_import_before_copy_completion_preserves_source_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source, backup, out = (
@@ -597,9 +597,9 @@ class LegacyMigrationTests(unittest.TestCase):
                         source, backup_db=backup, output_db=out,
                         confirm_no_unresolved_writes=True,
                     )
-            self.assertTrue(backup.is_file())
+            self.assertFalse(backup.exists())
             self.assertFalse(out.exists())
-            with sqlite3.connect(backup) as conn:
+            with sqlite3.connect(source) as conn:
                 self.assertEqual(table_names(conn), STAGES[0])
 
     def test_source_write_during_copy_is_blocked_by_sqlite_fence(self) -> None:
@@ -948,6 +948,46 @@ class LegacyMigrationTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o400)
 
+    def test_backup_is_not_public_until_staged_target_copy_is_complete(self) -> None:
+        from mark_api import legacy_migration
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, backup, output = (
+                root / "old.sqlite", root / "public-backup.sqlite",
+                root / "new.sqlite",
+            )
+            self.build_stage(source, STAGES[0])
+            actual_copy = legacy_migration._copy_historical_rows
+            during_copy = []
+
+            def copy_before_publication(*args, **kwargs):
+                during_copy.append(backup.exists())
+                self.assertFalse(
+                    backup.exists(),
+                    "public backup inode exposed while it can still influence target rows",
+                )
+                return actual_copy(*args, **kwargs)
+
+            with patch(
+                "mark_api.legacy_migration._copy_historical_rows",
+                side_effect=copy_before_publication,
+            ):
+                migrate_legacy_store(
+                    source, backup_db=backup, output_db=output,
+                    confirm_no_unresolved_writes=True,
+                )
+            self.assertEqual(during_copy, [False])
+            self.assertTrue(backup.is_file())
+            self.assertTrue(output.is_file())
+            with sqlite3.connect(output) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT views FROM ad_snapshots WHERE ad_id='42'"
+                    ).fetchone()[0],
+                    17,
+                )
+
     def test_backup_never_reopens_public_path_as_sqlite(self) -> None:
         # A public backup pathname can be renamed after O_EXCL creation.
         # The SQLite backup/read connections must use a private pinned stage.
@@ -1029,15 +1069,16 @@ class LegacyMigrationTests(unittest.TestCase):
             self.build_stage(source, STAGES[0])
             self.build_stage(victim, STAGES[0])
             victim_bytes = victim.read_bytes()
-            original_copy = legacy_migration._copy_historical_rows
+            original_link = os.link
 
-            def replace_published_backup(*args, **kwargs):
-                original_copy(*args, **kwargs)
-                backup.unlink()
-                backup.symlink_to(victim)
+            def replace_published_backup(stage: Path, target: Path) -> None:
+                original_link(stage, target)
+                if target == backup:
+                    backup.unlink()
+                    backup.symlink_to(victim)
 
             with patch(
-                "mark_api.legacy_migration._copy_historical_rows",
+                "mark_api.legacy_migration.os.link",
                 side_effect=replace_published_backup,
             ):
                 with self.assertRaisesRegex(LegacyMigrationError, "backup path"):

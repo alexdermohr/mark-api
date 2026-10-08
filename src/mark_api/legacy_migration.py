@@ -390,9 +390,6 @@ def migrate_legacy_store(
             original.backup(copy)
         os.chmod(staged_backup, 0o400)
         _fsync_file(staged_backup)
-        # Atomic no-clobber backup publication, then durable parent entry.
-        os.link(staged_backup, backup)
-        _fsync_directory(backup.parent)
         version_after = int(original.execute("PRAGMA data_version").fetchone()[0])
         if version_after != version_before:
             raise LegacyMigrationError("source changed during backup")
@@ -409,6 +406,11 @@ def migrate_legacy_store(
                 stage = Path(temporary_directory) / "mark.sqlite"
                 _copy_historical_rows(frozen, stage, names, counts, backup_sha)
                 _fsync_file(stage)
+                # Keep the copied source inode private until it can no longer
+                # influence destination rows. Publish durable backup first,
+                # then (and only then) the no-clobber destination link.
+                os.link(staged_backup, backup)
+                _fsync_directory(backup.parent)
                 # Hard-link publication is atomic and refuses an existing target.
                 # The original and backup are never overwritten.
                 if int(original.execute("PRAGMA data_version").fetchone()[0]) != version_before:
