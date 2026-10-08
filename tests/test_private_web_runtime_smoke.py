@@ -247,6 +247,70 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
 
         self.assertEqual(runtime.close_calls, 1)
 
+    def test_smoke_rejects_forged_ad_metric_evidence_with_same_value(self) -> None:
+        runtime = FakeInventoryRuntime(
+            ReadResult.success_nonempty((snapshot("1234567890"),))
+        )
+        original_json_get = runtime_smoke._json_get
+
+        def corrupt_ad_evidence(opener, base: str, path: str):
+            payload = original_json_get(opener, base, path)
+            if path == "/api/ads":
+                assert isinstance(payload, list)
+                rows = [dict(item) for item in payload]
+                evidence = dict(rows[0]["metric_evidence"])
+                views = dict(evidence["views"])
+                views["source"] = "forged-metrics"
+                evidence["views"] = views
+                rows[0]["metric_evidence"] = evidence
+                return rows
+            return payload
+
+        with patch(
+            "mark_api.private_web_runtime_smoke._json_get",
+            side_effect=corrupt_ad_evidence,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "dashboard ads projection does not match inventory",
+            ):
+                run_private_web_runtime_smoke(
+                    19610, runtime_factory=lambda **_kwargs: runtime,
+                )
+        self.assertEqual(runtime.close_calls, 1)
+
+    def test_smoke_rejects_forged_analytics_metric_evidence_and_types(self) -> None:
+        for corruption, error_text in (
+            ({"observed_at": "2026-09-29T20:00:00+00:00"},
+             "dashboard analytics views ranking does not match inventory"),
+            ({"last_known": 0}, "dashboard inventory projections are malformed"),
+        ):
+            with self.subTest(corruption=corruption):
+                runtime = FakeInventoryRuntime(
+                    ReadResult.success_nonempty((snapshot("1234567890"),))
+                )
+                original_json_get = runtime_smoke._json_get
+
+                def corrupt_ranking_evidence(opener, base: str, path: str):
+                    payload = original_json_get(opener, base, path)
+                    if path == "/api/analytics/ads?metric=views":
+                        assert isinstance(payload, list)
+                        rows = [dict(item) for item in payload]
+                        evidence = dict(rows[0]["metric_evidence"])
+                        evidence.update(corruption)
+                        rows[0]["metric_evidence"] = evidence
+                        return rows
+                    return payload
+
+                with patch(
+                    "mark_api.private_web_runtime_smoke._json_get",
+                    side_effect=corrupt_ranking_evidence,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, error_text):
+                        run_private_web_runtime_smoke(
+                            19610, runtime_factory=lambda **_kwargs: runtime,
+                        )
+                self.assertEqual(runtime.close_calls, 1)
+
     def test_smoke_queries_all_inventory_metric_rankings(self) -> None:
         runtime = FakeInventoryRuntime(
             ReadResult.success_nonempty((snapshot("1234567890"),))

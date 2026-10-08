@@ -890,6 +890,81 @@ class MarkQueryServiceTests(SeededStoreMixin, unittest.TestCase):
         self.assertEqual(deleted.watch_count, 0)
         self.assertEqual(deleted.reply_count, 1)
 
+    def test_metric_evidence_preserves_original_timestamp_source_and_zero(self) -> None:
+        store = self.make_store()
+        payloads = {
+            ad.ad_id: ad_view_to_dict(ad)
+            for ad in MarkQueryService(store).latest_ads()
+        }
+        inherited = payloads["1"]
+        self.assertEqual(inherited["observed_at"], T1.isoformat())
+        self.assertEqual(inherited["source"], "management-post-delete")
+        self.assertEqual(inherited["metric_evidence"], {
+            metric: {
+                "observed_at": T0.isoformat(),
+                "source": "management",
+                "last_known": True,
+            }
+            for metric in ("views", "watch_count", "reply_count")
+        })
+        self.assertEqual(inherited["watch_count"], 0)
+        current = payloads["2"]
+        for metric in ("views", "watch_count", "reply_count"):
+            self.assertEqual(current["metric_evidence"][metric], {
+                "observed_at": T1.isoformat(),
+                "source": "management+mobile",
+                "last_known": False,
+            })
+
+        store.append_ad_snapshot(AdSnapshot(
+            ad_id="3", observed_at=T1, source="status-only",
+            lifecycle_state=LifecycleState.ACTIVE,
+        ))
+        unknown = {
+            ad.ad_id: ad_view_to_dict(ad)
+            for ad in MarkQueryService(store).latest_ads()
+        }["3"]
+        self.assertIsNone(unknown["views"])
+        self.assertEqual(unknown["metric_evidence"], {
+            "views": None, "watch_count": None, "reply_count": None,
+        })
+
+    def test_metric_evidence_tracks_observation_order_not_arrival(self) -> None:
+        store = self.make_store()
+        store.append_ad_snapshot(AdSnapshot(
+            ad_id="7", observed_at=T1, source="new-metrics",
+            lifecycle_state=LifecycleState.ACTIVE, views=40, watch_count=0,
+        ))
+        store.append_ad_snapshot(AdSnapshot(
+            ad_id="7", observed_at=T0, source="late-backfill",
+            lifecycle_state=LifecycleState.PAUSED, views=2, watch_count=8,
+        ))
+        first = {
+            ad.ad_id: ad_view_to_dict(ad)
+            for ad in MarkQueryService(store).latest_ads()
+        }["7"]
+        self.assertEqual(first["views"], 40)
+        self.assertEqual(first["metric_evidence"]["views"], {
+            "observed_at": T1.isoformat(), "source": "new-metrics",
+            "last_known": False,
+        })
+        # An equal-instant later insertion wins the status tie, not the old metric.
+        store.append_ad_snapshot(AdSnapshot(
+            ad_id="7", observed_at=T1.astimezone(timezone(timedelta(hours=2))),
+            source="same-instant-status", lifecycle_state=LifecycleState.PAUSED,
+        ))
+        second = {
+            ad.ad_id: ad_view_to_dict(ad)
+            for ad in MarkQueryService(store).latest_ads()
+        }["7"]
+        self.assertEqual(second["observed_at"],
+                         T1.astimezone(timezone(timedelta(hours=2))).isoformat())
+        self.assertEqual(second["views"], 40)
+        self.assertEqual(second["metric_evidence"]["views"], {
+            "observed_at": T1.isoformat(), "source": "new-metrics",
+            "last_known": True,
+        })
+
     def test_summary_counts_presence_and_metric_coverage_separately(self) -> None:
         query = MarkQueryService(self.make_store())
 
@@ -1075,6 +1150,27 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertEqual(ads[0]["ad_id"], "1")
         self.assertEqual(ads[0]["lifecycle_state"], "absent")
         self.assertEqual(ads[0]["views"], 15)
+
+    def test_api_discloses_metric_evidence_without_claiming_sync_success(self) -> None:
+        _, _, ads_body = self.get("/api/ads")
+        ads = json.loads(ads_body)
+        inherited = next(row for row in ads if row["ad_id"] == "1")
+        self.assertEqual(inherited["metric_evidence"]["views"], {
+            "observed_at": T0.isoformat(),
+            "source": "management",
+            "last_known": True,
+        })
+        self.assertEqual(inherited["metric_evidence"]["watch_count"]["source"],
+                         "management")
+        self.assertEqual(inherited["metric_evidence"]["reply_count"]["last_known"],
+                         True)
+        _, _, rank_body = self.get("/api/analytics/ads?metric=views")
+        ranking = json.loads(rank_body)
+        self.assertEqual(ranking[0]["metric_evidence"],
+                         inherited["metric_evidence"]["views"])
+        _, _, html_body = self.get("/")
+        html = html_body.decode("utf-8")
+        self.assertIn("Sync-Status: nicht erfasst", html)
 
     def test_readyz_detects_existing_recovery_table_missing_required_columns(self) -> None:
         self.assertEqual(json.loads(self.get("/readyz")[2]), {"status": "ready"})
@@ -1618,6 +1714,63 @@ assert.equal(groupChart.children[0].children[2].textContent, "12.00 (n=1)");
         self.assertEqual(
             completed.returncode,
             0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+    def test_metric_evidence_runtime_shows_age_source_and_last_known(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        definitions, marker, _ = js_body.decode("utf-8").partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+class Element {
+  constructor(tagName) {
+    this.tagName = tagName;
+    this.textContent = "";
+    this.children = [];
+    this.className = "";
+  }
+  append(...items) { this.children.push(...items); }
+}
+globalThis.document = {createElement: (tagName) => new Element(tagName)};
+const originalNow = Date.now;
+Date.now = () => Date.parse("2026-09-25T12:00:00+00:00");
+const old = metricCellWithEvidence(0, {
+  observed_at: "2026-09-24T12:00:00+00:00",
+  source: "metrics-observer",
+  last_known: true,
+});
+assert.equal(old.textContent, "0");
+assert.equal(old.children.length, 1);
+assert.match(old.children[0].textContent, /letzter bekannter Wert/);
+assert.match(old.children[0].textContent, /vor 1 Tag/);
+assert.match(old.children[0].textContent, /metrics-observer/);
+assert.match(old.children[0].textContent, /2026-09-24T12:00:00/);
+const current = metricCellWithEvidence(10, {
+  observed_at: "2026-09-25T12:00:00+00:00",
+  source: "inventory",
+  last_known: false,
+});
+assert.match(current.children[0].textContent, /direkt beobachtet/);
+const aggregate = metricCellWithEvidence(3, {
+  observed_at: "2026-09-25T12:00:00+00:00",
+  source: "inbound_message_events",
+  last_known: null,
+});
+assert.match(aggregate.children[0].textContent, /eigenständige Evidenz/);
+const unknown = metricCellWithEvidence(null, null);
+assert.equal(unknown.textContent, "—");
+assert.equal(unknown.children.length, 0);
+Date.now = originalNow;
+"""
+        completed = subprocess.run(
+            ["node"], input=harness, text=True, capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            completed.returncode, 0,
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
