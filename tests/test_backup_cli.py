@@ -313,6 +313,82 @@ with closing(sqlite3.connect(sys.argv[1])) as writer:
             if process.stderr is not None:
                 process.stderr.close()
 
+    def test_rollback_mode_source_read_uses_locking_not_immutable(self) -> None:
+        # Ordinary Mark SQLite stores use rollback/DELETE journal mode. A
+        # sidecar-free source is not necessarily WAL mode: immutable=1 bypasses
+        # SQLite shared locks and can certify a torn concurrent Write snapshot.
+        self.assertEqual(self.source.read_bytes()[18:20], bytes((1, 1)))
+        original_connect = sqlite3.connect
+        source_uri = backup_cli._uri(self.source, "ro")
+        source_opened = False
+
+        def attest_source_uses_locking(database, *args, **kwargs):
+            nonlocal source_opened
+            connection = original_connect(database, *args, **kwargs)
+            if isinstance(database, str) and database.startswith(source_uri) and not source_opened:
+                source_opened = True
+                self.assertEqual(database, source_uri)
+                connection.execute("BEGIN")
+                connection.execute("SELECT count(*) FROM write_api_requests").fetchone()
+                with closing(original_connect(self.source, timeout=0)) as concurrent:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                        concurrent.execute("BEGIN EXCLUSIVE")
+                connection.execute("ROLLBACK")
+            return connection
+
+        with patch("mark_api.backup_cli.sqlite3.connect", side_effect=attest_source_uses_locking):
+            receipt = backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(source_opened)
+        self.assertEqual(receipt.pending_api_writes, 0)
+        self.assertTrue(self.backup.is_file())
+
+    def test_sqlite_open_time_wal_ctime_only_drift_keeps_valid_snapshot(self) -> None:
+        # SQLite 3.45 on Python 3.14 may advance a healthy WAL's ctime
+        # during schema_version without changing WAL bytes/size/mtime.
+        # Emulate that filesystem event on Python 3.12 to cover both builds.
+        wal = self.source.with_name(self.source.name + "-wal")
+        with closing(sqlite3.connect(self.source)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("open-time-ctime-fence", "d" * 64, NOW.isoformat()),
+            )
+            writer.commit()
+            initial = wal.stat()
+            source_uri = backup_cli._uri(self.source, "ro")
+            original_connect = sqlite3.connect
+            simulated = False
+
+            def simulate_sqlite_open_time_ctime(database, *args, **kwargs):
+                nonlocal simulated
+                conn = original_connect(database, *args, **kwargs)
+                if database == source_uri and not simulated:
+                    simulated = True
+                    conn.execute("PRAGMA schema_version").fetchone()
+                    os.utime(wal, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+                    self.assertNotEqual(wal.stat().st_ctime_ns, initial.st_ctime_ns)
+                    self.assertEqual(wal.stat().st_mtime_ns, initial.st_mtime_ns)
+                return conn
+
+            with patch(
+                "mark_api.backup_cli.sqlite3.connect",
+                side_effect=simulate_sqlite_open_time_ctime,
+            ):
+                receipt = backup_store(self.source, backup_db=self.backup)
+            self.assertTrue(simulated)
+            self.assertEqual(receipt.pending_api_writes, 1)
+            with closing(sqlite3.connect(self.backup)) as restored:
+                self.assertEqual(
+                    restored.execute(
+                        "SELECT state FROM write_api_requests "
+                        "WHERE idempotency_key='open-time-ctime-fence'"
+                    ).fetchone(),
+                    ("in_progress",),
+                )
+
     def test_quiescent_wal_database_without_sidecars_can_be_backed_up(self) -> None:
         # Closing the final WAL writer checkpoints and removes -wal/-shm.
         # A mode=ro SQLite reader may legitimately create an EMPTY WAL and

@@ -69,6 +69,32 @@ def _source_identity_unchanged(path: Path, original: os.stat_result) -> None:
 _SQLITE_HEADER = b"SQLite format 3\x00"
 
 
+def _source_journal_mode(path: Path, validated: os.stat_result) -> str:
+    """Read the SQLite header of the validated source inode, not a pathname alias."""
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        actual = os.fstat(descriptor)
+        header = os.pread(descriptor, 20, 0)
+    except OSError as exc:
+        raise BackupError("SQLite source journal mode cannot be attested") from exc
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISREG(actual.st_mode)
+        or (actual.st_dev, actual.st_ino, actual.st_nlink)
+        != (validated.st_dev, validated.st_ino, validated.st_nlink)
+        or header[:16] != _SQLITE_HEADER
+    ):
+        raise BackupError("SQLite source journal mode identity is invalid")
+    if header[18:20] == bytes((1, 1)):
+        return "rollback"
+    if header[18:20] == bytes((2, 2)):
+        return "wal"
+    raise BackupError("SQLite source journal mode is unsupported")
+
+
 _WAL_MAGICS = (b"\x37\x7f\x06\x82", b"\x37\x7f\x06\x83")
 
 
@@ -190,6 +216,28 @@ def _assert_sidecar_contents_unchanged(
     )
     if any(getattr(current, field) != getattr(original, field) for field in fields):
         raise BackupError("WAL source contents changed during backup")
+
+
+def _sidecar_digest(path: Path, original: os.stat_result | None) -> str | None:
+    if original is None:
+        return None
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as exc:
+        raise BackupError("WAL source content digest is unavailable") from exc
+    try:
+        current = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino, current.st_nlink)
+            != (original.st_dev, original.st_ino, original.st_nlink)
+        ):
+            raise BackupError("WAL source content digest identity changed")
+        return _sha256_fd(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _shared_file_mappings() -> set[tuple[int, int]]:
@@ -466,13 +514,17 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
     wal_before = _sidecar_identity(wal_path)
     shm_before = _sidecar_identity(shm_path)
     wal_contents_before = _capture_sidecar_contents(wal_path, wal_before)
+    wal_digest_before = _sidecar_digest(wal_path, wal_contents_before)
     if wal_before is None and shm_before is not None:
         raise BackupError("WAL source identity has orphan shared memory")
-    immutable_source = wal_before is None and shm_before is None
-    # A quiet WAL-mode database may have no sidecars. A normal read-only
-    # SQLite connection creates a fresh, mutable empty WAL that another
-    # process could fill and truncate during backup. Immutable mode never
-    # consumes newly introduced WAL frames; main-file stability is required.
+    journal_mode = _source_journal_mode(source, original)
+    immutable_source = (
+        journal_mode == "wal" and wal_before is None and shm_before is None
+    )
+    # Only a quiet WAL-mode source without sidecars is safe to open immutable:
+    # it must ignore injected WAL frames while its main file stays unchanged.
+    # Rollback-mode databases must use normal SQLite read locks or concurrent
+    # writes could produce a torn snapshot while skipping journaling.
     source_uri = _uri(source, "ro") + ("&immutable=1" if immutable_source else "")
     open_main_before = _sqlite_main_fds()
     open_wal_before = _sqlite_wal_fds()
@@ -500,7 +552,13 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 wal_path, shm_path, wal_before, shm_before,
                 open_wal_before, maps_before, resources,
             )
-            _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
+            # On some supported SQLite versions the reader itself advances a
+            # valid WAL inode's ctime during schema_version. Rebaseline only
+            # after proving its entire contents are byte-identical to the
+            # pre-open digest; subsequent edits remain fail-closed.
+            if _sidecar_digest(wal_path, wal_contents_before) != wal_digest_before:
+                raise BackupError("WAL source contents changed during opening")
+            wal_contents_open = _capture_sidecar_contents(wal_path, wal_identity)
             # An ordinary reader may touch -shm while establishing its WAL
             # read mark. Pin the SHM metadata after this expected open-time
             # bookkeeping, but still reject later in-place modifications.
@@ -559,7 +617,7 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 wal_path, wal_identity, sqlite_wal_fd,
                 shm_path, shm_identity, empty_wal_fd, maps_before,
             )
-            _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
+            _assert_sidecar_contents_unchanged(wal_path, wal_contents_open)
             _assert_sidecar_contents_unchanged(shm_path, shm_contents_open)
             _assert_no_rollback_journal(journal_path)
             os.fsync(stage_fd)
@@ -572,7 +630,7 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 wal_path, wal_identity, sqlite_wal_fd,
                 shm_path, shm_identity, empty_wal_fd, maps_before,
             )
-            _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
+            _assert_sidecar_contents_unchanged(wal_path, wal_contents_open)
             _assert_sidecar_contents_unchanged(shm_path, shm_contents_open)
             _assert_no_rollback_journal(journal_path)
             _new_target(target, target_dir_fd)
@@ -614,7 +672,7 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 wal_path, wal_identity, sqlite_wal_fd,
                 shm_path, shm_identity, empty_wal_fd, maps_before,
             )
-            _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
+            _assert_sidecar_contents_unchanged(wal_path, wal_contents_open)
             _assert_sidecar_contents_unchanged(shm_path, shm_contents_open)
             _assert_no_rollback_journal(journal_path)
             return BackupReceipt(

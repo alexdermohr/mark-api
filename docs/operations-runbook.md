@@ -73,17 +73,22 @@ Auch die tatsächlichen `-wal`-Dateideskriptoren und neu eingebundenen
 `-shm`-Mappings werden über die Linux-Inode-Identität geprüft. Zusätzlich
 werden Größe, Änderungszeit und Linux-`ctime` der Hauptdatei und der
 vorhandenen WAL vor und nach dem Snapshot verglichen. SQLite kann beim
-normalen Öffnen eines bestehenden WAL seine `-shm`-Metadaten aktualisieren;
-deren Inhaltsstabilität wird deshalb **nach** diesem Öffnungsvorgang bis zum
-Ende der Sicherung geprüft. Änderungen durch fremde Prozesse während
-der Sicherung führen zum sicheren Abbruch. Aktive Änderungen während der Sicherung können deshalb einen neuen
-Backup-Versuch nach Prüfung des Ergebnisses erforderlich machen.
+normalen Öffnen eines bestehenden WAL `-shm`-Metadaten und je nach
+SQLite-Version auch dessen `ctime` aktualisieren. Für vorhandene WAL-Dateien
+wird deshalb vor und nach dem Öffnen der vollständige SHA-256 verglichen,
+bevor die WAL-Metadatenbasis auf den Post-Open-Zustand gesetzt wird.
+Ab dann müssen WAL-/SHM-Inhalte und Metadaten bis zur Veröffentlichung stabil
+bleiben. Andernfalls wird die Sicherung sicher abgebrochen.
 
-Sind anfänglich **weder `-wal` noch `-shm` vorhanden**, nutzt die CLI
-SQLite im `immutable=1`-Lesemodus. Dieser liest den stabilen Hauptdateistand,
-ohne später eingespielte WAL-Frames zu übernehmen. Eine neu auftauchende
-Sidecar-Datei führt zum sicheren Abbruch. Bei bereits vorhandenen Sidecars
-bleibt der normale SQLite-Read einschließlich committeter WAL-Frames aktiv.
+Sind anfänglich **weder `-wal` noch `-shm` vorhanden**, unterscheidet
+die CLI anhand des validierten SQLite-Hauptdateiheaders:
+Bei **WAL-Modus** nutzt sie `immutable=1`, damit später eingeschleuste
+WAL-Frames nicht gelesen werden; eine neu auftauchende Sidecar-Datei
+blockiert das Backup. Bei **Rollback-Journalmodus** öffnet sie SQLite
+dagegen normal read-only mit SQLite-Lesesperren, damit parallele
+Produkt-Writes keinen inkonsistenten Snapshot verursachen.
+Bei bereits vorhandenen WAL-Sidecars bleibt der normale
+WAL-konsistente SQLite-Read einschließlich committeter Frames aktiv.
 Ein vorhandenes SQLite-Rollback-Journal (`-journal`), insbesondere nach
 einem abgestürzten Writer, blockiert jedes Backup bis zur zulässigen
 Offline-Recovery; `immutable=1` darf ein solches Journal nicht umgehen.
