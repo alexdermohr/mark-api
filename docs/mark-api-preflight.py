@@ -52,9 +52,15 @@ def _trusted_parents(path: Path) -> None:
 
 def _trusted_link(path: Path, root: Path) -> None:
     try:
+        # Compare the literal link target with its fully resolved target.
+        # A chain through an independently writable intermediary may be
+        # retargeted after the preflight, even when it resolves safely now.
+        literal = Path(os.path.normpath(str(path.parent / os.readlink(path))))
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise DeploymentBoundaryError("installed code symlink cannot be trusted") from exc
+    if literal != resolved:
+        raise DeploymentBoundaryError("installed code symlink uses an unaudited intermediary")
     inside_install = resolved.is_relative_to(root)
     if not inside_install and not resolved.is_relative_to(_SYSTEM_CODE_ROOT):
         raise DeploymentBoundaryError("installed code symlink escapes trusted roots")
@@ -168,9 +174,14 @@ def _check_os_stdlib(version: str) -> None:
                 raise DeploymentBoundaryError("system stdlib cannot be audited") from exc
         elif stat.S_ISLNK(info.st_mode):
             try:
+                literal = Path(os.path.normpath(str(path.parent / os.readlink(path))))
                 target = path.resolve(strict=True)
             except (OSError, RuntimeError) as exc:
                 raise DeploymentBoundaryError("system stdlib symlink cannot be trusted") from exc
+            # Reject chained links (including an intermediate writable
+            # directory) before trusting the final target metadata.
+            if literal != target:
+                raise DeploymentBoundaryError("system stdlib symlink has an unsafe intermediary")
             target_info = _trusted_metadata(target)
             regular = stat.S_ISREG(target_info.st_mode)
             directory = stat.S_ISDIR(target_info.st_mode)

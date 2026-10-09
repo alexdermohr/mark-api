@@ -279,7 +279,12 @@ Write-API bleiben loopback-only.
    oben **vorher** existieren, ohne dass der Dienststart sie neu erzeugt
    oder fremde Daten automatisch übernimmt. `ReadWritePaths=` erlaubt nur
    die benötigten bereits existierenden Pfade trotz `ProtectSystem=strict`.
-   `ExecStartPre=` beginnt mit `/bin/sh /etc/mark-api/bootstrap.sh`. Diese
+   `ExecCondition=` überprüft zuvor mit dem root-verwalteten nativen
+   `/usr/bin/find`, ob `/etc`, `/etc/mark-api` und das Bootstrap-Skript
+   root-owned, nicht gruppen-/weltweit beschreibbar und ohne Symlink auf
+   die erste ausführbare Scriptdatei verweisen. Ein Verstoß verhindert den
+   Dienststart, bevor ein Byte aus diesem Skript ausgeführt wird.
+   `ExecStartPre=` beginnt danach mit `/bin/sh /etc/mark-api/bootstrap.sh`. Diese
    root-verwaltete, schreibfreie native Stufe prüft zunächst den **eigenen**
    `/usr/bin/python3`-Interpreter samt tatsächlich zugehörigem
    `/usr/lib/pythonX.Y`-Importbaum, Symlink-Zielen einschließlich ihrer

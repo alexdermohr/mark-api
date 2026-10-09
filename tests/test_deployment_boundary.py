@@ -85,6 +85,18 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
         for filename in ("mark-api.service", "mark-api-backup@.service"):
             with self.subTest(filename=filename):
                 service = _unit(filename)["Service"]
+                # Validate the native shell file *before* it executes. A
+                # service-writable bootstrap must never become first code.
+                first = shlex.split(service["ExecCondition"])
+                self.assertEqual(first[:6], [
+                    "/usr/bin/find", "-P", "/etc", "/etc/mark-api",
+                    "/etc/mark-api/bootstrap.sh", "-maxdepth",
+                ])
+                self.assertEqual(first[6:8], ["0", "("])
+                self.assertIn("-uid", first)
+                self.assertIn("-perm", first)
+                self.assertIn("-type", first)
+                self.assertEqual(first[-4:], ["-exec", "/usr/bin/false", "{}", "+"])
                 self.assertEqual(
                     shlex.split(service["ExecStartPre"]),
                     ["/bin/sh", "/etc/mark-api/bootstrap.sh",
@@ -113,6 +125,7 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
         content = script.read_text(encoding="utf-8")
         self.assertIn('/usr/bin/find -L "$stdlib"', content)
         self.assertIn('/usr/bin/readlink -f', content)
+        self.assertIn('link_target=$(/usr/bin/readlink "$python_link")', content)
         self.assertIn('exec /usr/bin/python3 -I -S /etc/mark-api/preflight.py "$@"', content)
         self.assertLess(
             content.index('/usr/bin/find -L "$stdlib"'),
@@ -123,6 +136,63 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             text=True, capture_output=True, check=False,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_systemd_condition_rejects_untrusted_bootstrap_inode(self) -> None:
+        # Verify GNU find exit codes rather than assuming a warning or
+        # printed match will block systemd ExecStartPre.
+        guard = shlex.split(_unit("mark-api.service")["Service"]["ExecCondition"])
+        trusted = guard[:2] + ["/etc", "/usr", "/usr/bin/find"] + guard[5:]
+        ok = subprocess.run(trusted, text=True, capture_output=True, check=False)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        with TemporaryDirectory() as tmp:
+            attacker = Path(tmp) / "bootstrap.sh"
+            attacker.write_text("# attacker-controlled bootstrap\\n")
+            attacker.chmod(0o666)
+            untrusted = guard[:2] + ["/etc", "/usr", str(attacker)] + guard[5:]
+            blocked = subprocess.run(
+                untrusted, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(blocked.returncode, 0)
+
+    def test_native_bootstrap_attests_preflight_file_before_python(self) -> None:
+        script = (DOCS / "mark-api-bootstrap.sh").read_text(encoding="utf-8")
+        check = 'trusted "/etc/mark-api/preflight.py"'
+        launch = 'exec /usr/bin/python3 -I -S /etc/mark-api/preflight.py "$@"'
+        self.assertIn(check, script)
+        self.assertIn(launch, script)
+        self.assertLess(script.index(check), script.index(launch))
+
+    def test_native_bootstrap_fails_on_untrusted_preflight_script(self) -> None:
+        script = (DOCS / "mark-api-bootstrap.sh").read_text(encoding="utf-8")
+        prefix = (
+            'for path in /etc /etc/mark-api; do\n'
+            '    trusted "$path"\n'
+            'done\n'
+            'trusted "/etc/mark-api/bootstrap.sh"\n'
+        )
+        self.assertIn(prefix, script)
+        with TemporaryDirectory() as tmp:
+            untrusted = Path(tmp) / "preflight.py"
+            untrusted.write_text("raise RuntimeError('must not execute')\n")
+            untrusted.chmod(0o666)
+            marker_path = Path(tmp) / "python-executed"
+            shell = Path(tmp) / "bootstrap-check.sh"
+            # Isolate only the final script-file check; all OS stdlib checks
+            # execute normally, and this test never alters the real /etc.
+            altered = script.replace(prefix, ": # synthetic trusted parents\n")
+            altered = altered.replace(
+                "/etc/mark-api/preflight.py", str(untrusted)
+            ).replace(
+                f'exec /usr/bin/python3 -I -S {untrusted} "$@"',
+                f'printf dispatch > "{marker_path}"',
+            )
+            shell.write_text(altered)
+            proc = subprocess.run(
+                ["/bin/sh", str(shell)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(marker_path.exists(), proc.stdout + proc.stderr)
 
     def test_native_bootstrap_fail_closed_before_python_for_untrusted_stdlib(self) -> None:
         # Only the copied test shell is altered: the production guard has
@@ -431,6 +501,30 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             with self.assertRaises(boundary.DeploymentBoundaryError):
                 boundary.check_installed_code(root)
 
+    def test_preflight_rejects_interpreter_via_writable_intermediate_link(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            writable = root.parent.parent / "writable-intermediary"
+            writable.mkdir(mode=0o777)
+            writable.chmod(0o777)
+            (writable / "python-redirect").symlink_to(
+                root.parent.parent / "usr/bin/python3.12"
+            )
+            interpreter = root / "bin/python"
+            interpreter.unlink()
+            interpreter.symlink_to(writable / "python-redirect")
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
+
+    def test_preflight_rejects_package_via_writable_intermediate_link(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            writable = root.parent.parent / "writable-code-link"
+            writable.mkdir(mode=0o777)
+            writable.chmod(0o777)
+            (writable / "module-redirect").symlink_to(site / "PIL/Image.py")
+            (site / "PIL/intermediate.py").symlink_to(writable / "module-redirect")
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
+
     def test_preflight_rejects_python_symlink_to_wrong_minor_version(self) -> None:
         # A legitimate-looking /usr/bin/python3.13 symlink would import
         # a separate unchecked stdlib despite the package living in python3.12.
@@ -526,6 +620,21 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             outside.write_text("# trusted sitecustomize\n")
             (usr / "lib/python3.12/sitecustomize.py").symlink_to(outside)
             boundary.check_installed_code(root)
+
+    def test_preflight_rejects_stdlib_link_through_writable_intermediary(self) -> None:
+        # A read-only link may traverse a writable second symlink before
+        # resolving to a trusted existing system module.
+        with self._fake_root_install() as (root, site, _probe):
+            trusted = root.parent.parent / "usr/lib/python3.12/site.py"
+            writable = root.parent.parent / "untrusted-redirects"
+            writable.mkdir()
+            writable.chmod(0o777)
+            (writable / "redirect.py").symlink_to(trusted)
+            (root.parent.parent / "usr/lib/python3.12/sitecustomize.py").symlink_to(
+                writable / "redirect.py"
+            )
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
 
     def test_preflight_rejects_stdlib_symlink_to_unscanned_os_code(self) -> None:
         with self._fake_root_install() as (root, site, _probe):
