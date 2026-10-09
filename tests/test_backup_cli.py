@@ -230,6 +230,39 @@ class BackupCliTests(unittest.TestCase):
         with self.assertRaisesRegex(BackupError, "already exists"):
             backup_store(self.source, backup_db=self.backup)
 
+    def test_late_directory_fsync_error_preserves_new_backup_without_retry(self) -> None:
+        # Publication may have succeeded even when the durability confirmation
+        # fails. The caller must inspect the now-existing target, never retry
+        # over that name or silently remove a potentially valid backup.
+        self._seed_recovery_data()
+        with patch("mark_api.backup_cli._fsync_directory", side_effect=OSError("io")):
+            with self.assertRaisesRegex(BackupError, "publication uncertain"):
+                backup_store(self.source, backup_db=self.backup)
+
+        self.assertTrue(self.backup.is_file())
+        original_bytes = self.backup.read_bytes()
+        with self.assertRaisesRegex(BackupError, "already exists"):
+            backup_store(self.source, backup_db=self.backup)
+        self.assertEqual(self.backup.read_bytes(), original_bytes)
+
+        # A late publication error does not assert complete durability. In the
+        # injected environment the file is readable and its recovery fences
+        # are still intact; no platform action is ever triggered.
+        restored = self.root / "late-restore.sqlite"
+        shutil.copyfile(self.backup, restored)
+        os.chmod(restored, 0o600)
+        store = SnapshotStore(restored, create_if_missing=False)
+        self.assertTrue(store.is_ready())
+        self.assertEqual(store.sync_status()["state"], "in_progress")
+        with sqlite3.connect(restored) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='pending-api-fence'"
+                ).fetchone(),
+                ("in_progress",),
+            )
+
     def test_cli_receipt_is_safe_and_requires_explicit_destination(self) -> None:
         buf = io.StringIO()
         with redirect_stdout(buf):
