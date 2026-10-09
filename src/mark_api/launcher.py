@@ -25,7 +25,7 @@ from .private_web_runtime import (
     build_private_web_inventory_runtime,
     build_private_web_write_api_runtime,
 )
-from .results import ReadResult
+from .results import ReadResult, ReadStatus
 from .storage import SnapshotStore
 from .write_api import WriteApiAccess, WriteCapability
 
@@ -126,6 +126,11 @@ def _validated_inventory(
         )
 
     snapshots = tuple(result.value or ())
+    if (
+        (result.status is ReadStatus.SUCCESS_NONEMPTY and not snapshots)
+        or (result.status is ReadStatus.SUCCESS_EMPTY and snapshots)
+    ):
+        raise ProductLauncherError("private Web inventory status contradicts its data")
     if any(not isinstance(item, AdSnapshot) for item in snapshots):
         raise ProductLauncherError(
             "private Web inventory contains invalid snapshots"
@@ -405,6 +410,12 @@ def build_product_launcher(
         else:
             store = store_factory(db_path)
         tracked_ids = store.tracked_ad_ids()
+        attempt_id = store.begin_sync_attempt(
+            source=_LAUNCHER_SOURCE,
+            started_at=_validated_observed_at(clock),
+        )
+    except ProductLauncherError:
+        raise
     except Exception:
         raise ProductLauncherError("local snapshot store startup failed") from None
 
@@ -414,22 +425,64 @@ def build_product_launcher(
             timeout_seconds=timeout,
         )
     except PrivateWebRuntimeDependencyError:
+        store.fail_sync_attempt(
+            attempt_id, source=_LAUNCHER_SOURCE, completed_at=_validated_observed_at(clock),
+            error_kind="runtime_unavailable",
+        )
         raise
     except Exception:
+        store.fail_sync_attempt(
+            attempt_id, source=_LAUNCHER_SOURCE, completed_at=_validated_observed_at(clock),
+            error_kind="runtime_unavailable",
+        )
         raise ProductLauncherError("private Web runtime startup failed") from None
 
     server: LoopbackDashboardServer | None = None
     write_runtime: _WriteRuntime | None = None
     try:
-        result = inventory_runtime.read_inventory()
-        snapshots = _validated_inventory(result)
-        observed_at = _validated_observed_at(clock)
-        persisted = store.append_inventory_result(
-            result,
-            tracked_ad_ids=tracked_ids,
-            observed_at=observed_at,
-            source=_LAUNCHER_SOURCE,
-        )
+        try:
+            result = inventory_runtime.read_inventory()
+        except Exception:
+            store.fail_sync_attempt(
+                attempt_id, source=_LAUNCHER_SOURCE, completed_at=_validated_observed_at(clock),
+                error_kind="reader_exception",
+            )
+            raise
+        try:
+            snapshots = _validated_inventory(result)
+        except Exception:
+            if isinstance(result, ReadResult) and not result.is_success:
+                store.append_inventory_result(
+                    result,
+                    tracked_ad_ids=tracked_ids,
+                    observed_at=_validated_observed_at(clock),
+                    source=_LAUNCHER_SOURCE,
+                    attempt_id=attempt_id,
+                    completed_at=_validated_observed_at(clock),
+                )
+            else:
+                store.fail_sync_attempt(
+                    attempt_id, source=_LAUNCHER_SOURCE, completed_at=_validated_observed_at(clock),
+                    error_kind="invalid_inventory",
+                )
+            raise
+        try:
+            observed_at = _validated_observed_at(clock)
+            persisted = store.append_inventory_result(
+                result,
+                tracked_ad_ids=tracked_ids,
+                observed_at=observed_at,
+                source=_LAUNCHER_SOURCE,
+                attempt_id=attempt_id,
+                completed_at=observed_at,
+            )
+        except Exception:
+            # An unknown SQLite commit is never reclassified as success.
+            store.fail_sync_attempt(
+                attempt_id, source=_LAUNCHER_SOURCE, completed_at=_validated_observed_at(clock),
+                error_kind="persistence_error",
+            )
+            raise
         email_report = EmailImportReport(
             parsed_files=0,
             inserted_events=0,

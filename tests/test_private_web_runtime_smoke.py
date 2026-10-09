@@ -202,6 +202,42 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
 
                 self.assertEqual(runtime.close_calls, 1)
 
+    def test_smoke_rejects_forged_sync_success_in_summary_or_status(self) -> None:
+        original_json_get = runtime_smoke._json_get
+        for target_path in ("/api/summary", "/api/sync/status"):
+            with self.subTest(target_path=target_path):
+                runtime = FakeInventoryRuntime(
+                    ReadResult.success_nonempty((snapshot("1234567890"),))
+                )
+
+                def corrupt_sync(opener, base: str, path: str):
+                    payload = original_json_get(opener, base, path)
+                    if path == target_path:
+                        assert isinstance(payload, dict)
+                        row = dict(payload)
+                        if path == "/api/summary":
+                            evidence = dict(row["sync_status"])
+                            evidence["state"] = "success_nonempty"
+                            row["sync_status"] = evidence
+                        else:
+                            row["last_successful_attempt"] = {
+                                "outcome": "success_nonempty", "snapshot_count": 1
+                            }
+                        return row
+                    return payload
+
+                with patch(
+                    "mark_api.private_web_runtime_smoke._json_get",
+                    side_effect=corrupt_sync,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "dashboard inventory projections are malformed",
+                    ):
+                        run_private_web_runtime_smoke(
+                            19610, runtime_factory=lambda **_kwargs: runtime,
+                        )
+                self.assertEqual(runtime.close_calls, 1)
+
     def test_smoke_exercises_all_http_write_methods(self) -> None:
         runtime = FakeInventoryRuntime(
             ReadResult.success_nonempty((snapshot("1234567890"),))

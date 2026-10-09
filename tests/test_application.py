@@ -406,6 +406,8 @@ class MarkServiceTests(unittest.TestCase):
             [item.lifecycle_state for item in store.ad_history("3521676801")],
             [LifecycleState.ACTIVE, LifecycleState.ABSENT],
         )
+        self.assertEqual(store.sync_status()["state"], "success_empty")
+        self.assertEqual(store.last_successful_sync_attempt().snapshot_count, 0)
 
     def test_failed_inventory_refresh_does_not_mark_history_absent(self) -> None:
         store = self.make_store()
@@ -430,6 +432,29 @@ class MarkServiceTests(unittest.TestCase):
 
         self.assertEqual(result.status, ReadStatus.HTTP_ERROR)
         self.assertEqual(store.ad_history("3521676801"), (active,))
+        self.assertEqual(store.sync_status()["state"], "failed")
+        self.assertEqual(store.latest_sync_attempt().error_kind, "http_error")
+        self.assertIsNone(store.last_successful_sync_attempt())
+
+    def test_refresh_inventory_reader_exception_remains_failed_without_snapshots(self) -> None:
+        store = self.make_store()
+
+        class ExplodingReader:
+            def read_ads(self):
+                raise RuntimeError("private token should not be persisted")
+
+        service, _, _, _ = self.service(
+            owner_reader=ExplodingReader(),
+            management_reader=SequenceAdsReader(),
+            store=store,
+        )
+        with self.assertRaisesRegex(RuntimeError, "private token"):
+            service.refresh_inventory()
+        self.assertEqual(store.tracked_ad_ids(), ())
+        state = store.sync_status()
+        self.assertEqual(state["state"], "failed")
+        self.assertEqual(state["latest_attempt"]["error_kind"], "reader_exception")
+        self.assertNotIn("private token", str(state))
 
     def test_refresh_reactions_persists_snapshot(self) -> None:
         store = self.make_store()

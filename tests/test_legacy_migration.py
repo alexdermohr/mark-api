@@ -118,6 +118,33 @@ class LegacyMigrationTests(unittest.TestCase):
                 )
             for name in sorted(ALL_TABLES - stage):
                 connection.execute(f"DROP TABLE {name}")
+            # Historical stores predate the new sync-attempt journal/version.
+            # The test fixture starts from a modern SnapshotStore only to
+            # obtain the older schema layouts; remove newer data-only objects.
+            connection.execute("DROP TABLE sync_attempts")
+            connection.execute("PRAGMA user_version = 0")
+
+    def test_versioned_store_loss_cannot_masquerade_as_historical(self) -> None:
+        # A post-A5 store still has a durable marker even if its journal and
+        # newer recovery tables were lost. Offline migration must not erase
+        # that evidence merely because remaining table names look historical.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "damaged-modern.sqlite"
+            backup = root / "backup.sqlite"
+            target = root / "target.sqlite"
+            self.build_stage(source, STAGES[0])
+            with sqlite3.connect(source) as connection:
+                connection.execute("PRAGMA user_version = 1")
+            before = hashlib.sha256(source.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(LegacyMigrationError, "versioned"):
+                migrate_legacy_store(
+                    source, backup_db=backup, output_db=target,
+                    confirm_no_unresolved_writes=True,
+                )
+            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before)
+            self.assertFalse(backup.exists())
+            self.assertFalse(target.exists())
 
     def test_all_six_historical_stages_preserve_data_and_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
