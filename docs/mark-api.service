@@ -1,0 +1,46 @@
+# Install root-owned in /etc/systemd/system/mark-api.service.
+# Do not enable until an authenticated loopback CDP endpoint and an existing
+# verified database have been set up. Never run with --init-db.
+[Unit]
+Description=Mark Kleinanzeigen product runtime (trusted database owner)
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=mark-api
+Group=mark-api
+WorkingDirectory=/var/lib/mark-api
+ReadWritePaths=/var/lib/mark-api
+RuntimeDirectory=mark-api
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStartPre=/opt/mark-api/venv/bin/python -I -m mark_api.deployment_boundary --db /var/lib/mark-api/mark.sqlite --backup-dir /var/lib/mark-api-backups
+ExecStart=/opt/mark-api/venv/bin/mark-api-launch --db /var/lib/mark-api/mark.sqlite --cdp-port 9222 --dashboard-port 8875 --write-port 8876
+Restart=on-failure
+RestartSec=10s
+
+# mark-api-launch prints its process-scoped bearer and dashboard-fragment URL.
+# Keep STDOUT out of journald and inaccessible to non-service UIDs.
+StandardOutput=truncate:/run/mark-api/launcher.log
+StandardError=journal
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

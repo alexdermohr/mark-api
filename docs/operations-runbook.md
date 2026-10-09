@@ -168,6 +168,129 @@ Medien-/Browserprofile sind getrennte Betreiberaufgaben. Persistente
 SQLite-Daten allein stellen keine CDP-Sitzung und keine opaken
 temporären Media-Staging-Handles wieder her.
 
+## Isolierter Linux-Systemdienst: tatsächliche Vertrauensgrenze
+
+**Vorlagen, keine laufende Installation:** `docs/mark-api.service`,
+`docs/mark-api-backup@.service` und `docs/mark-api.sysusers.conf`
+beschreiben einen root-verwalteten, dedizierten `mark-api`-Unix-Nutzer ohne
+Login-Shell. Diese Dateien im Repository oder ein erfolgreicher Unit-Test
+beweisen **keine** tatsächlich eingerichtete, sichere Laufzeitidentität.
+
+Ein Benutzerprozess, der dieselbe Unix-UID und Schreibrechte wie die
+SQLite-Dateien besitzt und böswillig über bereits writable `MAP_SHARED`
+gemappte Main-/WAL-/SHM-Seiten schreibt, kann die Inhalts-/Zeitpunktprüfungen
+der Backup-CLI umgehen und alte, scheinbar gültige Snapshots erzwingen.
+Weder `lstat`, Datei-Hashes, ein SQLite-Leselock noch die neue Rohseiten-
+Vergleichsfunktion sind dafür eine kontinuierliche Isolation. Der harte
+Betriebsrand ist deshalb: **Das Dienstkonto darf ausschließlich die
+vertrauenswürdige Mark-Laufzeit und ihre Backup-Aufgabe ausführen.** Alle
+anderen Desktop-/Browser-/Automation-Prozesse bleiben unter getrennten
+Unprivilegierten-UIDs; ausschließlich root darf die Unit oder ihre
+Programmdateien ändern. Direkte UID-Impersonation, eine kompromittierte
+Mark-Laufzeit oder root sind damit nicht als abgewehrte Angreifer
+modelliert. Gegen diese Bedrohungen braucht es zusätzliche, extern
+verifizierbare Integrität und/oder unabhängig isolierte Storage-Snapshots.
+
+Die Vorlage bewahrt die normale `mark-api-launch`-Komposition mit
+**default-on** Create-/Media-/Update-/Pause-/Delete-Write-Funktionen und
+sämtlichen existierenden Bestätigungs-, Ownership-, Idempotenz- und
+Recovery-Fences. Sie deaktiviert keine Produkt-Write-API. Der Browser
+läuft als **separater bereits authentifizierter Nutzerprozess** mit
+loopback-only CDP; das Dienstkonto greift über den lokalen TCP-Port zu,
+nicht durch Lesen des Browserprofils. Zum Hochladen von Bildern dient der
+vorhandene pfadfreie Media-Staging-Endpunkt. Das Dashboard und die
+Write-API bleiben loopback-only.
+
+### Einrichtung ausschließlich mit geprüftem Produkt-Release
+
+1. Vor Ausführung echte Backup-/Restore-Evidenz der vorhandenen Mark-Datenbank,
+   aktuelle offene Pending-Write-Fences und eine zulässige, bereits
+   authentifizierte CDP-Sitzung prüfen. Bestehende Daten **niemals**
+   mit `--init-db` neu anlegen oder blind durch ein Altbackup ersetzen.
+   Die Vorlage setzt ein root-owned, ausschließlich aus einem geprüften
+   Release installiertes `/opt/mark-api/venv` mit Python 3.12+ und
+   `mark-api[private-web]` voraus; das System-Python kann ungeeignet sein.
+2. Vor dem ersten Start einmalig ein dediziertes, nicht interaktives
+   Systemkonto und geschützte Verzeichnisse vorbereiten:
+
+   ~~~bash
+   sudo install -D -o root -g root -m 0644 docs/mark-api.sysusers.conf /etc/sysusers.d/mark-api.conf
+   sudo systemd-sysusers /etc/sysusers.d/mark-api.conf
+   sudo install -d -o mark-api -g mark-api -m 0700 /var/lib/mark-api /var/lib/mark-api-backups
+   /opt/mark-api/venv/bin/python --version
+   ~~~
+
+   Nur bei **wirklich neuer**, nachweislich noch nicht vorhandener Datenbank
+   mit dem bereits geprüften installierten Paket initialisieren, ohne
+   Browser- oder Plattformzugriff:
+
+   ~~~bash
+   sudo -u mark-api /opt/mark-api/venv/bin/python -c "from mark_api.storage import SnapshotStore; SnapshotStore('/var/lib/mark-api/mark.sqlite', create_if_missing=True)"
+   ~~~
+
+   Bei bestehenden Mark-Stores stattdessen nur nach nachvollzogenem
+   Offline-Stop, unveränderter SHA-256-Quellprüfung und streng geprüftem
+   Backup/Restore den neuen Owner-Pfad vorbereiten. Keine automatische
+   Migration/Ownership-Änderung laufender Daten.
+   Die Systemd-Vorlagen verwenden ausdrücklich **kein** `StateDirectory=`,
+   da systemd ein bereits bestehendes Verzeichnis andernfalls automatisch
+   rekursiv umberechtigen könnte. Die Datenverzeichnisse müssen daher wie
+   oben **vorher** existieren, ohne dass der Dienststart sie neu erzeugt
+   oder fremde Daten automatisch übernimmt. `ReadWritePaths=` erlaubt nur
+   die benötigten bereits existierenden Pfade trotz `ProtectSystem=strict`.
+   `ExecStartPre=` prüft anschließend ohne Dateiänderungen die genaue
+   Dienst-UID/-GID, die Nicht-Login-Shell, die `0700`-Verzeichnisse, die
+   `0600`-Datenbank samt vorhandenen Sidecars und den root-owned
+   Installationspfad unter `/opt/mark-api/venv`. Bei einem Verstoß startet
+   weder Launcher noch Backup; dadurch entstehen keine neuen Writes.
+   **Diese Prüfung erkennt keine fremden, bereits unter der kompromittierten
+   Dienst-UID laufenden Prozesse oder vorbestehende mmap-Schreibzugriffe.**
+3. Root-verwaltete Units installieren, aber erst nach verifiziertem
+   CDP-Endpunkt und sicherem DB-Eigentum starten:
+
+   ~~~bash
+   sudo install -o root -g root -m 0644 docs/mark-api.service /etc/systemd/system/mark-api.service
+   sudo install -o root -g root -m 0644 'docs/mark-api-backup@.service' '/etc/systemd/system/mark-api-backup@.service'
+   sudo systemctl daemon-reload
+   sudo systemctl cat mark-api.service
+   sudo stat -c '%U:%G %a %n' /var/lib/mark-api /var/lib/mark-api/mark.sqlite /var/lib/mark-api-backups
+   ~~~
+
+   Erwartet sind `mark-api:mark-api`, `0700` auf beiden Verzeichnissen
+   und `0600` auf der Quelldatei. Vor Livebetrieb prüfen, dass eine andere
+   nicht-root UID keinen Dateizugriff erhält und kein Fremdprozess unter der
+   Dienst-UID läuft. Der Browser und die lokalen CLI-Tools unter dem
+   Desktopkonto dürfen **nicht** mehr direkt in diese Datenbank schreiben.
+   Das Starten der Unit ohne authentifiziertes Loopback-CDP liefert
+   keine produktive Abnahme.
+4. Die Vorlage verwendet `--dashboard-port 8875 --write-port 8876`,
+   da die Standardports `8765/8766` auf dem überprüften Host von der
+   Audioverwaltung belegt waren. Ports unmittelbar vor Inbetriebnahme
+   erneut prüfen. Nach sicherem Start mit `sudo systemctl start mark-api.service`
+   erscheinen Dashboard-URL samt Fragment und prozesslokaler Bearer
+   **nicht im Journal**, sondern ausschließlich in
+   `/run/mark-api/launcher.log` innerhalb des `0700`-RuntimeDirectory.
+   Datei und Token nur über einen autorisierten Operator lesen, niemals
+   in öffentlich zugängliche Logs oder PR-Kommentare kopieren.
+5. Eine explizit benannte, eindeutige Backup-Instanz ausführen, etwa
+   `sudo systemctl start mark-api-backup@20261009T1700.service`. Die
+   Ausgabe enthält nur den sanitisierten Receipt. Wiederverwendung
+   derselben Instanz darf die existierende Datei **nicht** überschreiben;
+   bei unklarem Lauf-/Publikationsstatus Zielpfad und Hash zuerst prüfen,
+   kein blinder Retry. Der Dienst/Backup-Prozess benutzt dieselbe
+   **vertrauenswürdige** UID, während normale gleichberechtigte
+   SQLite-Anwendungen weiterhin über SQLite-Koordinierung laufen können.
+
+**Merge-/Produktabnahme:** Ein Unit-Template, statische Tests oder eine grüne
+CI ersetzen nicht die unabhängige Live-Prüfung der tatsächlich laufenden
+Prozess-UID, systemd-Sandbox, Besitzer-/Gruppen-/Modusrechte des Datenbank-
+und WAL-/SHM-Verzeichnisses, anderer Prozesse unter der Dienst-UID, des
+Installationspfads und des erfolgreichen Backups einer realen, vollständigen
+Write-/Sync-Recovery-Datenbank. Die offenen mmap-basierten Review-Befunde
+bleiben solange blockierend, bis eine für den realen Produktpfad wirksame
+Vertrauensgrenze nachgewiesen und der konkrete PR-Head unabhängig
+nachgeprüft ist.
+
 ## Restore – ausschließlich in neue Datei
 
 1. Mark, Dashboard, Write-API und andere SQLite-Nutzer stoppen.

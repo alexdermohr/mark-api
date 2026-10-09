@@ -37,6 +37,25 @@ Die additive Tabelle erhält den SQLite-`user_version`-Marker 1 erst nach vollst
 
 Für den angereicherten Besitzerbestand bleibt die allgemeine Anzeige-/Inhaltsquelle zusammengesetzt (beispielsweise management+mobile). Die tatsächliche Zählerquelle wird separat und unverwechselbar in `ad_snapshots.metric_source` gespeichert. Bei bereits vollständigen SQLite-Stores wird diese optionale Spalte erst **nach der Prüfung sämtlicher vorhandener Recovery-Tabellen und Idempotenz-Fences** additiv ergänzt; der Quelltext `source` bleibt stets unverändert, auch bei beliebigen Präfixen oder JSON-ähnlichen Provider-Namen. Fehlende Recovery-Fences und unerkannte historische Tabellenschemata werden weiterhin nicht automatisch repariert. Fehlt bei älteren oder direkt gespeicherten Snapshots `metric_source`, wird in `metric_evidence.source` ausschließlich der unveränderte Quelltext `source` angezeigt. Gerade bei zusammengesetzten Bezeichnungen ist damit **nicht** unabhängig belegt, welcher Teil die Zähler geliefert hat. Weder Pluszeichen noch Präfixe werden als Trennzeichen oder Herkunftsbeweise interpretiert; eine Management-Teilquelle wird nicht geraten.
 
+## Isolierter Produktbetrieb unter eigener Unix-UID
+
+Für den root-verwalteten Linux-Produktbetrieb gibt es
+[`docs/mark-api.service`](docs/mark-api.service),
+[`docs/mark-api-backup@.service`](docs/mark-api-backup@.service) und
+[`docs/mark-api.sysusers.conf`](docs/mark-api.sysusers.conf).
+Sie beschreiben einen nicht interaktiv verwendbaren, dedizierten
+`mark-api`-Unix-Account mit privaten SQLite- und Runtime-Verzeichnissen;
+der normale Launcher aktiviert weiterhin alle vorhandenen produktseitigen
+Write-Capabilities **default-on**. Ausführbare Installationsanweisungen,
+Sicherheits- und Beweisgrenzen stehen im
+[`docs/operations-runbook.md`](docs/operations-runbook.md).
+Die Repository-Vorlagen wurden nicht als laufender Dienst installiert:
+Insbesondere ist eine echte OS-Identitätstrennung gegen andere
+gleichberechtigte lokale Prozesse erst nach Installation und unabhängiger
+Liveprüfung belegt, nicht durch eine statische Unit-Datei. Die
+Standard-Ports 8765/8766 können auf dem Host belegt sein; die Vorlage
+verwendet daher 8875/8876 (vor Start erneut auf Kollision prüfen).
+
 ## Product Launcher
 
 Der installierte Startpfad für den aktuellen Produktstand ist `mark-api-launch`. Er verwendet einen **bereits laufenden, vom Nutzer bereits authentifizierten** lokalen Chrome-/Chromium-Prozess mit loopback-CDP; der Launcher startet keinen Browser und automatisiert weder Login noch MFA/CAPTCHA.
