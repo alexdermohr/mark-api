@@ -157,6 +157,41 @@ def _sidecar_identity(path: Path) -> tuple[int, int] | None:
     return info.st_dev, info.st_ino
 
 
+def _capture_sidecar_contents(
+    path: Path, identity: tuple[int, int] | None,
+) -> os.stat_result | None:
+    if identity is None:
+        return None
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise BackupError("WAL source contents cannot be inspected") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or (info.st_dev, info.st_ino) != identity
+    ):
+        raise BackupError("WAL source contents changed during preflight")
+    return info
+
+
+def _assert_sidecar_contents_unchanged(
+    path: Path, original: os.stat_result | None,
+) -> None:
+    if original is None:
+        return
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise BackupError("WAL source contents could not be verified") from exc
+    fields = (
+        "st_dev", "st_ino", "st_nlink", "st_size",
+        "st_mtime_ns", "st_ctime_ns",
+    )
+    if any(getattr(current, field) != getattr(original, field) for field in fields):
+        raise BackupError("WAL source contents changed during backup")
+
+
 def _shared_file_mappings() -> set[tuple[int, int]]:
     """Identify file-backed shared mappings, including renamed SQLite -shm.
 
@@ -194,6 +229,8 @@ def _attest_sidecars(
         or (shm_before is not None and shm_now != shm_before)
     ):
         raise BackupError("WAL source identity changed during connection")
+    if wal_before is None and wal_now is not None:
+        raise BackupError("WAL source identity appeared after initially absent WAL")
     if wal_now is None and shm_before is None and shm_now is not None:
         raise BackupError("WAL source identity has unexpected shared memory")
     # SQLite may create an empty WAL when it opens a quiet WAL-mode database
@@ -205,8 +242,6 @@ def _attest_sidecars(
             current = wal_path.lstat()
         except OSError as exc:
             raise BackupError("WAL source identity could not be inspected") from exc
-        if wal_before is None and current.st_size != 0:
-            raise BackupError("WAL source identity newly introduced frames")
         if current.st_size == 0:
             try:
                 descriptor = os.open(
@@ -279,6 +314,21 @@ def _assert_sidecars_unchanged(
             raise BackupError("WAL source identity fd changed")
     if any(identity != shm_identity for identity in _shared_file_mappings() - maps_before):
         raise BackupError("WAL source identity mapping changed")
+
+
+def _assert_source_contents_unchanged(
+    descriptor: int, original: os.stat_result,
+) -> None:
+    """Fail closed if the validated SQLite main inode changed in-place."""
+    try:
+        current = os.fstat(descriptor)
+    except OSError as exc:
+        raise BackupError("immutable SQLite source descriptor was lost") from exc
+    fields = (
+        "st_dev", "st_ino", "st_size", "st_nlink", "st_mtime_ns", "st_ctime_ns",
+    )
+    if any(getattr(current, field) != getattr(original, field) for field in fields):
+        raise BackupError("source contents changed during backup")
 
 
 def _assert_destination_parent(path: Path, descriptor: int) -> None:
@@ -387,6 +437,16 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
     shm_path = source.with_name(source.name + "-shm")
     wal_before = _sidecar_identity(wal_path)
     shm_before = _sidecar_identity(shm_path)
+    wal_contents_before = _capture_sidecar_contents(wal_path, wal_before)
+    shm_contents_before = _capture_sidecar_contents(shm_path, shm_before)
+    if wal_before is None and shm_before is not None:
+        raise BackupError("WAL source identity has orphan shared memory")
+    immutable_source = wal_before is None and shm_before is None
+    # A quiet WAL-mode database may have no sidecars. A normal read-only
+    # SQLite connection creates a fresh, mutable empty WAL that another
+    # process could fill and truncate during backup. Immutable mode never
+    # consumes newly introduced WAL frames; main-file stability is required.
+    source_uri = _uri(source, "ro") + ("&immutable=1" if immutable_source else "")
     open_main_before = _sqlite_main_fds()
     open_wal_before = _sqlite_wal_fds()
     maps_before = _shared_file_mappings()
@@ -403,15 +463,18 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             )
             _new_target(target, target_dir_fd)
             original_db = resources.enter_context(
-                closing(sqlite3.connect(_uri(source, "ro"), uri=True, timeout=5))
+                closing(sqlite3.connect(source_uri, uri=True, timeout=5))
             )
             sqlite_source_fd = _attest_source_connection(
                 original_db, open_main_before, original,
             )
+            _assert_source_contents_unchanged(sqlite_source_fd, original)
             wal_identity, sqlite_wal_fd, shm_identity, empty_wal_fd = _attest_sidecars(
                 wal_path, shm_path, wal_before, shm_before,
                 open_wal_before, maps_before, resources,
             )
+            _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
+            _assert_sidecar_contents_unchanged(shm_path, shm_contents_before)
             _require_healthy_store(original_db)
             # Resolve staging through the pinned directory descriptor: a
             # later rename/symlink replacement of its pathname cannot retarget
@@ -455,19 +518,25 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 }
             _source_identity_unchanged(source, original)
             _assert_source_connection_inode(sqlite_source_fd, original)
+            _assert_source_contents_unchanged(sqlite_source_fd, original)
             _assert_sidecars_unchanged(
                 wal_path, wal_identity, sqlite_wal_fd,
                 shm_path, shm_identity, empty_wal_fd, maps_before,
             )
+            _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
+            _assert_sidecar_contents_unchanged(shm_path, shm_contents_before)
             os.fchmod(stage_fd, 0o400)
             os.fsync(stage_fd)
             backup_sha256 = _sha256_fd(stage_fd)
             _source_identity_unchanged(source, original)
             _assert_source_connection_inode(sqlite_source_fd, original)
+            _assert_source_contents_unchanged(sqlite_source_fd, original)
             _assert_sidecars_unchanged(
                 wal_path, wal_identity, sqlite_wal_fd,
                 shm_path, shm_identity, empty_wal_fd, maps_before,
             )
+            _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
+            _assert_sidecar_contents_unchanged(shm_path, shm_contents_before)
             _new_target(target, target_dir_fd)
             # Linux linkat follows this procfd symlink to the exact open stage
             # inode; the destination is addressed only by pinned dirfd.
@@ -494,10 +563,13 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             _assert_destination_parent(target.parent, target_dir_fd)
             _source_identity_unchanged(source, original)
             _assert_source_connection_inode(sqlite_source_fd, original)
+            _assert_source_contents_unchanged(sqlite_source_fd, original)
             _assert_sidecars_unchanged(
                 wal_path, wal_identity, sqlite_wal_fd,
                 shm_path, shm_identity, empty_wal_fd, maps_before,
             )
+            _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
+            _assert_sidecar_contents_unchanged(shm_path, shm_contents_before)
             return BackupReceipt(
                 created_at=datetime.now(timezone.utc).isoformat(),
                 backup_sha256=backup_sha256,

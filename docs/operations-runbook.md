@@ -70,17 +70,26 @@ Das Backup vorzugsweise als **eigenständigen CLI-Prozess** ausführen:
 im selben Prozess vorbestehende SQLite-Hauptdateideskriptoren fremder Datenbanken
 oder eine nicht eindeutig bestimmbare Quellbindung führen zum sicheren Abbruch.
 Auch die tatsächlichen `-wal`-Dateideskriptoren und neu eingebundenen
-`-shm`-Mappings werden über die Linux-Inode-Identität geprüft. Ein
-Sidecar-Wechsel oder eine fehlgeschlagene procfs-Attestation blockiert die
-Sicherung. Ausnahme: Öffnet SQLite eine zuvor nicht vorhandene WAL-Datei neu
-und leer (0 Frames), ist dies zulässig, solange ihr gepinnter Inode bis zum
-Abschluss nachweislich leer bleibt. Eine neu erscheinende WAL mit Frames oder
-ein späteres Anwachsen führt zum sicheren Abbruch. Bestehende Handles
-derselben validierten Quelle bleiben zulässig;
-ein unsicherer Pfad-Fallback findet nicht statt. Temporäre Sicherungsdatei
-und endgültige create-only-Veröffentlichung werden über geöffnete Stage-
-und Zielverzeichnis-Deskriptoren adressiert, nicht über erneut aufgelöste
-veränderliche Elternpfade.
+`-shm`-Mappings werden über die Linux-Inode-Identität geprüft. Zusätzlich
+werden Größe, Änderungszeit und Linux-`ctime` der SQLite-Hauptdatei und
+anfänglich vorhandener Sidecars vor und nach dem Snapshot verglichen:
+auch ein kurzzeitiges Überschreiben und Zurückschreiben führt zum sicheren
+Abbruch. Aktive Änderungen während der Sicherung können deshalb einen neuen
+Backup-Versuch nach Prüfung des Ergebnisses erforderlich machen.
+
+Sind anfänglich **weder `-wal` noch `-shm` vorhanden**, nutzt die CLI
+SQLite im `immutable=1`-Lesemodus. Dieser liest den stabilen Hauptdateistand,
+ohne später eingespielte WAL-Frames zu übernehmen. Eine neu auftauchende
+Sidecar-Datei führt zum sicheren Abbruch. Bei bereits vorhandenen Sidecars
+bleibt der normale SQLite-Read einschließlich committeter WAL-Frames aktiv.
+Fehlende procfs-Verifikation führt niemals zum unsicheren Pfad-Fallback.
+
+Temporäre Sicherungsdatei und endgültige create-only-Veröffentlichung werden
+über geöffnete Stage- und Zielverzeichnis-Deskriptoren adressiert, nicht
+über erneut aufgelöste veränderliche Elternpfade. Voraussetzung bleibt ein
+vertrauenswürdiger lokaler Betrieb; Angreifer mit privilegiertem Zugriff
+auf Dateisystem oder Backup-Prozess sind nicht durch ein Backup-Receipt
+autorisiert oder ausgeschlossen.
 
 ~~~bash
 mkdir -m 700 -p /sicherer/backup-ordner

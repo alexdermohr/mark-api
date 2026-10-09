@@ -165,6 +165,100 @@ class BackupCliTests(unittest.TestCase):
                 ("in_progress",),
             )
 
+    def test_transient_existing_wal_content_edit_never_claims_success(self) -> None:
+        # An attacker can edit and restore bytes on the same open WAL inode.
+        # Device/inode, final WAL magic and st_size alone do not reveal this.
+        wal = self.source.with_name(self.source.name + "-wal")
+        with closing(sqlite3.connect(self.source)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("pending-wal-content", "d" * 64, NOW.isoformat()),
+            )
+            writer.commit()
+            self.assertGreater(wal.stat().st_size, 32)
+            before = wal.stat()
+            original_count = backup_cli._count
+            tampered = False
+
+            def transient_wal_edit(connection, sql):
+                nonlocal tampered
+                if not tampered:
+                    tampered = True
+                    with wal.open("r+b") as stream:
+                        original_byte = stream.read(1)
+                        self.assertEqual(len(original_byte), 1)
+                        stream.seek(0)
+                        stream.write(bytes((original_byte[0] ^ 1,)))
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                        stream.seek(0)
+                        stream.write(original_byte)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.utime(wal, ns=(before.st_atime_ns, before.st_mtime_ns))
+                return original_count(connection, sql)
+
+            with patch("mark_api.backup_cli._count", side_effect=transient_wal_edit):
+                with self.assertRaisesRegex(BackupError, "WAL source contents changed"):
+                    backup_store(self.source, backup_db=self.backup)
+            self.assertTrue(tampered)
+            self.assertFalse(self.backup.exists())
+            self.assertEqual(
+                writer.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='pending-wal-content'"
+                ).fetchone(),
+                ("in_progress",),
+            )
+
+    def test_transient_existing_shm_content_edit_never_claims_success(self) -> None:
+        # A forged WAL-index could be reverted on the original -shm inode,
+        # leaving inode, size and final bytes apparently intact. ctime must
+        # still invalidate the backup receipt.
+        shm = self.source.with_name(self.source.name + "-shm")
+        with closing(sqlite3.connect(self.source)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("pending-shm-content", "d" * 64, NOW.isoformat()),
+            )
+            writer.commit()
+            self.assertTrue(shm.is_file())
+            initial = shm.stat()
+            original_count = backup_cli._count
+            tampered = False
+
+            def transient_shm_edit(connection, sql):
+                nonlocal tampered
+                if not tampered:
+                    tampered = True
+                    with shm.open("r+b") as handle:
+                        old = handle.read(1)
+                        self.assertEqual(len(old), 1)
+                        handle.seek(0)
+                        handle.write(bytes((old[0] ^ 1,)))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        handle.seek(0)
+                        handle.write(old)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.utime(shm, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+                return original_count(connection, sql)
+
+            with patch("mark_api.backup_cli._count", side_effect=transient_shm_edit):
+                with self.assertRaisesRegex(BackupError, "WAL source contents changed"):
+                    backup_store(self.source, backup_db=self.backup)
+            self.assertTrue(tampered)
+            self.assertFalse(self.backup.exists())
+
     def test_quiescent_wal_database_without_sidecars_can_be_backed_up(self) -> None:
         # Closing the final WAL writer checkpoints and removes -wal/-shm.
         # A mode=ro SQLite reader may legitimately create an EMPTY WAL and
@@ -223,7 +317,7 @@ class BackupCliTests(unittest.TestCase):
 
         def connect_after_planted_old_wal(database, *args, **kwargs):
             nonlocal planted
-            if database != source_uri or planted:
+            if not isinstance(database, str) or not database.startswith(source_uri) or planted:
                 return real_connect(database, *args, **kwargs)
             planted = True
             shutil.copyfile(saved_wal, wal)
@@ -238,49 +332,134 @@ class BackupCliTests(unittest.TestCase):
         self.assertTrue(planted)
         self.assertFalse(self.backup.exists())
 
-    def test_new_empty_wal_growing_frames_during_backup_blocks_publication(self) -> None:
-        # A legitimate write concurrent with backup startup must not turn an
-        # initially absent/empty sidecar into an untracked committed WAL.
-        # Retain its pinned fd and fail closed before create-only publication.
+    def test_new_wal_during_immutable_backup_blocks_publication(self) -> None:
+        # A quiet WAL database has no sidecars. Immutable source reads the
+        # stable main file without consuming concurrent newly created WALs.
+        # If a legitimate writer starts during the copy, fail closed rather
+        # than claiming a backup with potentially incomplete recovery data.
         wal = self.source.with_name(self.source.name + "-wal")
         with closing(sqlite3.connect(self.source)) as writer:
             writer.execute("PRAGMA journal_mode=WAL")
         gc.collect()
         self.assertFalse(wal.exists())
-
         original_validate = backup_cli._require_healthy_store
+        new_writer: sqlite3.Connection | None = None
         injected = False
 
         def concurrent_commit(connection):
-            nonlocal injected
+            nonlocal injected, new_writer
             if not injected:
                 injected = True
-                self.assertTrue(wal.is_file())
-                self.assertEqual(wal.stat().st_size, 0)
-                with closing(sqlite3.connect(self.source)) as writer:
-                    writer.execute(
-                        "INSERT INTO write_api_requests "
-                        "(idempotency_key, request_sha256, state, requested_at) "
-                        "VALUES (?, ?, 'in_progress', ?)",
-                        ("new-wal-concurrent-fence", "c" * 64, NOW.isoformat()),
-                    )
-                    writer.commit()
+                self.assertFalse(wal.exists())
+                new_writer = sqlite3.connect(self.source)
+                new_writer.execute("PRAGMA wal_autocheckpoint=0")
+                new_writer.execute(
+                    "INSERT INTO write_api_requests "
+                    "(idempotency_key, request_sha256, state, requested_at) "
+                    "VALUES (?, ?, 'in_progress', ?)",
+                    ("new-wal-concurrent-fence", "c" * 64, NOW.isoformat()),
+                )
+                new_writer.commit()
                 self.assertGreater(wal.stat().st_size, 32)
             return original_validate(connection)
 
-        with patch(
-            "mark_api.backup_cli._require_healthy_store",
-            side_effect=concurrent_commit,
-        ):
-            with self.assertRaisesRegex(BackupError, "WAL source identity newly introduced frames"):
-                backup_store(self.source, backup_db=self.backup)
-        self.assertTrue(injected)
-        self.assertFalse(self.backup.exists())
+        try:
+            with patch(
+                "mark_api.backup_cli._require_healthy_store",
+                side_effect=concurrent_commit,
+            ):
+                with self.assertRaisesRegex(BackupError, "WAL source identity"):
+                    backup_store(self.source, backup_db=self.backup)
+            self.assertTrue(injected)
+            self.assertFalse(self.backup.exists())
+        finally:
+            if new_writer is not None:
+                new_writer.close()
         with closing(sqlite3.connect(self.source)) as check:
             self.assertEqual(
                 check.execute(
                     "SELECT state FROM write_api_requests "
                     "WHERE idempotency_key='new-wal-concurrent-fence'"
+                ).fetchone(),
+                ("in_progress",),
+            )
+
+    def test_same_inode_main_content_restore_never_loses_pending_write(self) -> None:
+        # An attacker can overwrite the SAME source inode with an older valid
+        # Mark DB for SQLite's read, then restore the original contents while
+        # preserving the original mtime. An inode/header check cannot detect
+        # this; Linux st_ctime_ns can.
+        with closing(sqlite3.connect(self.source)) as writer:
+            self.assertEqual(
+                writer.execute("PRAGMA journal_mode=WAL").fetchone(), ("wal",),
+            )
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            self.assertEqual(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0], 0)
+            old_contents = self.source.read_bytes()
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("real-main-pending-fence", "d" * 64, NOW.isoformat()),
+            )
+            writer.commit()
+            self.assertEqual(writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0], 0)
+            real_contents = self.source.read_bytes()
+            original_stat = self.source.stat()
+            self.assertNotEqual(old_contents, real_contents)
+            self.assertTrue(self.source.with_name(self.source.name + "-wal").exists())
+            source_uri = backup_cli._uri(self.source, "ro")
+            original_connect = sqlite3.connect
+            original_count = backup_cli._count
+            swapped = False
+            restored = False
+
+            def set_main_bytes(contents: bytes) -> None:
+                with self.source.open("r+b") as target:
+                    target.write(contents)
+                    target.truncate()
+                    target.flush()
+                    os.fsync(target.fileno())
+
+            def swap_main_before_connect(database, *args, **kwargs):
+                nonlocal swapped
+                if isinstance(database, str) and database.startswith(source_uri) and not swapped:
+                    swapped = True
+                    set_main_bytes(old_contents)
+                return original_connect(database, *args, **kwargs)
+
+            def restore_main_after_snapshot(connection, sql):
+                nonlocal restored
+                if not restored:
+                    restored = True
+                    set_main_bytes(real_contents)
+                    os.utime(
+                        self.source,
+                        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                    )
+                return original_count(connection, sql)
+
+            try:
+                with (
+                    patch("mark_api.backup_cli.sqlite3.connect", side_effect=swap_main_before_connect),
+                    patch("mark_api.backup_cli._count", side_effect=restore_main_after_snapshot),
+                ):
+                    with self.assertRaisesRegex(BackupError, "source contents changed"):
+                        backup_store(self.source, backup_db=self.backup)
+            finally:
+                if not restored:
+                    set_main_bytes(real_contents)
+                    os.utime(
+                        self.source,
+                        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                    )
+            self.assertTrue(swapped)
+            self.assertFalse(self.backup.exists())
+        with closing(sqlite3.connect(self.source)) as verify:
+            self.assertEqual(
+                verify.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='real-main-pending-fence'"
                 ).fetchone(),
                 ("in_progress",),
             )
@@ -422,7 +601,7 @@ class BackupCliTests(unittest.TestCase):
 
         def malicious_connect(database, *args, **kwargs):
             nonlocal swapped
-            if database != source_uri or swapped:
+            if not isinstance(database, str) or not database.startswith(source_uri) or swapped:
                 return original(database, *args, **kwargs)
             swapped = True
             os.replace(self.source, moved)
