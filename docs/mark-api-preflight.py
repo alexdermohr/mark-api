@@ -1,0 +1,216 @@
+"""First-code, read-only bootstrap for the isolated Mark systemd services.
+
+Install a reviewed copy at /etc/mark-api/preflight.py, owned by root with mode
+0644, in a root-owned 0755 directory. Invoke with the OS interpreter:
+    /usr/bin/python3 -I -S /etc/mark-api/preflight.py --db ... --backup-dir ...
+No Mark or virtualenv module is imported before checking the entire installed
+runtime tree. This preflight cannot exclude root compromise, or malicious code
+already legitimately running under the trusted Mark service UID.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import pwd
+import stat
+
+
+class DeploymentBoundaryError(RuntimeError):
+    """Fail closed without mutating any user files or network state."""
+
+
+_INSTALL_ROOT = Path("/opt/mark-api/venv")
+_BOOTSTRAP = Path("/etc/mark-api/preflight.py")
+_SYSTEM_CODE_ROOT = Path("/usr")
+
+
+def _lstat(path: Path) -> os.stat_result:
+    try:
+        return path.lstat()
+    except OSError as exc:
+        raise DeploymentBoundaryError("required trusted path is unavailable") from exc
+
+
+def _trusted_metadata(path: Path) -> os.stat_result:
+    info = _lstat(path)
+    if info.st_uid != 0 or (
+        not stat.S_ISLNK(info.st_mode) and stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise DeploymentBoundaryError("installed code is not root-owned and non-writable")
+    return info
+
+
+def _trusted_parents(path: Path) -> None:
+    for parent in path.parents:
+        info = _trusted_metadata(parent)
+        if not stat.S_ISDIR(info.st_mode):
+            raise DeploymentBoundaryError("trusted installation has a symlinked parent")
+
+
+def _trusted_link(path: Path, root: Path) -> None:
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise DeploymentBoundaryError("installed code symlink cannot be trusted") from exc
+    if not (
+        resolved.is_relative_to(root)
+        or resolved.is_relative_to(_SYSTEM_CODE_ROOT)
+    ):
+        raise DeploymentBoundaryError("installed code symlink escapes trusted roots")
+    target_info = _trusted_metadata(resolved)
+    if not (
+        stat.S_ISREG(target_info.st_mode) or stat.S_ISDIR(target_info.st_mode)
+    ):
+        raise DeploymentBoundaryError("installed code symlink resolves to unsafe type")
+    _trusted_parents(resolved)
+
+
+def _safe_pth(path: Path, root: Path) -> None:
+    # Site-package .pth files may extend sys.path or run code *before*
+    # application preflight. Avoid executing code-bearing .pth declarations,
+    # or adding data/code paths outside the trusted install and OS stdlib.
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise DeploymentBoundaryError("package path declaration is unreadable") from exc
+    for line in lines:
+        item = line.strip()
+        if not item or item.startswith("#"):
+            continue
+        if item.startswith(("import ", "import\t")):
+            raise DeploymentBoundaryError("executable package path declaration is unsafe")
+        candidate = (path.parent / item).resolve(strict=False)
+        if not (
+            candidate.is_relative_to(root)
+            or candidate.is_relative_to(_SYSTEM_CODE_ROOT)
+        ):
+            raise DeploymentBoundaryError("package path declaration escapes trusted roots")
+
+
+def check_installed_code(root: Path) -> None:
+    """Audit *all* installed code, dependencies, entrypoints and .pth files.
+
+    Symlinks are never followed during directory walking; targets and their
+    entire parent chain are checked independently. The runtime Python and
+    system stdlib under /usr are considered the root-owned OS trust base.
+    """
+    if not root.is_absolute():
+        raise DeploymentBoundaryError("installation path must be absolute")
+    try:
+        if root.resolve(strict=True) != root:
+            raise DeploymentBoundaryError("installation root may not be symlinked")
+    except (OSError, RuntimeError) as exc:
+        raise DeploymentBoundaryError("installation root is unavailable") from exc
+    _trusted_parents(root)
+    stack = [root]
+    while stack:
+        path = stack.pop()
+        info = _trusted_metadata(path)
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                stack.extend(path.iterdir())
+            except OSError as exc:
+                raise DeploymentBoundaryError("installed code directory cannot be scanned") from exc
+        elif stat.S_ISLNK(info.st_mode):
+            _trusted_link(path, root)
+        elif stat.S_ISREG(info.st_mode):
+            if path.suffix == ".pth":
+                _safe_pth(path, root)
+        else:
+            raise DeploymentBoundaryError("installed code has an unexpected file type")
+    if not (root / "bin/python").exists():
+        raise DeploymentBoundaryError("isolated Mark Python interpreter is missing")
+    matches = list(root.glob("lib/python*/site-packages/mark_api/__init__.py"))
+    if len(matches) != 1 or not matches[0].resolve(strict=True).is_relative_to(root):
+        raise DeploymentBoundaryError("one non-editable Mark package must be installed")
+
+
+def _require_private_path(
+    path: Path, *, uid: int, gid: int, directory: bool, mode: int,
+) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise DeploymentBoundaryError("required private runtime path is missing") from exc
+    correct_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if (
+        not correct_type
+        or info.st_uid != uid
+        or info.st_gid != gid
+        or stat.S_IMODE(info.st_mode) != mode
+        or (not directory and info.st_nlink != 1)
+    ):
+        raise DeploymentBoundaryError("runtime path ownership, mode or inode is unsafe")
+
+
+def check_deployment(db: Path, backup_dir: Path) -> None:
+    """Check service identity and private DB/sidecars without opening SQLite."""
+    try:
+        account = pwd.getpwnam("mark-api")
+    except KeyError as exc:
+        raise DeploymentBoundaryError("dedicated mark-api account is absent") from exc
+    if (
+        account.pw_uid == 0
+        or account.pw_gid == 0
+        or os.geteuid() != account.pw_uid
+        or os.getegid() != account.pw_gid
+        or not account.pw_shell.endswith("/nologin")
+        or set(os.getgroups()) - {account.pw_gid}
+    ):
+        raise DeploymentBoundaryError("process is not the dedicated non-login service")
+    if (
+        not db.is_absolute()
+        or not backup_dir.is_absolute()
+        or ".." in db.parts
+        or ".." in backup_dir.parts
+        or db.parent == backup_dir
+    ):
+        raise DeploymentBoundaryError("runtime paths must be distinct absolute paths")
+    _require_private_path(
+        db.parent, uid=account.pw_uid, gid=account.pw_gid, directory=True, mode=0o700
+    )
+    _require_private_path(
+        db, uid=account.pw_uid, gid=account.pw_gid, directory=False, mode=0o600
+    )
+    _require_private_path(
+        backup_dir, uid=account.pw_uid, gid=account.pw_gid,
+        directory=True, mode=0o700,
+    )
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = db.with_name(db.name + suffix)
+        if not sidecar.exists() and not sidecar.is_symlink():
+            continue
+        _require_private_path(
+            sidecar, uid=account.pw_uid, gid=account.pw_gid,
+            directory=False, mode=0o600,
+        )
+
+
+def _check_bootstrap_installation() -> None:
+    if Path(__file__) != _BOOTSTRAP:
+        raise DeploymentBoundaryError("bootstrap must be installed in /etc/mark-api")
+    info = _trusted_metadata(_BOOTSTRAP)
+    if not stat.S_ISREG(info.st_mode):
+        raise DeploymentBoundaryError("bootstrap file is not a trusted regular file")
+    _trusted_parents(_BOOTSTRAP)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Read-only trusted Mark code tree and SQLite owner preflight"
+    )
+    parser.add_argument("--db", required=True, type=Path)
+    parser.add_argument("--backup-dir", required=True, type=Path)
+    args = parser.parse_args(argv)
+    try:
+        _check_bootstrap_installation()
+        check_installed_code(_INSTALL_ROOT)
+        check_deployment(args.db, args.backup_dir)
+    except DeploymentBoundaryError as exc:
+        parser.error(str(exc))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

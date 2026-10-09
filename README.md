@@ -41,10 +41,14 @@ Für den angereicherten Besitzerbestand bleibt die allgemeine Anzeige-/Inhaltsqu
 
 Für den root-verwalteten Linux-Produktbetrieb gibt es
 [`docs/mark-api.service`](docs/mark-api.service),
-[`docs/mark-api-backup@.service`](docs/mark-api-backup@.service) und
+[`docs/mark-api-backup@.service`](docs/mark-api-backup@.service),
+[`docs/mark-api-preflight.py`](docs/mark-api-preflight.py) und
 [`docs/mark-api.sysusers.conf`](docs/mark-api.sysusers.conf).
 Sie beschreiben einen nicht interaktiv verwendbaren, dedizierten
 `mark-api`-Unix-Account mit privaten SQLite- und Runtime-Verzeichnissen;
+der erste Code-Check wird mit OS-Python `-I -S` **vor** dem Laden des
+installierten Mark-Pakets durchgeführt und prüft alle First-/Third-Party-
+Dateien des nicht-editierbaren, root-owned Venvs.
 der normale Launcher aktiviert weiterhin alle vorhandenen produktseitigen
 Write-Capabilities **default-on**. Ausführbare Installationsanweisungen,
 Sicherheits- und Beweisgrenzen stehen im

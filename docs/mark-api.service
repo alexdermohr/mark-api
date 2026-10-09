@@ -16,8 +16,8 @@ ReadWritePaths=/var/lib/mark-api
 RuntimeDirectory=mark-api
 RuntimeDirectoryMode=0700
 UMask=0077
-ExecStartPre=/opt/mark-api/venv/bin/python -I -m mark_api.deployment_boundary --db /var/lib/mark-api/mark.sqlite --backup-dir /var/lib/mark-api-backups
-ExecStart=/opt/mark-api/venv/bin/mark-api-launch --db /var/lib/mark-api/mark.sqlite --cdp-port 9222 --dashboard-port 8875 --write-port 8876
+ExecStartPre=/usr/bin/python3 -I -S /etc/mark-api/preflight.py --db /var/lib/mark-api/mark.sqlite --backup-dir /var/lib/mark-api-backups
+ExecStart=/opt/mark-api/venv/bin/python -I -m mark_api.launcher --db /var/lib/mark-api/mark.sqlite --cdp-port 9222 --dashboard-port 8875 --write-port 8876
 Restart=on-failure
 RestartSec=10s
 

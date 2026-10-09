@@ -171,7 +171,8 @@ temporären Media-Staging-Handles wieder her.
 ## Isolierter Linux-Systemdienst: tatsächliche Vertrauensgrenze
 
 **Vorlagen, keine laufende Installation:** `docs/mark-api.service`,
-`docs/mark-api-backup@.service` und `docs/mark-api.sysusers.conf`
+`docs/mark-api-backup@.service`, `docs/mark-api-preflight.py` und
+`docs/mark-api.sysusers.conf`
 beschreiben einen root-verwalteten, dedizierten `mark-api`-Unix-Nutzer ohne
 Login-Shell. Diese Dateien im Repository oder ein erfolgreicher Unit-Test
 beweisen **keine** tatsächlich eingerichtete, sichere Laufzeitidentität.
@@ -208,8 +209,19 @@ Write-API bleiben loopback-only.
    authentifizierte CDP-Sitzung prüfen. Bestehende Daten **niemals**
    mit `--init-db` neu anlegen oder blind durch ein Altbackup ersetzen.
    Die Vorlage setzt ein root-owned, ausschließlich aus einem geprüften
-   Release installiertes `/opt/mark-api/venv` mit Python 3.12+ und
-   `mark-api[private-web]` voraus; das System-Python kann ungeeignet sein.
+   Release **nicht-editierbar** installiertes `/opt/mark-api/venv` mit
+   Python 3.12+ und `mark-api[private-web]` voraus. Die komplette venv
+   einschließlich aller transitiven Abhängigkeiten, .pth-Dateien und
+   Console-Scripts muss root-owned sein, weder gruppen- noch weltweit
+   schreibbar, ohne nach Benutzer-Home oder andere untrusted Pfade zeigende
+   Imports/Symlinks. **Kein bestehendes user-owned Venv durch bloßes `chown`
+   umwidmen:** Bereits gehaltene writable Mappings könnten sonst weiter
+   auf seine Inodes wirken. Stattdessen ein neues, leeres root-owned Venv
+   aus geprüftem Release anlegen und dessen Pakete direkt dort installieren.
+   Der Python-Interpreter muss selbst root-owned und unter `/usr` oder im
+   geschützten Venv liegen; Symlinks auf ein User-Home scheitern am Preflight.
+   Die OS-System-Python-Version darf älter sein; sie startet ausschließlich
+   den isolierten stdlib-Preflight mit `-I -S`.
 2. Vor dem ersten Start einmalig ein dediziertes, nicht interaktives
    Systemkonto und geschützte Verzeichnisse vorbereiten:
 
@@ -238,26 +250,36 @@ Write-API bleiben loopback-only.
    oben **vorher** existieren, ohne dass der Dienststart sie neu erzeugt
    oder fremde Daten automatisch übernimmt. `ReadWritePaths=` erlaubt nur
    die benötigten bereits existierenden Pfade trotz `ProtectSystem=strict`.
-   `ExecStartPre=` prüft anschließend ohne Dateiänderungen die genaue
-   Dienst-UID/-GID, die Nicht-Login-Shell, die `0700`-Verzeichnisse, die
-   `0600`-Datenbank samt vorhandenen Sidecars und den root-owned
-   Installationspfad unter `/opt/mark-api/venv`. Bei einem Verstoß startet
-   weder Launcher noch Backup; dadurch entstehen keine neuen Writes.
+   `ExecStartPre=` führt **vor jedem Import aus dem Mark-Venv** das separate
+   root-owned `/etc/mark-api/preflight.py` durch das OS-Python mit `-I -S`
+   aus. Dieser schreibfreie Bootstrap prüft den vollständigen Installationsbaum
+   einschließlich Python-Code aller Mark-/Drittanbieter-Module, Binärmodule,
+   Skripte, Paket-Pfaddeklarationen und Symlink-Ziele auf root-Eigentum und
+   Nicht-Schreibbarkeit. Zugleich verifiziert er Dienst-UID/-GID, Nicht-Login-
+   Shell, `0700`-Verzeichnisse und `0600`-Datenbank/Sidecars. Unverifizierte
+   Installationen, schreibbare Fremdmodule und untrusted `.pth`-Imports
+   blockieren den Start. Der eigentliche Produktprozess benutzt anschließend
+   den isolierten Venv-Aufruf `python -I -m mark_api.launcher` und aktiviert
+   weiterhin sämtliche normalen Writes **default-on**. Ein Fehler startet
+   weder Launcher noch Backup und löst keinerlei Plattformaktion aus.
    **Diese Prüfung erkennt keine fremden, bereits unter der kompromittierten
    Dienst-UID laufenden Prozesse oder vorbestehende mmap-Schreibzugriffe.**
 3. Root-verwaltete Units installieren, aber erst nach verifiziertem
    CDP-Endpunkt und sicherem DB-Eigentum starten:
 
    ~~~bash
+   sudo install -d -o root -g root -m 0755 /etc/mark-api
+   sudo install -o root -g root -m 0644 docs/mark-api-preflight.py /etc/mark-api/preflight.py
    sudo install -o root -g root -m 0644 docs/mark-api.service /etc/systemd/system/mark-api.service
    sudo install -o root -g root -m 0644 'docs/mark-api-backup@.service' '/etc/systemd/system/mark-api-backup@.service'
    sudo systemctl daemon-reload
    sudo systemctl cat mark-api.service
-   sudo stat -c '%U:%G %a %n' /var/lib/mark-api /var/lib/mark-api/mark.sqlite /var/lib/mark-api-backups
+   sudo stat -c '%U:%G %a %n' /etc/mark-api /etc/mark-api/preflight.py /var/lib/mark-api /var/lib/mark-api/mark.sqlite /var/lib/mark-api-backups
    ~~~
 
-   Erwartet sind `mark-api:mark-api`, `0700` auf beiden Verzeichnissen
-   und `0600` auf der Quelldatei. Vor Livebetrieb prüfen, dass eine andere
+   Erwartet sind `root:root`, `0755` für `/etc/mark-api`, `0644` für
+   das Preflight-Skript sowie `mark-api:mark-api`, `0700` auf beiden
+   Datenverzeichnissen und `0600` auf der Quelldatei. Vor Livebetrieb prüfen, dass eine andere
    nicht-root UID keinen Dateizugriff erhält und kein Fremdprozess unter der
    Dienst-UID läuft. Der Browser und die lokalen CLI-Tools unter dem
    Desktopkonto dürfen **nicht** mehr direkt in diese Datenbank schreiben.
