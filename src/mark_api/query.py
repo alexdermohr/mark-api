@@ -1,10 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Mapping
 from datetime import datetime
 
 from .domain import AdSnapshot, LifecycleState, ReactionSnapshot
 from .storage import SnapshotStore
+
+
+@dataclass(frozen=True, slots=True)
+class MetricEvidence:
+    """Evidence for one value, never a claim about sync success."""
+
+    observed_at: datetime
+    source: str
+    # Only inventory metrics have a meaningful latest-status comparison.
+    last_known: bool | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +30,7 @@ class AdView:
     views: int | None
     watch_count: int | None
     reply_count: int | None
+    metric_evidence: Mapping[str, MetricEvidence | None] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +67,27 @@ def _last_not_none(
     return None
 
 
+def _last_metric_with_evidence(
+    history: tuple[AdSnapshot, ...],
+    field_name: str,
+) -> tuple[int | None, MetricEvidence | None]:
+    """Use the same selected snapshot for a metric value and its origin."""
+
+    for position, snapshot in enumerate(reversed(history)):
+        value = getattr(snapshot, field_name)
+        if value is not None:
+            return value, MetricEvidence(
+                observed_at=snapshot.observed_at,
+                source=(
+                    snapshot.metric_source
+                    if snapshot.metric_source is not None
+                    else snapshot.source
+                ),
+                last_known=position != 0,
+            )
+    return None, None
+
+
 class MarkQueryService:
     """Read-only projections over the append-only SQLite history."""
 
@@ -68,6 +101,10 @@ class MarkQueryService:
             if not history:
                 continue
             latest = history[-1]
+            metrics = {
+                field_name: _last_metric_with_evidence(history, field_name)
+                for field_name in ("views", "watch_count", "reply_count")
+            }
             rows.append(
                 AdView(
                     ad_id=ad_id,
@@ -77,9 +114,13 @@ class MarkQueryService:
                     source=latest.source,
                     title=_last_not_none(history, "title"),
                     description=_last_not_none(history, "description"),
-                    views=_last_not_none(history, "views"),
-                    watch_count=_last_not_none(history, "watch_count"),
-                    reply_count=_last_not_none(history, "reply_count"),
+                    views=metrics["views"][0],
+                    watch_count=metrics["watch_count"][0],
+                    reply_count=metrics["reply_count"][0],
+                    metric_evidence={
+                        field_name: evidence
+                        for field_name, (_, evidence) in metrics.items()
+                    },
                 )
             )
         return tuple(rows)
@@ -151,6 +192,18 @@ class MarkQueryService:
         )
 
 
+def metric_evidence_to_dict(
+    item: MetricEvidence | None,
+) -> dict[str, object] | None:
+    if item is None:
+        return None
+    return {
+        "observed_at": item.observed_at.isoformat(),
+        "source": item.source,
+        "last_known": item.last_known,
+    }
+
+
 def ad_view_to_dict(item: AdView) -> dict[str, object]:
     return {
         "ad_id": item.ad_id,
@@ -163,6 +216,10 @@ def ad_view_to_dict(item: AdView) -> dict[str, object]:
         "views": item.views,
         "watch_count": item.watch_count,
         "reply_count": item.reply_count,
+        "metric_evidence": {
+            field_name: metric_evidence_to_dict(item.metric_evidence.get(field_name))
+            for field_name in ("views", "watch_count", "reply_count")
+        },
     }
 
 

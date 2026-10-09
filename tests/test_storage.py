@@ -91,6 +91,83 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(reopened.tracked_ad_ids(), ("123",))
         self.assertEqual(reopened.latest_ad_snapshot("123").views, 7)
 
+    def test_preexisting_source_prefix_values_preserve_exact_literal_identity(self) -> None:
+        store = self.make_store()
+        originals = (
+            "mark:source-v1:ordinary-provider",
+            'mark:source-v1:{"source":"forged","metric_source":"forged"}',
+            "mark:source-v1:{not-json",
+        )
+        with sqlite3.connect(store.path) as conn:
+            for index, source in enumerate(originals):
+                conn.execute(
+                    "INSERT INTO ad_snapshots "
+                    "(ad_id, observed_at, source, lifecycle_state, views) "
+                    "VALUES (?, ?, ?, 'active', 0)",
+                    (f"legacy-{index}", NOW.isoformat(), source),
+                )
+        reopened = SnapshotStore(store.path, create_if_missing=False)
+        for index, source in enumerate(originals):
+            item = reopened.latest_ad_snapshot(f"legacy-{index}")
+            self.assertEqual(item.source, source)
+            self.assertIsNone(item.metric_source)
+            self.assertEqual(item.views, 0)
+
+    def test_metric_source_column_upgrade_requires_prior_recovery_validation(self) -> None:
+        store = self.make_store()
+        with sqlite3.connect(store.path) as conn:
+            fields = {row[1] for row in conn.execute("PRAGMA table_info(ad_snapshots)")}
+            if "metric_source" in fields:
+                conn.execute("ALTER TABLE ad_snapshots DROP COLUMN metric_source")
+        reopened = SnapshotStore(store.path, create_if_missing=False)
+        self.assertTrue(reopened.is_ready())
+        with sqlite3.connect(store.path) as conn:
+            fields = {row[1] for row in conn.execute("PRAGMA table_info(ad_snapshots)")}
+            self.assertIn("metric_source", fields)
+            conn.execute("ALTER TABLE ad_snapshots DROP COLUMN metric_source")
+            conn.execute("DROP TABLE write_api_requests")
+        with self.assertRaises(sqlite3.DatabaseError):
+            SnapshotStore(store.path, create_if_missing=False)
+        with sqlite3.connect(store.path) as conn:
+            fields = {row[1] for row in conn.execute("PRAGMA table_info(ad_snapshots)")}
+            self.assertNotIn("metric_source", fields)
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='write_api_requests'"
+            ).fetchone())
+
+    def test_metric_source_column_preserves_raw_source_and_disallows_blank_origin(self) -> None:
+        store = self.make_store()
+        value = AdSnapshot(
+            ad_id="origin", observed_at=NOW, source="owner+content",
+            lifecycle_state=LifecycleState.ACTIVE,
+            metric_source="management+stats", views=0, watch_count=2,
+        )
+        store.append_ad_snapshot(value)
+        literal = AdSnapshot(
+            ad_id="literal", observed_at=NOW,
+            source="mark:source-v1:literal-legacy-provider",
+            lifecycle_state=LifecycleState.ACTIVE, views=7,
+        )
+        store.append_ad_snapshot(literal)
+        reopened = SnapshotStore(store.path, create_if_missing=False)
+        self.assertEqual(reopened.latest_ad_snapshot("origin"), value)
+        self.assertEqual(reopened.latest_ad_snapshot("literal"), literal)
+        with sqlite3.connect(store.path) as connection:
+            stored = connection.execute(
+                "SELECT source, metric_source FROM ad_snapshots WHERE ad_id='origin'"
+            ).fetchone()
+            self.assertEqual(stored, ("owner+content", "management+stats"))
+            literal_source = connection.execute(
+                "SELECT source FROM ad_snapshots WHERE ad_id='literal'"
+            ).fetchone()[0]
+            self.assertEqual(literal_source, literal.source)
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE ad_snapshots SET metric_source='' WHERE ad_id='origin'"
+                )
+        self.assertEqual(reopened.latest_ad_snapshot("origin"), value)
+
     def test_readiness_requires_write_recovery_tables(self) -> None:
         store = self.make_store()
         self.assertTrue(store.is_ready())

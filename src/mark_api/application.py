@@ -149,6 +149,11 @@ class EnrichedOwnerReader:
                     views=management_snapshot.views,
                     watch_count=management_snapshot.watch_count,
                     reply_count=management_snapshot.reply_count,
+                    metric_source=(
+                        management_snapshot.metric_source
+                        if management_snapshot.metric_source is not None
+                        else management_snapshot.source
+                    ),
                 )
             )
 

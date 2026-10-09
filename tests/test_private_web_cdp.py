@@ -1817,8 +1817,54 @@ class CdpPrivateWebOwnerReaderTests(unittest.TestCase):
             enriched.source,
             "kleinanzeigen-management+private-web",
         )
+        self.assertEqual(enriched.metric_source, "kleinanzeigen-management")
         self.assertEqual(pages[0].opened, [AD_ID])
         self.assertTrue(pages[0].closed)
+
+    def test_owner_reader_keeps_explicit_counter_origin_when_content_is_enriched(self) -> None:
+        target = AdSnapshot(
+            ad_id=AD_ID,
+            observed_at=datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc),
+            source="owner+mobile",
+            metric_source="authoritative-management",
+            lifecycle_state=LifecycleState.ACTIVE,
+            title="Before",
+            description="Before",
+            views=0,
+            watch_count=3,
+            reply_count=2,
+        )
+
+        class OwnerReader:
+            def read_ads(self):
+                return ReadResult.success_nonempty((target,))
+
+        class Page:
+            def open_editor(self, ad_id):
+                assert ad_id == AD_ID
+
+            def read_editor(self):
+                return PrivateWebEditorSnapshot(
+                    state=PrivateWebEditorState.READY,
+                    ad_id=AD_ID,
+                    title="After",
+                    description="After",
+                )
+
+            def close(self):
+                pass
+
+        result = CdpPrivateWebOwnerReader(
+            owner_reader=OwnerReader(), page_factory=Page, ad_id=AD_ID,
+        ).read_ads()
+        self.assertEqual(result.status, ReadStatus.SUCCESS_NONEMPTY)
+        item = result.value[0]
+        self.assertEqual(item.title, "After")
+        self.assertEqual(item.source, "owner+mobile+private-web")
+        self.assertEqual(item.metric_source, "authoritative-management")
+        self.assertEqual(item.views, 0)
+        self.assertEqual(item.watch_count, 3)
+        self.assertEqual(item.reply_count, 2)
 
     def test_owner_reader_does_not_open_editor_for_non_owner_target(self) -> None:
         owner_result = ReadResult.success_nonempty(

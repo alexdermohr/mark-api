@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .domain import LifecycleState
-from .query import AdView, MarkQueryService
+from .query import AdView, MarkQueryService, MetricEvidence, metric_evidence_to_dict
 from .storage import SnapshotStore
 
 
@@ -71,6 +71,7 @@ class AdMetricRanking:
     present: bool | None
     lifecycle_state: LifecycleState | None
     title: str | None
+    metric_evidence: MetricEvidence | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,28 +117,48 @@ class AnalyticsService:
         if dimension not in ANALYTICS_DIMENSIONS:
             raise ValueError(f"unknown analytics dimension: {dimension}")
 
-    def _metric_value(self, ad: AdView, metric: str) -> int | None:
+    def _metric_with_evidence(
+        self, ad: AdView, metric: str,
+    ) -> tuple[int | None, MetricEvidence | None]:
         if metric in _AD_METRICS:
             value = getattr(ad, metric)
-            return value if isinstance(value, int) else None
+            if not isinstance(value, int):
+                return None, None
+            return value, ad.metric_evidence.get(metric)
 
         if metric in _REACTION_METRICS:
             history = self._store.reaction_history(ad.ad_id)
             if not history:
-                return None
+                return None, None
             _, latest = max(
                 enumerate(history),
                 key=lambda pair: (pair[1].observed_at, pair[0]),
             )
             value = getattr(latest, metric)
-            return value if isinstance(value, int) else None
+            if not isinstance(value, int):
+                return None, None
+            # Reaction history is independently observed, not a carried-over
+            # field from the latest owner/status snapshot.
+            return value, MetricEvidence(
+                observed_at=latest.observed_at,
+                source=latest.source,
+                last_known=None,
+            )
 
         if metric in _EMAIL_REACTION_METRICS:
             item = self._query.email_reaction(ad.ad_id)
             if item is None:
-                return None
+                return None, None
             value = getattr(item, _EMAIL_REACTION_METRICS[metric])
-            return value if isinstance(value, int) else None
+            if not isinstance(value, int):
+                return None, None
+            # Aggregates cover all imported events; do not credit the whole
+            # sum to the most recent email's individual source.
+            return value, MetricEvidence(
+                observed_at=item.last_observed_at,
+                source="inbound_message_events",
+                last_known=None,
+            )
 
         raise ValueError(f"unknown analytics metric: {metric}")
 
@@ -160,6 +181,11 @@ class AnalyticsService:
                             ad.lifecycle_state if ad is not None else None
                         ),
                         title=ad.title if ad is not None else None,
+                        metric_evidence=MetricEvidence(
+                            observed_at=email_item.last_observed_at,
+                            source="inbound_message_events",
+                            last_known=None,
+                        ),
                     )
                 )
             rows.sort(key=lambda item: (-item.value, item.ad_id))
@@ -167,7 +193,7 @@ class AnalyticsService:
 
         rows: list[AdMetricRanking] = []
         for ad in self._query.latest_ads():
-            value = self._metric_value(ad, metric)
+            value, evidence = self._metric_with_evidence(ad, metric)
             if value is None:
                 continue
             rows.append(
@@ -178,6 +204,7 @@ class AnalyticsService:
                     present=ad.present,
                     lifecycle_state=ad.lifecycle_state,
                     title=ad.title,
+                    metric_evidence=evidence,
                 )
             )
         rows.sort(key=lambda item: (-item.value, item.ad_id))
@@ -261,6 +288,7 @@ def ad_metric_ranking_to_dict(item: AdMetricRanking) -> dict[str, object]:
             else None
         ),
         "title": item.title,
+        "metric_evidence": metric_evidence_to_dict(item.metric_evidence),
     }
 
 

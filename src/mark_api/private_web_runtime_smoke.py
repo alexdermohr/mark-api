@@ -95,6 +95,44 @@ def _expect_http_error(
     )
 
 
+def _expected_inventory_metric_evidence(
+    snapshot: AdSnapshot, metric: str,
+) -> dict[str, object] | None:
+    """Independent smoke truth from the actual one-shot inventory read."""
+
+    if getattr(snapshot, metric) is None:
+        return None
+    return {
+        "observed_at": snapshot.observed_at.isoformat(),
+        "source": (
+            snapshot.metric_source
+            if snapshot.metric_source is not None
+            else snapshot.source
+        ),
+        "last_known": False,
+    }
+
+
+def _strict_metric_evidence(value: object) -> dict[str, object] | None:
+    """Validate nested API shape before comparing it to independent truth."""
+
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"observed_at", "source", "last_known"}
+        or not isinstance(value["observed_at"], str)
+        or not isinstance(value["source"], str)
+        or type(value["last_known"]) is not bool
+    ):
+        raise TypeError("invalid metric evidence")
+    return {
+        "observed_at": value["observed_at"],
+        "source": value["source"],
+        "last_known": value["last_known"],
+    }
+
+
 def _validated_inventory(
     result: ReadResult[tuple[AdSnapshot, ...]],
 ) -> tuple[AdSnapshot, ...]:
@@ -317,6 +355,10 @@ def run_private_web_runtime_smoke(
                     "views": item.views,
                     "watch_count": item.watch_count,
                     "reply_count": item.reply_count,
+                    "metric_evidence": {
+                        metric: _expected_inventory_metric_evidence(item, metric)
+                        for metric in _INVENTORY_METRICS
+                    },
                 }
                 for item in snapshots
             }
@@ -330,6 +372,9 @@ def run_private_web_runtime_smoke(
                         "present": item.lifecycle_state is not LifecycleState.ABSENT,
                         "lifecycle_state": item.lifecycle_state.value,
                         "title": item.title,
+                        "metric_evidence": _expected_inventory_metric_evidence(
+                            item, metric,
+                        ),
                     }
                     for item in snapshots
                     if getattr(item, metric) is not None
@@ -351,6 +396,7 @@ def run_private_web_runtime_smoke(
                     "views",
                     "watch_count",
                     "reply_count",
+                    "metric_evidence",
                 }
                 for item in ads:
                     if not isinstance(item, dict) or set(item) != ad_fields:
@@ -365,6 +411,16 @@ def run_private_web_runtime_smoke(
                     views = item["views"]
                     watch_count = item["watch_count"]
                     reply_count = item["reply_count"]
+                    raw_metric_evidence = item["metric_evidence"]
+                    if (
+                        not isinstance(raw_metric_evidence, dict)
+                        or set(raw_metric_evidence) != set(_INVENTORY_METRICS)
+                    ):
+                        raise TypeError("invalid dashboard metric evidence")
+                    metric_evidence = {
+                        metric: _strict_metric_evidence(raw_metric_evidence[metric])
+                        for metric in _INVENTORY_METRICS
+                    }
                     if (
                         not isinstance(ad_id, str)
                         or not isinstance(lifecycle_state, str)
@@ -402,6 +458,7 @@ def run_private_web_runtime_smoke(
                         "views": views,
                         "watch_count": watch_count,
                         "reply_count": reply_count,
+                        "metric_evidence": metric_evidence,
                     }
                 projected_rankings: dict[
                     str, list[dict[str, object]]
@@ -413,6 +470,7 @@ def run_private_web_runtime_smoke(
                     "present",
                     "lifecycle_state",
                     "title",
+                    "metric_evidence",
                 }
                 for expected_metric, ranking in rankings.items():
                     projected_rows: list[dict[str, object]] = []
@@ -428,6 +486,9 @@ def run_private_web_runtime_smoke(
                         present = item["present"]
                         lifecycle_state = item["lifecycle_state"]
                         title = item["title"]
+                        metric_evidence = _strict_metric_evidence(
+                            item["metric_evidence"]
+                        )
                         if (
                             not isinstance(ad_id, str)
                             or metric != expected_metric
@@ -448,6 +509,7 @@ def run_private_web_runtime_smoke(
                                 "present": present,
                                 "lifecycle_state": lifecycle_state,
                                 "title": title,
+                                "metric_evidence": metric_evidence,
                             }
                         )
                     projected_rankings[expected_metric] = projected_rows

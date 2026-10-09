@@ -477,6 +477,63 @@ class AnalyticsTests(unittest.TestCase):
         self.assertNotIn("winner", encoded)
         self.assertNotIn("best", encoded)
 
+    def test_ranking_evidence_distinguishes_ad_reaction_and_email_origins(self) -> None:
+        store = self.make_store()
+        store.append_ad_snapshot(AdSnapshot(
+            ad_id="1", observed_at=T0, source="metrics-observer",
+            lifecycle_state=LifecycleState.ACTIVE, views=10,
+        ))
+        store.append_ad_snapshot(AdSnapshot(
+            ad_id="1", observed_at=T1, source="status-only",
+            lifecycle_state=LifecycleState.PAUSED,
+        ))
+        store.append_reaction_snapshot(ReactionSnapshot(
+            ad_id="1", observed_at=T0, source="old-mobile",
+            conversation_count=1, unique_buyer_count=1,
+            inbound_message_count=1,
+        ))
+        store.append_reaction_snapshot(ReactionSnapshot(
+            ad_id="1", observed_at=T1, source="current-mobile",
+            conversation_count=2, unique_buyer_count=2,
+            inbound_message_count=3,
+        ))
+        store.append_inbound_message_events((
+            InboundMessageEvent(
+                ad_id="1", conversation_id="x",
+                provider_message_id="message-a", observed_at=T0,
+                source="first-email",
+            ),
+            InboundMessageEvent(
+                ad_id="1", conversation_id="x",
+                provider_message_id="message-b", observed_at=T2,
+                source="second-email",
+            ),
+        ))
+        analytics = AnalyticsService(store)
+        actual = {
+            metric: ad_metric_ranking_to_dict(analytics.rank_ads(metric)[0])
+            for metric in (
+                "views", "inbound_message_count",
+                "email_inbound_message_count",
+            )
+        }
+        self.assertEqual(actual["views"]["metric_evidence"], {
+            "observed_at": T0.isoformat(),
+            "source": "metrics-observer",
+            "last_known": True,
+        })
+        self.assertEqual(actual["inbound_message_count"]["metric_evidence"], {
+            "observed_at": T1.isoformat(),
+            "source": "current-mobile",
+            "last_known": None,
+        })
+        self.assertEqual(actual["email_inbound_message_count"]["metric_evidence"], {
+            "observed_at": T2.isoformat(),
+            "source": "inbound_message_events",
+            "last_known": None,
+        })
+        self.assertEqual(actual["email_inbound_message_count"]["value"], 2)
+
     def test_email_metrics_are_source_explicit_and_do_not_replace_reactions(self) -> None:
         store = self.make_store()
         store.append_ad_snapshot(

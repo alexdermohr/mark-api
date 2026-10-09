@@ -44,6 +44,7 @@ _REQUIRED_STORE_COLUMNS: dict[str, tuple[str, ...]] = {
         "views",
         "watch_count",
         "reply_count",
+        "metric_source",
     ),
     "reaction_snapshots": (
         "id",
@@ -156,6 +157,7 @@ _REQUIRED_STORE_COLUMNS: dict[str, tuple[str, ...]] = {
 
 # Only these missing historical columns may be added to an otherwise complete store.
 _LEGACY_ADDABLE_COLUMNS: dict[str, frozenset[str]] = {
+    "ad_snapshots": frozenset(("metric_source",)),
     "create_operation_receipts": frozenset((
         "authorization_by", "authorization_reference",
         "media_post_read_status", "media_persistence_confirmed",
@@ -331,7 +333,11 @@ class SnapshotStore:
                     description TEXT,
                     views INTEGER,
                     watch_count INTEGER,
-                    reply_count INTEGER
+                    reply_count INTEGER,
+                    metric_source TEXT CHECK (
+                        metric_source IS NULL OR
+                        (typeof(metric_source) = 'text' AND length(trim(metric_source)) > 0)
+                    )
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_ad_snapshots_ad_id_observed
@@ -483,6 +489,21 @@ class SnapshotStore:
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
+            # Existing stores are pre-validated, including write-recovery fences,
+            # before this strictly additive data-only column upgrade.
+            metric_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(ad_snapshots)"
+                ).fetchall()
+            }
+            if "metric_source" not in metric_columns:
+                connection.execute(
+                    "ALTER TABLE ad_snapshots ADD COLUMN metric_source TEXT "
+                    "CHECK (metric_source IS NULL OR "
+                    "(typeof(metric_source) = 'text' "
+                    "AND length(trim(metric_source)) > 0))"
+                )
             dashboard_pending_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -552,8 +573,8 @@ class SnapshotStore:
             """
             INSERT INTO ad_snapshots (
                 ad_id, observed_at, source, lifecycle_state, title, description,
-                views, watch_count, reply_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                views, watch_count, reply_count, metric_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.ad_id,
@@ -565,6 +586,7 @@ class SnapshotStore:
                 snapshot.views,
                 snapshot.watch_count,
                 snapshot.reply_count,
+                snapshot.metric_source,
             ),
         )
 
@@ -1632,7 +1654,7 @@ class SnapshotStore:
             rows = connection.execute(
                 """
                 SELECT id, ad_id, observed_at, source, lifecycle_state, title,
-                       description, views, watch_count, reply_count
+                       description, views, watch_count, reply_count, metric_source
                 FROM ad_snapshots
                 WHERE ad_id = ?
                 """,
@@ -1650,6 +1672,7 @@ class SnapshotStore:
                 ad_id=row["ad_id"],
                 observed_at=datetime.fromisoformat(row["observed_at"]),
                 source=row["source"],
+                metric_source=row["metric_source"],
                 lifecycle_state=LifecycleState(row["lifecycle_state"]),
                 title=row["title"],
                 description=row["description"],

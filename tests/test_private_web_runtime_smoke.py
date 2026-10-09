@@ -108,6 +108,65 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
         self.assertTrue(report.write_route_absent)
         self.assertFalse(report.platform_writes_enabled)
 
+    def test_smoke_uses_authoritative_metric_source_for_enriched_inventory(self) -> None:
+        for source, metric_source in (
+            ("management+mobile", "management"),
+            ("legacy+opaque", None),
+        ):
+            with self.subTest(source=source):
+                runtime = FakeInventoryRuntime(ReadResult.success_nonempty((
+                    AdSnapshot(
+                        ad_id="1234567890", observed_at=NOW,
+                        source=source, metric_source=metric_source,
+                        lifecycle_state=LifecycleState.ACTIVE,
+                        title="Owned", views=0, watch_count=2, reply_count=1,
+                    ),
+                )))
+                report = run_private_web_runtime_smoke(
+                    19610, runtime_factory=lambda **_kwargs: runtime,
+                )
+                self.assertEqual(report.inventory_count, 1)
+                self.assertEqual(report.analytics_ranked_ads, 1)
+                self.assertFalse(report.platform_writes_enabled)
+                self.assertEqual(runtime.close_calls, 1)
+
+    def test_smoke_preserves_opaque_plus_source_as_observed(self) -> None:
+        source = "provider+v2"
+        runtime = FakeInventoryRuntime(ReadResult.success_nonempty((
+            AdSnapshot(
+                ad_id="1234567890", observed_at=NOW,
+                source=source, lifecycle_state=LifecycleState.ACTIVE,
+                title="Owned", views=0, watch_count=2, reply_count=1,
+            ),
+        )))
+        original_json_get = runtime_smoke._json_get
+        captured: dict[str, object] = {}
+
+        def capture_projection(opener, base: str, path: str):
+            result = original_json_get(opener, base, path)
+            if path in ("/api/ads", "/api/analytics/ads?metric=views"):
+                captured[path] = result
+            return result
+
+        with patch(
+            "mark_api.private_web_runtime_smoke._json_get",
+            side_effect=capture_projection,
+        ):
+            report = run_private_web_runtime_smoke(
+                19610, runtime_factory=lambda **_kwargs: runtime,
+            )
+        self.assertEqual(report.inventory_count, 1)
+        self.assertEqual(runtime.close_calls, 1)
+        self.assertEqual(
+            captured["/api/ads"][0]["metric_evidence"]["views"]["source"],
+            source,
+        )
+        self.assertEqual(
+            captured["/api/analytics/ads?metric=views"][0]
+            ["metric_evidence"]["source"],
+            source,
+        )
+
     def test_smoke_rejects_corrupted_dashboard_summary(self) -> None:
         original_json_get = runtime_smoke._json_get
 
@@ -246,6 +305,70 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
                 )
 
         self.assertEqual(runtime.close_calls, 1)
+
+    def test_smoke_rejects_forged_ad_metric_evidence_with_same_value(self) -> None:
+        runtime = FakeInventoryRuntime(
+            ReadResult.success_nonempty((snapshot("1234567890"),))
+        )
+        original_json_get = runtime_smoke._json_get
+
+        def corrupt_ad_evidence(opener, base: str, path: str):
+            payload = original_json_get(opener, base, path)
+            if path == "/api/ads":
+                assert isinstance(payload, list)
+                rows = [dict(item) for item in payload]
+                evidence = dict(rows[0]["metric_evidence"])
+                views = dict(evidence["views"])
+                views["source"] = "forged-metrics"
+                evidence["views"] = views
+                rows[0]["metric_evidence"] = evidence
+                return rows
+            return payload
+
+        with patch(
+            "mark_api.private_web_runtime_smoke._json_get",
+            side_effect=corrupt_ad_evidence,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "dashboard ads projection does not match inventory",
+            ):
+                run_private_web_runtime_smoke(
+                    19610, runtime_factory=lambda **_kwargs: runtime,
+                )
+        self.assertEqual(runtime.close_calls, 1)
+
+    def test_smoke_rejects_forged_analytics_metric_evidence_and_types(self) -> None:
+        for corruption, error_text in (
+            ({"observed_at": "2026-09-29T20:00:00+00:00"},
+             "dashboard analytics views ranking does not match inventory"),
+            ({"last_known": 0}, "dashboard inventory projections are malformed"),
+        ):
+            with self.subTest(corruption=corruption):
+                runtime = FakeInventoryRuntime(
+                    ReadResult.success_nonempty((snapshot("1234567890"),))
+                )
+                original_json_get = runtime_smoke._json_get
+
+                def corrupt_ranking_evidence(opener, base: str, path: str):
+                    payload = original_json_get(opener, base, path)
+                    if path == "/api/analytics/ads?metric=views":
+                        assert isinstance(payload, list)
+                        rows = [dict(item) for item in payload]
+                        evidence = dict(rows[0]["metric_evidence"])
+                        evidence.update(corruption)
+                        rows[0]["metric_evidence"] = evidence
+                        return rows
+                    return payload
+
+                with patch(
+                    "mark_api.private_web_runtime_smoke._json_get",
+                    side_effect=corrupt_ranking_evidence,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, error_text):
+                        run_private_web_runtime_smoke(
+                            19610, runtime_factory=lambda **_kwargs: runtime,
+                        )
+                self.assertEqual(runtime.close_calls, 1)
 
     def test_smoke_queries_all_inventory_metric_rankings(self) -> None:
         runtime = FakeInventoryRuntime(

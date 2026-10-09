@@ -219,6 +219,7 @@ _DASHBOARD_HTML = """<!doctype html>
       <p class="note">Stichprobengröße 1 ist nur ein Datenwert, keine Qualitätsaussage.</p>
 
       <h3>Anzeigenranking</h3>
+      <p class="note">Jeder Ranking-Wert besitzt seine eigene Beobachtungszeit und Quelle. Reaktions- und E-Mail-Werte stammen aus getrennten Datengrundlagen; Summen sind keine aktuelle Plattformbestätigung.</p>
       <div id="ranking-chart" class="chart" role="list" aria-label="Anzeigenvergleich nach ausgewählter Metrik" hidden></div>
       <div class="table-wrap">
         <table>
@@ -239,6 +240,7 @@ _DASHBOARD_HTML = """<!doctype html>
 
     <section class="panel">
       <h2>Anzeigen</h2>
+      <p class="note">Die Zähler zeigen jeweils ihren eigenen Zeitpunkt, ihre Quelle und gegebenenfalls „letzter bekannter Wert“. Die Status-Beobachtung ist nicht automatisch das Alter aller Zähler. Sync-Status: nicht erfasst (aus Snapshots wird weder Erfolg noch Fehler abgeleitet).</p>
       <div class="table-wrap">
         <table>
           <thead>
@@ -358,6 +360,12 @@ textarea { min-height: 110px; resize: vertical; }
   gap: 8px;
 }
 button.danger { border-color: #87505a; }
+.metric-evidence {
+  display: block;
+  font-size: 0.76rem;
+  color: #aeb5c0;
+  overflow-wrap: anywhere;
+}
 .write-status.success { color: #82db9e; }
 .write-status.warning { color: #f2c36b; }
 .write-status.error { color: #ef9aa8; }
@@ -682,6 +690,43 @@ function td(value, className = "") {
   return element;
 }
 
+function ageDescription(observedAt) {
+  const observedMs = Date.parse(observedAt);
+  if (!Number.isFinite(observedMs)) return "Alter unbekannt";
+  const elapsedMs = Date.now() - observedMs;
+  if (elapsedMs < 0) return "Beobachtungszeit in der Zukunft";
+  const minutes = Math.floor(elapsedMs / 60000);
+  if (minutes < 1) return "vor weniger als 1 Minute";
+  if (minutes < 60) return "vor " + minutes + (minutes === 1 ? " Minute" : " Minuten");
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return "vor " + hours + (hours === 1 ? " Stunde" : " Stunden");
+  const days = Math.floor(hours / 24);
+  return "vor " + days + (days === 1 ? " Tag" : " Tagen");
+}
+
+function metricCellWithEvidence(value, evidence) {
+  const cell = td(value);
+  if (
+    value === null || value === undefined
+    || evidence === null || evidence === undefined || typeof evidence !== "object"
+  ) return cell;
+  const note = document.createElement("small");
+  note.className = "metric-evidence";
+  const evidenceKind = evidence.last_known === true
+    ? "letzter bekannter Wert"
+    : evidence.last_known === false
+      ? "direkt beobachtet"
+      : "eigenständige Evidenz";
+  const observedAt = typeof evidence.observed_at === "string"
+    ? evidence.observed_at : "Zeitpunkt unbekannt";
+  const source = typeof evidence.source === "string"
+    ? evidence.source : "Quelle unbekannt";
+  note.textContent = evidenceKind + " · " + ageDescription(observedAt)
+    + " · " + observedAt + " · Quelle: " + source;
+  cell.append(note);
+  return cell;
+}
+
 function managedBaselineFor(ad) {
   const titleKnown = typeof ad.title === "string";
   const descriptionKnown = typeof ad.description === "string";
@@ -780,9 +825,9 @@ function renderAds(ads) {
     stateCell.append(state);
     row.append(stateCell);
 
-    row.append(td(ad.views));
-    row.append(td(ad.watch_count));
-    row.append(td(ad.reply_count));
+    row.append(metricCellWithEvidence(ad.views, ad.metric_evidence?.views));
+    row.append(metricCellWithEvidence(ad.watch_count, ad.metric_evidence?.watch_count));
+    row.append(metricCellWithEvidence(ad.reply_count, ad.metric_evidence?.reply_count));
     row.append(td(ad.observed_at));
 
     const actionCell = document.createElement("td");
@@ -893,7 +938,7 @@ function renderRanking(items) {
     const row = document.createElement("tr");
     row.append(td(item.ad_id));
     row.append(td(item.title, "title"));
-    row.append(td(item.value));
+    row.append(metricCellWithEvidence(item.value, item.metric_evidence));
     row.append(td(item.present === null ? "—" : (item.present ? "ja" : "nein")));
     row.append(td(item.lifecycle_state));
     body.append(row);
