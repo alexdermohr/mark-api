@@ -171,8 +171,8 @@ temporären Media-Staging-Handles wieder her.
 ## Isolierter Linux-Systemdienst: tatsächliche Vertrauensgrenze
 
 **Vorlagen, keine laufende Installation:** `docs/mark-api.service`,
-`docs/mark-api-backup@.service`, `docs/mark-api-preflight.py` und
-`docs/mark-api.sysusers.conf`
+`docs/mark-api-backup@.service`, `docs/mark-api-bootstrap.sh`,
+`docs/mark-api-preflight.py` und `docs/mark-api.sysusers.conf`
 beschreiben einen root-verwalteten, dedizierten `mark-api`-Unix-Nutzer ohne
 Login-Shell. Diese Dateien im Repository oder ein erfolgreicher Unit-Test
 beweisen **keine** tatsächlich eingerichtete, sichere Laufzeitidentität.
@@ -235,8 +235,13 @@ Write-API bleiben loopback-only.
    voraus; das nur im Benutzer-Home vorhandene Python 3.12 genügt nicht
    für die isolierte Produktions-Unit. Diese Vorgabe ersetzt keine Prüfung
    der tatsächlichen Host- und Dienst-Identität.
-   Die OS-System-Python-Version darf älter sein; sie startet ausschließlich
-   den isolierten stdlib-Preflight mit `-I -S`.
+   Die OS-System-Python-Version darf älter sein. Ihr Importbaum wird **vor**
+   dem ersten Python-Aufruf durch das root-verwaltete native POSIX-Bootstrap-
+   Skript geprüft; nur danach startet es den isolierten Preflight mit `-I -S`.
+   Das eingesetzte `/bin/sh`, `/usr/bin/find`, `/usr/bin/readlink`, deren
+   nativer Loader und die root-verwaltete systemd-Unit sind ausdrücklich
+   Teil der zugrunde gelegten vertrauenswürdigen OS-Basis. Gegen deren
+   Kompromittierung schützt kein in derselben Unit ausgeführter Preflight.
 2. Vor dem ersten Start einmalig ein dediziertes, nicht interaktives
    Systemkonto und geschützte Verzeichnisse vorbereiten:
 
@@ -265,9 +270,14 @@ Write-API bleiben loopback-only.
    oben **vorher** existieren, ohne dass der Dienststart sie neu erzeugt
    oder fremde Daten automatisch übernimmt. `ReadWritePaths=` erlaubt nur
    die benötigten bereits existierenden Pfade trotz `ProtectSystem=strict`.
-   `ExecStartPre=` führt **vor jedem Import aus dem Mark-Venv** das separate
-   root-owned `/etc/mark-api/preflight.py` durch das OS-Python mit `-I -S`
-   aus. Dieser schreibfreie Bootstrap prüft den vollständigen Installationsbaum
+   `ExecStartPre=` beginnt mit `/bin/sh /etc/mark-api/bootstrap.sh`. Diese
+   root-verwaltete, schreibfreie native Stufe prüft zunächst den **eigenen**
+   `/usr/bin/python3`-Interpreter samt tatsächlich zugehörigem
+   `/usr/lib/pythonX.Y`-Importbaum, Symlink-Zielen einschließlich ihrer
+   Elternverzeichnisse und optionalem Stdlib-ZIP auf root-Eigentum sowie
+   Nicht-Schreibbarkeit. Erst danach wird das getrennte root-owned
+   `/etc/mark-api/preflight.py` unter `/usr/bin/python3 -I -S` ausgeführt.
+   Dieser zweite schreibfreie Bootstrap prüft den vollständigen Installationsbaum
    einschließlich Python-Code aller Mark-/Drittanbieter-Module, Binärmodule,
    Skripte, Paket-Pfaddeklarationen und Symlink-Ziele auf root-Eigentum und
    Nicht-Schreibbarkeit. Zugleich verifiziert er Dienst-UID/-GID, Nicht-Login-
@@ -284,16 +294,17 @@ Write-API bleiben loopback-only.
 
    ~~~bash
    sudo install -d -o root -g root -m 0755 /etc/mark-api
+   sudo install -o root -g root -m 0644 docs/mark-api-bootstrap.sh /etc/mark-api/bootstrap.sh
    sudo install -o root -g root -m 0644 docs/mark-api-preflight.py /etc/mark-api/preflight.py
    sudo install -o root -g root -m 0644 docs/mark-api.service /etc/systemd/system/mark-api.service
    sudo install -o root -g root -m 0644 'docs/mark-api-backup@.service' '/etc/systemd/system/mark-api-backup@.service'
    sudo systemctl daemon-reload
    sudo systemctl cat mark-api.service
-   sudo stat -c '%U:%G %a %n' /etc/mark-api /etc/mark-api/preflight.py /var/lib/mark-api /var/lib/mark-api/mark.sqlite /var/lib/mark-api-backups
+   sudo stat -c '%U:%G %a %n' /etc/mark-api /etc/mark-api/bootstrap.sh /etc/mark-api/preflight.py /var/lib/mark-api /var/lib/mark-api/mark.sqlite /var/lib/mark-api-backups
    ~~~
 
    Erwartet sind `root:root`, `0755` für `/etc/mark-api`, `0644` für
-   das Preflight-Skript sowie `mark-api:mark-api`, `0700` auf beiden
+   beide Preflight-Skripte sowie `mark-api:mark-api`, `0700` auf beiden
    Datenverzeichnissen und `0600` auf der Quelldatei. Vor Livebetrieb prüfen, dass eine andere
    nicht-root UID keinen Dateizugriff erhält und kein Fremdprozess unter der
    Dienst-UID läuft. Der Browser und die lokalen CLI-Tools unter dem

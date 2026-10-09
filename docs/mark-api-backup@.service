@@ -12,7 +12,8 @@ Group=mark-api
 WorkingDirectory=/var/lib/mark-api
 ReadWritePaths=/var/lib/mark-api /var/lib/mark-api-backups
 UMask=0077
-ExecStartPre=/usr/bin/python3 -I -S /etc/mark-api/preflight.py --db /var/lib/mark-api/mark.sqlite --backup-dir /var/lib/mark-api-backups
+# First code: native OS Python trust scan, then /usr/bin/python3 -I -S preflight.
+ExecStartPre=/bin/sh /etc/mark-api/bootstrap.sh --db /var/lib/mark-api/mark.sqlite --backup-dir /var/lib/mark-api-backups
 ExecStart=/opt/mark-api/venv/bin/python -I -m mark_api.backup_cli --db /var/lib/mark-api/mark.sqlite --backup /var/lib/mark-api-backups/mark-%i.sqlite
 StandardOutput=journal
 StandardError=journal

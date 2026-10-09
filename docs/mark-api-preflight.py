@@ -1,7 +1,9 @@
 """First-code, read-only bootstrap for the isolated Mark systemd services.
 
 Install a reviewed copy at /etc/mark-api/preflight.py, owned by root with mode
-0644, in a root-owned 0755 directory. Invoke with the OS interpreter:
+0644, in a root-owned 0755 directory. Invoke only after the native OS-stdlib check in the root-managed
+/etc/mark-api/bootstrap.sh, via the systemd ExecStartPre command. That
+script then invokes:
     /usr/bin/python3 -I -S /etc/mark-api/preflight.py --db ... --backup-dir ...
 No Mark or virtualenv module is imported before checking the entire installed
 runtime tree. This preflight cannot exclude root compromise, or malicious code

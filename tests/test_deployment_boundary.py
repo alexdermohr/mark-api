@@ -11,6 +11,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import stat
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -86,7 +87,7 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
                 service = _unit(filename)["Service"]
                 self.assertEqual(
                     shlex.split(service["ExecStartPre"]),
-                    ["/usr/bin/python3", "-I", "-S", "/etc/mark-api/preflight.py",
+                    ["/bin/sh", "/etc/mark-api/bootstrap.sh",
                      "--db", SOURCE_DB, "--backup-dir", BACKUP_DIR],
                 )
                 self.assertNotIn("StateDirectory", service)
@@ -106,6 +107,49 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
                     ("UMask", "0077"),
                 ):
                     self.assertEqual(service[key], expected)
+
+    def test_native_bootstrap_guards_python_before_import(self) -> None:
+        script = DOCS / "mark-api-bootstrap.sh"
+        content = script.read_text(encoding="utf-8")
+        self.assertIn('/usr/bin/find -L "$stdlib"', content)
+        self.assertIn('/usr/bin/readlink -f', content)
+        self.assertIn('exec /usr/bin/python3 -I -S /etc/mark-api/preflight.py "$@"', content)
+        self.assertLess(
+            content.index('/usr/bin/find -L "$stdlib"'),
+            content.index('exec /usr/bin/python3 -I -S /etc/mark-api/preflight.py'),
+        )
+        proc = subprocess.run(
+            ["/bin/sh", "-n", str(script)],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_native_bootstrap_fail_closed_before_python_for_untrusted_stdlib(self) -> None:
+        # Only the copied test shell is altered: the production guard has
+        # immutable OS-root and interpreter arguments.
+        content = (DOCS / "mark-api-bootstrap.sh").read_text(encoding="utf-8")
+        guard = 'stdlib="$os_root/lib/$base"'
+        end = 'exec /usr/bin/python3 -I -S /etc/mark-api/preflight.py "$@"'
+        self.assertIn(guard, content)
+        self.assertIn(end, content)
+        with TemporaryDirectory() as tmp:
+            untrusted = Path(tmp) / "stdlib"
+            untrusted.mkdir()
+            (untrusted / "sitecustomize.py").write_text("# malicious code\n")
+            (untrusted / "sitecustomize.py").chmod(0o666)
+            marker = Path(tmp) / "executed-python"
+            test_shell = Path(tmp) / "native-guard.sh"
+            test_shell.write_text(
+                content.replace(guard, f'stdlib="{untrusted}"')
+                .replace(end, f'printf dispatch > "{marker}"'),
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                ["/bin/sh", str(test_shell)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(marker.exists(), proc.stdout + proc.stderr)
 
     def test_backup_uses_create_only_isolated_package_module(self) -> None:
         service = _unit("mark-api-backup@.service")["Service"]
