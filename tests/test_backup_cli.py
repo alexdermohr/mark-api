@@ -165,6 +165,126 @@ class BackupCliTests(unittest.TestCase):
                 ("in_progress",),
             )
 
+    def test_quiescent_wal_database_without_sidecars_can_be_backed_up(self) -> None:
+        # Closing the final WAL writer checkpoints and removes -wal/-shm.
+        # A mode=ro SQLite reader may legitimately create an EMPTY WAL and
+        # shared-memory index on the next open. Rejecting every new sidecar
+        # would break normal backups of a healthy quiet WAL-mode database.
+        wal = self.source.with_name(self.source.name + "-wal")
+        shm = self.source.with_name(self.source.name + "-shm")
+        with closing(sqlite3.connect(self.source)) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode=WAL").fetchone(), ("wal",))
+        gc.collect()
+        self.assertFalse(wal.exists())
+        self.assertFalse(shm.exists())
+
+        receipt = backup_store(self.source, backup_db=self.backup)
+
+        self.assertTrue(self.backup.exists())
+        self.assertEqual(receipt.pending_api_writes, 0)
+        with closing(sqlite3.connect(self.backup)) as check:
+            self.assertEqual(check.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+
+    def test_previously_absent_wal_rejects_newly_planted_old_frames(self) -> None:
+        # An attacker may plant an earlier valid -wal/-shm pair after the
+        # initial "absent" identity read but before sqlite3.connect(path).
+        # Unlike an empty SQLite-created WAL, the captured pair contains
+        # frames and must fail closed before any backup is published.
+        wal = self.source.with_name(self.source.name + "-wal")
+        shm = self.source.with_name(self.source.name + "-shm")
+        saved_wal = self.root / "captured-old-wal"
+        saved_shm = self.root / "captured-old-shm"
+        with closing(sqlite3.connect(self.source)) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode=WAL").fetchone(), ("wal",))
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("old-wal-fence", "e" * 64, NOW.isoformat()),
+            )
+            writer.commit()
+            self.assertGreater(wal.stat().st_size, 32)
+            shutil.copyfile(wal, saved_wal)
+            shutil.copyfile(shm, saved_shm)
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("newer-main-fence", "f" * 64, NOW.isoformat()),
+            )
+            writer.commit()
+        gc.collect()
+        self.assertFalse(wal.exists())
+        self.assertFalse(shm.exists())
+        real_connect = sqlite3.connect
+        source_uri = backup_cli._uri(self.source, "ro")
+        planted = False
+
+        def connect_after_planted_old_wal(database, *args, **kwargs):
+            nonlocal planted
+            if database != source_uri or planted:
+                return real_connect(database, *args, **kwargs)
+            planted = True
+            shutil.copyfile(saved_wal, wal)
+            shutil.copyfile(saved_shm, shm)
+            connection = real_connect(database, *args, **kwargs)
+            connection.execute("PRAGMA schema_version").fetchone()
+            return connection
+
+        with patch("mark_api.backup_cli.sqlite3.connect", side_effect=connect_after_planted_old_wal):
+            with self.assertRaisesRegex(BackupError, "WAL source identity"):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(planted)
+        self.assertFalse(self.backup.exists())
+
+    def test_new_empty_wal_growing_frames_during_backup_blocks_publication(self) -> None:
+        # A legitimate write concurrent with backup startup must not turn an
+        # initially absent/empty sidecar into an untracked committed WAL.
+        # Retain its pinned fd and fail closed before create-only publication.
+        wal = self.source.with_name(self.source.name + "-wal")
+        with closing(sqlite3.connect(self.source)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+        gc.collect()
+        self.assertFalse(wal.exists())
+
+        original_validate = backup_cli._require_healthy_store
+        injected = False
+
+        def concurrent_commit(connection):
+            nonlocal injected
+            if not injected:
+                injected = True
+                self.assertTrue(wal.is_file())
+                self.assertEqual(wal.stat().st_size, 0)
+                with closing(sqlite3.connect(self.source)) as writer:
+                    writer.execute(
+                        "INSERT INTO write_api_requests "
+                        "(idempotency_key, request_sha256, state, requested_at) "
+                        "VALUES (?, ?, 'in_progress', ?)",
+                        ("new-wal-concurrent-fence", "c" * 64, NOW.isoformat()),
+                    )
+                    writer.commit()
+                self.assertGreater(wal.stat().st_size, 32)
+            return original_validate(connection)
+
+        with patch(
+            "mark_api.backup_cli._require_healthy_store",
+            side_effect=concurrent_commit,
+        ):
+            with self.assertRaisesRegex(BackupError, "WAL source identity newly introduced frames"):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(injected)
+        self.assertFalse(self.backup.exists())
+        with closing(sqlite3.connect(self.source)) as check:
+            self.assertEqual(
+                check.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='new-wal-concurrent-fence'"
+                ).fetchone(),
+                ("in_progress",),
+            )
+
     def test_create_only_never_overwrites_existing_backup(self) -> None:
         first = backup_store(self.source, backup_db=self.backup)
         old_bytes = self.backup.read_bytes()

@@ -72,7 +72,11 @@ oder eine nicht eindeutig bestimmbare Quellbindung führen zum sicheren Abbruch.
 Auch die tatsächlichen `-wal`-Dateideskriptoren und neu eingebundenen
 `-shm`-Mappings werden über die Linux-Inode-Identität geprüft. Ein
 Sidecar-Wechsel oder eine fehlgeschlagene procfs-Attestation blockiert die
-Sicherung. Bestehende Handles derselben validierten Quelle bleiben zulässig;
+Sicherung. Ausnahme: Öffnet SQLite eine zuvor nicht vorhandene WAL-Datei neu
+und leer (0 Frames), ist dies zulässig, solange ihr gepinnter Inode bis zum
+Abschluss nachweislich leer bleibt. Eine neu erscheinende WAL mit Frames oder
+ein späteres Anwachsen führt zum sicheren Abbruch. Bestehende Handles
+derselben validierten Quelle bleiben zulässig;
 ein unsicherer Pfad-Fallback findet nicht statt. Temporäre Sicherungsdatei
 und endgültige create-only-Veröffentlichung werden über geöffnete Stage-
 und Zielverzeichnis-Deskriptoren adressiert, nicht über erneut aufgelöste

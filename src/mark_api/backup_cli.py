@@ -185,7 +185,8 @@ def _attest_sidecars(
     shm_before: tuple[int, int] | None,
     open_wal_before: dict[int, tuple[int, int]],
     maps_before: set[tuple[int, int]],
-) -> tuple[tuple[int, int] | None, int | None, tuple[int, int] | None]:
+    resources: ExitStack,
+) -> tuple[tuple[int, int] | None, int | None, tuple[int, int] | None, int | None]:
     wal_now = _sidecar_identity(wal_path)
     shm_now = _sidecar_identity(shm_path)
     if (
@@ -193,12 +194,45 @@ def _attest_sidecars(
         or (shm_before is not None and shm_now != shm_before)
     ):
         raise BackupError("WAL source identity changed during connection")
+    if wal_now is None and shm_before is None and shm_now is not None:
+        raise BackupError("WAL source identity has unexpected shared memory")
+    # SQLite may create an empty WAL when it opens a quiet WAL-mode database
+    # read-only. It contains no frames; a new nonempty WAL could instead be
+    # an older captured sidecar planted after the first preflight read.
+    empty_wal_fd: int | None = None
+    if wal_now is not None:
+        try:
+            current = wal_path.lstat()
+        except OSError as exc:
+            raise BackupError("WAL source identity could not be inspected") from exc
+        if wal_before is None and current.st_size != 0:
+            raise BackupError("WAL source identity newly introduced frames")
+        if current.st_size == 0:
+            try:
+                descriptor = os.open(
+                    wal_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                )
+            except OSError as exc:
+                raise BackupError("WAL source identity empty file unavailable") from exc
+            resources.callback(os.close, descriptor)
+            try:
+                actual = os.fstat(descriptor)
+            except OSError as exc:
+                raise BackupError("WAL source identity empty file unavailable") from exc
+            if (
+                not stat.S_ISREG(actual.st_mode)
+                or actual.st_nlink != 1
+                or (actual.st_dev, actual.st_ino) != wal_now
+                or actual.st_size != 0
+            ):
+                raise BackupError("WAL source identity empty file changed")
+            empty_wal_fd = descriptor
     observed = _sqlite_wal_fds()
     candidates = [
         (fd, identity) for fd, identity in observed.items()
         if open_wal_before.get(fd) != identity
     ]
-    if wal_now is None:
+    if wal_now is None or empty_wal_fd is not None:
         if candidates:
             raise BackupError("WAL source identity cannot be attested")
         wal_fd = None
@@ -209,18 +243,29 @@ def _attest_sidecars(
     introduced_maps = _shared_file_mappings() - maps_before
     if any(identity != shm_now for identity in introduced_maps):
         raise BackupError("WAL source identity differs from SQLite shared mappings")
-    return wal_now, wal_fd, shm_now
+    return wal_now, wal_fd, shm_now, empty_wal_fd
 
 
 def _assert_sidecars_unchanged(
     wal_path: Path, wal_identity: tuple[int, int] | None, wal_fd: int | None,
     shm_path: Path, shm_identity: tuple[int, int] | None,
+    empty_wal_fd: int | None,
     maps_before: set[tuple[int, int]],
 ) -> None:
     if _sidecar_identity(wal_path) != wal_identity:
         raise BackupError("WAL source identity changed during backup")
     if _sidecar_identity(shm_path) != shm_identity:
         raise BackupError("WAL source identity changed during backup")
+    if empty_wal_fd is not None:
+        try:
+            empty = os.fstat(empty_wal_fd)
+        except OSError as exc:
+            raise BackupError("WAL source identity empty file was lost") from exc
+        if (
+            (empty.st_dev, empty.st_ino) != wal_identity
+            or empty.st_size != 0
+        ):
+            raise BackupError("WAL source identity newly introduced frames")
     if wal_fd is not None:
         try:
             now = os.fstat(wal_fd)
@@ -363,9 +408,9 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             sqlite_source_fd = _attest_source_connection(
                 original_db, open_main_before, original,
             )
-            wal_identity, sqlite_wal_fd, shm_identity = _attest_sidecars(
+            wal_identity, sqlite_wal_fd, shm_identity, empty_wal_fd = _attest_sidecars(
                 wal_path, shm_path, wal_before, shm_before,
-                open_wal_before, maps_before,
+                open_wal_before, maps_before, resources,
             )
             _require_healthy_store(original_db)
             # Resolve staging through the pinned directory descriptor: a
@@ -410,7 +455,7 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             _assert_source_connection_inode(sqlite_source_fd, original)
             _assert_sidecars_unchanged(
                 wal_path, wal_identity, sqlite_wal_fd,
-                shm_path, shm_identity, maps_before,
+                shm_path, shm_identity, empty_wal_fd, maps_before,
             )
             os.fchmod(stage_fd, 0o400)
             os.fsync(stage_fd)
@@ -419,7 +464,7 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             _assert_source_connection_inode(sqlite_source_fd, original)
             _assert_sidecars_unchanged(
                 wal_path, wal_identity, sqlite_wal_fd,
-                shm_path, shm_identity, maps_before,
+                shm_path, shm_identity, empty_wal_fd, maps_before,
             )
             _new_target(target, target_dir_fd)
             # Linux linkat follows this procfd symlink to the exact open stage
@@ -449,7 +494,7 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             _assert_source_connection_inode(sqlite_source_fd, original)
             _assert_sidecars_unchanged(
                 wal_path, wal_identity, sqlite_wal_fd,
-                shm_path, shm_identity, maps_before,
+                shm_path, shm_identity, empty_wal_fd, maps_before,
             )
             return BackupReceipt(
                 created_at=datetime.now(timezone.utc).isoformat(),
