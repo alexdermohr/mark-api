@@ -14,7 +14,7 @@ ReadWritePaths=/var/lib/mark-api /var/lib/mark-api-backups
 UMask=0077
 # First code: native OS Python trust scan, then /usr/bin/python3 -I -S preflight.
 # Refuse an untrusted bootstrap file before executing it.
-ExecCondition=/usr/bin/find -P /etc /etc/mark-api /etc/mark-api/bootstrap.sh -maxdepth 0 ( ! -uid 0 -o -perm /022 -o -type l ) -exec /usr/bin/false {} +
+ExecCondition=/usr/bin/find -P / /etc /etc/mark-api /etc/mark-api/bootstrap.sh -maxdepth 0 ( ! -uid 0 -o -perm /022 -o -type l ) -exec /usr/bin/false {} +
 ExecStartPre=/bin/sh /etc/mark-api/bootstrap.sh --db /var/lib/mark-api/mark.sqlite --backup-dir /var/lib/mark-api-backups
 ExecStart=/opt/mark-api/venv/bin/python -I -m mark_api.backup_cli --db /var/lib/mark-api/mark.sqlite --backup /var/lib/mark-api-backups/mark-%i.sqlite
 StandardOutput=journal

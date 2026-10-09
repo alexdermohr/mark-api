@@ -55,7 +55,10 @@ def _trusted_link(path: Path, root: Path) -> None:
         # Compare the literal link target with its fully resolved target.
         # A chain through an independently writable intermediary may be
         # retargeted after the preflight, even when it resolves safely now.
-        literal = Path(os.path.normpath(str(path.parent / os.readlink(path))))
+        raw_target = os.readlink(path)
+        if ".." in raw_target.split("/"):
+            raise DeploymentBoundaryError("installed code symlink traverses parent path")
+        literal = Path(os.path.normpath(str(path.parent / raw_target)))
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise DeploymentBoundaryError("installed code symlink cannot be trusted") from exc
@@ -174,7 +177,10 @@ def _check_os_stdlib(version: str) -> None:
                 raise DeploymentBoundaryError("system stdlib cannot be audited") from exc
         elif stat.S_ISLNK(info.st_mode):
             try:
-                literal = Path(os.path.normpath(str(path.parent / os.readlink(path))))
+                raw_target = os.readlink(path)
+                if ".." in raw_target.split("/"):
+                    raise DeploymentBoundaryError("system stdlib symlink traverses parent path")
+                literal = Path(os.path.normpath(str(path.parent / raw_target)))
                 target = path.resolve(strict=True)
             except (OSError, RuntimeError) as exc:
                 raise DeploymentBoundaryError("system stdlib symlink cannot be trusted") from exc

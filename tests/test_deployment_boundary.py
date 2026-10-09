@@ -88,11 +88,11 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
                 # Validate the native shell file *before* it executes. A
                 # service-writable bootstrap must never become first code.
                 first = shlex.split(service["ExecCondition"])
-                self.assertEqual(first[:6], [
-                    "/usr/bin/find", "-P", "/etc", "/etc/mark-api",
+                self.assertEqual(first[:7], [
+                    "/usr/bin/find", "-P", "/", "/etc", "/etc/mark-api",
                     "/etc/mark-api/bootstrap.sh", "-maxdepth",
                 ])
-                self.assertEqual(first[6:8], ["0", "("])
+                self.assertEqual(first[7:9], ["0", "("])
                 self.assertIn("-uid", first)
                 self.assertIn("-perm", first)
                 self.assertIn("-type", first)
@@ -141,14 +141,14 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
         # Verify GNU find exit codes rather than assuming a warning or
         # printed match will block systemd ExecStartPre.
         guard = shlex.split(_unit("mark-api.service")["Service"]["ExecCondition"])
-        trusted = guard[:2] + ["/etc", "/usr", "/usr/bin/find"] + guard[5:]
+        trusted = guard[:2] + ["/etc", "/usr", "/usr/bin/find"] + guard[6:]
         ok = subprocess.run(trusted, text=True, capture_output=True, check=False)
         self.assertEqual(ok.returncode, 0, ok.stderr)
         with TemporaryDirectory() as tmp:
             attacker = Path(tmp) / "bootstrap.sh"
             attacker.write_text("# attacker-controlled bootstrap\\n")
             attacker.chmod(0o666)
-            untrusted = guard[:2] + ["/etc", "/usr", str(attacker)] + guard[5:]
+            untrusted = guard[:2] + ["/etc", "/usr", str(attacker)] + guard[6:]
             blocked = subprocess.run(
                 untrusted, text=True, capture_output=True, check=False
             )
@@ -522,6 +522,32 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             writable.chmod(0o777)
             (writable / "module-redirect").symlink_to(site / "PIL/Image.py")
             (site / "PIL/intermediate.py").symlink_to(writable / "module-redirect")
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
+
+    def test_preflight_rejects_interpreter_symlink_with_writable_dotdot_path(self) -> None:
+        # Lexical normpath hides the mutable directory, but the OS traverses it.
+        with self._fake_root_install() as (root, site, _probe):
+            writable = root.parent.parent / "mutable-path"
+            writable.mkdir()
+            writable.chmod(0o777)
+            interpreter = root / "bin/python"
+            interpreter.unlink()
+            interpreter.symlink_to(
+                writable / "../usr/bin/python3.12"
+            )
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
+
+    def test_preflight_rejects_stdlib_symlink_with_writable_dotdot_path(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            writable = root.parent.parent / "mutable-stdlib"
+            writable.mkdir()
+            writable.chmod(0o777)
+            stdlib = root.parent.parent / "usr/lib/python3.12"
+            (stdlib / "unsafe-alias.py").symlink_to(
+                writable / "../usr/lib/python3.12/site.py"
+            )
             with self.assertRaises(boundary.DeploymentBoundaryError):
                 boundary.check_installed_code(root)
 
