@@ -116,6 +116,14 @@ def _inspect_historical_store(
     integrity = connection.execute("PRAGMA quick_check(1)").fetchone()
     if integrity is None or integrity[0] != "ok":
         raise LegacyMigrationError("legacy database integrity check failed")
+    # The offline recovery contract applies ONLY to unversioned historical
+    # stores. A versioned current store with lost journal/recovery tables may
+    # mimic a historical table set; never treat that loss as old lineage.
+    marker = connection.execute("PRAGMA user_version").fetchone()
+    if marker is None or type(marker[0]) is not int or marker[0] != 0:
+        raise LegacyMigrationError(
+            "versioned database is not a recognized historical schema"
+        )
     objects = connection.execute(
         "SELECT type, name FROM sqlite_master "
         "WHERE name NOT LIKE 'sqlite_%'"

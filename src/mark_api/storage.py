@@ -23,6 +23,20 @@ from .domain import (
 )
 from .results import ReadResult, ReadStatus
 
+_SYNC_SCHEMA_VERSION = 1
+_SYNC_ERROR_KINDS = frozenset({
+    "unauthenticated", "http_error", "transport_error", "parse_error",
+    "reader_exception", "runtime_unavailable", "invalid_inventory",
+    "persistence_error",
+})
+
+
+def _sync_time(value: datetime) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("sync timestamp must be timezone-aware")
+    return value.astimezone(timezone.utc).isoformat()
+
+
 
 _CLASSIFICATION_FIELDS = (
     "image_type",
@@ -174,6 +188,79 @@ _REQUIRED_SINGLE_COLUMN_UNIQUES: dict[str, tuple[str, ...]] = {
 }
 
 @dataclass(frozen=True, slots=True)
+class SyncAttemptRecord:
+    id: int
+    source: str
+    started_at: datetime
+    completed_at: datetime | None
+    outcome: str
+    error_kind: str | None
+    snapshot_count: int | None
+
+
+def _sync_attempt_from_row(row: sqlite3.Row) -> SyncAttemptRecord:
+    """Treat corrupt journal data as a database error, never a claimed sync."""
+    try:
+        attempt_id = row["id"]
+        source = row["source"]
+        raw_started = row["started_at"]
+        raw_completed = row["completed_at"]
+        outcome = row["outcome"]
+        error_kind = row["error_kind"]
+        count = row["snapshot_count"]
+        if (
+            type(attempt_id) is not int or attempt_id < 1
+            or not isinstance(source, str) or not source.strip()
+            or not isinstance(raw_started, str)
+            or (raw_completed is not None and not isinstance(raw_completed, str))
+        ):
+            raise ValueError("invalid sync journal fields")
+        started = datetime.fromisoformat(raw_started)
+        completed = (
+            datetime.fromisoformat(raw_completed)
+            if raw_completed is not None else None
+        )
+        if started.utcoffset() is None or (
+            completed is not None and completed.utcoffset() is None
+        ):
+            raise ValueError("sync journal datetime has no timezone")
+        if completed is not None and completed < started:
+            raise ValueError("sync completion before start")
+        if outcome == "in_progress":
+            valid = completed is None and error_kind is None and count is None
+        elif outcome == "failed":
+            valid = completed is not None and error_kind in _SYNC_ERROR_KINDS and count is None
+        elif outcome == "success_empty":
+            valid = completed is not None and error_kind is None and count == 0
+        elif outcome == "success_nonempty":
+            valid = completed is not None and error_kind is None and type(count) is int and count > 0
+        else:
+            valid = False
+        if not valid:
+            raise ValueError("inconsistent sync journal outcome")
+    except (TypeError, ValueError, IndexError, KeyError) as exc:
+        raise sqlite3.DatabaseError("invalid sync attempt journal record") from exc
+    return SyncAttemptRecord(
+        id=attempt_id, source=source,
+        started_at=started, completed_at=completed,
+        outcome=outcome, error_kind=error_kind, snapshot_count=count,
+    )
+
+
+def _sync_attempt_to_dict(item: SyncAttemptRecord | None) -> dict[str, object] | None:
+    if item is None:
+        return None
+    return {
+        "id": item.id, "source": item.source,
+        "started_at": item.started_at.isoformat(),
+        "completed_at": (item.completed_at.isoformat()
+                         if item.completed_at is not None else None),
+        "outcome": item.outcome, "error_kind": item.error_kind,
+        "snapshot_count": item.snapshot_count,
+    }
+
+
+@dataclass(frozen=True, slots=True)
 class WriteApiRequestRecord:
     idempotency_key: str
     request_sha256: str
@@ -304,6 +391,47 @@ class SnapshotStore:
                     unique_columns
                 ):
                     raise sqlite3.DatabaseError("database recovery keys are not unique")
+
+        version_row = connection.execute("PRAGMA user_version").fetchone()
+        version = int(version_row[0]) if version_row is not None else -1
+        if version not in (0, _SYNC_SCHEMA_VERSION):
+            raise sqlite3.DatabaseError("database version is unsupported")
+        journal_type = connection.execute(
+            "SELECT type FROM sqlite_master WHERE name='sync_attempts'"
+        ).fetchone()
+        if journal_type is None:
+            if version != 0 or not allow_additive_migrations:
+                raise sqlite3.DatabaseError("sync attempt journal is missing")
+        else:
+            if journal_type["type"] != "table":
+                raise sqlite3.DatabaseError("sync attempt journal schema is invalid")
+            columns = {
+                str(row["name"]): row
+                for row in connection.execute("PRAGMA table_info(sync_attempts)")
+            }
+            expected = {
+                "id", "source", "started_at", "completed_at",
+                "outcome", "error_kind", "snapshot_count",
+            }
+            if set(columns) != expected or columns["id"]["pk"] != 1:
+                raise sqlite3.DatabaseError("sync attempt journal schema is invalid")
+            if version == 0:
+                if not allow_additive_migrations:
+                    raise sqlite3.DatabaseError("sync attempt schema version is missing")
+                if connection.execute("SELECT 1 FROM sync_attempts LIMIT 1").fetchone():
+                    raise sqlite3.DatabaseError("unversioned sync journal is ambiguous")
+            else:
+                # Readiness must not claim success when the values required
+                # by the actual dashboard projection cannot be decoded.
+                for statement in (
+                    "SELECT * FROM sync_attempts ORDER BY id DESC LIMIT 1",
+                    "SELECT * FROM sync_attempts WHERE outcome IN "
+                    "('success_empty','success_nonempty') "
+                    "ORDER BY completed_at DESC, id DESC LIMIT 1",
+                ):
+                    record = connection.execute(statement).fetchone()
+                    if record is not None:
+                        _sync_attempt_from_row(record)
 
     def is_ready(self) -> bool:
         """Observe complete schema/data without creating or repairing a store."""
@@ -486,6 +614,28 @@ class SnapshotStore:
                     acknowledged INTEGER NOT NULL DEFAULT 0
                         CHECK (acknowledged IN (0, 1))
                 );
+
+                CREATE TABLE IF NOT EXISTS sync_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL CHECK(length(trim(source)) > 0),
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    outcome TEXT NOT NULL CHECK (
+                        outcome IN ('in_progress', 'success_empty', 'success_nonempty', 'failed')
+                    ),
+                    error_kind TEXT,
+                    snapshot_count INTEGER,
+                    CHECK (
+                        (outcome = 'in_progress' AND completed_at IS NULL
+                         AND error_kind IS NULL AND snapshot_count IS NULL)
+                        OR (outcome = 'failed' AND completed_at IS NOT NULL
+                            AND error_kind IS NOT NULL AND snapshot_count IS NULL)
+                        OR (outcome = 'success_empty' AND completed_at IS NOT NULL
+                            AND error_kind IS NULL AND snapshot_count = 0)
+                        OR (outcome = 'success_nonempty' AND completed_at IS NOT NULL
+                            AND error_kind IS NULL AND snapshot_count > 0)
+                    )
+                );
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
@@ -562,6 +712,9 @@ class SnapshotStore:
                     "ADD COLUMN execution_started_at TEXT"
                 )
 
+            # Existing stores pass old Write-recovery validation before
+            # migrations. The journal and version marker commit together.
+            connection.execute(f"PRAGMA user_version = {_SYNC_SCHEMA_VERSION}")
             self._validate_store_schema(connection)
 
     @staticmethod
@@ -1609,6 +1762,113 @@ class SnapshotStore:
                 )
             return "finalized"
 
+    def begin_sync_attempt(self, *, source: str, started_at: datetime) -> int:
+        """Record intent durably before any owner-inventory network read."""
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("sync source must not be empty")
+        with self._connect() as connection:
+            record = connection.execute(
+                "INSERT INTO sync_attempts (source, started_at, outcome) "
+                "VALUES (?, ?, 'in_progress')",
+                (source, _sync_time(started_at)),
+            )
+            if record.lastrowid is None:
+                raise sqlite3.DatabaseError("sync attempt insert failed")
+            return int(record.lastrowid)
+
+    @staticmethod
+    def _finish_sync_attempt(
+        connection: sqlite3.Connection,
+        attempt_id: int,
+        *,
+        expected_source: str,
+        completed_at: datetime,
+        outcome: str,
+        error_kind: str | None,
+        snapshot_count: int | None,
+    ) -> None:
+        if type(attempt_id) is not int or attempt_id < 1:
+            raise ValueError("sync attempt id is invalid")
+        if not isinstance(expected_source, str) or not expected_source.strip():
+            raise ValueError("sync source binding is invalid")
+        if outcome == "failed":
+            if error_kind not in _SYNC_ERROR_KINDS or snapshot_count is not None:
+                raise ValueError("sync failure classification is invalid")
+        elif outcome == "success_empty":
+            if error_kind is not None or snapshot_count != 0:
+                raise ValueError("empty sync result is invalid")
+        elif outcome == "success_nonempty":
+            if error_kind is not None or type(snapshot_count) is not int or snapshot_count < 1:
+                raise ValueError("nonempty sync result is invalid")
+        else:
+            raise ValueError("terminal sync outcome is invalid")
+        terminal = _sync_time(completed_at)
+        original = connection.execute(
+            "SELECT started_at FROM sync_attempts "
+            "WHERE id=? AND source=? AND outcome='in_progress'",
+            (attempt_id, expected_source),
+        ).fetchone()
+        if original is None:
+            raise RuntimeError("sync attempt missing or already completed")
+        if datetime.fromisoformat(terminal) < datetime.fromisoformat(original["started_at"]):
+            raise ValueError("sync completion predates its start")
+        updated = connection.execute(
+            "UPDATE sync_attempts SET completed_at=?, outcome=?, "
+            "error_kind=?, snapshot_count=? "
+            "WHERE id=? AND source=? AND outcome='in_progress' AND completed_at IS NULL",
+            (terminal, outcome, error_kind, snapshot_count, attempt_id, expected_source),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("sync attempt has been concurrently completed")
+
+    def fail_sync_attempt(
+        self, attempt_id: int, *, source: str, completed_at: datetime, error_kind: str,
+    ) -> None:
+        """Settle an open read failure without changing any owner snapshots."""
+        with self._connect() as connection:
+            self._finish_sync_attempt(
+                connection, attempt_id, expected_source=source, completed_at=completed_at,
+                outcome="failed", error_kind=error_kind, snapshot_count=None,
+            )
+
+    def latest_sync_attempt(self) -> SyncAttemptRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_attempts ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return _sync_attempt_from_row(row) if row is not None else None
+
+    def last_successful_sync_attempt(self) -> SyncAttemptRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM sync_attempts "
+                "WHERE outcome IN ('success_empty', 'success_nonempty') "
+                "ORDER BY completed_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+        return _sync_attempt_from_row(row) if row is not None else None
+
+    def sync_status(self) -> dict[str, object]:
+        """Display attempts independently of old metric/status observations."""
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            latest = connection.execute(
+                "SELECT * FROM sync_attempts ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            successful = connection.execute(
+                "SELECT * FROM sync_attempts "
+                "WHERE outcome IN ('success_empty', 'success_nonempty') "
+                "ORDER BY completed_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+        latest_item = _sync_attempt_from_row(latest) if latest is not None else None
+        success_item = (
+            _sync_attempt_from_row(successful) if successful is not None else None
+        )
+        return {
+            "state": latest_item.outcome if latest_item is not None else "never_attempted",
+            "latest_attempt": _sync_attempt_to_dict(latest_item),
+            "last_successful_attempt": _sync_attempt_to_dict(success_item),
+        }
+
     def append_inventory_result(
         self,
         result: ReadResult[tuple[AdSnapshot, ...]],
@@ -1616,18 +1876,37 @@ class SnapshotStore:
         tracked_ad_ids: Iterable[str] = (),
         observed_at: datetime,
         source: str,
+        attempt_id: int | None = None,
+        completed_at: datetime | None = None,
     ) -> int:
-        """Persist a complete owner-inventory observation without erasing history.
+        """Persist owner inventory and an optional journal outcome atomically.
 
-        Failed reads create no snapshots. A successful owner-inventory read records
-        returned ads and appends ABSENT snapshots for tracked IDs not present in the
-        result. Existing rows are never deleted.
+        Failed reads append no snapshots. Successful reads carry forward ABSENT
+        for tracked IDs not observed. Direct snapshot imports with no attempt id
+        make no claim about an independently completed owner sync.
         """
-
+        if not isinstance(result, ReadResult):
+            raise TypeError("inventory result must be ReadResult")
+        if (attempt_id is None) != (completed_at is None):
+            raise ValueError("sync attempt and completion time must be paired")
         if not result.is_success:
+            if attempt_id is not None:
+                with self._connect() as connection:
+                    self._finish_sync_attempt(
+                        connection, attempt_id, expected_source=source, completed_at=completed_at,
+                        outcome="failed", error_kind=result.status.value,
+                        snapshot_count=None,
+                    )
             return 0
 
         snapshots = tuple(result.value or ())
+        if attempt_id is not None and (
+            (result.status is ReadStatus.SUCCESS_EMPTY and snapshots)
+            or (result.status is ReadStatus.SUCCESS_NONEMPTY and not snapshots)
+            or any(not isinstance(item, AdSnapshot) for item in snapshots)
+            or len({item.ad_id for item in snapshots}) != len(snapshots)
+        ):
+            raise ValueError("inconsistent owner inventory")
         present_ids = {snapshot.ad_id for snapshot in snapshots}
         tracked_ids = {ad_id for ad_id in tracked_ad_ids if ad_id.strip()}
         absent_ids = sorted(tracked_ids - present_ids)
@@ -1644,6 +1923,12 @@ class SnapshotStore:
                         source=source,
                         lifecycle_state=LifecycleState.ABSENT,
                     ),
+                )
+            if attempt_id is not None:
+                self._finish_sync_attempt(
+                    connection, attempt_id, expected_source=source, completed_at=completed_at,
+                    outcome="success_nonempty" if snapshots else "success_empty",
+                    error_kind=None, snapshot_count=len(snapshots),
                 )
         return len(snapshots) + len(absent_ids)
 

@@ -210,14 +210,37 @@ class MarkService:
         )
 
     def refresh_inventory(self) -> ReadResult[tuple[AdSnapshot, ...]]:
+        """Record read intent first; persist result and snapshots atomically."""
         tracked_ids = self._store.tracked_ad_ids()
-        result = self._owner_reader.read_ads()
-        self._store.append_inventory_result(
-            result,
-            tracked_ad_ids=tracked_ids,
-            observed_at=self._clock(),
-            source="mark-service-owner-inventory",
+        source = "mark-service-owner-inventory"
+        attempt_id = self._store.begin_sync_attempt(
+            source=source, started_at=self._clock(),
         )
+        try:
+            result = self._owner_reader.read_ads()
+        except Exception:
+            self._store.fail_sync_attempt(
+                attempt_id, source=source, completed_at=self._clock(),
+                error_kind="reader_exception",
+            )
+            raise
+        try:
+            self._store.append_inventory_result(
+                result,
+                tracked_ad_ids=tracked_ids,
+                observed_at=self._clock(),
+                source=source,
+                attempt_id=attempt_id,
+                completed_at=self._clock(),
+            )
+        except Exception:
+            # The independent failed-record CAS refuses to overwrite a
+            # committed successful outcome on an unknown SQLite write result.
+            self._store.fail_sync_attempt(
+                attempt_id, source=source, completed_at=self._clock(),
+                error_kind="persistence_error",
+            )
+            raise
         return result
 
     def refresh_reactions(self, ad_id: str) -> ReadResult[ReactionSnapshot]:

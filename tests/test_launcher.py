@@ -468,6 +468,8 @@ class ProductLauncherTests(unittest.TestCase):
             persisted.latest_ad_snapshot("2222222222"),
             current,
         )
+        self.assertEqual(persisted.sync_status()["state"], "success_nonempty")
+        self.assertEqual(persisted.latest_sync_attempt().snapshot_count, 1)
 
         launcher.serve_forever()
         self.assertEqual(server.serve_calls, 1)
@@ -677,6 +679,25 @@ class ProductLauncherTests(unittest.TestCase):
             ).lifecycle_state,
             LifecycleState.ABSENT,
         )
+        self.assertEqual(SnapshotStore(db).sync_status()["state"], "success_empty")
+
+    def test_runtime_construction_failure_records_no_success_and_no_write(self) -> None:
+        _tmp, db = self.make_db()
+
+        def broken_runtime(**kwargs):
+            raise OSError("private browser configuration")
+
+        with self.assertRaisesRegex(ProductLauncherError, "runtime startup failed"):
+            build_product_launcher(
+                db_path=db, cdp_port=9222,
+                runtime_factory=broken_runtime, clock=lambda: NOW,
+            )
+        self.write_factory.assert_not_called()
+        status = SnapshotStore(db).sync_status()
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["latest_attempt"]["error_kind"], "runtime_unavailable")
+        self.assertIsNone(status["last_successful_attempt"])
+        self.assertNotIn("private browser", str(status))
 
     def test_failed_inventory_stops_before_dashboard_and_writes_nothing(self) -> None:
         _tmp, db = self.make_db()
@@ -718,6 +739,10 @@ class ProductLauncherTests(unittest.TestCase):
         self.assertEqual(dashboard_calls, 0)
         self.write_factory.assert_not_called()
         self.assertEqual(SnapshotStore(db).ad_history("1111111111"), (original,))
+        status = SnapshotStore(db).sync_status()
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["latest_attempt"]["error_kind"], "http_error")
+        self.assertIsNone(status["last_successful_attempt"])
 
     def test_duplicate_inventory_fails_before_dashboard(self) -> None:
         _tmp, db = self.make_db()
@@ -753,6 +778,9 @@ class ProductLauncherTests(unittest.TestCase):
 
         self.assertTrue(inventory.closed)
         self.write_factory.assert_not_called()
+        status = SnapshotStore(db).sync_status()
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["latest_attempt"]["error_kind"], "invalid_inventory")
 
     def test_dashboard_construction_failure_closes_inventory_runtime(self) -> None:
         _tmp, db = self.make_db()

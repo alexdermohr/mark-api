@@ -1229,7 +1229,24 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
                          inherited["metric_evidence"]["views"])
         _, _, html_body = self.get("/")
         html = html_body.decode("utf-8")
-        self.assertIn("Sync-Status: nicht erfasst", html)
+        self.assertIn('id="sync-status"', html)
+        self.assertIn("Letzte bestätigte Bestandsgrundlage", self.get("/dashboard.js")[2].decode("utf-8"))
+        initial = json.loads(self.get("/api/sync/status")[2])
+        self.assertEqual(initial, {
+            "state": "never_attempted",
+            "latest_attempt": None,
+            "last_successful_attempt": None,
+        })
+        self.assertEqual(json.loads(self.get("/api/summary")[2])["sync_status"], initial)
+        attempt_id = self.store.begin_sync_attempt(source="test-owner", started_at=T1)
+        self.assertEqual(json.loads(self.get("/api/sync/status")[2])["state"], "in_progress")
+        self.store.fail_sync_attempt(
+            attempt_id, source="test-owner", completed_at=T1, error_kind="transport_error",
+        )
+        failed = json.loads(self.get("/api/sync/status")[2])
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["latest_attempt"]["error_kind"], "transport_error")
+        self.assertIsNone(failed["last_successful_attempt"])
 
     def test_readyz_detects_existing_recovery_table_missing_required_columns(self) -> None:
         self.assertEqual(json.loads(self.get("/readyz")[2]), {"status": "ready"})
@@ -1263,6 +1280,7 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         failing_paths = (
             "/readyz",
             "/api/summary",
+            "/api/sync/status",
             "/api/ads",
             "/api/analytics/groups?dimension=city&metric=views",
             "/api/ads/1/history",
@@ -1298,6 +1316,30 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         shutil.copyfile(backup, self.store.path)
         self.assertEqual(json.loads(self.get("/readyz")[2]), {"status": "ready"})
         self.assertEqual(json.loads(self.get("/api/summary")[2]), expected)
+
+    def test_corrupted_sync_journal_returns_sanitized_unavailable_http(self) -> None:
+        attempt = self.store.begin_sync_attempt(source="owner", started_at=T1)
+        with sqlite3.connect(self.store.path) as connection:
+            connection.execute(
+                "UPDATE sync_attempts SET started_at='corrupt private value' WHERE id=?",
+                (attempt,),
+            )
+        self.assertEqual(json.loads(self.get("/healthz")[2]), {"status": "ok"})
+        for path in ("/readyz", "/api/summary", "/api/sync/status"):
+            with self.subTest(path=path):
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(self.base + path, timeout=2)
+                error = caught.exception
+                self.assertEqual(error.code, 503)
+                payload = json.loads(error.read())
+                if path == "/readyz":
+                    self.assertEqual(payload, {
+                        "status": "unavailable",
+                        "error": "database_unavailable",
+                    })
+                else:
+                    self.assertEqual(payload, {"error": "database_unavailable"})
+                self.assertNotIn("corrupt private value", str(payload))
 
     def test_history_and_reactions_endpoints(self) -> None:
         _, _, history_body = self.get("/api/ads/1/history")

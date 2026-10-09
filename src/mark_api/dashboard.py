@@ -240,7 +240,8 @@ _DASHBOARD_HTML = """<!doctype html>
 
     <section class="panel">
       <h2>Anzeigen</h2>
-      <p class="note">Die Zähler zeigen jeweils ihren eigenen Zeitpunkt, ihre Quelle und gegebenenfalls „letzter bekannter Wert“. Die Status-Beobachtung ist nicht automatisch das Alter aller Zähler. Sync-Status: nicht erfasst (aus Snapshots wird weder Erfolg noch Fehler abgeleitet).</p>
+      <p id="sync-status" class="note" aria-live="polite">Synchronisationsjournal wird geladen …</p>
+      <p class="note">Der letzte erfolgreiche Bestandsread und das Alter einzelner Zähler sind getrennte Aussagen. Metrikwerte zeigen jeweils ihre eigene Beobachtungszeit, Quelle und gegebenenfalls „letzter bekannter Wert“.</p>
       <div class="table-wrap">
         <table>
           <thead>
@@ -702,6 +703,47 @@ function ageDescription(observedAt) {
   if (hours < 24) return "vor " + hours + (hours === 1 ? " Stunde" : " Stunden");
   const days = Math.floor(hours / 24);
   return "vor " + days + (days === 1 ? " Tag" : " Tagen");
+}
+
+function renderSyncStatus(sync) {
+  const view = byId("sync-status");
+  if (!sync || typeof sync !== "object") {
+    view.textContent = "Sync-Status nicht verfügbar; Datenfrische unbekannt.";
+    return;
+  }
+  const latest = sync.latest_attempt;
+  const successful = sync.last_successful_attempt;
+  const state = sync.state;
+  let headline = "Noch kein Eigentümer-Sync protokolliert.";
+  if (latest && typeof latest === "object") {
+    const ago = ageDescription(latest.started_at);
+    const source = typeof latest.source === "string" ? latest.source : "unbekannt";
+    if (state === "in_progress") {
+      headline = "Letzter Sync gestartet " + ago
+        + " (" + source + "); kein bestätigter Abschluss. Läuft oder wurde unterbrochen.";
+    } else if (state === "failed") {
+      const error = typeof latest.error_kind === "string"
+        ? latest.error_kind : "unbekannt";
+      headline = "Letzter Sync fehlgeschlagen (" + error + ") · "
+        + ageDescription(latest.completed_at) + " · Quelle: " + source + ".";
+    } else if (state === "success_empty" || state === "success_nonempty") {
+      const count = state === "success_empty" ? 0 : latest.snapshot_count;
+      headline = "Letzter Sync erfolgreich · "
+        + (state === "success_empty"
+          ? "bestätigter leerer Besitzerbestand"
+          : String(count) + " Anzeigen")
+        + " · " + ageDescription(latest.completed_at)
+        + " · Quelle: " + source + ".";
+    }
+  }
+  const baseline = successful && typeof successful === "object"
+    ? " Letzte bestätigte Bestandsgrundlage: "
+      + successful.completed_at + " ("
+      + ageDescription(successful.completed_at) + "), Quelle: "
+      + successful.source + "."
+    : " Keine bestätigte Bestandsgrundlage aus diesem Journal.";
+  view.textContent = headline + baseline
+    + " Das Alter einzelner Zähler ist separat ausgewiesen.";
 }
 
 function metricCellWithEvidence(value, evidence) {
@@ -1721,6 +1763,7 @@ async function load() {
     await refreshPendingWrites();
     renderWriteAvailability();
     renderAds(ads);
+    renderSyncStatus(summary.sync_status);
     renderAnalyticsContract(contract);
 
     const metricSelect = byId("metric-select");
@@ -2342,8 +2385,13 @@ def _handler_factory(
                     {"pending_writes": pending_rows},
                 )
                 return
+            if path == "/api/sync/status":
+                self._send_json(200, store.sync_status())
+                return
             if path == "/api/summary":
-                self._send_json(200, summary_to_dict(query.summary()))
+                payload = summary_to_dict(query.summary())
+                payload["sync_status"] = store.sync_status()
+                self._send_json(200, payload)
                 return
             if path == "/api/ads":
                 self._send_json(
