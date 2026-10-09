@@ -87,8 +87,10 @@ WAL-Frames nicht gelesen werden; eine neu auftauchende Sidecar-Datei
 blockiert das Backup. Bei **Rollback-Journalmodus** öffnet sie SQLite
 dagegen normal read-only mit SQLite-Lesesperren, damit parallele
 Produkt-Writes keinen inkonsistenten Snapshot verursachen.
-Bei bereits vorhandenen WAL-Sidecars bleibt der normale
-WAL-konsistente SQLite-Read einschließlich committeter Frames aktiv.
+Bei bereits vorhandenen vollständigen WAL-/SHM-Sidecars bleibt der
+normale WAL-konsistente SQLite-Read einschließlich committeter Frames aktiv.
+Eine allein vorhandene WAL ohne ihre SHM-Datei blockiert das Backup
+fail-closed; der Betreiber muss die SQLite-Wiederherstellung klären.
 Ein vorhandenes SQLite-Rollback-Journal (`-journal`), insbesondere nach
 einem abgestürzten Writer, blockiert jedes Backup bis zur zulässigen
 Offline-Recovery; `immutable=1` darf ein solches Journal nicht umgehen.
@@ -116,6 +118,12 @@ mark-api-backup --db /sicherer/pfad/mark.sqlite \
   Recovery-, Idempotenz- und Sync-Journal-Schema validiert. Der private
   Stage wird nach dem SQLite-Backup unabhängig auf volle Integrität
   und Bereitschaft geprüft.
+- Die SQLite-Schreib- und Prüfverbindung zur privaten Stage werden
+  vor jeder Datenübertragung beziehungsweise Recovery-Abfrage anhand ihrer
+  tatsächlich geöffneten Dateideskriptoren an den bereits gepinnten
+  Stage-Inode gebunden; die Stage-Schreibverbindung verwendet
+  `journal_mode=OFF`, damit keine Kopie über veränderliche temporäre
+  Journalpfade geht.
 - Der private Stage wird nach dem SQLite-Backup auf 0400 gesetzt und sein
   offener Inode gegen Größe/`mtime`/`ctime` der vollständigen
   Integritäts- und Recovery-Prüfung gebunden. SHA-256 und Metadaten werden

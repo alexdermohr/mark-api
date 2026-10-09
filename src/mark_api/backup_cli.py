@@ -123,6 +123,65 @@ def _sqlite_file_fds(magics: tuple[bytes, ...]) -> dict[int, tuple[int, int]]:
     return found
 
 
+def _regular_file_fds() -> dict[int, tuple[int, int]]:
+    """Read device/inode of open regular files even before SQLite writes header."""
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError as exc:
+        raise BackupError("SQLite stage connection inode attestation is unavailable") from exc
+    found: dict[int, tuple[int, int]] = {}
+    for item in names:
+        try:
+            descriptor = int(item)
+            info = os.fstat(descriptor)
+        except (OSError, ValueError):
+            continue
+        if stat.S_ISREG(info.st_mode):
+            found[descriptor] = (info.st_dev, info.st_ino)
+    return found
+
+
+def _assert_stage_connection_inode(sqlite_fd: int, pinned_fd: int) -> None:
+    try:
+        actual = os.fstat(sqlite_fd)
+        pinned = os.fstat(pinned_fd)
+    except OSError as exc:
+        raise BackupError("SQLite stage connection inode was lost") from exc
+    if (
+        not stat.S_ISREG(actual.st_mode)
+        or not stat.S_ISREG(pinned.st_mode)
+        or (actual.st_dev, actual.st_ino) != (pinned.st_dev, pinned.st_ino)
+    ):
+        raise BackupError("SQLite stage connection inode does not match pinned stage")
+
+
+def _attest_stage_connection(
+    connection: sqlite3.Connection,
+    stage_fd: int,
+    before: dict[int, tuple[int, int]],
+) -> int:
+    """Bind a freshly opened SQLite connection to the pinned stage inode.
+
+    The unix SQLite VFS resolves /proc/self/fd/N back to a mutable filename.
+    Attest its actual opened file descriptor before any backup pages or
+    receipt SQL are allowed to reach that connection.
+    """
+    connection.execute("PRAGMA schema_version").fetchone()
+    pinned = os.fstat(stage_fd)
+    identity = (pinned.st_dev, pinned.st_ino)
+    candidates = [
+        descriptor
+        for descriptor, found in _regular_file_fds().items()
+        if descriptor != stage_fd
+        and found == identity
+        and before.get(descriptor) != identity
+    ]
+    if len(candidates) != 1:
+        raise BackupError("SQLite stage connection inode does not match pinned stage")
+    _assert_stage_connection_inode(candidates[0], stage_fd)
+    return candidates[0]
+
+
 def _sqlite_main_fds() -> dict[int, tuple[int, int]]:
     return _sqlite_file_fds((_SQLITE_HEADER,))
 
@@ -517,6 +576,8 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
     wal_digest_before = _sidecar_digest(wal_path, wal_contents_before)
     if wal_before is None and shm_before is not None:
         raise BackupError("WAL source identity has orphan shared memory")
+    if wal_before is not None and shm_before is None:
+        raise BackupError("WAL source identity missing shared memory")
     journal_mode = _source_journal_mode(source, original)
     immutable_source = (
         journal_mode == "wal" and wal_before is None and shm_before is None
@@ -579,16 +640,29 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             )
             resources.callback(os.close, stage_fd)
             stage_ref = Path(f"/proc/self/fd/{stage_fd}")
-            # SQLite must write through the same pinned stage inode that we
-            # later verify and publish. The temp directory pathname can be
-            # renamed/replaced by another local process after os.open().
+            # SQLite's unix VFS can resolve the magic fd link back to a
+            # mutable pathname. Require an actual FD to the pinned inode
+            # before any data-bearing backup() call.
+            copy_before = _regular_file_fds()
             with closing(sqlite3.connect(_uri(stage_ref, "rw"), uri=True, timeout=5)) as copy:
+                sqlite_copy_fd = _attest_stage_connection(copy, stage_fd, copy_before)
+                # The stage is private and temporary: disable its disk journal
+                # so no source pages can leak through a renamed journal path.
+                mode = copy.execute("PRAGMA journal_mode=OFF").fetchone()
+                if mode is None or mode[0].lower() != "off":
+                    raise BackupError("SQLite stage journal cannot be disabled")
+                _assert_stage_connection_inode(sqlite_copy_fd, stage_fd)
                 original_db.backup(copy, pages=128, sleep=0.05)
-            # Establish immutable stage-content evidence before independent
-            # schema/integrity/count reads, not after they have closed.
+                _assert_stage_connection_inode(sqlite_copy_fd, stage_fd)
+            # Independently attest the reader before any integrity/count SQL.
             os.fchmod(stage_fd, 0o400)
             verified_stage = os.fstat(stage_fd)
-            with closing(sqlite3.connect(_uri(stage_ref, "ro"), uri=True, timeout=5)) as check:
+            check_before = _regular_file_fds()
+            with closing(sqlite3.connect(
+                _uri(stage_ref, "ro") + "&immutable=1", uri=True, timeout=5,
+            )) as check:
+                sqlite_check_fd = _attest_stage_connection(check, stage_fd, check_before)
+                _assert_stage_connection_inode(sqlite_check_fd, stage_fd)
                 _require_healthy_store(check)
                 integrity = check.execute("PRAGMA integrity_check").fetchone()
                 if integrity is None or integrity[0] != "ok":

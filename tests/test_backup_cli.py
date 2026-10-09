@@ -830,6 +830,34 @@ os._exit(7)
             self.assertEqual(receipt.pending_api_writes, 0)
         self.assertTrue(self.backup.is_file())
 
+    def test_nonempty_wal_without_shm_fails_closed(self) -> None:
+        # An initially nonempty WAL with no SHM could be filled with earlier
+        # valid frames during SQLite open, then restored after a snapshot.
+        # Do not allow the SQLite connection to reconstruct an unverifiable
+        # WAL index from an incomplete sidecar set.
+        wal = self.source.with_name(self.source.name + "-wal")
+        shm = self.source.with_name(self.source.name + "-shm")
+        captured = self.root / "captured-wal"
+        with closing(sqlite3.connect(self.source)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key,request_sha256,state,requested_at) "
+                "VALUES ('captured-fence','a','in_progress','t')"
+            )
+            writer.commit()
+            self.assertGreater(wal.stat().st_size, 32)
+            shutil.copyfile(wal, captured)
+        gc.collect()
+        self.assertFalse(wal.exists())
+        self.assertFalse(shm.exists())
+        shutil.copyfile(captured, wal)
+        self.assertFalse(shm.exists())
+        with self.assertRaisesRegex(BackupError, "missing shared memory"):
+            backup_store(self.source, backup_db=self.backup)
+        self.assertFalse(self.backup.exists())
+
     def test_swapped_older_wal_sidecars_never_publish_missing_write_fence(self) -> None:
         # Keep committed frames in WAL, snapshot an earlier valid WAL/SHM pair,
         # then transiently substitute those sidecars while SQLite opens its
@@ -1097,6 +1125,82 @@ with closing(sqlite3.connect(db)) as c:
                 backup_store(self.source, backup_db=self.backup)
         self.assertFalse(self.backup.exists())
         self.assertTrue(self.store.is_ready())
+
+    def test_stage_copy_connection_to_other_inode_never_receives_write_data(self) -> None:
+        # The SQLite unix VFS can resolve /proc/self/fd/N to a mutable
+        # pathname and open a different inode. Validate its FD before
+        # invoking the data-bearing online backup, or pending write fences
+        # would be copied into an attacker-accessible file.
+        with closing(sqlite3.connect(self.source)) as db:
+            db.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key,request_sha256,state,requested_at) "
+                "VALUES ('private-write-fence','c','in_progress','t')"
+            )
+            db.commit()
+        impostor = self.root / "attacker.sqlite"
+        SnapshotStore(impostor)
+        gc.collect()
+        real_connect = sqlite3.connect
+        used = False
+
+        def redirect_stage_copy(database, *args, **kwargs):
+            nonlocal used
+            if (
+                not used and isinstance(database, str)
+                and database.startswith("file:/proc/self/fd/")
+                and database.endswith("?mode=rw")
+            ):
+                used = True
+                return real_connect(impostor)
+            return real_connect(database, *args, **kwargs)
+
+        with patch("mark_api.backup_cli.sqlite3.connect", side_effect=redirect_stage_copy):
+            with self.assertRaisesRegex(BackupError, "stage connection inode"):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(used)
+        self.assertFalse(self.backup.exists())
+        with closing(sqlite3.connect(impostor)) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT count(*) FROM write_api_requests "
+                    "WHERE idempotency_key='private-write-fence'"
+                ).fetchone(),
+                (0,),
+            )
+
+    def test_stage_check_connection_to_other_inode_never_uses_wrong_receipt(self) -> None:
+        # A separate stage check connection also must prove the opened FD is
+        # the pinned, freshly copied inode before integrity/receipt reads.
+        with closing(sqlite3.connect(self.source)) as db:
+            db.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key,request_sha256,state,requested_at) "
+                "VALUES ('real-stage-check-fence','c','in_progress','t')"
+            )
+            db.commit()
+        other = self.root / "attacker-healthy.sqlite"
+        SnapshotStore(other)
+        gc.collect()
+        real_connect = sqlite3.connect
+        used = False
+
+        def redirect_check(database, *args, **kwargs):
+            nonlocal used
+            if (
+                not used and isinstance(database, str)
+                and database.startswith("file:/proc/self/fd/")
+                and "?mode=ro" in database
+            ):
+                used = True
+                return real_connect("file:" + str(other) + "?mode=ro", uri=True)
+            return real_connect(database, *args, **kwargs)
+
+        with patch("mark_api.backup_cli.sqlite3.connect", side_effect=redirect_check):
+            with self.assertRaisesRegex(BackupError, "stage connection inode"):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(used)
+        self.assertFalse(self.backup.exists())
 
     def test_stage_content_tamper_after_integrity_cannot_publish_stale_copy(self) -> None:
         # This is intentionally after the stage's SQL integrity/count reads.
