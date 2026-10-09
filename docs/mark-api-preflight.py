@@ -66,6 +66,8 @@ def _trusted_link(path: Path, root: Path) -> None:
     if not inside_install and not (
         path.parent == root / "bin"
         and path.name.startswith("python")
+        and resolved.parent == _SYSTEM_CODE_ROOT / "bin"
+        and resolved.name.startswith("python3")
         and stat.S_ISREG(target_info.st_mode)
     ):
         raise DeploymentBoundaryError("installed package symlink escapes audited install")
@@ -77,7 +79,7 @@ def _safe_pth(path: Path, root: Path) -> None:
     # application preflight. Avoid executing code-bearing .pth declarations,
     # or adding data/code paths outside the trusted install and OS stdlib.
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
     except (OSError, UnicodeError) as exc:
         raise DeploymentBoundaryError("package path declaration is unreadable") from exc
     for line in lines:
@@ -125,12 +127,66 @@ def _check_venv_config(root: Path) -> None:
         resolved = base_home.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise DeploymentBoundaryError("venv Python base is unavailable") from exc
-    if not resolved.is_relative_to(_SYSTEM_CODE_ROOT):
-        raise DeploymentBoundaryError("venv Python base escapes OS trust root")
+    # Only the distro-managed /usr/bin Python layout is supported. Arbitrary
+    # nested OS prefixes can load unscanned stdlib/sitecustomize modules.
+    if base_home != _SYSTEM_CODE_ROOT / "bin" or resolved != base_home:
+        raise DeploymentBoundaryError("venv Python base is not the audited OS installation")
     for path in (base_home, resolved):
         if not stat.S_ISDIR(_trusted_metadata(path).st_mode):
             raise DeploymentBoundaryError("venv Python base is not a trusted directory")
         _trusted_parents(path)
+
+
+def _check_os_stdlib(version: str) -> None:
+    """Audit the executable OS stdlib reachable before application imports.
+
+    The only supported base is /usr/bin backed by /usr/lib/pythonX.Y.
+    Do not trust the /usr prefix alone, including transitive importable code.
+    """
+    if (
+        not version.startswith("python3.")
+        or not version.removeprefix("python3.").isdigit()
+    ):
+        raise DeploymentBoundaryError("installed Python version is not supported")
+    stdlib = _SYSTEM_CODE_ROOT / "lib" / version
+    try:
+        if stdlib.resolve(strict=True) != stdlib:
+            raise DeploymentBoundaryError("system stdlib may not be symlinked")
+    except (OSError, RuntimeError) as exc:
+        raise DeploymentBoundaryError("required OS Python stdlib is unavailable") from exc
+    _trusted_parents(stdlib)
+    stack = [stdlib]
+    while stack:
+        path = stack.pop()
+        info = _trusted_metadata(path)
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                stack.extend(path.iterdir())
+            except OSError as exc:
+                raise DeploymentBoundaryError("system stdlib cannot be audited") from exc
+        elif stat.S_ISLNK(info.st_mode):
+            try:
+                target = path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise DeploymentBoundaryError("system stdlib symlink cannot be trusted") from exc
+            if not target.is_relative_to(stdlib):
+                raise DeploymentBoundaryError("system stdlib symlink escapes audited tree")
+            if not stat.S_ISREG(_trusted_metadata(target).st_mode) and not stat.S_ISDIR(
+                _trusted_metadata(target).st_mode
+            ):
+                raise DeploymentBoundaryError("system stdlib symlink has unsafe target")
+            _trusted_parents(target)
+        elif not stat.S_ISREG(info.st_mode):
+            raise DeploymentBoundaryError("system stdlib has unsafe file type")
+    # CPython can import a standard-library ZIP before the directory tree.
+    # It need not exist, but if present it must be root-owned and immutable.
+    archive = _SYSTEM_CODE_ROOT / "lib" / (
+        version.replace(".", "") + ".zip"
+    )
+    if archive.exists() or archive.is_symlink():
+        if not stat.S_ISREG(_trusted_metadata(archive).st_mode):
+            raise DeploymentBoundaryError("system stdlib archive is not a trusted file")
+        _trusted_parents(archive)
 
 
 def check_installed_code(root: Path) -> None:
@@ -170,6 +226,7 @@ def check_installed_code(root: Path) -> None:
     matches = list(root.glob("lib/python*/site-packages/mark_api/__init__.py"))
     if len(matches) != 1 or not matches[0].resolve(strict=True).is_relative_to(root):
         raise DeploymentBoundaryError("one non-editable Mark package must be installed")
+    _check_os_stdlib(matches[0].parents[2].name)
 
 
 def _require_private_path(

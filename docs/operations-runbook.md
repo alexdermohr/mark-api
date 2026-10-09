@@ -223,10 +223,18 @@ Write-API bleiben loopback-only.
    Der Preflight lehnt zusätzlich .pth-Pfaderweiterungen außerhalb der
    vollständig gescannten Venv, ungescannte Paket-Symlinks nach /usr und
    `include-system-site-packages = true` ab. In `pyvenv.cfg` müssen
-   `include-system-site-packages = false` und ein `home`-Pfad auf eine
-   nachweislich root-owned, nicht schreibbare Python-Basis unter `/usr`
-   zeigen. Ein Venv mit `home` in einem Benutzerverzeichnis ist nicht
-   zulässig, auch wenn die Venv-Dateien selbst root-owned sind.
+   `include-system-site-packages = false` und exakt `home = /usr/bin`
+   enthalten. Andere Python-Basis-Pfade, auch scheinbar geschützte unter
+   `/usr/local`, werden abgewiesen. Der Preflight prüft zusätzlich den
+   vollständig erreichbaren OS-Standardbibliotheksbaum unter
+   `/usr/lib/pythonX.Y` (einschließlich Symlink-Zielen) und gegebenenfalls
+   `/usr/lib/pythonXY.zip` auf root-owned, nicht schreibbare Inhalte.
+   UTF-8-BOM in `.pth`-Dateien werden entsprechend CPythons `site.py`
+   vor der Importzeilenprüfung entfernt. Das normale Mark-Venv setzt somit
+   eine sicher installierte passende OS-Python-Version unter `/usr/bin`
+   voraus; das nur im Benutzer-Home vorhandene Python 3.12 genügt nicht
+   für die isolierte Produktions-Unit. Diese Vorgabe ersetzt keine Prüfung
+   der tatsächlichen Host- und Dienst-Identität.
    Die OS-System-Python-Version darf älter sein; sie startet ausschließlich
    den isolierten stdlib-Preflight mit `-I -S`.
 2. Vor dem ersten Start einmalig ein dediziertes, nicht interaktives

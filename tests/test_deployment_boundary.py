@@ -223,7 +223,15 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             (third / "Image.py").write_text("# code\n", encoding="utf-8")
             (root / "bin").mkdir()
             (root / "bin/python").write_bytes(b"python-test-executable")
-            (root / "pyvenv.cfg").write_text("home = /usr/bin\ninclude-system-site-packages = false\n")
+            fake_usr = Path(tmp) / "usr"
+            (fake_usr / "bin").mkdir(parents=True)
+            (fake_usr / "bin/python3").write_bytes(b"synthetic-system-python")
+            system_stdlib = fake_usr / "lib/python3.12"
+            system_stdlib.mkdir(parents=True)
+            (system_stdlib / "site.py").write_text("# trusted OS stdlib\n")
+            (root / "pyvenv.cfg").write_text(
+                f"home = {fake_usr / 'bin'}\ninclude-system-site-packages = false\n"
+            )
             ancestor_paths = set(root.parents)
 
             def simulated_root_lstat(path):
@@ -234,7 +242,10 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
                 mode = actual.st_mode & ~0o022 if is_ancestor else actual.st_mode
                 return SimpleNamespace(st_mode=mode, st_uid=0, st_gid=0)
 
-            with patch.object(boundary, "_lstat", side_effect=simulated_root_lstat) as mock:
+            with (
+                patch.object(boundary, "_lstat", side_effect=simulated_root_lstat) as mock,
+                patch.object(boundary, "_SYSTEM_CODE_ROOT", fake_usr),
+            ):
                 yield root, site, mock
 
     def test_bootstrap_scans_all_installed_first_and_third_party_code(self) -> None:
@@ -298,7 +309,7 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
         with self._fake_root_install() as (root, site, _probe):
             python = root / "bin/python"
             python.unlink()
-            python.symlink_to("/usr/bin/python3")
+            python.symlink_to(root.parent.parent / "usr/bin/python3")
             boundary.check_installed_code(root)
 
     def test_preflight_rejects_unscanned_system_package_symlink(self) -> None:
@@ -372,6 +383,81 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
                 "home = /home/alex/.local/share/uv/python/bin\n"
                 "include-system-site-packages = false\n"
             )
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
+
+    def test_preflight_rejects_utf8_bom_executable_pth(self) -> None:
+        # CPython site.addpackage strips a UTF-8 BOM before parsing imports.
+        with self._fake_root_install() as (root, site, _probe):
+            (site / "bom-execute.pth").write_bytes(
+                b"\xef\xbb\xbfimport malicious_site_hook\n"
+            )
+            with self.assertRaisesRegex(
+                boundary.DeploymentBoundaryError, "executable package path"
+            ):
+                boundary.check_installed_code(root)
+
+    def test_preflight_rejects_custom_python_under_usr_with_writable_stdlib(self) -> None:
+        # A trusted *prefix* does not secure derived stdlib/sitecustomize paths.
+        with self._fake_root_install() as (root, site, _probe):
+            fake_usr = root.parent.parent / "usr"
+            home = fake_usr / "local/custom-python/bin"
+            home.mkdir(parents=True)
+            foreign_module = fake_usr / "local/custom-python/lib/python3.12/sitecustomize.py"
+            foreign_module.parent.mkdir(parents=True)
+            foreign_module.write_text("raise RuntimeError('untrusted module')\n")
+            foreign_module.chmod(0o666)
+            (root / "pyvenv.cfg").write_text(
+                f"home = {home}\ninclude-system-site-packages = false\n"
+            )
+            with patch.object(boundary, "_SYSTEM_CODE_ROOT", fake_usr):
+                with self.assertRaises(boundary.DeploymentBoundaryError):
+                    boundary.check_installed_code(root)
+
+    def test_preflight_rejects_writable_system_stdlib_under_trusted_bin(self) -> None:
+        # Even /usr/bin may import writable /usr/lib/pythonX.Y/sitecustomize.
+        with self._fake_root_install() as (root, site, _probe):
+            fake_usr = root.parent.parent / "usr"
+            system_bin = fake_usr / "bin"
+            system_bin.mkdir(parents=True, exist_ok=True)
+            system_lib = fake_usr / "lib/python3.12"
+            system_lib.mkdir(parents=True, exist_ok=True)
+            (system_lib / "sitecustomize.py").write_text("# attacker\n")
+            (system_lib / "sitecustomize.py").chmod(0o666)
+            (root / "pyvenv.cfg").write_text(
+                f"home = {system_bin}\ninclude-system-site-packages = false\n"
+            )
+            with patch.object(boundary, "_SYSTEM_CODE_ROOT", fake_usr):
+                with self.assertRaises(boundary.DeploymentBoundaryError):
+                    boundary.check_installed_code(root)
+
+    def test_preflight_rejects_bom_absolute_pth_path(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            foreign = root.parent.parent / "usr/local/python-plugins"
+            foreign.mkdir(parents=True)
+            (site / "bom-path.pth").write_bytes(
+                b"\xef\xbb\xbf" + str(foreign).encode("utf-8") + b"\n"
+            )
+            with self.assertRaisesRegex(
+                boundary.DeploymentBoundaryError, "escapes audited install"
+            ):
+                boundary.check_installed_code(root)
+
+    def test_preflight_rejects_writable_stdlib_archive(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            archive = root.parent.parent / "usr/lib/python312.zip"
+            archive.write_bytes(b"synthetic-importable-archive")
+            archive.chmod(0o666)
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
+
+    def test_preflight_rejects_stdlib_symlink_to_unscanned_os_code(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            usr = root.parent.parent / "usr"
+            foreign = usr / "local/writable-plugin.py"
+            foreign.parent.mkdir(parents=True)
+            foreign.write_text("# external import\n")
+            (usr / "lib/python3.12/alias.py").symlink_to(foreign)
             with self.assertRaises(boundary.DeploymentBoundaryError):
                 boundary.check_installed_code(root)
 
