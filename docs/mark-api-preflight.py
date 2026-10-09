@@ -171,12 +171,15 @@ def _check_os_stdlib(version: str) -> None:
                 target = path.resolve(strict=True)
             except (OSError, RuntimeError) as exc:
                 raise DeploymentBoundaryError("system stdlib symlink cannot be trusted") from exc
-            if not target.is_relative_to(stdlib):
-                raise DeploymentBoundaryError("system stdlib symlink escapes audited tree")
-            if not stat.S_ISREG(_trusted_metadata(target).st_mode) and not stat.S_ISDIR(
-                _trusted_metadata(target).st_mode
-            ):
+            target_info = _trusted_metadata(target)
+            regular = stat.S_ISREG(target_info.st_mode)
+            directory = stat.S_ISDIR(target_info.st_mode)
+            if not (regular or directory):
                 raise DeploymentBoundaryError("system stdlib symlink has unsafe target")
+            # A distro may link sitecustomize.py to /etc/pythonX.Y. Accept
+            # only trusted external *files*, never unscanned directories.
+            if not target.is_relative_to(stdlib) and not regular:
+                raise DeploymentBoundaryError("system stdlib symlink escapes audited tree")
             _trusted_parents(target)
         elif not stat.S_ISREG(info.st_mode):
             raise DeploymentBoundaryError("system stdlib has unsafe file type")
@@ -189,6 +192,43 @@ def _check_os_stdlib(version: str) -> None:
         if not stat.S_ISREG(_trusted_metadata(archive).st_mode):
             raise DeploymentBoundaryError("system stdlib archive is not a trusted file")
         _trusted_parents(archive)
+
+
+
+def _check_venv_interpreter(root: Path, version: str) -> None:
+    """Bind the actual service interpreter to the audited OS stdlib version.
+
+    A root-owned copied binary or an alias to another Python minor version
+    can load unrelated import roots before mark_api is even imported.
+    """
+    expected = _SYSTEM_CODE_ROOT / "bin" / version
+    if not stat.S_ISREG(_trusted_metadata(expected).st_mode):
+        raise DeploymentBoundaryError("audited system Python must be a regular file")
+    _trusted_parents(expected)
+    try:
+        entries = list((root / "bin").iterdir())
+    except OSError as exc:
+        raise DeploymentBoundaryError("venv interpreter directory is unavailable") from exc
+    found_service_interpreter = False
+    for entry in entries:
+        name = entry.name
+        if not (
+            name in ("python", "python3", version)
+            or name.startswith("python3.") and name[8:].isdigit()
+        ):
+            continue
+        if not stat.S_ISLNK(_lstat(entry).st_mode):
+            raise DeploymentBoundaryError("venv Python must link to audited OS interpreter")
+        try:
+            resolved = entry.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise DeploymentBoundaryError("venv Python interpreter link is unsafe") from exc
+        if resolved != expected:
+            raise DeploymentBoundaryError("venv Python version differs from audited OS stdlib")
+        if name == "python":
+            found_service_interpreter = True
+    if not found_service_interpreter:
+        raise DeploymentBoundaryError("isolated Mark Python interpreter is missing")
 
 
 def check_installed_code(root: Path) -> None:
@@ -223,12 +263,12 @@ def check_installed_code(root: Path) -> None:
         else:
             raise DeploymentBoundaryError("installed code has an unexpected file type")
     _check_venv_config(root)
-    if not (root / "bin/python").exists():
-        raise DeploymentBoundaryError("isolated Mark Python interpreter is missing")
     matches = list(root.glob("lib/python*/site-packages/mark_api/__init__.py"))
     if len(matches) != 1 or not matches[0].resolve(strict=True).is_relative_to(root):
         raise DeploymentBoundaryError("one non-editable Mark package must be installed")
-    _check_os_stdlib(matches[0].parents[2].name)
+    version = matches[0].parents[2].name
+    _check_venv_interpreter(root, version)
+    _check_os_stdlib(version)
 
 
 def _require_private_path(

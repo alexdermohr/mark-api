@@ -218,8 +218,13 @@ Write-API bleiben loopback-only.
    umwidmen:** Bereits gehaltene writable Mappings könnten sonst weiter
    auf seine Inodes wirken. Stattdessen ein neues, leeres root-owned Venv
    aus geprüftem Release anlegen und dessen Pakete direkt dort installieren.
-   Der Python-Interpreter muss selbst root-owned und unter `/usr` oder im
-   geschützten Venv liegen; Symlinks auf ein User-Home scheitern am Preflight.
+   Der tatsächlich gestartete `/opt/mark-api/venv/bin/python` und seine
+   vorhandenen Python-Interpreter-Aliasse müssen Symlinks auf **dieselbe**
+   root-owned `/usr/bin/python3.X`-Datei sein, deren `X` dem einzigen
+   installierten Mark-Paketverzeichnis `lib/python3.X/site-packages` entspricht.
+   Kopierte Interpreter im Venv oder Links auf andere Minor-Versionen
+   werden abgelehnt, weil sie ungeprüfte Standardbibliotheken laden könnten.
+   Symlinks auf ein Benutzer-Home sind unzulässig.
    Der Preflight lehnt zusätzlich .pth-Pfaderweiterungen außerhalb der
    vollständig gescannten Venv, ungescannte Paket-Symlinks nach /usr und
    `include-system-site-packages = true` ab. In `pyvenv.cfg` müssen
@@ -228,7 +233,11 @@ Write-API bleiben loopback-only.
    `/usr/local`, werden abgewiesen. Der Preflight prüft zusätzlich den
    vollständig erreichbaren OS-Standardbibliotheksbaum unter
    `/usr/lib/pythonX.Y` (einschließlich Symlink-Zielen) und gegebenenfalls
-   `/usr/lib/pythonXY.zip` auf root-owned, nicht schreibbare Inhalte.
+   `/usr/lib/pythonXY.zip` auf root-owned, nicht schreibbare Inhalte. Ein
+   OS-übliches Symlink auf eine externe **reguläre Datei** (etwa
+   `/etc/pythonX.Y/sitecustomize.py`) ist nur bei geschütztem Ziel und
+   geschützter gesamter Elternkette zulässig; externe Verzeichnis-Symlinks
+   bleiben gesperrt.
    UTF-8-BOM in `.pth`-Dateien werden entsprechend CPythons `site.py`
    vor der Importzeilenprüfung entfernt. Das normale Mark-Venv setzt somit
    eine sicher installierte passende OS-Python-Version unter `/usr/bin`

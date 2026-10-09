@@ -266,10 +266,10 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             third.mkdir()
             (third / "Image.py").write_text("# code\n", encoding="utf-8")
             (root / "bin").mkdir()
-            (root / "bin/python").write_bytes(b"python-test-executable")
             fake_usr = Path(tmp) / "usr"
             (fake_usr / "bin").mkdir(parents=True)
-            (fake_usr / "bin/python3").write_bytes(b"synthetic-system-python")
+            (fake_usr / "bin/python3.12").write_bytes(b"synthetic-system-python")
+            (root / "bin/python").symlink_to(fake_usr / "bin/python3.12")
             system_stdlib = fake_usr / "lib/python3.12"
             system_stdlib.mkdir(parents=True)
             (system_stdlib / "site.py").write_text("# trusted OS stdlib\n")
@@ -353,7 +353,7 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
         with self._fake_root_install() as (root, site, _probe):
             python = root / "bin/python"
             python.unlink()
-            python.symlink_to(root.parent.parent / "usr/bin/python3")
+            python.symlink_to(root.parent.parent / "usr/bin/python3.12")
             boundary.check_installed_code(root)
 
     def test_preflight_rejects_unscanned_system_package_symlink(self) -> None:
@@ -420,6 +420,27 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
                 (root / "pyvenv.cfg").write_text(content)
                 with self.assertRaises(boundary.DeploymentBoundaryError):
                     boundary.check_installed_code(root)
+
+    def test_preflight_rejects_python_binary_with_unattested_stdlib(self) -> None:
+        # A root-owned copied interpreter in the venv can derive a different
+        # stdlib root from the one selected by the installed package path.
+        with self._fake_root_install() as (root, site, _probe):
+            python = root / "bin/python"
+            python.unlink()
+            python.write_bytes(b"copied-python-unknown-stdlib")
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
+
+    def test_preflight_rejects_python_symlink_to_wrong_minor_version(self) -> None:
+        # A legitimate-looking /usr/bin/python3.13 symlink would import
+        # a separate unchecked stdlib despite the package living in python3.12.
+        with self._fake_root_install() as (root, site, _probe):
+            other = root.parent.parent / "usr/bin/python3.13"
+            other.write_bytes(b"synthetic-other-system-python")
+            (root / "bin/python").unlink()
+            (root / "bin/python").symlink_to(other)
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
 
     def test_preflight_rejects_untrusted_python_base(self) -> None:
         with self._fake_root_install() as (root, site, _probe):
@@ -495,12 +516,24 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             with self.assertRaises(boundary.DeploymentBoundaryError):
                 boundary.check_installed_code(root)
 
+    def test_preflight_accepts_root_protected_external_stdlib_file_symlink(self) -> None:
+        # Distro Python commonly links sitecustomize.py to /etc/pythonX.Y.
+        # The target and every ancestor are root-owned/non-writable.
+        with self._fake_root_install() as (root, site, _probe):
+            usr = root.parent.parent / "usr"
+            outside = usr / "etc/python3.12/sitecustomize.py"
+            outside.parent.mkdir(parents=True)
+            outside.write_text("# trusted sitecustomize\n")
+            (usr / "lib/python3.12/sitecustomize.py").symlink_to(outside)
+            boundary.check_installed_code(root)
+
     def test_preflight_rejects_stdlib_symlink_to_unscanned_os_code(self) -> None:
         with self._fake_root_install() as (root, site, _probe):
             usr = root.parent.parent / "usr"
             foreign = usr / "local/writable-plugin.py"
             foreign.parent.mkdir(parents=True)
             foreign.write_text("# external import\n")
+            foreign.chmod(0o666)
             (usr / "lib/python3.12/alias.py").symlink_to(foreign)
             with self.assertRaises(boundary.DeploymentBoundaryError):
                 boundary.check_installed_code(root)
