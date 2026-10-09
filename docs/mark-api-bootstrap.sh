@@ -76,14 +76,33 @@ unsafe=$(/usr/bin/find -L "$stdlib" \
         raw=$(/usr/bin/readlink "$link") || exit 1
         path=$(/usr/bin/readlink -f "$link") || exit 1
         [ -n "$path" ] || exit 1
-        # Only a direct link can be attested by the target-parent scan.
-        # Intermediate symlinks can be replaced between preflight and import.
+        # Audit each lexical transit component *before* resolving ../.
+        # Protected Ubuntu ../../ links are valid; writable intermediate
+        # directories and chained symlinks are not.
         case "$raw" in
-            /*) direct="$raw" ;;
-            */*|"."|"..") exit 1 ;;
-            *) direct="${link%/*}/$raw" ;;
+            /*) walk=/ ;;
+            *) walk="${link%/*}" ;;
         esac
-        [ "$direct" = "$path" ] || exit 1
+        old_ifs=$IFS
+        IFS=/
+        set -f
+        for part in $raw; do
+            case "$part" in
+                ""|".") continue ;;
+                "..") walk=${walk%/*}; [ -n "$walk" ] || walk=/ ;;
+                *) case "$walk" in
+                    /) walk="/$part" ;;
+                    *) walk="$walk/$part" ;;
+                   esac ;;
+            esac
+            unsafe=$(/usr/bin/find -P "$walk" -maxdepth 0 \
+                \( ! -uid 0 -o -perm /022 -o \( ! -type d -a ! -type f \) \) \
+                -print -quit) || exit 1
+            [ -z "$unsafe" ] || exit 1
+        done
+        set +f
+        IFS=$old_ifs
+        [ "$walk" = "$path" ] || exit 1
         while :; do
             unsafe=$(/usr/bin/find -P "$path" -maxdepth 0 \
                 \( ! -uid 0 -o -perm /022 -o \( ! -type d -a ! -type f \) \) \

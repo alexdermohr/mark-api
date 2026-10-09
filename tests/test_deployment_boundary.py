@@ -154,6 +154,55 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             )
             self.assertNotEqual(blocked.returncode, 0)
 
+    def test_native_stdlib_relative_link_requires_protected_transit(self) -> None:
+        # Execute the exact production find -exec shell body with a synthetic
+        # private tree. For temporary test-only files, accept test UID as
+        # well as root; the mode and inode-type requirements are unchanged.
+        script = (DOCS / "mark-api-bootstrap.sh").read_text(encoding="utf-8")
+        start = '/usr/bin/find -P "$stdlib" -type l -exec /bin/sh -c ' + "'\n"
+        end = "\n' _ {} + || fail"
+        self.assertIn(start, script)
+        body = script.split(start, 1)[1].split(end, 1)[0]
+        body = body.replace(
+            "! -uid 0", rf"\( ! -uid 0 -a ! -uid {os.getuid()} \)"
+        )
+        # /tmp is root-owned mode 1777; exempt only this sticky parent in
+        # the synthetic test, not the user-owned writable attack directory.
+        body = body.replace(
+            "-perm /022",
+            r"\( -perm /022 -a ! \( -uid 0 -a -perm /1000 \) \)",
+        )
+        command = start + body + "\n' _ {} +"
+        with TemporaryDirectory(prefix="mark-native-stdlib-") as tmp:
+            lib = Path(tmp) / "usr/lib"
+            stdlib = lib / "python3.12"
+            config = stdlib / "config-3.12-x86_64-linux-gnu"
+            config.mkdir(parents=True)
+            target = lib / "x86_64-linux-gnu/libpython3.12.so.1"
+            target.parent.mkdir()
+            target.write_bytes(b"synthetic-trusted-library")
+            (config / "libpython3.12.so").symlink_to(
+                "../../x86_64-linux-gnu/libpython3.12.so.1"
+            )
+            env = {**os.environ, "stdlib": str(stdlib)}
+            good = subprocess.run(
+                ["/bin/sh", "-c", command],
+                capture_output=True, text=True, check=False, env=env,
+            )
+            self.assertEqual(good.returncode, 0, good.stderr)
+
+            writable = lib / "mutable"
+            writable.mkdir()
+            writable.chmod(0o777)
+            (config / "unsafe.so").symlink_to(
+                "../../mutable/../x86_64-linux-gnu/libpython3.12.so.1"
+            )
+            bad = subprocess.run(
+                ["/bin/sh", "-c", command],
+                capture_output=True, text=True, check=False, env=env,
+            )
+            self.assertNotEqual(bad.returncode, 0)
+
     def test_native_bootstrap_attests_preflight_file_before_python(self) -> None:
         script = (DOCS / "mark-api-bootstrap.sh").read_text(encoding="utf-8")
         check = 'trusted "/etc/mark-api/preflight.py"'
@@ -645,6 +694,21 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             outside.parent.mkdir(parents=True)
             outside.write_text("# trusted sitecustomize\n")
             (usr / "lib/python3.12/sitecustomize.py").symlink_to(outside)
+            boundary.check_installed_code(root)
+
+    def test_preflight_allows_attested_ubuntu_parent_relative_stdlib_link(self) -> None:
+        # Ubuntu's config-3.12-* libpython link traverses two trusted
+        # root-owned parent directories to /usr/lib/x86_64-linux-gnu.
+        with self._fake_root_install() as (root, site, _probe):
+            usr = root.parent.parent / "usr"
+            target = usr / "lib/x86_64-linux-gnu/libpython3.12.so.1"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"synthetic-root-owned-library")
+            config = usr / "lib/python3.12/config-3.12-x86_64-linux-gnu"
+            config.mkdir()
+            (config / "libpython3.12.so").symlink_to(
+                "../../x86_64-linux-gnu/libpython3.12.so.1"
+            )
             boundary.check_installed_code(root)
 
     def test_preflight_rejects_stdlib_link_through_writable_intermediary(self) -> None:

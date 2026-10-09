@@ -50,20 +50,39 @@ def _trusted_parents(path: Path) -> None:
             raise DeploymentBoundaryError("trusted installation has a symlinked parent")
 
 
-def _trusted_link(path: Path, root: Path) -> None:
+def _attest_direct_link(path: Path) -> Path:
+    """Follow lexical components while checking *every* visited inode.
+
+    Merely normalizing ../ before stat omits an attacker-writable component.
+    Intermediate symlinks are deliberately unsupported; direct protected
+    parent-relative paths (e.g. Ubuntu's ../../libpython.so) are allowed.
+    """
     try:
-        # Compare the literal link target with its fully resolved target.
-        # A chain through an independently writable intermediary may be
-        # retargeted after the preflight, even when it resolves safely now.
-        raw_target = os.readlink(path)
-        if ".." in raw_target.split("/"):
-            raise DeploymentBoundaryError("installed code symlink traverses parent path")
-        literal = Path(os.path.normpath(str(path.parent / raw_target)))
+        raw = os.readlink(path)
+        current = Path("/") if raw.startswith("/") else path.parent
+        if not stat.S_ISDIR(_trusted_metadata(current).st_mode):
+            raise DeploymentBoundaryError("symlink parent is not a trusted directory")
+        _trusted_parents(current)
+        segments = [item for item in raw.split("/") if item and item != "."]
+        for index, item in enumerate(segments):
+            current = current.parent if item == ".." else current / item
+            info = _trusted_metadata(current)
+            if stat.S_ISLNK(info.st_mode):
+                raise DeploymentBoundaryError("symlink crosses an untrusted link component")
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise DeploymentBoundaryError("symlink traverses an unexpected inode type")
+            if index < len(segments) - 1 and not stat.S_ISDIR(info.st_mode):
+                raise DeploymentBoundaryError("symlink transit component is not a directory")
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise DeploymentBoundaryError("installed code symlink cannot be trusted") from exc
-    if literal != resolved:
-        raise DeploymentBoundaryError("installed code symlink uses an unaudited intermediary")
+        raise DeploymentBoundaryError("installed symlink cannot be attested") from exc
+    if current != resolved:
+        raise DeploymentBoundaryError("symlink resolution differs from attested transit")
+    return resolved
+
+
+def _trusted_link(path: Path, root: Path) -> None:
+    resolved = _attest_direct_link(path)
     inside_install = resolved.is_relative_to(root)
     if not inside_install and not resolved.is_relative_to(_SYSTEM_CODE_ROOT):
         raise DeploymentBoundaryError("installed code symlink escapes trusted roots")
@@ -83,7 +102,6 @@ def _trusted_link(path: Path, root: Path) -> None:
     ):
         raise DeploymentBoundaryError("installed package symlink escapes audited install")
     _trusted_parents(resolved)
-
 
 def _safe_pth(path: Path, root: Path) -> None:
     # Site-package .pth files may extend sys.path or run code *before*
@@ -176,18 +194,9 @@ def _check_os_stdlib(version: str) -> None:
             except OSError as exc:
                 raise DeploymentBoundaryError("system stdlib cannot be audited") from exc
         elif stat.S_ISLNK(info.st_mode):
-            try:
-                raw_target = os.readlink(path)
-                if ".." in raw_target.split("/"):
-                    raise DeploymentBoundaryError("system stdlib symlink traverses parent path")
-                literal = Path(os.path.normpath(str(path.parent / raw_target)))
-                target = path.resolve(strict=True)
-            except (OSError, RuntimeError) as exc:
-                raise DeploymentBoundaryError("system stdlib symlink cannot be trusted") from exc
-            # Reject chained links (including an intermediate writable
-            # directory) before trusting the final target metadata.
-            if literal != target:
-                raise DeploymentBoundaryError("system stdlib symlink has an unsafe intermediary")
+            # Ubuntu's stdlib may link via protected ../ parent directories.
+            # Audit those lexical inodes before resolving the final target.
+            target = _attest_direct_link(path)
             target_info = _trusted_metadata(target)
             regular = stat.S_ISREG(target_info.st_mode)
             directory = stat.S_ISDIR(target_info.st_mode)
