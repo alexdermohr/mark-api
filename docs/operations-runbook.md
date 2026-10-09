@@ -132,11 +132,13 @@ mark-api-backup --db /sicherer/pfad/mark.sqlite \
   SQLite Online Backup kopiert in die private In-Memory-Datenbank;
   dort werden Integrität und alle Receipt-Zähler vor der Serialisierung
   geprüft. Eine zweite dateibasierte SQLite-Stage-Verbindung entfällt.
-- Die serialisierten Bytes besitzen einen eigenen SHA-256-Bezug und
-  werden ausschließlich über den offenen `O_TMPFILE`-Inode geschrieben,
-  ohne vorherigen Dateinamen im Zielverzeichnis. Bei Speichermangel,
-  fehlender Serialisierung oder nicht unterstütztem `O_TMPFILE` wird
-  fail-closed abgebrochen.
+- Die serialisierten Bytes besitzen einen unveränderlichen SHA-256-
+  Referenzwert aus dem geprüften RAM-Snapshot. Jeder spätere Stage-Hash
+  muss diesem ursprünglichen Wert entsprechen; ein späterer Hash wird
+  niemals als neue Vertrauensbasis übernommen. Geschrieben wird nur
+  über den offenen `O_TMPFILE`-Inode ohne vorherigen Dateinamen im
+  Zielverzeichnis. Bei Speichermangel, fehlender Serialisierung oder
+  nicht unterstütztem `O_TMPFILE` wird fail-closed abgebrochen.
 - Der anonyme Stage-Inode wird auf 0400 gesetzt und mit fsync sowie
   Hash- und Metadatenkontrollen geprüft. Nach atomarer create-only-
   Hardlink-Veröffentlichung folgen ein erneuter Hash-/Inode-Readback und

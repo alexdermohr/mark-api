@@ -472,6 +472,15 @@ def _sha256_fd(descriptor: int) -> str:
     return digest.hexdigest()
 
 
+@contextmanager
+def _memory_allocation_fence():
+    """Never expose an uncontrolled MemoryError or partial backup receipt."""
+    try:
+        yield
+    except MemoryError as exc:
+        raise BackupError("in-memory backup allocation unavailable") from exc
+
+
 def _require_healthy_store(connection: sqlite3.Connection) -> None:
     connection.row_factory = sqlite3.Row
     # Read-only: do not let SnapshotStore.__init__ implicitly migrate anything.
@@ -569,7 +578,12 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             # SQLite only writes into private process memory. Its unix VFS
             # can resolve /proc/self/fd/N into an attacker-replaceable path;
             # never give it a file-backed stage or journal pathname.
-            with closing(sqlite3.connect(":memory:", timeout=5)) as snapshot:
+            # Wrap connection creation, online copy, schema/count reads and
+            # serialization: all memory pressure must fail closed before any
+            # anonymous stage is created or linked.
+            with _memory_allocation_fence(), closing(
+                sqlite3.connect(":memory:", timeout=5)
+            ) as snapshot:
                 original_db.backup(snapshot, pages=128, sleep=0.05)
                 _require_healthy_store(snapshot)
                 integrity = snapshot.execute("PRAGMA integrity_check").fetchone()
@@ -639,6 +653,8 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             _assert_no_rollback_journal(journal_path)
             os.fsync(stage_fd)
             backup_sha256 = _sha256_fd(stage_fd)
+            if backup_sha256 != expected_image_sha256:
+                raise BackupError("anonymous backup stage contents changed after fsync")
             _assert_stage_contents_unchanged(stage_fd, verified_stage)
             _source_identity_unchanged(source, original)
             _assert_source_connection_inode(sqlite_source_fd, original)
@@ -678,7 +694,7 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 != (published.st_dev, published.st_ino)
             ):
                 raise BackupError("backup publication identity mismatch")
-            if _sha256_fd(stage_fd) != backup_sha256:
+            if _sha256_fd(stage_fd) != expected_image_sha256:
                 raise BackupError("backup stage contents changed after publication")
             _assert_stage_contents_unchanged(stage_fd, linked_stage)
             _assert_destination_parent(target.parent, target_dir_fd)

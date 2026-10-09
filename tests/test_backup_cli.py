@@ -1229,6 +1229,59 @@ with closing(sqlite3.connect(db)) as c:
             receipt.backup_sha256,
         )
 
+    def test_stage_hash_never_rebaselines_after_verified_memory_image(self) -> None:
+        # Model a stage whose bytes change after the first trusted
+        # in-memory-image hash comparison, while filesystem metadata appears
+        # unchanged (e.g. an already-dirty shared mmap page). Both later
+        # readbacks may agree on a stale digest; neither may supersede the
+        # original validated snapshot hash.
+        genuine_hash = backup_cli._sha256_fd
+        reads = 0
+        substituted_hash = "f" * 64
+
+        def later_stage_hash(descriptor):
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                return genuine_hash(descriptor)
+            return substituted_hash
+
+        with patch("mark_api.backup_cli._sha256_fd", side_effect=later_stage_hash):
+            with self.assertRaisesRegex(BackupError, "anonymous backup stage contents changed"):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertGreaterEqual(reads, 2)
+        self.assertFalse(self.backup.exists())
+        self.assertTrue(self.store.is_ready())
+
+    def test_in_memory_backup_copy_memory_error_fails_closed(self) -> None:
+        # Allocation can fail inside sqlite3.Connection.backup() before
+        # serialize() runs. The CLI must return a controlled BackupError
+        # and never create or publish a partial target.
+        class SourceFailingDuringCopy(sqlite3.Connection):
+            def backup(self, target, *, pages=-1, progress=None, name="main", sleep=0.250):
+                raise MemoryError("synthetic in-memory SQLite copy exhaustion")
+
+        source_uri = backup_cli._uri(self.source, "ro")
+        actual_connect = sqlite3.connect
+        triggered = False
+
+        def connect_with_failing_backup(database, *args, **kwargs):
+            nonlocal triggered
+            if database == source_uri:
+                triggered = True
+                kwargs["factory"] = SourceFailingDuringCopy
+            return actual_connect(database, *args, **kwargs)
+
+        with patch(
+            "mark_api.backup_cli.sqlite3.connect",
+            side_effect=connect_with_failing_backup,
+        ):
+            with self.assertRaisesRegex(BackupError, "in-memory backup"):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(triggered)
+        self.assertFalse(self.backup.exists())
+        self.assertTrue(self.store.is_ready())
+
     def test_in_memory_snapshot_serialization_memory_error_fails_closed(self) -> None:
         # In-memory snapshots require available RAM. Exhaustion must fail
         # before a target is linked, without deleting recovery fences.
