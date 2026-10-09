@@ -19,6 +19,7 @@ mark-api-import-mail = "mark_api.email_import_cli:main"
 mark-api-local-smoke = "mark_api.local_smoke:main"
 mark-api-launch = "mark_api.launcher:main"
 mark-api-migrate-legacy = "mark_api.legacy_migration:main"
+mark-api-backup = "mark_api.backup_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

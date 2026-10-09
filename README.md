@@ -79,6 +79,29 @@ Für jede Plattformaktion erzeugt die Browser-UX genau einen Idempotency-Key. Vo
 
 CDP, Dashboard und Write API bleiben auf Loopback begrenzt. Ein zusätzlicher Write-Opt-in ist im normalen Produktpfad nicht erforderlich. Schlägt Initial-Read oder expliziter Mail-Import fehl, startet keine HTTP-Surface. Kann die Write API nicht starten, wird das Dashboard nicht konstruiert; scheitert die spätere Dashboard-Konstruktion, wird die bereits gestartete Write-Runtime geschlossen. Der Launcher führt weiterhin **keine periodische Synchronisation** aus; Freshness/Recovery folgen separat.
 
+## Backup und Wiederanlauf des Gesamtprodukts (A6)
+
+Das installierte Tool **mark-api-backup** sichert eine bestehende, vollständig
+validierte SQLite-Produktdatenbank einschließlich WAL, Sync-Journal und
+persistenter Write-Idempotenz-/Dashboard-Pending-Fences. Es erzeugt
+ausschließlich einen neuen, geschützten Backup-Pfad und überschreibt
+keine vorhandenen Daten. Kein Plattformrequest wird ausgelöst.
+
+~~~bash
+mark-api-backup --db /sicherer/pfad/mark.sqlite \
+  --backup /sicherer/backup-ordner/mark-2026-10-09.sqlite
+~~~
+
+Backup-Receipt, aktuelle Start-/Readiness-Prüfungen, sichere Offline-Restores
+**nur auf neue Pfade**, Reconciliation ungeklärter Plattformwrites sowie die
+verifizierten und weiterhin offenen Gesamtprodukt-Gates stehen im
+[Betriebs- und Wiederanlaufhandbuch](docs/operations-runbook.md).
+Eine lokale Backup-/Restore-Abnahme ist keine Berechtigung zur
+Kleinanzeigen-Plattformautomation und kein Ersatz für einen echten,
+autorisierten Create/Update/Delete/Media-End-to-End-Test. Die normale
+Write-Komposition des Product Launchers bleibt default-on; Authentisierung,
+Confirmation, Ownership und No-Blind-Retry bleiben unverändert.
+
 ## Historische SQLite-Datenbanken sicher übernehmen
 
 Eine ältere Mark-Datenbank kann 3, 4, 5, 6, 7 oder 8 der heute 9 Tabellen enthalten. Beim normalen Start und auch mit `--init-db` werden fehlende Tabellen **nicht** automatisch nachgebaut: Die alten Dateien besitzen keinen verlässlichen Schema-Versionsmarker. Eine historisch noch nicht angelegte Recovery-Tabelle lässt sich deshalb nicht sicher von einem nach einem Plattformwrite verlorenen Idempotenz-Fence unterscheiden.
