@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+import gc
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import mark_api.backup_cli as backup_cli
 from mark_api.backup_cli import BackupError, backup_store, main
 from mark_api.domain import AdSnapshot, LifecycleState
 from mark_api.results import ReadResult
@@ -24,6 +26,10 @@ NOW = datetime(2026, 10, 9, 5, 0, tzinfo=timezone.utc)
 
 class BackupCliTests(unittest.TestCase):
     def setUp(self) -> None:
+        # sqlite3.Connection.__exit__ commits but does not close. Reclaim
+        # unreachable handles from prior tests so their temp DBs cannot be
+        # mistaken for concurrently opened, unrelated SQLite files.
+        gc.collect()
         self.directory = tempfile.TemporaryDirectory(prefix="mark-backup-test-")
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
@@ -229,6 +235,95 @@ class BackupCliTests(unittest.TestCase):
         self.assertTrue(self.backup.is_file())
         with self.assertRaisesRegex(BackupError, "already exists"):
             backup_store(self.source, backup_db=self.backup)
+
+    def test_source_swapped_during_sqlite_connect_never_publishes_wrong_inode(self) -> None:
+        # A valid substitute database can be connected while the public path
+        # is temporarily replaced, then the original pathname restored. A
+        # later lstat(path) is NOT proof of what the SQLite handle opened.
+        with sqlite3.connect(self.source) as connection:
+            connection.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("real-pending-fence", "c" * 64, NOW.isoformat()),
+            )
+        fake = self.root / "other-valid.sqlite"
+        SnapshotStore(fake)
+        # The attack database is created in-process for this test. Drop
+        # unreachable temporary SQLite connections to model a separate
+        # attacker process rather than rejecting an unrelated local handle.
+        gc.collect()
+        moved = self.root / "original-temporarily-moved.sqlite"
+        original = sqlite3.connect
+        source_uri = backup_cli._uri(self.source, "ro")
+        swapped = False
+        starting_inode = self.source.stat().st_ino
+
+        def malicious_connect(database, *args, **kwargs):
+            nonlocal swapped
+            if database != source_uri or swapped:
+                return original(database, *args, **kwargs)
+            swapped = True
+            os.replace(self.source, moved)
+            os.replace(fake, self.source)
+            try:
+                connection = original(database, *args, **kwargs)
+                # Force SQLite to open the substituted file descriptor BEFORE
+                # we put the original filename back.
+                connection.execute("PRAGMA schema_version").fetchone()
+                return connection
+            finally:
+                os.replace(self.source, fake)
+                os.replace(moved, self.source)
+
+        with patch("mark_api.backup_cli.sqlite3.connect", side_effect=malicious_connect):
+            with self.assertRaisesRegex(BackupError, "source inode"):
+                backup_store(self.source, backup_db=self.backup)
+
+        self.assertTrue(swapped)
+        self.assertFalse(self.backup.exists())
+        self.assertEqual(self.source.stat().st_ino, starting_inode)
+        with sqlite3.connect(self.source) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='real-pending-fence'"
+                ).fetchone(),
+                ("in_progress",),
+            )
+
+    def test_preexisting_sqlite_fd_fails_closed_instead_of_trusting_fd_reuse(self) -> None:
+        # An fd-number delta does not identify an SQLite connection: a
+        # concurrent close/reopen on the same inode could hide an impostor.
+        # Backup therefore rejects unrelated main-file handles instead of
+        # accepting a plausible but misattributed fd delta.
+        other = self.root / "another.sqlite"
+        SnapshotStore(other)
+        with sqlite3.connect(other) as outside:
+            outside.execute("PRAGMA schema_version").fetchone()
+            self.assertTrue(backup_cli._sqlite_main_fds())
+            with self.assertRaisesRegex(BackupError, "unrelated open SQLite files"):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertFalse(self.backup.exists())
+        self.assertTrue(self.store.is_ready())
+
+    def test_existing_real_source_connection_still_allows_wal_backup(self) -> None:
+        # Online backup must work while a legitimate handle holds the same
+        # validated inode; only unrelated preexisting SQLite files are unsafe.
+        with sqlite3.connect(self.source) as live:
+            live.execute("PRAGMA schema_version").fetchone()
+            receipt = backup_store(self.source, backup_db=self.backup)
+            self.assertEqual(receipt.pending_api_writes, 0)
+        self.assertTrue(self.backup.is_file())
+
+    def test_missing_sqlite_fd_attestation_fails_closed(self) -> None:
+        # Do not silently fall back to pathname validation on non-Linux or
+        # procfs-restricted hosts: it would reintroduce the race above.
+        with patch("mark_api.backup_cli.os.listdir", side_effect=OSError("blocked")):
+            with self.assertRaisesRegex(BackupError, "attestation is unavailable"):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertFalse(self.backup.exists())
+        self.assertTrue(self.store.is_ready())
 
     def test_late_directory_fsync_error_preserves_new_backup_without_retry(self) -> None:
         # Publication may have succeeded even when the durability confirmation

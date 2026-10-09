@@ -65,6 +65,13 @@ Die neue installierte **mark-api-backup**-CLI benutzt SQLite Online Backup
 statt einer unsicheren Kopie der live genutzten Datenbankdatei. Committe
 WAL-Daten werden in einem konsistenten Punkt-in-Zeit-Snapshot erfasst.
 
+Die Quell-Inode-Attestation benötigt Linux mit lesbarem `/proc/self/fd`.
+Das Backup vorzugsweise als **eigenständigen CLI-Prozess** ausführen:
+im selben Prozess vorbestehende SQLite-Hauptdateideskriptoren fremder Datenbanken
+oder eine nicht eindeutig bestimmbare Quellbindung führen zum sicheren Abbruch.
+Bestehende Handles derselben validierten Quelle bleiben zulässig; ein unsicherer
+Pfad-Fallback findet nicht statt.
+
 ~~~bash
 mkdir -m 700 -p /sicherer/backup-ordner
 mark-api-backup --db /sicherer/pfad/mark.sqlite \

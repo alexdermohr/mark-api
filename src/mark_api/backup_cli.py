@@ -66,6 +66,79 @@ def _source_identity_unchanged(path: Path, original: os.stat_result) -> None:
         raise BackupError("source identity changed during backup")
 
 
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _sqlite_main_fds() -> dict[int, tuple[int, int]]:
+    """Identify live SQLite main-file descriptors in this Linux process.
+
+    A connection's PRAGMA database_list only exposes its *path*, which can be
+    swapped back after sqlite3.connect. Inspect actual open file descriptors
+    instead. Fail closed on hosts without the Linux proc-fd readback.
+    """
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError as exc:
+        raise BackupError("SQLite source inode attestation is unavailable") from exc
+    found: dict[int, tuple[int, int]] = {}
+    for item in names:
+        try:
+            descriptor = int(item)
+            first = os.fstat(descriptor)
+            if not stat.S_ISREG(first.st_mode):
+                continue
+            if os.pread(descriptor, len(_SQLITE_HEADER), 0) != _SQLITE_HEADER:
+                continue
+            second = os.fstat(descriptor)
+        except (OSError, ValueError):
+            # Listing /proc/self/fd itself creates a transient directory fd.
+            continue
+        if (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino):
+            found[descriptor] = (first.st_dev, first.st_ino)
+    return found
+
+def _attest_source_connection(
+    connection: sqlite3.Connection,
+    before: dict[int, tuple[int, int]],
+    source: os.stat_result,
+) -> int:
+    """Require exactly one newly opened SQLite main fd bound to source.
+
+    Preexisting SQLite main files must all be the validated source inode.
+    Otherwise a preexisting foreign fd could close and be reused for the
+    substituted inode with the same number, hiding it from the fd diff.
+    Existing handles to the real source remain safe for live SQLite backups.
+    Normal SQLite pathname/WAL resolution must remain intact.
+    """
+    connection.execute("PRAGMA schema_version").fetchone()
+    opened = _sqlite_main_fds()
+    candidates = [
+        (descriptor, identity)
+        for descriptor, identity in opened.items()
+        if before.get(descriptor) != identity
+    ]
+    if len(candidates) != 1 or candidates[0][1] != (source.st_dev, source.st_ino):
+        raise BackupError("SQLite source inode does not match validated database")
+    return candidates[0][0]
+
+
+def _assert_source_connection_inode(
+    descriptor: int, source: os.stat_result,
+) -> None:
+    """Require the already-attested SQLite fd to remain bound until publish."""
+    try:
+        current = os.fstat(descriptor)
+        header = os.pread(descriptor, len(_SQLITE_HEADER), 0)
+    except OSError as exc:
+        raise BackupError("SQLite source connection identity was lost") from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != (source.st_dev, source.st_ino)
+        or header != _SQLITE_HEADER
+    ):
+        raise BackupError("SQLite source connection identity changed")
+
+
 def _new_target(path: Path) -> None:
     try:
         parent = path.parent.lstat()
@@ -140,12 +213,21 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
         raise BackupError("source and backup must be different")
     original = _validated_source(source)
     _new_target(target)
+    opened_before = _sqlite_main_fds()
+    if any(
+        identity != (original.st_dev, original.st_ino)
+        for identity in opened_before.values()
+    ):
+        raise BackupError("SQLite source attestation has unrelated open SQLite files")
 
     try:
         with (
             closing(sqlite3.connect(_uri(source, "ro"), uri=True, timeout=5)) as original_db,
             tempfile.TemporaryDirectory(prefix=".mark-backup-", dir=target.parent) as temp_dir,
         ):
+            sqlite_source_fd = _attest_source_connection(
+                original_db, opened_before, original,
+            )
             _require_healthy_store(original_db)
             staged = Path(temp_dir) / "backup.sqlite"
             flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
@@ -180,8 +262,9 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             os.chmod(staged, 0o400)
             _fsync_file(staged)
             backup_sha256 = _sha256(staged)
-            # Recheck source and create-only destination directly before publish.
+            # Recheck both the path and the actual open SQLite source inode.
             _source_identity_unchanged(source, original)
+            _assert_source_connection_inode(sqlite_source_fd, original)
             _new_target(target)
             os.link(staged, target)
             try:
@@ -202,6 +285,7 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             # Post-publication drift invalidates a success claim. The copy
             # remains available for manual inspection; never blindly retry.
             _source_identity_unchanged(source, original)
+            _assert_source_connection_inode(sqlite_source_fd, original)
             return BackupReceipt(
                 created_at=datetime.now(timezone.utc).isoformat(),
                 backup_sha256=backup_sha256,
