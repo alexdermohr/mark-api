@@ -89,6 +89,14 @@ dagegen normal read-only mit SQLite-Lesesperren, damit parallele
 Produkt-Writes keinen inkonsistenten Snapshot verursachen.
 Bei bereits vorhandenen vollständigen WAL-/SHM-Sidecars bleibt der
 normale WAL-konsistente SQLite-Read einschließlich committeter Frames aktiv.
+Fehlen beide Sidecars, werden zusätzlich alle serialisierten Snapshot-Seiten
+mit den roh aus dem geprüften Hauptdatei-Deskriptor gelesenen Seiten
+verglichen; lediglich der von SQLite beim Backup veränderbare
+Schema-Cookie im Header ist ausgenommen. Ein zwar valider, aber während
+des Öffnens veralteter SQLite-Snapshot führt damit zum Abbruch statt zum
+Verlust offener Write-Recovery-Einträge. Dieser Abgleich ist keine
+kontinuierliche Kernel-Isolation gegen einen aktiv böswilligen Prozess mit
+denselben Dateirechten und manipulierbaren Prüfzeitpunkten.
 Eine allein vorhandene WAL ohne ihre SHM-Datei blockiert das Backup
 fail-closed; der Betreiber muss die SQLite-Wiederherstellung klären.
 Ein vorhandenes SQLite-Rollback-Journal (`-journal`), insbesondere nach

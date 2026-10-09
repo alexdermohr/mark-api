@@ -481,6 +481,52 @@ def _memory_allocation_fence():
         raise BackupError("in-memory backup allocation unavailable") from exc
 
 
+def _assert_quiet_source_snapshot_matches(
+    source_fd: int, image: bytes,
+) -> None:
+    """Bind sidecarless SQLite snapshot pages to the actual open source inode.
+
+    SQLite Online Backup can legitimately adjust the four schema-cookie bytes
+    in page 1 (offsets 40..43). All other on-disk bytes must equal the
+    validated in-memory copy if the main database has no active WAL.
+    This catches a stale but structurally healthy SQLite pager snapshot even
+    when a local mmap writer has restored the main file's metadata.
+    """
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != len(image):
+            raise BackupError("source snapshot contents differ from validated database")
+        view = memoryview(image)
+        try:
+            offset = 0
+            while offset < len(view):
+                data = os.pread(source_fd, min(1024 * 1024, len(view) - offset), offset)
+                if not data:
+                    raise BackupError("source snapshot contents cannot be read")
+                expected = view[offset:offset + len(data)]
+                if offset == 0:
+                    # The destination's schema-cookie may be advanced by the
+                    # SQLite backup API, but that counter holds no user data.
+                    if data[:40] != expected[:40] or data[44:] != expected[44:]:
+                        raise BackupError("source snapshot contents differ from validated database")
+                elif data != expected:
+                    raise BackupError("source snapshot contents differ from validated database")
+                offset += len(data)
+        finally:
+            view.release()
+        after = os.fstat(source_fd)
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in (
+                "st_dev", "st_ino", "st_size", "st_nlink",
+                "st_mtime_ns", "st_ctime_ns",
+            )
+        ):
+            raise BackupError("source snapshot contents changed during verification")
+    except OSError as exc:
+        raise BackupError("source snapshot contents could not be attested") from exc
+
+
 def _require_healthy_store(connection: sqlite3.Connection) -> None:
     connection.row_factory = sqlite3.Row
     # Read-only: do not let SnapshotStore.__init__ implicitly migrate anything.
@@ -609,6 +655,12 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                     image = snapshot.serialize()
                 except (AttributeError, MemoryError, sqlite3.Error) as exc:
                     raise BackupError("in-memory backup serialization unavailable") from exc
+                # With neither WAL nor SHM initially present, all committed
+                # records are in the main file. A separate raw FD comparison
+                # rejects a transiently stale SQLite pager image; a live WAL
+                # cannot be compared this way because its frames overlay main.
+                if wal_before is None and shm_before is None:
+                    _assert_quiet_source_snapshot_matches(sqlite_source_fd, image)
             if not image or image[:16] != _SQLITE_HEADER:
                 raise BackupError("in-memory backup serialization is invalid")
             # O_TMPFILE leaves no stage pathname to swap or pre-open. The

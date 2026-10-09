@@ -515,6 +515,63 @@ with closing(sqlite3.connect(sys.argv[1])) as writer:
                 ("in_progress",),
             )
 
+    def test_quiet_source_stale_pager_cannot_lose_open_write_fence(self) -> None:
+        # Model the outcome of a transient same-inode mmap overwrite during
+        # SQLite's source read. Metadata and inode of the actual source stay
+        # valid after restoration, but the copied SQLite pages are from an
+        # older healthy Mark database without the pending Write fence.
+        with closing(sqlite3.connect(self.source)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES ('source-current-fence', 'a', 'in_progress', ?)",
+                (NOW.isoformat(),),
+            )
+            writer.commit()
+        gc.collect()
+        self.assertFalse(self.source.with_name(self.source.name + "-wal").exists())
+        stale = self.root / "stale-valid.sqlite"
+        SnapshotStore(stale)
+        gc.collect()
+        self.assertEqual(self.source.stat().st_size, stale.stat().st_size)
+        normal_connect = sqlite3.connect
+        uri = backup_cli._uri(self.source, "ro") + "&immutable=1"
+        used = False
+
+        class StaleSourcePages(sqlite3.Connection):
+            def backup(self, target, *, pages=-1, progress=None, name="main", sleep=0.250):
+                nonlocal used
+                used = True
+                with closing(normal_connect(stale)) as older:
+                    return older.backup(
+                        target, pages=pages, progress=progress, name=name, sleep=sleep,
+                    )
+
+        def source_with_transient_stale_pages(database, *args, **kwargs):
+            if database == uri:
+                kwargs["factory"] = StaleSourcePages
+            return normal_connect(database, *args, **kwargs)
+
+        with patch(
+            "mark_api.backup_cli.sqlite3.connect",
+            side_effect=source_with_transient_stale_pages,
+        ):
+            with self.assertRaisesRegex(
+                BackupError, "source snapshot contents",
+            ):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(used)
+        self.assertFalse(self.backup.exists())
+        with closing(sqlite3.connect(self.source)) as current:
+            self.assertEqual(
+                current.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='source-current-fence'"
+                ).fetchone(),
+                ("in_progress",),
+            )
+
     def test_same_inode_main_content_restore_never_loses_pending_write(self) -> None:
         # An attacker can overwrite the SAME source inode with an older valid
         # Mark DB for SQLite's read, then restore the original contents while
