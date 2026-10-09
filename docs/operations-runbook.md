@@ -69,8 +69,14 @@ Die Quell-Inode-Attestation benötigt Linux mit lesbarem `/proc/self/fd`.
 Das Backup vorzugsweise als **eigenständigen CLI-Prozess** ausführen:
 im selben Prozess vorbestehende SQLite-Hauptdateideskriptoren fremder Datenbanken
 oder eine nicht eindeutig bestimmbare Quellbindung führen zum sicheren Abbruch.
-Bestehende Handles derselben validierten Quelle bleiben zulässig; ein unsicherer
-Pfad-Fallback findet nicht statt.
+Auch die tatsächlichen `-wal`-Dateideskriptoren und neu eingebundenen
+`-shm`-Mappings werden über die Linux-Inode-Identität geprüft. Ein
+Sidecar-Wechsel oder eine fehlgeschlagene procfs-Attestation blockiert die
+Sicherung. Bestehende Handles derselben validierten Quelle bleiben zulässig;
+ein unsicherer Pfad-Fallback findet nicht statt. Temporäre Sicherungsdatei
+und endgültige create-only-Veröffentlichung werden über geöffnete Stage-
+und Zielverzeichnis-Deskriptoren adressiert, nicht über erneut aufgelöste
+veränderliche Elternpfade.
 
 ~~~bash
 mkdir -m 700 -p /sicherer/backup-ordner
@@ -81,6 +87,8 @@ mark-api-backup --db /sicherer/pfad/mark.sqlite \
 - Das Ziel darf *noch nicht existieren*. Auch Symlinks und defekte
   Symlinks werden nicht überschrieben. Das reale Elternverzeichnis
   muss vorhanden sein. Die Quelle darf kein Symlink/Hardlink-Alias sein.
+  Namen der SQLite-Quell-Sidecars (`-wal`, `-shm`, `-journal`) sind
+  als Backup-Ziel ebenfalls gesperrt.
 - Vor dem Backup wird die aktuelle Mark-Datenbank read-only inklusive
   Recovery-, Idempotenz- und Sync-Journal-Schema validiert. Der private
   Stage wird nach dem SQLite-Backup unabhängig auf volle Integrität

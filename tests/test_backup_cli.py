@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import gc
 import io
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import sqlite3
+import subprocess
+import sys
 import stat
 import tempfile
 import unittest
@@ -133,6 +136,35 @@ class BackupCliTests(unittest.TestCase):
                 (1,),
             )
 
+    def test_backup_includes_committed_frames_still_in_live_wal(self) -> None:
+        # Keep the SQLite writer open after commit, with automatic checkpoint
+        # disabled. This proves the pending recovery fence is read from the
+        # actual nonempty WAL, not from an already checkpointed main database.
+        wal = self.source.with_name(self.source.name + "-wal")
+        with closing(sqlite3.connect(self.source)) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode=WAL").fetchone(), ("wal",))
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("live-wal-pending-fence", "d" * 64, NOW.isoformat()),
+            )
+            writer.commit()
+            self.assertTrue(wal.is_file())
+            self.assertGreater(wal.stat().st_size, 32)
+            receipt = backup_store(self.source, backup_db=self.backup)
+            self.assertEqual(receipt.pending_api_writes, 1)
+            self.assertTrue(wal.is_file())
+        with closing(sqlite3.connect(self.backup)) as restored:
+            self.assertEqual(
+                restored.execute(
+                    "SELECT state FROM write_api_requests WHERE idempotency_key=?",
+                    ("live-wal-pending-fence",),
+                ).fetchone(),
+                ("in_progress",),
+            )
+
     def test_create_only_never_overwrites_existing_backup(self) -> None:
         first = backup_store(self.source, backup_db=self.backup)
         old_bytes = self.backup.read_bytes()
@@ -154,6 +186,15 @@ class BackupCliTests(unittest.TestCase):
         with self.assertRaisesRegex(BackupError, "already exists"):
             backup_store(self.source, backup_db=self.backup)
         self.assertTrue(self.backup.is_symlink())
+
+    def test_reserved_source_sidecar_targets_are_rejected(self) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            with self.subTest(suffix=suffix):
+                sidecar = self.source.with_name(self.source.name + suffix)
+                was_present = sidecar.exists()
+                with self.assertRaisesRegex(BackupError, "source SQLite sidecar"):
+                    backup_store(self.source, backup_db=sidecar)
+                self.assertEqual(sidecar.exists(), was_present)
 
     def test_source_symlink_and_hardlink_are_refused(self) -> None:
         alias = self.root / "alias.sqlite"
@@ -315,6 +356,197 @@ class BackupCliTests(unittest.TestCase):
             receipt = backup_store(self.source, backup_db=self.backup)
             self.assertEqual(receipt.pending_api_writes, 0)
         self.assertTrue(self.backup.is_file())
+
+    def test_swapped_older_wal_sidecars_never_publish_missing_write_fence(self) -> None:
+        # Keep committed frames in WAL, snapshot an earlier valid WAL/SHM pair,
+        # then transiently substitute those sidecars while SQLite opens its
+        # read-only source. The main database inode never changes.
+        wal = self.source.with_name(self.source.name + "-wal")
+        shm = self.source.with_name(self.source.name + "-shm")
+        old_wal = self.root / "old-source-wal"
+        old_shm = self.root / "old-source-shm"
+        moved_wal = self.root / "current-wal-moved"
+        moved_shm = self.root / "current-shm-moved"
+        with closing(sqlite3.connect(self.source)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("before-wal-swap", "e" * 64, NOW.isoformat()),
+            )
+            writer.commit()
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+            shutil.copyfile(wal, old_wal)
+            shutil.copyfile(shm, old_shm)
+            writer.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("latest-wal-fence", "f" * 64, NOW.isoformat()),
+            )
+            writer.commit()
+            original_connect = sqlite3.connect
+            original_uri = backup_cli._uri(self.source, "ro")
+            swapped = False
+
+            def connect_using_old_wal(database, *args, **kwargs):
+                nonlocal swapped
+                if database != original_uri or swapped:
+                    return original_connect(database, *args, **kwargs)
+                swapped = True
+                os.replace(wal, moved_wal)
+                os.replace(old_wal, wal)
+                os.replace(shm, moved_shm)
+                os.replace(old_shm, shm)
+                try:
+                    db = original_connect(database, *args, **kwargs)
+                    db.execute("PRAGMA schema_version").fetchone()
+                    return db
+                finally:
+                    os.replace(wal, old_wal)
+                    os.replace(moved_wal, wal)
+                    os.replace(shm, old_shm)
+                    os.replace(moved_shm, shm)
+
+            with patch("mark_api.backup_cli.sqlite3.connect", side_effect=connect_using_old_wal):
+                with self.assertRaisesRegex(BackupError, "WAL source identity"):
+                    backup_store(self.source, backup_db=self.backup)
+            self.assertTrue(swapped)
+            self.assertFalse(self.backup.exists())
+            self.assertEqual(
+                writer.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='latest-wal-fence'"
+                ).fetchone(),
+                ("in_progress",),
+            )
+
+    def test_swapped_only_shm_during_sqlite_open_fails_closed(self) -> None:
+        # Use a separate SQLite writer process so this backup process cannot
+        # reuse that writer's already-open -shm mapping (SQLite VFS cache).
+        shm = self.source.with_name(self.source.name + "-shm")
+        stale_shm = self.root / "stale-shared-memory"
+        held_shm = self.root / "current-shared-memory"
+        source_uri = backup_cli._uri(self.source, "ro")
+        original_connect = sqlite3.connect
+        swapped = False
+        child_code = """
+import sys, sqlite3
+from contextlib import closing
+db = sys.argv[1]
+with closing(sqlite3.connect(db)) as c:
+    c.execute('PRAGMA journal_mode=WAL')
+    c.execute('PRAGMA wal_autocheckpoint=0')
+    c.execute("INSERT INTO write_api_requests (idempotency_key,request_sha256,state,requested_at) VALUES (?,?, 'in_progress',?)",
+              ('shm-base','a'*64,'2026-10-09T05:00:00+00:00'))
+    c.commit()
+    print('BASE', flush=True)
+    sys.stdin.readline()
+    c.execute("INSERT INTO write_api_requests (idempotency_key,request_sha256,state,requested_at) VALUES (?,?, 'in_progress',?)",
+              ('shm-new-fence','b'*64,'2026-10-09T05:00:00+00:00'))
+    c.commit()
+    print('READY', flush=True)
+    sys.stdin.readline()
+"""
+        process = subprocess.Popen(
+            [sys.executable, "-u", "-c", child_code, str(self.source)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        def require_child_signal(expected: str) -> None:
+            assert process.stdout is not None
+            self.assertTrue(select.select([process.stdout], [], [], 10)[0])
+            self.assertEqual(process.stdout.readline().strip(), expected)
+
+        try:
+            require_child_signal("BASE")
+            self.assertTrue(shm.exists())
+            shutil.copyfile(shm, stale_shm)
+            assert process.stdin is not None
+            process.stdin.write(chr(10))
+            process.stdin.flush()
+            require_child_signal("READY")
+            gc.collect()
+
+            def swapped_connect(database, *args, **kwargs):
+                nonlocal swapped
+                if swapped or database != source_uri:
+                    return original_connect(database, *args, **kwargs)
+                swapped = True
+                os.replace(shm, held_shm)
+                os.replace(stale_shm, shm)
+                try:
+                    connection = original_connect(database, *args, **kwargs)
+                    connection.execute("PRAGMA schema_version").fetchone()
+                    return connection
+                finally:
+                    os.replace(shm, stale_shm)
+                    os.replace(held_shm, shm)
+
+            with patch("mark_api.backup_cli.sqlite3.connect", side_effect=swapped_connect):
+                with self.assertRaisesRegex(BackupError, "WAL source identity"):
+                    backup_store(self.source, backup_db=self.backup)
+            self.assertTrue(swapped)
+            self.assertFalse(self.backup.exists())
+        finally:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+    def test_destination_parent_swap_never_claims_attacker_directory(self) -> None:
+        destination_parent = self.root / "private-backups"
+        destination_parent.mkdir(mode=0o700)
+        destination = destination_parent / "new.sqlite"
+        attacker_parent = self.root / "attacker-backups"
+        attacker_parent.mkdir(mode=0o700)
+        displaced = self.root / "private-backups-moved"
+        real_link = os.link
+        swapped = False
+
+        def swap_parent_at_link(src, dst, *args, **kwargs):
+            nonlocal swapped
+            if swapped:
+                return real_link(src, dst, *args, **kwargs)
+            swapped = True
+            destination_parent.rename(displaced)
+            # A replacement *real directory* passes a path-only O_NOFOLLOW
+            # parent fsync, unlike a symlink; this is the adversarial case.
+            attacker_parent.rename(destination_parent)
+            # The vulnerable path-based implementation could be lured into
+            # linking an attacker copy of its temp stage and receipting it.
+            try:
+                relative = Path(src).relative_to(destination_parent)
+            except ValueError:
+                pass  # A pinned /proc/self/fd source cannot be redirected.
+            else:
+                shadow = destination_parent / relative
+                shadow.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(displaced / relative, shadow)
+            return real_link(src, dst, *args, **kwargs)
+
+        try:
+            with patch("mark_api.backup_cli.os.link", side_effect=swap_parent_at_link):
+                with self.assertRaisesRegex(BackupError, "destination directory"):
+                    backup_store(self.source, backup_db=destination)
+        finally:
+            if destination_parent.exists() and displaced.exists():
+                destination_parent.rename(attacker_parent)
+            if displaced.exists():
+                displaced.rename(destination_parent)
+        self.assertTrue(swapped)
+        self.assertFalse((attacker_parent / "new.sqlite").exists())
 
     def test_missing_sqlite_fd_attestation_fails_closed(self) -> None:
         # Do not silently fall back to pathname validation on non-Linux or

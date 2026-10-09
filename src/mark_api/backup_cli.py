@@ -7,7 +7,7 @@ remain pending recovery fences in the backup.
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -69,33 +69,41 @@ def _source_identity_unchanged(path: Path, original: os.stat_result) -> None:
 _SQLITE_HEADER = b"SQLite format 3\x00"
 
 
-def _sqlite_main_fds() -> dict[int, tuple[int, int]]:
-    """Identify live SQLite main-file descriptors in this Linux process.
+_WAL_MAGICS = (b"\x37\x7f\x06\x82", b"\x37\x7f\x06\x83")
 
-    A connection's PRAGMA database_list only exposes its *path*, which can be
-    swapped back after sqlite3.connect. Inspect actual open file descriptors
-    instead. Fail closed on hosts without the Linux proc-fd readback.
-    """
+
+def _sqlite_file_fds(magics: tuple[bytes, ...]) -> dict[int, tuple[int, int]]:
+    """Attest open SQLite/WAL file identities through Linux procfs."""
     try:
         names = os.listdir("/proc/self/fd")
     except OSError as exc:
         raise BackupError("SQLite source inode attestation is unavailable") from exc
     found: dict[int, tuple[int, int]] = {}
+    length = max(map(len, magics))
     for item in names:
         try:
             descriptor = int(item)
             first = os.fstat(descriptor)
             if not stat.S_ISREG(first.st_mode):
                 continue
-            if os.pread(descriptor, len(_SQLITE_HEADER), 0) != _SQLITE_HEADER:
+            signature = os.pread(descriptor, length, 0)
+            if not any(signature.startswith(magic) for magic in magics):
                 continue
             second = os.fstat(descriptor)
         except (OSError, ValueError):
-            # Listing /proc/self/fd itself creates a transient directory fd.
             continue
         if (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino):
             found[descriptor] = (first.st_dev, first.st_ino)
     return found
+
+
+def _sqlite_main_fds() -> dict[int, tuple[int, int]]:
+    return _sqlite_file_fds((_SQLITE_HEADER,))
+
+
+def _sqlite_wal_fds() -> dict[int, tuple[int, int]]:
+    return _sqlite_file_fds(_WAL_MAGICS)
+
 
 def _attest_source_connection(
     connection: sqlite3.Connection,
@@ -139,49 +147,160 @@ def _assert_source_connection_inode(
         raise BackupError("SQLite source connection identity changed")
 
 
-def _new_target(path: Path) -> None:
+def _sidecar_identity(path: Path) -> tuple[int, int] | None:
     try:
-        parent = path.parent.lstat()
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise BackupError("WAL source identity is unsafe")
+    return info.st_dev, info.st_ino
+
+
+def _shared_file_mappings() -> set[tuple[int, int]]:
+    """Identify file-backed shared mappings, including renamed SQLite -shm.
+
+    Pathnames in /proc/self/maps are not reliable after a rename. Compare
+    numeric mapped device/inode against the attested -shm inode instead.
+    """
+    found: set[tuple[int, int]] = set()
+    try:
+        with open("/proc/self/maps", encoding="ascii") as mappings:
+            for line in mappings:
+                fields = line.split(maxsplit=5)
+                if len(fields) < 5 or len(fields[1]) != 4 or fields[1][3] != "s":
+                    continue
+                if int(fields[4]) == 0:
+                    continue
+                major, minor = fields[3].split(":", 1)
+                found.add((os.makedev(int(major, 16), int(minor, 16)), int(fields[4])))
+    except (OSError, ValueError) as exc:
+        raise BackupError("WAL source identity mapping attestation is unavailable") from exc
+    return found
+
+
+def _attest_sidecars(
+    wal_path: Path, shm_path: Path,
+    wal_before: tuple[int, int] | None,
+    shm_before: tuple[int, int] | None,
+    open_wal_before: dict[int, tuple[int, int]],
+    maps_before: set[tuple[int, int]],
+) -> tuple[tuple[int, int] | None, int | None, tuple[int, int] | None]:
+    wal_now = _sidecar_identity(wal_path)
+    shm_now = _sidecar_identity(shm_path)
+    if (
+        (wal_before is not None and wal_now != wal_before)
+        or (shm_before is not None and shm_now != shm_before)
+    ):
+        raise BackupError("WAL source identity changed during connection")
+    observed = _sqlite_wal_fds()
+    candidates = [
+        (fd, identity) for fd, identity in observed.items()
+        if open_wal_before.get(fd) != identity
+    ]
+    if wal_now is None:
+        if candidates:
+            raise BackupError("WAL source identity cannot be attested")
+        wal_fd = None
+    elif len(candidates) != 1 or candidates[0][1] != wal_now:
+        raise BackupError("WAL source identity does not match SQLite connection")
+    else:
+        wal_fd = candidates[0][0]
+    introduced_maps = _shared_file_mappings() - maps_before
+    if any(identity != shm_now for identity in introduced_maps):
+        raise BackupError("WAL source identity differs from SQLite shared mappings")
+    return wal_now, wal_fd, shm_now
+
+
+def _assert_sidecars_unchanged(
+    wal_path: Path, wal_identity: tuple[int, int] | None, wal_fd: int | None,
+    shm_path: Path, shm_identity: tuple[int, int] | None,
+    maps_before: set[tuple[int, int]],
+) -> None:
+    if _sidecar_identity(wal_path) != wal_identity:
+        raise BackupError("WAL source identity changed during backup")
+    if _sidecar_identity(shm_path) != shm_identity:
+        raise BackupError("WAL source identity changed during backup")
+    if wal_fd is not None:
+        try:
+            now = os.fstat(wal_fd)
+            signature = os.pread(wal_fd, 4, 0)
+        except OSError as exc:
+            raise BackupError("WAL source identity fd was lost") from exc
+        if (
+            (now.st_dev, now.st_ino) != wal_identity
+            or signature not in _WAL_MAGICS
+        ):
+            raise BackupError("WAL source identity fd changed")
+    if any(identity != shm_identity for identity in _shared_file_mappings() - maps_before):
+        raise BackupError("WAL source identity mapping changed")
+
+
+def _assert_destination_parent(path: Path, descriptor: int) -> None:
+    try:
+        current = path.lstat()
+        pinned = os.fstat(descriptor)
+    except OSError as exc:
+        raise BackupError("destination directory identity was lost") from exc
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or not stat.S_ISDIR(pinned.st_mode)
+        or (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino)
+    ):
+        raise BackupError("destination directory identity changed")
+
+
+@contextmanager
+def _pinned_destination_parent(path: Path):
+    try:
+        original = path.lstat()
     except FileNotFoundError as exc:
         raise BackupError("destination directory must already exist") from exc
-    if not stat.S_ISDIR(parent.st_mode):
+    if not stat.S_ISDIR(original.st_mode):
         raise BackupError("destination directory must be a real directory")
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
     try:
-        path.lstat()
+        if (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino) != (
+            original.st_dev, original.st_ino
+        ):
+            raise BackupError("destination directory identity changed")
+        _assert_destination_parent(path, descriptor)
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _new_target(path: Path, directory_fd: int) -> None:
+    _assert_destination_parent(path.parent, directory_fd)
+    try:
+        os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return
     raise BackupError("backup destination already exists; never overwrite it")
 
 
-def _fsync_file(path: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+def _fsync_directory(descriptor: int) -> None:
+    os.fsync(descriptor)
 
 
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _sha256(path: Path) -> str:
+def _sha256_fd(descriptor: int) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
+    before = os.fstat(descriptor)
+    offset = 0
+    while offset < before.st_size:
+        part = os.pread(descriptor, min(1024 * 1024, before.st_size - offset), offset)
+        if not part:
+            raise BackupError("backup contents changed during hashing")
+        digest.update(part)
+        offset += len(part)
+    after = os.fstat(descriptor)
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    ):
+        raise BackupError("backup contents changed during hashing")
     return digest.hexdigest()
 
 
@@ -209,35 +328,64 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
         raise TypeError("source and backup paths must be pathlib.Path")
     source = source_db.expanduser().absolute()
     target = backup_db.expanduser().absolute()
-    if source.resolve(strict=False) == target.resolve(strict=False):
+    canonical_source = source.resolve(strict=False)
+    canonical_target = target.resolve(strict=False)
+    if canonical_source == canonical_target:
         raise BackupError("source and backup must be different")
+    if canonical_target in {
+        canonical_source.with_name(canonical_source.name + suffix)
+        for suffix in ("-wal", "-shm", "-journal")
+    }:
+        raise BackupError("backup destination conflicts with source SQLite sidecar")
     original = _validated_source(source)
-    _new_target(target)
-    opened_before = _sqlite_main_fds()
-    if any(
-        identity != (original.st_dev, original.st_ino)
-        for identity in opened_before.values()
-    ):
+    wal_path = source.with_name(source.name + "-wal")
+    shm_path = source.with_name(source.name + "-shm")
+    wal_before = _sidecar_identity(wal_path)
+    shm_before = _sidecar_identity(shm_path)
+    open_main_before = _sqlite_main_fds()
+    open_wal_before = _sqlite_wal_fds()
+    maps_before = _shared_file_mappings()
+    source_identity = (original.st_dev, original.st_ino)
+    if any(identity != source_identity for identity in open_main_before.values()):
         raise BackupError("SQLite source attestation has unrelated open SQLite files")
+    if any(identity != wal_before for identity in open_wal_before.values()):
+        raise BackupError("WAL source identity has unrelated open SQLite WAL files")
 
     try:
-        with (
-            closing(sqlite3.connect(_uri(source, "ro"), uri=True, timeout=5)) as original_db,
-            tempfile.TemporaryDirectory(prefix=".mark-backup-", dir=target.parent) as temp_dir,
-        ):
+        with ExitStack() as resources:
+            target_dir_fd = resources.enter_context(
+                _pinned_destination_parent(target.parent)
+            )
+            _new_target(target, target_dir_fd)
+            original_db = resources.enter_context(
+                closing(sqlite3.connect(_uri(source, "ro"), uri=True, timeout=5))
+            )
             sqlite_source_fd = _attest_source_connection(
-                original_db, opened_before, original,
+                original_db, open_main_before, original,
+            )
+            wal_identity, sqlite_wal_fd, shm_identity = _attest_sidecars(
+                wal_path, shm_path, wal_before, shm_before,
+                open_wal_before, maps_before,
             )
             _require_healthy_store(original_db)
+            # Resolve staging through the pinned directory descriptor: a
+            # later rename/symlink replacement of its pathname cannot retarget
+            # SQLite or the private stage.
+            temp_dir = resources.enter_context(
+                tempfile.TemporaryDirectory(
+                    prefix=".mark-backup-", dir=f"/proc/self/fd/{target_dir_fd}",
+                )
+            )
             staged = Path(temp_dir) / "backup.sqlite"
-            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            fd = os.open(staged, flags, 0o600)
-            os.close(fd)
+            stage_fd = os.open(
+                staged, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600,
+            )
+            resources.callback(os.close, stage_fd)
             with closing(sqlite3.connect(_uri(staged, "rw"), uri=True, timeout=5)) as copy:
                 original_db.backup(copy, pages=128, sleep=0.05)
-            with closing(sqlite3.connect(_uri(staged, "ro"), uri=True, timeout=5)) as check:
+            # Readback from the pinned *original* stage inode, not its name.
+            stage_ref = Path(f"/proc/self/fd/{stage_fd}")
+            with closing(sqlite3.connect(_uri(stage_ref, "ro"), uri=True, timeout=5)) as check:
                 _require_healthy_store(check)
                 integrity = check.execute("PRAGMA integrity_check").fetchone()
                 if integrity is None or integrity[0] != "ok":
@@ -259,33 +407,50 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                     ),
                 }
             _source_identity_unchanged(source, original)
-            os.chmod(staged, 0o400)
-            _fsync_file(staged)
-            backup_sha256 = _sha256(staged)
-            # Recheck both the path and the actual open SQLite source inode.
+            _assert_source_connection_inode(sqlite_source_fd, original)
+            _assert_sidecars_unchanged(
+                wal_path, wal_identity, sqlite_wal_fd,
+                shm_path, shm_identity, maps_before,
+            )
+            os.fchmod(stage_fd, 0o400)
+            os.fsync(stage_fd)
+            backup_sha256 = _sha256_fd(stage_fd)
             _source_identity_unchanged(source, original)
             _assert_source_connection_inode(sqlite_source_fd, original)
-            _new_target(target)
-            os.link(staged, target)
+            _assert_sidecars_unchanged(
+                wal_path, wal_identity, sqlite_wal_fd,
+                shm_path, shm_identity, maps_before,
+            )
+            _new_target(target, target_dir_fd)
+            # Linux linkat follows this procfd symlink to the exact open stage
+            # inode; the destination is addressed only by pinned dirfd.
+            os.link(
+                str(stage_ref), target.name, dst_dir_fd=target_dir_fd,
+                follow_symlinks=True,
+            )
             try:
-                _fsync_directory(target.parent)
+                _fsync_directory(target_dir_fd)
             except OSError as exc:
-                # The destination may already exist even if fsync failed.
                 raise BackupError(
                     "backup publication uncertain; inspect destination before retry"
                 ) from exc
-            copied = staged.lstat()
-            published = target.lstat()
+            copied = os.fstat(stage_fd)
+            published = os.stat(
+                target.name, dir_fd=target_dir_fd, follow_symlinks=False,
+            )
             if (
                 not stat.S_ISREG(published.st_mode)
                 or (copied.st_dev, copied.st_ino)
                 != (published.st_dev, published.st_ino)
             ):
                 raise BackupError("backup publication identity mismatch")
-            # Post-publication drift invalidates a success claim. The copy
-            # remains available for manual inspection; never blindly retry.
+            _assert_destination_parent(target.parent, target_dir_fd)
             _source_identity_unchanged(source, original)
             _assert_source_connection_inode(sqlite_source_fd, original)
+            _assert_sidecars_unchanged(
+                wal_path, wal_identity, sqlite_wal_fd,
+                shm_path, shm_identity, maps_before,
+            )
             return BackupReceipt(
                 created_at=datetime.now(timezone.utc).isoformat(),
                 backup_sha256=backup_sha256,
