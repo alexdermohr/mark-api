@@ -96,12 +96,25 @@ einem abgestürzten Writer, blockiert jedes Backup bis zur zulässigen
 Offline-Recovery; `immutable=1` darf ein solches Journal nicht umgehen.
 Fehlende procfs-Verifikation führt niemals zum unsicheren Pfad-Fallback.
 
-Temporäre Sicherungsdatei und endgültige create-only-Veröffentlichung werden
-über geöffnete Stage- und Zielverzeichnis-Deskriptoren adressiert, nicht
-über erneut aufgelöste veränderliche Elternpfade. Voraussetzung bleibt ein
-vertrauenswürdiger lokaler Betrieb; Angreifer mit privilegiertem Zugriff
-auf Dateisystem oder Backup-Prozess sind nicht durch ein Backup-Receipt
-autorisiert oder ausgeschlossen.
+Der SQLite-Online-Snapshot wird zuerst ausschließlich im privaten
+Prozessspeicher angelegt, einschließlich vollständiger Integritätsprüfung
+und Recovery-Zähler. Erst danach werden seine serialisierten Bytes über
+einen unbenannten Linux-`O_TMPFILE`-Deskriptor im vorhandenen
+Backup-Zielverzeichnis geschrieben. Ein durch andere Prozesse austauschbarer
+temporärer SQLite-Pfad oder ein SQLite-Journal für die Stage existiert
+nicht. SHA-256, Stage-Inode und Zielverzeichnis werden vor und nach der
+atomaren create-only-Veröffentlichung geprüft.
+
+**Betriebsanforderungen:** Linux mit lesbarem procfs, ein Ziel-Dateisystem
+mit `O_TMPFILE` und ausreichend freier Arbeitsspeicher für den vollständigen
+SQLite-Snapshot **plus** seine serialisierte Kopie. Der Spitzenbedarf kann
+deutlich größer sein als die Datenbankdatei. Fehlt eine Voraussetzung,
+wird keine bestätigte Sicherung veröffentlicht; es gibt keinen unsicheren
+Pfad-Fallback. Insbesondere für große Datenbanken vor dem Backup den
+tatsächlichen RAM-Bedarf und freien Zielspeicher prüfen. Voraussetzung
+bleibt ein vertrauenswürdiger lokaler Betrieb; privilegierte oder
+kompromittierte Prozesse mit direktem Zugriff auf Dateideskriptoren
+sind durch ein Backup-Receipt nicht ausgeschlossen.
 
 ~~~bash
 mkdir -m 700 -p /sicherer/backup-ordner
@@ -114,23 +127,20 @@ mark-api-backup --db /sicherer/pfad/mark.sqlite \
   muss vorhanden sein. Die Quelle darf kein Symlink/Hardlink-Alias sein.
   Namen der SQLite-Quell-Sidecars (`-wal`, `-shm`, `-journal`) sind
   als Backup-Ziel ebenfalls gesperrt.
-- Vor dem Backup wird die aktuelle Mark-Datenbank read-only inklusive
-  Recovery-, Idempotenz- und Sync-Journal-Schema validiert. Der private
-  Stage wird nach dem SQLite-Backup unabhängig auf volle Integrität
-  und Bereitschaft geprüft.
-- Die SQLite-Schreib- und Prüfverbindung zur privaten Stage werden
-  vor jeder Datenübertragung beziehungsweise Recovery-Abfrage anhand ihrer
-  tatsächlich geöffneten Dateideskriptoren an den bereits gepinnten
-  Stage-Inode gebunden; die Stage-Schreibverbindung verwendet
-  `journal_mode=OFF`, damit keine Kopie über veränderliche temporäre
-  Journalpfade geht.
-- Der private Stage wird nach dem SQLite-Backup auf 0400 gesetzt und sein
-  offener Inode gegen Größe/`mtime`/`ctime` der vollständigen
-  Integritäts- und Recovery-Prüfung gebunden. SHA-256 und Metadaten werden
-  vor der Veröffentlichung erneut kontrolliert; nach der atomaren
-  create-only-Hardlink-Veröffentlichung werden der Hash und die neue
-  Inode-Bindung nochmals geprüft. Datei und Zielverzeichnis werden
-  fsynct. Es wird niemals in die Quelldatenbank geschrieben,
+- Vor dem Backup wird die bestehende Mark-Quelldatenbank read-only
+  einschließlich Recovery-, Idempotenz- und Sync-Journal-Schema validiert.
+  SQLite Online Backup kopiert in die private In-Memory-Datenbank;
+  dort werden Integrität und alle Receipt-Zähler vor der Serialisierung
+  geprüft. Eine zweite dateibasierte SQLite-Stage-Verbindung entfällt.
+- Die serialisierten Bytes besitzen einen eigenen SHA-256-Bezug und
+  werden ausschließlich über den offenen `O_TMPFILE`-Inode geschrieben,
+  ohne vorherigen Dateinamen im Zielverzeichnis. Bei Speichermangel,
+  fehlender Serialisierung oder nicht unterstütztem `O_TMPFILE` wird
+  fail-closed abgebrochen.
+- Der anonyme Stage-Inode wird auf 0400 gesetzt und mit fsync sowie
+  Hash- und Metadatenkontrollen geprüft. Nach atomarer create-only-
+  Hardlink-Veröffentlichung folgen ein erneuter Hash-/Inode-Readback und
+  Verzeichnis-fsync. Es wird niemals in die Quelldatenbank geschrieben,
   kein Plattformrequest gestartet und kein bestehendes Backup überschrieben.
 - Der JSON-Receipt enthält SHA-256 und reine Mengenangaben,
   darunter pending_api_writes, pending_dashboard_writes und

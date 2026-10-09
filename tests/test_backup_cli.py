@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import gc
+import hashlib
 import io
 import json
 import os
@@ -1006,62 +1007,37 @@ with closing(sqlite3.connect(db)) as c:
             if process.stderr is not None:
                 process.stderr.close()
 
-    def test_stage_directory_swap_during_sqlite_backup_uses_pinned_inode(self) -> None:
-        # After opening the private stage FD, a same-uid attacker can rename
-        # the containing temp directory and replace its former pathname.
-        # SQLite must back up into the pinned inode, not the replacement path.
-        with closing(sqlite3.connect(self.source)) as source:
-            source.execute(
+    def test_named_stage_substitution_cannot_affect_anonymous_copy(self) -> None:
+        # A same-UID attacker can fabricate the old predictable stage
+        # directory and an older valid SQLite image. No SQLite connection
+        # may read or write that named stage: backup goes to private memory,
+        # then O_TMPFILE without a replaceable stage pathname.
+        with closing(sqlite3.connect(self.source)) as db:
+            db.execute(
                 "INSERT INTO write_api_requests "
                 "(idempotency_key, request_sha256, state, requested_at) "
                 "VALUES (?, ?, 'in_progress', ?)",
                 ("original-source-pending", "d" * 64, NOW.isoformat()),
             )
-            source.commit()
-        fake = self.root / "other-valid-mark.sqlite"
+            db.commit()
+        fake = self.root / "older-valid-mark.sqlite"
         SnapshotStore(fake)
         gc.collect()
-        original_connect = sqlite3.connect
+        named_stage = self.root / ".mark-backup-attacker"
         original_open = os.open
-        seen: dict[str, Path] = {}
-        moved_stage_dir = self.root / "moved-pinned-stage"
         attacked = False
 
-        def observe_stage_open(file, flags, *args, **kwargs):
-            descriptor = original_open(file, flags, *args, **kwargs)
-            if (
-                Path(str(file)).name == "backup.sqlite"
-                and flags & os.O_CREAT
-                and flags & os.O_EXCL
-            ):
-                seen["stage"] = Path(file)
-            return descriptor
-
-        def swap_stage_before_connect(database, *args, **kwargs):
+        def create_named_decoy(path, flags, *args, **kwargs):
             nonlocal attacked
-            if (
-                attacked
-                or not isinstance(database, str)
-                or not database.startswith("file:/proc/self/fd/")
-                or not database.endswith("?mode=rw")
-            ):
-                return original_connect(database, *args, **kwargs)
-            self.assertIn("stage", seen)
-            attacked = True
-            stage_path = seen["stage"]
-            stage_path.parent.rename(moved_stage_dir)
-            stage_path.parent.mkdir(mode=0o700)
-            (stage_path.parent / "backup.sqlite").touch(mode=0o600)
-            # Populate the original pinned stage with a healthy older Mark
-            # database lacking the real open Write recovery fence.
-            shutil.copyfile(fake, moved_stage_dir / "backup.sqlite")
-            return original_connect(database, *args, **kwargs)
+            if not attacked and flags & os.O_TMPFILE == os.O_TMPFILE:
+                attacked = True
+                named_stage.mkdir(mode=0o700)
+                shutil.copyfile(fake, named_stage / "backup.sqlite")
+            return original_open(path, flags, *args, **kwargs)
 
-        with (
-            patch("mark_api.backup_cli.os.open", side_effect=observe_stage_open),
-            patch("mark_api.backup_cli.sqlite3.connect", side_effect=swap_stage_before_connect),
-        ):
+        with patch("mark_api.backup_cli.os.open", side_effect=create_named_decoy):
             receipt = backup_store(self.source, backup_db=self.backup)
+
         self.assertTrue(attacked)
         self.assertEqual(receipt.pending_api_writes, 1)
         self.assertTrue(self.backup.exists())
@@ -1072,6 +1048,14 @@ with closing(sqlite3.connect(db)) as c:
                     "WHERE idempotency_key='original-source-pending'"
                 ).fetchone(),
                 ("in_progress",),
+            )
+        with closing(sqlite3.connect(named_stage / "backup.sqlite")) as decoy:
+            self.assertEqual(
+                decoy.execute(
+                    "SELECT count(*) FROM write_api_requests "
+                    "WHERE idempotency_key='original-source-pending'"
+                ).fetchone(),
+                (0,),
             )
 
     def test_destination_parent_swap_never_claims_attacker_directory(self) -> None:
@@ -1156,10 +1140,19 @@ with closing(sqlite3.connect(db)) as c:
             return real_connect(database, *args, **kwargs)
 
         with patch("mark_api.backup_cli.sqlite3.connect", side_effect=redirect_stage_copy):
-            with self.assertRaisesRegex(BackupError, "stage connection inode"):
-                backup_store(self.source, backup_db=self.backup)
-        self.assertTrue(used)
-        self.assertFalse(self.backup.exists())
+            receipt = backup_store(self.source, backup_db=self.backup)
+        # No file-backed SQLite stage connection is used: snapshot pages stay
+        # within :memory: until serialized into an anonymous O_TMPFILE.
+        self.assertFalse(used)
+        self.assertEqual(receipt.pending_api_writes, 1)
+        self.assertTrue(self.backup.exists())
+        with closing(sqlite3.connect(self.backup)) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='private-write-fence'"
+                ).fetchone(), ("in_progress",),
+            )
         with closing(sqlite3.connect(impostor)) as db:
             self.assertEqual(
                 db.execute(
@@ -1197,10 +1190,91 @@ with closing(sqlite3.connect(db)) as c:
             return real_connect(database, *args, **kwargs)
 
         with patch("mark_api.backup_cli.sqlite3.connect", side_effect=redirect_check):
-            with self.assertRaisesRegex(BackupError, "stage connection inode"):
+            receipt = backup_store(self.source, backup_db=self.backup)
+        self.assertFalse(used)
+        self.assertEqual(receipt.pending_api_writes, 1)
+        with closing(sqlite3.connect(self.backup)) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='real-stage-check-fence'"
+                ).fetchone(), ("in_progress",),
+            )
+
+    def test_anonymous_stage_has_no_name_before_create_only_publication(self) -> None:
+        # The staged inode cannot be reached by a swap of a .mark-backup-*
+        # pathname: before link(2), it has no directory entry at all.
+        original_link = os.link
+        checked = False
+
+        def check_anonymous_stage(src, dst, *args, **kwargs):
+            nonlocal checked
+            fd = int(str(src).rsplit("/", 1)[-1])
+            info = os.fstat(fd)
+            checked = True
+            self.assertTrue(stat.S_ISREG(info.st_mode))
+            self.assertEqual(info.st_nlink, 0)
+            self.assertFalse(any(
+                p.name.startswith(".mark-backup-") for p in self.root.iterdir()
+            ))
+            self.assertFalse(self.backup.exists())
+            return original_link(src, dst, *args, **kwargs)
+
+        with patch("mark_api.backup_cli.os.link", side_effect=check_anonymous_stage):
+            receipt = backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(checked)
+        self.assertTrue(self.backup.is_file())
+        self.assertEqual(
+            hashlib.sha256(self.backup.read_bytes()).hexdigest(),
+            receipt.backup_sha256,
+        )
+
+    def test_in_memory_snapshot_serialization_memory_error_fails_closed(self) -> None:
+        # In-memory snapshots require available RAM. Exhaustion must fail
+        # before a target is linked, without deleting recovery fences.
+        class UnserializableSnapshot(sqlite3.Connection):
+            def serialize(self, name="main"):
+                raise MemoryError("synthetic exhausted snapshot memory")
+
+        original_connect = sqlite3.connect
+        intercepted = False
+
+        def memory_limited_connect(database, *args, **kwargs):
+            nonlocal intercepted
+            if database == ":memory:":
+                intercepted = True
+                kwargs["factory"] = UnserializableSnapshot
+            return original_connect(database, *args, **kwargs)
+
+        with patch(
+            "mark_api.backup_cli.sqlite3.connect",
+            side_effect=memory_limited_connect,
+        ):
+            with self.assertRaisesRegex(
+                BackupError, "in-memory backup serialization unavailable",
+            ):
                 backup_store(self.source, backup_db=self.backup)
-        self.assertTrue(used)
+        self.assertTrue(intercepted)
         self.assertFalse(self.backup.exists())
+        self.assertTrue(self.store.is_ready())
+
+    def test_unavailable_anonymous_stage_fails_closed(self) -> None:
+        original_open = os.open
+        attempted = False
+
+        def fail_unsupported_tmpfile(path, flags, *args, **kwargs):
+            nonlocal attempted
+            if flags & os.O_TMPFILE == os.O_TMPFILE:
+                attempted = True
+                raise OSError("filesystem does not support O_TMPFILE")
+            return original_open(path, flags, *args, **kwargs)
+
+        with patch("mark_api.backup_cli.os.open", side_effect=fail_unsupported_tmpfile):
+            with self.assertRaisesRegex(BackupError, "anonymous backup staging is unavailable"):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(attempted)
+        self.assertFalse(self.backup.exists())
+        self.assertTrue(self.store.is_ready())
 
     def test_stage_content_tamper_after_integrity_cannot_publish_stale_copy(self) -> None:
         # This is intentionally after the stage's SQL integrity/count reads.
