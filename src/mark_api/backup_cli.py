@@ -331,6 +331,32 @@ def _assert_source_contents_unchanged(
         raise BackupError("source contents changed during backup")
 
 
+def _assert_no_rollback_journal(path: Path) -> None:
+    # A left-behind SQLite rollback journal may contain uncommitted pages.
+    # immutable=1 does not perform hot-journal recovery; never certify a DB
+    # with such unresolved recovery state.
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise BackupError("source rollback journal requires offline recovery")
+
+
+def _assert_stage_contents_unchanged(
+    descriptor: int, original: os.stat_result,
+) -> None:
+    try:
+        current = os.fstat(descriptor)
+    except OSError as exc:
+        raise BackupError("backup stage contents identity was lost") from exc
+    fields = (
+        "st_dev", "st_ino", "st_nlink", "st_size",
+        "st_mtime_ns", "st_ctime_ns",
+    )
+    if any(getattr(current, field) != getattr(original, field) for field in fields):
+        raise BackupError("backup stage contents changed during backup")
+
+
 def _assert_destination_parent(path: Path, descriptor: int) -> None:
     try:
         current = path.lstat()
@@ -435,10 +461,11 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
     original = _validated_source(source)
     wal_path = source.with_name(source.name + "-wal")
     shm_path = source.with_name(source.name + "-shm")
+    journal_path = source.with_name(source.name + "-journal")
+    _assert_no_rollback_journal(journal_path)
     wal_before = _sidecar_identity(wal_path)
     shm_before = _sidecar_identity(shm_path)
     wal_contents_before = _capture_sidecar_contents(wal_path, wal_before)
-    shm_contents_before = _capture_sidecar_contents(shm_path, shm_before)
     if wal_before is None and shm_before is not None:
         raise BackupError("WAL source identity has orphan shared memory")
     immutable_source = wal_before is None and shm_before is None
@@ -474,7 +501,11 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 open_wal_before, maps_before, resources,
             )
             _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
-            _assert_sidecar_contents_unchanged(shm_path, shm_contents_before)
+            # An ordinary reader may touch -shm while establishing its WAL
+            # read mark. Pin the SHM metadata after this expected open-time
+            # bookkeeping, but still reject later in-place modifications.
+            shm_contents_open = _capture_sidecar_contents(shm_path, shm_identity)
+            _assert_no_rollback_journal(journal_path)
             _require_healthy_store(original_db)
             # Resolve staging through the pinned directory descriptor: a
             # later rename/symlink replacement of its pathname cannot retarget
@@ -495,6 +526,10 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
             # renamed/replaced by another local process after os.open().
             with closing(sqlite3.connect(_uri(stage_ref, "rw"), uri=True, timeout=5)) as copy:
                 original_db.backup(copy, pages=128, sleep=0.05)
+            # Establish immutable stage-content evidence before independent
+            # schema/integrity/count reads, not after they have closed.
+            os.fchmod(stage_fd, 0o400)
+            verified_stage = os.fstat(stage_fd)
             with closing(sqlite3.connect(_uri(stage_ref, "ro"), uri=True, timeout=5)) as check:
                 _require_healthy_store(check)
                 integrity = check.execute("PRAGMA integrity_check").fetchone()
@@ -516,6 +551,7 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                         check, "SELECT count(*) FROM dashboard_pending_writes"
                     ),
                 }
+            _assert_stage_contents_unchanged(stage_fd, verified_stage)
             _source_identity_unchanged(source, original)
             _assert_source_connection_inode(sqlite_source_fd, original)
             _assert_source_contents_unchanged(sqlite_source_fd, original)
@@ -524,10 +560,11 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 shm_path, shm_identity, empty_wal_fd, maps_before,
             )
             _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
-            _assert_sidecar_contents_unchanged(shm_path, shm_contents_before)
-            os.fchmod(stage_fd, 0o400)
+            _assert_sidecar_contents_unchanged(shm_path, shm_contents_open)
+            _assert_no_rollback_journal(journal_path)
             os.fsync(stage_fd)
             backup_sha256 = _sha256_fd(stage_fd)
+            _assert_stage_contents_unchanged(stage_fd, verified_stage)
             _source_identity_unchanged(source, original)
             _assert_source_connection_inode(sqlite_source_fd, original)
             _assert_source_contents_unchanged(sqlite_source_fd, original)
@@ -536,14 +573,20 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 shm_path, shm_identity, empty_wal_fd, maps_before,
             )
             _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
-            _assert_sidecar_contents_unchanged(shm_path, shm_contents_before)
+            _assert_sidecar_contents_unchanged(shm_path, shm_contents_open)
+            _assert_no_rollback_journal(journal_path)
             _new_target(target, target_dir_fd)
+            _assert_stage_contents_unchanged(stage_fd, verified_stage)
             # Linux linkat follows this procfd symlink to the exact open stage
             # inode; the destination is addressed only by pinned dirfd.
             os.link(
                 str(stage_ref), target.name, dst_dir_fd=target_dir_fd,
                 follow_symlinks=True,
             )
+            # Hard-link publication legitimately increments nlink and ctime.
+            # Rebind after that exact effect; never silently accept a later
+            # in-place write even if the attacker restores the old mtime.
+            linked_stage = os.fstat(stage_fd)
             try:
                 _fsync_directory(target_dir_fd)
             except OSError as exc:
@@ -560,6 +603,9 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 != (published.st_dev, published.st_ino)
             ):
                 raise BackupError("backup publication identity mismatch")
+            if _sha256_fd(stage_fd) != backup_sha256:
+                raise BackupError("backup stage contents changed after publication")
+            _assert_stage_contents_unchanged(stage_fd, linked_stage)
             _assert_destination_parent(target.parent, target_dir_fd)
             _source_identity_unchanged(source, original)
             _assert_source_connection_inode(sqlite_source_fd, original)
@@ -569,7 +615,8 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 shm_path, shm_identity, empty_wal_fd, maps_before,
             )
             _assert_sidecar_contents_unchanged(wal_path, wal_contents_before)
-            _assert_sidecar_contents_unchanged(shm_path, shm_contents_before)
+            _assert_sidecar_contents_unchanged(shm_path, shm_contents_open)
+            _assert_no_rollback_journal(journal_path)
             return BackupReceipt(
                 created_at=datetime.now(timezone.utc).isoformat(),
                 backup_sha256=backup_sha256,

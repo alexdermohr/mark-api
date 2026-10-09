@@ -259,6 +259,60 @@ class BackupCliTests(unittest.TestCase):
             self.assertTrue(tampered)
             self.assertFalse(self.backup.exists())
 
+    def test_external_live_wal_writer_is_backed_up_without_false_content_drift(self) -> None:
+        # A separate process keeps committed WAL frames live. A read-only
+        # backup must include those frames without rejecting harmless
+        # SQLite open-time metadata on a healthy source.
+        child = """
+import sqlite3, sys
+from contextlib import closing
+with closing(sqlite3.connect(sys.argv[1])) as writer:
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute(
+        "INSERT INTO write_api_requests "
+        "(idempotency_key,request_sha256,state,requested_at) "
+        "VALUES ('external-live-fence','e','in_progress','t')"
+    )
+    writer.commit()
+    print('READY',flush=True)
+    sys.stdin.readline()
+"""
+        process = subprocess.Popen(
+            [sys.executable, "-u", "-c", child, str(self.source)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert process.stdout is not None
+            self.assertTrue(select.select([process.stdout], [], [], 10)[0])
+            self.assertEqual(process.stdout.readline().strip(), "READY")
+            self.assertGreater(
+                self.source.with_name(self.source.name + "-wal").stat().st_size, 32,
+            )
+            receipt = backup_store(self.source, backup_db=self.backup)
+            self.assertEqual(receipt.pending_api_writes, 1)
+            with closing(sqlite3.connect(self.backup)) as copy:
+                self.assertEqual(
+                    copy.execute(
+                        "SELECT state FROM write_api_requests "
+                        "WHERE idempotency_key='external-live-fence'"
+                    ).fetchone(),
+                    ("in_progress",),
+                )
+        finally:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
     def test_quiescent_wal_database_without_sidecars_can_be_backed_up(self) -> None:
         # Closing the final WAL writer checkpoints and removes -wal/-shm.
         # A mode=ro SQLite reader may legitimately create an EMPTY WAL and
@@ -534,6 +588,50 @@ class BackupCliTests(unittest.TestCase):
                     "WHERE name='write_api_requests'"
                 ).fetchone()
             )
+
+    def test_hot_rollback_journal_blocks_immutable_backup(self) -> None:
+        # A killed SQLite writer can leave a hot rollback journal with
+        # uncommitted pages already spilled into the main file. immutable=1
+        # skips recovery, so it must never treat this as a clean snapshot.
+        with closing(sqlite3.connect(self.source)) as db:
+            self.assertEqual(
+                db.execute("PRAGMA journal_mode=DELETE").fetchone(), ("delete",),
+            )
+            db.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key,request_sha256,state,requested_at) "
+                "VALUES ('hot-journal-fence','e','in_progress','t')"
+            )
+            db.commit()
+        child = """
+import os, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("PRAGMA journal_mode=DELETE")
+db.execute("PRAGMA cache_size=1")
+db.execute("PRAGMA cache_spill=ON")
+db.execute("BEGIN IMMEDIATE")
+db.execute("DELETE FROM write_api_requests WHERE idempotency_key='hot-journal-fence'")
+for n in range(300):
+    db.execute(
+        "INSERT INTO inbound_message_events "
+        "(provider_message_id,ad_id,conversation_id,observed_at,source) "
+        "VALUES (?,?,?,?,?)",
+        (str(n), 'ad', 'conversation', 'now', 'email'),
+    )
+os._exit(7)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", child, str(self.source)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 7, result.stderr)
+        journal = self.source.with_name(self.source.name + "-journal")
+        self.assertTrue(journal.is_file())
+        self.assertGreater(journal.stat().st_size, 512)
+        with self.assertRaisesRegex(BackupError, "rollback journal"):
+            backup_store(self.source, backup_db=self.backup)
+        self.assertFalse(self.backup.exists())
+        self.assertTrue(journal.exists())
 
     def test_lost_versioned_sync_journal_blocks_backup_and_restore(self) -> None:
         self._seed_recovery_data()
@@ -923,6 +1021,49 @@ with closing(sqlite3.connect(db)) as c:
                 backup_store(self.source, backup_db=self.backup)
         self.assertFalse(self.backup.exists())
         self.assertTrue(self.store.is_ready())
+
+    def test_stage_content_tamper_after_integrity_cannot_publish_stale_copy(self) -> None:
+        # This is intentionally after the stage's SQL integrity/count reads.
+        # A same-UID process can still write through an already writable FD,
+        # even if the staged file has since been chmod'ed 0400.
+        with closing(sqlite3.connect(self.source)) as db:
+            db.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key,request_sha256,state,requested_at) "
+                "VALUES ('real-stage-pending-fence','f','in_progress','t')"
+            )
+            db.commit()
+        old = self.root / "stale-valid-mark.sqlite"
+        SnapshotStore(old)
+        gc.collect()
+        older_data = old.read_bytes()
+        original_hash = backup_cli._sha256_fd
+        tampered = False
+
+        def overwrite_verified_stage_before_hash(descriptor):
+            nonlocal tampered
+            tampered = True
+            os.ftruncate(descriptor, len(older_data))
+            self.assertEqual(os.pwrite(descriptor, older_data, 0), len(older_data))
+            os.fsync(descriptor)
+            return original_hash(descriptor)
+
+        with patch(
+            "mark_api.backup_cli._sha256_fd",
+            side_effect=overwrite_verified_stage_before_hash,
+        ):
+            with self.assertRaisesRegex(BackupError, "backup stage contents changed"):
+                backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(tampered)
+        self.assertFalse(self.backup.exists())
+        with closing(sqlite3.connect(self.source)) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='real-stage-pending-fence'"
+                ).fetchone(),
+                ("in_progress",),
+            )
 
     def test_late_directory_fsync_error_preserves_new_backup_without_retry(self) -> None:
         # Publication may have succeeded even when the durability confirmation

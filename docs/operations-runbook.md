@@ -71,10 +71,12 @@ im selben Prozess vorbestehende SQLite-Hauptdateideskriptoren fremder Datenbanke
 oder eine nicht eindeutig bestimmbare Quellbindung führen zum sicheren Abbruch.
 Auch die tatsächlichen `-wal`-Dateideskriptoren und neu eingebundenen
 `-shm`-Mappings werden über die Linux-Inode-Identität geprüft. Zusätzlich
-werden Größe, Änderungszeit und Linux-`ctime` der SQLite-Hauptdatei und
-anfänglich vorhandener Sidecars vor und nach dem Snapshot verglichen:
-auch ein kurzzeitiges Überschreiben und Zurückschreiben führt zum sicheren
-Abbruch. Aktive Änderungen während der Sicherung können deshalb einen neuen
+werden Größe, Änderungszeit und Linux-`ctime` der Hauptdatei und der
+vorhandenen WAL vor und nach dem Snapshot verglichen. SQLite kann beim
+normalen Öffnen eines bestehenden WAL seine `-shm`-Metadaten aktualisieren;
+deren Inhaltsstabilität wird deshalb **nach** diesem Öffnungsvorgang bis zum
+Ende der Sicherung geprüft. Änderungen durch fremde Prozesse während
+der Sicherung führen zum sicheren Abbruch. Aktive Änderungen während der Sicherung können deshalb einen neuen
 Backup-Versuch nach Prüfung des Ergebnisses erforderlich machen.
 
 Sind anfänglich **weder `-wal` noch `-shm` vorhanden**, nutzt die CLI
@@ -82,6 +84,9 @@ SQLite im `immutable=1`-Lesemodus. Dieser liest den stabilen Hauptdateistand,
 ohne später eingespielte WAL-Frames zu übernehmen. Eine neu auftauchende
 Sidecar-Datei führt zum sicheren Abbruch. Bei bereits vorhandenen Sidecars
 bleibt der normale SQLite-Read einschließlich committeter WAL-Frames aktiv.
+Ein vorhandenes SQLite-Rollback-Journal (`-journal`), insbesondere nach
+einem abgestürzten Writer, blockiert jedes Backup bis zur zulässigen
+Offline-Recovery; `immutable=1` darf ein solches Journal nicht umgehen.
 Fehlende procfs-Verifikation führt niemals zum unsicheren Pfad-Fallback.
 
 Temporäre Sicherungsdatei und endgültige create-only-Veröffentlichung werden
@@ -106,11 +111,14 @@ mark-api-backup --db /sicherer/pfad/mark.sqlite \
   Recovery-, Idempotenz- und Sync-Journal-Schema validiert. Der private
   Stage wird nach dem SQLite-Backup unabhängig auf volle Integrität
   und Bereitschaft geprüft.
-- Der vollständig geprüfte Stage wird auf 0400 gesetzt, fsynct und
-  per atomarem create-only Hardlink veröffentlicht; das Verzeichnis
-  wird ebenfalls fsynct. Es wird niemals in die Quelldatenbank
-  geschrieben, kein Plattformrequest gestartet und kein bestehendes
-  Backup überschrieben.
+- Der private Stage wird nach dem SQLite-Backup auf 0400 gesetzt und sein
+  offener Inode gegen Größe/`mtime`/`ctime` der vollständigen
+  Integritäts- und Recovery-Prüfung gebunden. SHA-256 und Metadaten werden
+  vor der Veröffentlichung erneut kontrolliert; nach der atomaren
+  create-only-Hardlink-Veröffentlichung werden der Hash und die neue
+  Inode-Bindung nochmals geprüft. Datei und Zielverzeichnis werden
+  fsynct. Es wird niemals in die Quelldatenbank geschrieben,
+  kein Plattformrequest gestartet und kein bestehendes Backup überschrieben.
 - Der JSON-Receipt enthält SHA-256 und reine Mengenangaben,
   darunter pending_api_writes, pending_dashboard_writes und
   open_sync_attempts. Keine Nachrichtentexte oder Zugangsdaten.
