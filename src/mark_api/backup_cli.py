@@ -426,10 +426,12 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
                 staged, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600,
             )
             resources.callback(os.close, stage_fd)
-            with closing(sqlite3.connect(_uri(staged, "rw"), uri=True, timeout=5)) as copy:
-                original_db.backup(copy, pages=128, sleep=0.05)
-            # Readback from the pinned *original* stage inode, not its name.
             stage_ref = Path(f"/proc/self/fd/{stage_fd}")
+            # SQLite must write through the same pinned stage inode that we
+            # later verify and publish. The temp directory pathname can be
+            # renamed/replaced by another local process after os.open().
+            with closing(sqlite3.connect(_uri(stage_ref, "rw"), uri=True, timeout=5)) as copy:
+                original_db.backup(copy, pages=128, sleep=0.05)
             with closing(sqlite3.connect(_uri(stage_ref, "ro"), uri=True, timeout=5)) as check:
                 _require_healthy_store(check)
                 integrity = check.execute("PRAGMA integrity_check").fetchone()

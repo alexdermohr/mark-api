@@ -625,6 +625,74 @@ with closing(sqlite3.connect(db)) as c:
             if process.stderr is not None:
                 process.stderr.close()
 
+    def test_stage_directory_swap_during_sqlite_backup_uses_pinned_inode(self) -> None:
+        # After opening the private stage FD, a same-uid attacker can rename
+        # the containing temp directory and replace its former pathname.
+        # SQLite must back up into the pinned inode, not the replacement path.
+        with closing(sqlite3.connect(self.source)) as source:
+            source.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("original-source-pending", "d" * 64, NOW.isoformat()),
+            )
+            source.commit()
+        fake = self.root / "other-valid-mark.sqlite"
+        SnapshotStore(fake)
+        gc.collect()
+        original_connect = sqlite3.connect
+        original_open = os.open
+        seen: dict[str, Path] = {}
+        moved_stage_dir = self.root / "moved-pinned-stage"
+        attacked = False
+
+        def observe_stage_open(file, flags, *args, **kwargs):
+            descriptor = original_open(file, flags, *args, **kwargs)
+            if (
+                Path(str(file)).name == "backup.sqlite"
+                and flags & os.O_CREAT
+                and flags & os.O_EXCL
+            ):
+                seen["stage"] = Path(file)
+            return descriptor
+
+        def swap_stage_before_connect(database, *args, **kwargs):
+            nonlocal attacked
+            if (
+                attacked
+                or not isinstance(database, str)
+                or not database.startswith("file:/proc/self/fd/")
+                or not database.endswith("?mode=rw")
+            ):
+                return original_connect(database, *args, **kwargs)
+            self.assertIn("stage", seen)
+            attacked = True
+            stage_path = seen["stage"]
+            stage_path.parent.rename(moved_stage_dir)
+            stage_path.parent.mkdir(mode=0o700)
+            (stage_path.parent / "backup.sqlite").touch(mode=0o600)
+            # Populate the original pinned stage with a healthy older Mark
+            # database lacking the real open Write recovery fence.
+            shutil.copyfile(fake, moved_stage_dir / "backup.sqlite")
+            return original_connect(database, *args, **kwargs)
+
+        with (
+            patch("mark_api.backup_cli.os.open", side_effect=observe_stage_open),
+            patch("mark_api.backup_cli.sqlite3.connect", side_effect=swap_stage_before_connect),
+        ):
+            receipt = backup_store(self.source, backup_db=self.backup)
+        self.assertTrue(attacked)
+        self.assertEqual(receipt.pending_api_writes, 1)
+        self.assertTrue(self.backup.exists())
+        with closing(sqlite3.connect(self.backup)) as backed_up:
+            self.assertEqual(
+                backed_up.execute(
+                    "SELECT state FROM write_api_requests "
+                    "WHERE idempotency_key='original-source-pending'"
+                ).fetchone(),
+                ("in_progress",),
+            )
+
     def test_destination_parent_swap_never_claims_attacker_directory(self) -> None:
         destination_parent = self.root / "private-backups"
         destination_parent.mkdir(mode=0o700)
