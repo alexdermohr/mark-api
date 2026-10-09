@@ -53,16 +53,22 @@ def _trusted_link(path: Path, root: Path) -> None:
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise DeploymentBoundaryError("installed code symlink cannot be trusted") from exc
-    if not (
-        resolved.is_relative_to(root)
-        or resolved.is_relative_to(_SYSTEM_CODE_ROOT)
-    ):
+    inside_install = resolved.is_relative_to(root)
+    if not inside_install and not resolved.is_relative_to(_SYSTEM_CODE_ROOT):
         raise DeploymentBoundaryError("installed code symlink escapes trusted roots")
     target_info = _trusted_metadata(resolved)
     if not (
         stat.S_ISREG(target_info.st_mode) or stat.S_ISDIR(target_info.st_mode)
     ):
         raise DeploymentBoundaryError("installed code symlink resolves to unsafe type")
+    # A symlinked package directory under /usr would bypass the recursive
+    # installation scan. Only interpreter symlinks may enter the OS trust base.
+    if not inside_install and not (
+        path.parent == root / "bin"
+        and path.name.startswith("python")
+        and stat.S_ISREG(target_info.st_mode)
+    ):
+        raise DeploymentBoundaryError("installed package symlink escapes audited install")
     _trusted_parents(resolved)
 
 
@@ -81,11 +87,50 @@ def _safe_pth(path: Path, root: Path) -> None:
         if item.startswith(("import ", "import\t")):
             raise DeploymentBoundaryError("executable package path declaration is unsafe")
         candidate = (path.parent / item).resolve(strict=False)
-        if not (
-            candidate.is_relative_to(root)
-            or candidate.is_relative_to(_SYSTEM_CODE_ROOT)
-        ):
-            raise DeploymentBoundaryError("package path declaration escapes trusted roots")
+        if not candidate.is_relative_to(root):
+            # Paths under /usr are NOT scanned by the venv walker. Even a
+            # root-owned .pth can reference writable code below that prefix.
+            raise DeploymentBoundaryError("package path declaration escapes audited install")
+
+
+
+def _check_venv_config(root: Path) -> None:
+    """Refuse Python site initialization that reaches unscanned code."""
+    config = root / "pyvenv.cfg"
+    if not stat.S_ISREG(_trusted_metadata(config).st_mode):
+        raise DeploymentBoundaryError("venv configuration must be a regular file")
+    try:
+        lines = config.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise DeploymentBoundaryError("venv configuration is unreadable") from exc
+    values: dict[str, str] = {}
+    for line in lines:
+        item = line.strip()
+        if not item or item.startswith("#"):
+            continue
+        if "=" not in item:
+            raise DeploymentBoundaryError("venv configuration is malformed")
+        key, value = (part.strip() for part in item.split("=", 1))
+        key = key.lower()
+        if key in ("home", "include-system-site-packages"):
+            if key in values:
+                raise DeploymentBoundaryError("duplicate venv trust declaration")
+            values[key] = value
+    if values.get("include-system-site-packages", "").lower() != "false":
+        raise DeploymentBoundaryError("system site-packages must be disabled")
+    base_home = Path(values.get("home", ""))
+    if not base_home.is_absolute():
+        raise DeploymentBoundaryError("venv Python base must be absolute")
+    try:
+        resolved = base_home.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise DeploymentBoundaryError("venv Python base is unavailable") from exc
+    if not resolved.is_relative_to(_SYSTEM_CODE_ROOT):
+        raise DeploymentBoundaryError("venv Python base escapes OS trust root")
+    for path in (base_home, resolved):
+        if not stat.S_ISDIR(_trusted_metadata(path).st_mode):
+            raise DeploymentBoundaryError("venv Python base is not a trusted directory")
+        _trusted_parents(path)
 
 
 def check_installed_code(root: Path) -> None:
@@ -119,6 +164,7 @@ def check_installed_code(root: Path) -> None:
                 _safe_pth(path, root)
         else:
             raise DeploymentBoundaryError("installed code has an unexpected file type")
+    _check_venv_config(root)
     if not (root / "bin/python").exists():
         raise DeploymentBoundaryError("isolated Mark Python interpreter is missing")
     matches = list(root.glob("lib/python*/site-packages/mark_api/__init__.py"))

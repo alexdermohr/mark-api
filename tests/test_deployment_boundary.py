@@ -223,7 +223,7 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             (third / "Image.py").write_text("# code\n", encoding="utf-8")
             (root / "bin").mkdir()
             (root / "bin/python").write_bytes(b"python-test-executable")
-            (root / "pyvenv.cfg").write_text("include-system-site-packages = false\n")
+            (root / "pyvenv.cfg").write_text("home = /usr/bin\ninclude-system-site-packages = false\n")
             ancestor_paths = set(root.parents)
 
             def simulated_root_lstat(path):
@@ -282,7 +282,7 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
         with self._fake_root_install() as (root, site, _probe):
             (site / "editable.pth").write_text("/home/attacker/mark-api/src\n")
             with self.assertRaisesRegex(
-                boundary.DeploymentBoundaryError, "escapes trusted roots"
+                boundary.DeploymentBoundaryError, "escapes audited install"
             ):
                 boundary.check_installed_code(root)
 
@@ -292,6 +292,87 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 boundary.DeploymentBoundaryError, "executable package path"
             ):
+                boundary.check_installed_code(root)
+
+    def test_preflight_accepts_trusted_os_interpreter_symlink(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            python = root / "bin/python"
+            python.unlink()
+            python.symlink_to("/usr/bin/python3")
+            boundary.check_installed_code(root)
+
+    def test_preflight_rejects_unscanned_system_package_symlink(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            fake_usr = root.parent.parent / "usr"
+            foreign = fake_usr / "lib/mark-unscanned"
+            foreign.mkdir(parents=True)
+            (foreign / "untrusted.py").write_text("# writable outside scanner\n")
+            (site / "PIL/system-plugin").symlink_to(
+                foreign, target_is_directory=True
+            )
+            with patch.object(boundary, "_SYSTEM_CODE_ROOT", fake_usr):
+                with self.assertRaises(boundary.DeploymentBoundaryError):
+                    boundary.check_installed_code(root)
+
+    def test_preflight_rejects_pth_into_writable_system_tree(self) -> None:
+        # Reproduce a root-owned .pth reaching a writable /usr subtree.
+        with self._fake_root_install() as (root, site, _probe):
+            fake_usr = root.parent.parent / "usr"
+            foreign = fake_usr / "local/lib/mark-writable"
+            foreign.mkdir(parents=True)
+            foreign.chmod(0o777)
+            (foreign / "payload.py").write_text("# attacker module\n")
+            (site / "unexpected.pth").write_text(str(foreign) + "\n")
+            with patch.object(boundary, "_SYSTEM_CODE_ROOT", fake_usr):
+                with self.assertRaises(boundary.DeploymentBoundaryError):
+                    boundary.check_installed_code(root)
+
+    def test_preflight_allows_only_audited_internal_pth_paths(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            internal = site / "trusted-vendor"
+            internal.mkdir()
+            (internal / "library.py").write_text("# trusted module\n")
+            (site / "internal.pth").write_text("trusted-vendor\n")
+            boundary.check_installed_code(root)
+
+    def test_preflight_rejects_pth_symlink_escape(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            foreign = root.parent.parent / "external-libs"
+            foreign.mkdir()
+            (site / "foreign").symlink_to(foreign, target_is_directory=True)
+            (site / "escape.pth").write_text("foreign\n")
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
+
+    def test_preflight_rejects_global_site_packages(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            (root / "pyvenv.cfg").write_text(
+                "home = /usr/bin\ninclude-system-site-packages = true\n"
+            )
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
+
+    def test_preflight_rejects_missing_or_duplicate_site_flag(self) -> None:
+        for content in (
+            "home = /usr/bin\n",
+            "include-system-site-packages = false\n"
+            "include-system-site-packages = true\n",
+        ):
+            with (
+                self.subTest(content=content),
+                self._fake_root_install() as (root, site, _probe),
+            ):
+                (root / "pyvenv.cfg").write_text(content)
+                with self.assertRaises(boundary.DeploymentBoundaryError):
+                    boundary.check_installed_code(root)
+
+    def test_preflight_rejects_untrusted_python_base(self) -> None:
+        with self._fake_root_install() as (root, site, _probe):
+            (root / "pyvenv.cfg").write_text(
+                "home = /home/alex/.local/share/uv/python/bin\n"
+                "include-system-site-packages = false\n"
+            )
+            with self.assertRaises(boundary.DeploymentBoundaryError):
                 boundary.check_installed_code(root)
 
     def test_preflight_rejects_nonroot_bootstrap_source(self) -> None:

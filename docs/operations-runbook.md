@@ -220,6 +220,13 @@ Write-API bleiben loopback-only.
    aus geprüftem Release anlegen und dessen Pakete direkt dort installieren.
    Der Python-Interpreter muss selbst root-owned und unter `/usr` oder im
    geschützten Venv liegen; Symlinks auf ein User-Home scheitern am Preflight.
+   Der Preflight lehnt zusätzlich .pth-Pfaderweiterungen außerhalb der
+   vollständig gescannten Venv, ungescannte Paket-Symlinks nach /usr und
+   `include-system-site-packages = true` ab. In `pyvenv.cfg` müssen
+   `include-system-site-packages = false` und ein `home`-Pfad auf eine
+   nachweislich root-owned, nicht schreibbare Python-Basis unter `/usr`
+   zeigen. Ein Venv mit `home` in einem Benutzerverzeichnis ist nicht
+   zulässig, auch wenn die Venv-Dateien selbst root-owned sind.
    Die OS-System-Python-Version darf älter sein; sie startet ausschließlich
    den isolierten stdlib-Preflight mit `-I -S`.
 2. Vor dem ersten Start einmalig ein dediziertes, nicht interaktives
