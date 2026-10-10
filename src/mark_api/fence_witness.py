@@ -10,6 +10,7 @@ browser/runtime UID. A working unit test under one UID is not that OS proof.
 from __future__ import annotations
 
 import argparse
+import fcntl
 from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
@@ -191,75 +192,144 @@ class FenceLedger:
         self._db_identity = (checked.st_dev, checked.st_ino)
         parent_info = path.parent.lstat()
         self._parent_identity = (parent_info.st_dev, parent_info.st_ino)
-        if created:
+        self._lock_path = path.with_name(path.name + ".lock")
+        self._lock_fd: int | None = self._acquire_lock()
+        try:
+            if created:
+                with closing(self._connect()) as conn:
+                    conn.executescript("""
+                        BEGIN IMMEDIATE;
+                        CREATE TABLE sessions (
+                            id TEXT PRIMARY KEY,
+                            state TEXT NOT NULL CHECK(state IN ('active','sealed')),
+                            opened_at TEXT NOT NULL,
+                            sealed_at TEXT
+                        );
+                        CREATE TABLE events (
+                            seq INTEGER PRIMARY KEY,
+                            session_id TEXT NOT NULL,
+                            kind TEXT NOT NULL,
+                            request_key TEXT,
+                            request_sha256 TEXT,
+                            action TEXT,
+                            outcome TEXT,
+                            response_sha256 TEXT,
+                            evidence_reference TEXT,
+                            created_at TEXT NOT NULL,
+                            previous_sha256 TEXT NOT NULL,
+                            row_sha256 TEXT NOT NULL
+                        );
+                        CREATE UNIQUE INDEX one_start_per_key ON events(request_key)
+                            WHERE kind = 'started';
+                        CREATE UNIQUE INDEX one_completion_per_key ON events(request_key)
+                            WHERE kind = 'completed';
+                        CREATE UNIQUE INDEX one_clearance_per_key ON events(request_key)
+                            WHERE kind IN ('runtime_cleared', 'operator_cleared');
+                        CREATE TRIGGER events_no_update BEFORE UPDATE ON events
+                            BEGIN SELECT RAISE(ABORT, 'append-only events'); END;
+                        CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+                            BEGIN SELECT RAISE(ABORT, 'append-only events'); END;
+                        PRAGMA user_version = 1;
+                        COMMIT;
+                    """)
+                # Persist first-time directory entry, not only the SQLite pages.
+                parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
             with closing(self._connect()) as conn:
-                conn.executescript("""
-                    BEGIN IMMEDIATE;
-                    CREATE TABLE sessions (
-                        id TEXT PRIMARY KEY,
-                        state TEXT NOT NULL CHECK(state IN ('active','sealed')),
-                        opened_at TEXT NOT NULL,
-                        sealed_at TEXT
-                    );
-                    CREATE TABLE events (
-                        seq INTEGER PRIMARY KEY,
-                        session_id TEXT NOT NULL,
-                        kind TEXT NOT NULL,
-                        request_key TEXT,
-                        request_sha256 TEXT,
-                        action TEXT,
-                        outcome TEXT,
-                        response_sha256 TEXT,
-                        evidence_reference TEXT,
-                        created_at TEXT NOT NULL,
-                        previous_sha256 TEXT NOT NULL,
-                        row_sha256 TEXT NOT NULL
-                    );
-                    CREATE UNIQUE INDEX one_start_per_key ON events(request_key)
-                        WHERE kind = 'started';
-                    CREATE UNIQUE INDEX one_completion_per_key ON events(request_key)
-                        WHERE kind = 'completed';
-                    CREATE UNIQUE INDEX one_clearance_per_key ON events(request_key)
-                        WHERE kind IN ('runtime_cleared', 'operator_cleared');
-                    CREATE TRIGGER events_no_update BEFORE UPDATE ON events
-                        BEGIN SELECT RAISE(ABORT, 'append-only events'); END;
-                    CREATE TRIGGER events_no_delete BEFORE DELETE ON events
-                        BEGIN SELECT RAISE(ABORT, 'append-only events'); END;
-                    PRAGMA user_version = 1;
-                    COMMIT;
-                """)
-            # Persist first-time directory entry, not only the SQLite pages.
-            parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                objects = {
+                    (row[0], row[1])
+                    for row in conn.execute(
+                        "SELECT type,name FROM sqlite_master WHERE type IN ('table','index','trigger')"
+                    )
+                }
+                necessary = {
+                    ("table", "sessions"), ("table", "events"),
+                    ("index", "one_start_per_key"), ("index", "one_completion_per_key"),
+                    ("index", "one_clearance_per_key"),
+                    ("trigger", "events_no_update"), ("trigger", "events_no_delete"),
+                }
+                if version != _VERSION or not necessary.issubset(objects):
+                    raise FenceWitnessError("ledger recovery schema is damaged")
+                if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise FenceWitnessError("ledger integrity is invalid")
+                self._verify_chain(conn)
+                # After an owner crash, no old socket session may gain new writes.
+                conn.execute("BEGIN IMMEDIATE")
+                self._seal_orphaned_sessions(conn)
+                conn.commit()
+
+        except BaseException:
+            self.close()
+            raise
+
+    def _acquire_lock(self) -> int:
+        """Hold a separate OS flock before any recovery-session reconciliation."""
+        try:
+            descriptor = os.open(
+                self._lock_path,
+                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError as exc:
+            raise FenceWitnessError("exclusive witness ledger lock unavailable") from exc
+        try:
+            entry = self._lock_path.lstat()
+            actual = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(actual.st_mode)
+                or actual.st_uid != self._uid
+                or stat.S_IMODE(actual.st_mode) != 0o600
+                or actual.st_nlink != 1
+                or (entry.st_dev, entry.st_ino) != (actual.st_dev, actual.st_ino)
+            ):
+                raise FenceWitnessError("witness ledger lock inode is unsafe")
             try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
-        with closing(self._connect()) as conn:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            objects = {
-                (row[0], row[1])
-                for row in conn.execute(
-                    "SELECT type,name FROM sqlite_master WHERE type IN ('table','index','trigger')"
-                )
-            }
-            necessary = {
-                ("table", "sessions"), ("table", "events"),
-                ("index", "one_start_per_key"), ("index", "one_completion_per_key"),
-                ("index", "one_clearance_per_key"),
-                ("trigger", "events_no_update"), ("trigger", "events_no_delete"),
-            }
-            if version != _VERSION or not necessary.issubset(objects):
-                raise FenceWitnessError("ledger recovery schema is damaged")
-            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                raise FenceWitnessError("ledger integrity is invalid")
-            self._verify_chain(conn)
-            # After an owner crash, no old socket session may gain new writes.
-            conn.execute("BEGIN IMMEDIATE")
-            self._seal_orphaned_sessions(conn)
-            conn.commit()
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError) as exc:
+                raise FenceWitnessError(
+                    "another witness owner already controls this ledger"
+                ) from exc
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def close(self) -> None:
+        with self._guard:
+            descriptor = getattr(self, "_lock_fd", None)
+            self._lock_fd = None
+            if descriptor is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except (AttributeError, OSError):
+            pass
+
+    def __enter__(self) -> "FenceLedger":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
 
     def _connect(self) -> sqlite3.Connection:
+        if self._lock_fd is None:
+            raise FenceWitnessError("witness owner lease is closed")
         _private_directory(self.path.parent, self._uid, mode=0o700)
+        current_lock = os.fstat(self._lock_fd)
+        published_lock = self._lock_path.lstat()
+        if (current_lock.st_dev, current_lock.st_ino) != (
+            published_lock.st_dev, published_lock.st_ino
+        ):
+            raise FenceWitnessError("witness owner lock inode changed")
         parent = self.path.parent.lstat()
         file_info = _file_identity(self.path, self._uid)
         if (
@@ -410,7 +480,7 @@ class FenceLedger:
     ) -> None:
         key = _required_string(key, _KEY, "idempotency key")
         sha = _required_string(sha, _SHA, "request SHA-256")
-        if action not in _ACTIONS:
+        if not isinstance(action, str) or action not in _ACTIONS:
             raise FenceWitnessError("write action is not supported")
         with self._guard, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -563,7 +633,13 @@ class _WitnessUnixHandler(socketserver.StreamRequestHandler):
                 pass
         finally:
             if session is not None:
-                server.ledger.seal_session(session)
+                try:
+                    server.ledger.seal_session(session)
+                except (FenceWitnessError, sqlite3.Error, OSError):
+                    # The caller is no longer authenticated to this session,
+                    # and an unavailable journal must fail the entire owner
+                    # service rather than silently retain an active session.
+                    server._fatal.set()
 
     def _next_frame(self, *, role: str) -> dict[str, object] | None:
         # A runtime may legitimately need minutes for one external browser
@@ -696,6 +772,7 @@ class _WitnessUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
         self.role = role
         self.peer_uid = peer_uid
         self._path = path
+        self._fatal = Event()
         self._peers_lock = RLock()
         self._peers: set[socket.socket] = set()
         self._no_active_peers = Event()
@@ -756,8 +833,11 @@ class FenceWitnessServer:
     def close(self) -> None:
         servers = (self._runtime, self._operator)
         if self._threads:
-            for server in servers:
-                server.shutdown()
+            # Thread.start() can fail between the two servers. shutdown()
+            # must never be called on a server without serve_forever().
+            for server, thread in zip(servers, self._threads):
+                if thread.is_alive():
+                    server.shutdown()
         # Release the accepted sockets as well as the listeners. A malicious
         # authenticated peer could otherwise hold the witness process alive
         # indefinitely by sending a frame every few seconds.
@@ -771,7 +851,7 @@ class FenceWitnessServer:
                 server.server_close()
             for thread in self._threads:
                 thread.join(timeout=2)
-        if not drained:
+        if not drained or any(server._fatal.is_set() for server in servers):
             raise FenceWitnessError(
                 "witness shutdown could not seal all sessions before deadline"
             )
@@ -838,7 +918,7 @@ class FenceWitnessClient:
                 encoded = (_canonical_json(request) + "\n").encode("utf-8")
                 if len(encoded) > _MAX_FRAME + 1:
                     raise FenceWitnessError("witness request exceeds frame bound")
-                self._stream.write(encoded)
+                self._socket.sendall(encoded)
                 received = self._receive()
                 if received.get("ok") is not True or not isinstance(
                     received.get("result"), dict
@@ -966,6 +1046,8 @@ def main(argv: list[str] | None = None) -> int:
             while not stopping.wait(0.2):
                 if not all(thread.is_alive() for thread in server._threads):
                     raise FenceWitnessError("witness IPC service stopped unexpectedly")
+                if server._runtime._fatal.is_set() or server._operator._fatal.is_set():
+                    raise FenceWitnessError("witness session sealing failed")
         except KeyboardInterrupt:
             pass
         finally:

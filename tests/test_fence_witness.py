@@ -12,6 +12,8 @@ from pathlib import Path
 import socket
 import sqlite3
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -48,6 +50,46 @@ class FenceWitnessTests(unittest.TestCase):
         self.data.mkdir(mode=0o700)
         self.ledger_file = self.data / "witness.sqlite"
         self.owner = FenceLedger(self.ledger_file, initialize=True)
+        self.addCleanup(self.owner.close)
+
+    def test_second_owner_cannot_seal_live_session_or_clear_active_fence(self) -> None:
+        """A second witness process must fail before touching active sessions."""
+        session = self.owner.open_session()
+        self.owner.execution_started(
+            session, key="second-owner-fence", sha=_SHA, action="create_media",
+        )
+        child_code = """
+import sys
+from pathlib import Path
+from mark_api.fence_witness import FenceLedger, FenceWitnessError
+try:
+    other = FenceLedger(Path(sys.argv[1]))
+except FenceWitnessError:
+    print("SECOND_OWNER_DENIED")
+    raise SystemExit(0)
+else:
+    print("SECOND_OWNER_OPENED_AND_SEALED")
+    raise SystemExit(2)
+"""
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", child_code, str(self.ledger_file)],
+            capture_output=True, text=True, check=False, timeout=8,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("SECOND_OWNER_DENIED", result.stdout)
+        with self.assertRaisesRegex(FenceWitnessError, "sealed"):
+            self.owner.operator_clearance(
+                key="second-owner-fence", sha=_SHA,
+                evidence="operator:premature-clear",
+            )
+        self.assertEqual(
+            self.owner.execution_completed(
+                session, key="second-owner-fence", sha=_SHA,
+                response=_UNKNOWN_MEDIA,
+            ),
+            "ambiguous",
+        )
+        self.assertTrue(self.owner.fence_pending())
 
     def test_acknowledged_ledger_commits_use_delete_journal_extra_sync(self) -> None:
         # A confirmed execution_started ACK must not be based on SQLite
@@ -66,7 +108,9 @@ class FenceWitnessTests(unittest.TestCase):
             session, key=_KEY, sha=_SHA, action="create_media",
         )
         self.owner.seal_session(session)
-        self.assertTrue(FenceLedger(self.ledger_file).fence_pending())
+        self.owner.close()
+        with FenceLedger(self.ledger_file) as reopened:
+            self.assertTrue(reopened.fence_pending())
 
     def test_never_initializes_missing_or_corrupt_previous_ledger_implicitly(self) -> None:
         absent = self.data / "missing.sqlite"
@@ -74,6 +118,7 @@ class FenceWitnessTests(unittest.TestCase):
             FenceLedger(absent)
         self.assertFalse(absent.exists())
         self.assertTrue(self.ledger_file.exists())
+        self.owner.close()
         with closing(sqlite3.connect(self.ledger_file)) as db:
             db.execute("DROP TABLE events")
             db.commit()
@@ -142,7 +187,9 @@ class FenceWitnessTests(unittest.TestCase):
                 session, key=_KEY, sha=_SHA, evidence="postread:evidence-1",
             )
         self.owner.seal_session(session)
+        self.owner.close()
         reopened = FenceLedger(self.ledger_file)
+        self.addCleanup(reopened.close)
         self.assertFalse(reopened.fence_pending())
         with self.assertRaisesRegex(FenceWitnessError, "already"):
             new_session = reopened.open_session()
@@ -161,7 +208,9 @@ class FenceWitnessTests(unittest.TestCase):
                 evidence="premature:operator-readback",
             )
         self.assertTrue(self.owner.fence_pending())
+        self.owner.close()  # simulate process exit; the OS releases its flock
         reopened = FenceLedger(self.ledger_file)
+        self.addCleanup(reopened.close)
         self.assertTrue(reopened.fence_pending())
         with self.assertRaisesRegex(FenceWitnessError, "not active"):
             reopened.execution_completed(
@@ -214,7 +263,9 @@ class FenceWitnessTests(unittest.TestCase):
                 session, key="confirmed-key", sha="b" * 64, action="create",
             )
         self.owner.seal_session(session)
+        self.owner.close()
         current = FenceLedger(self.ledger_file)
+        self.addCleanup(current.close)
         next_session = current.open_session()
         with self.assertRaisesRegex(FenceWitnessError, "already"):
             current.execution_started(
@@ -295,7 +346,9 @@ class FenceWitnessTests(unittest.TestCase):
                 db.execute("UPDATE events SET request_key='forged'")
             db.rollback()
         self.owner.seal_session(session)
-        self.assertTrue(FenceLedger(self.ledger_file).fence_pending())
+        self.owner.close()
+        with FenceLedger(self.ledger_file) as reopened:
+            self.assertTrue(reopened.fence_pending())
         with closing(sqlite3.connect(self.ledger_file)) as db:
             db.execute("DROP TRIGGER events_no_update")
             db.execute("UPDATE events SET request_key='forged' WHERE kind='started'")
