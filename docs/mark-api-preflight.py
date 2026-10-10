@@ -51,34 +51,50 @@ def _trusted_parents(path: Path) -> None:
 
 
 def _attest_direct_link(path: Path) -> Path:
-    """Follow lexical components while checking *every* visited inode.
+    """Attest every lexical transit inode, including terminal link chains.
 
-    Merely normalizing ../ before stat omits an attacker-writable component.
-    Intermediate symlinks are deliberately unsupported; direct protected
-    parent-relative paths (e.g. Ubuntu's ../../libpython.so) are allowed.
+    Only a symlink at the *last* component of a target may be followed.
+    Every link in that chain and every intervening directory is checked
+    before resolving it; a writable intermediate path is never normalized
+    away. Distro-managed chains such as Ubuntu libpython.so.1 -> .so.1.0
+    are legitimate when entirely protected.
     """
     try:
-        raw = os.readlink(path)
-        current = Path("/") if raw.startswith("/") else path.parent
-        if not stat.S_ISDIR(_trusted_metadata(current).st_mode):
-            raise DeploymentBoundaryError("symlink parent is not a trusted directory")
-        _trusted_parents(current)
-        segments = [item for item in raw.split("/") if item and item != "."]
-        for index, item in enumerate(segments):
-            current = current.parent if item == ".." else current / item
-            info = _trusted_metadata(current)
+        link = path
+        for _ in range(40):
+            if not stat.S_ISLNK(_trusted_metadata(link).st_mode):
+                raise DeploymentBoundaryError("expected a protected symlink")
+            raw = os.readlink(link)
+            current = Path("/") if raw.startswith("/") else link.parent
+            if not stat.S_ISDIR(_trusted_metadata(current).st_mode):
+                raise DeploymentBoundaryError("symlink parent is not a trusted directory")
+            _trusted_parents(current)
+            segments = [item for item in raw.split("/") if item and item != "."]
+            if not segments:
+                raise DeploymentBoundaryError("symlink target is empty")
+            for index, item in enumerate(segments):
+                current = current.parent if item == ".." else current / item
+                info = _trusted_metadata(current)
+                last = index == len(segments) - 1
+                if stat.S_ISLNK(info.st_mode):
+                    if not last:
+                        raise DeploymentBoundaryError(
+                            "symlink crosses an untrusted link component"
+                        )
+                elif not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                    raise DeploymentBoundaryError("symlink traverses an unexpected inode type")
+                if not last and not stat.S_ISDIR(info.st_mode):
+                    raise DeploymentBoundaryError("symlink transit component is not a directory")
             if stat.S_ISLNK(info.st_mode):
-                raise DeploymentBoundaryError("symlink crosses an untrusted link component")
-            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
-                raise DeploymentBoundaryError("symlink traverses an unexpected inode type")
-            if index < len(segments) - 1 and not stat.S_ISDIR(info.st_mode):
-                raise DeploymentBoundaryError("symlink transit component is not a directory")
-        resolved = path.resolve(strict=True)
+                link = current
+                continue
+            resolved = path.resolve(strict=True)
+            if current != resolved:
+                raise DeploymentBoundaryError("symlink resolution differs from attested transit")
+            return resolved
     except (OSError, RuntimeError) as exc:
         raise DeploymentBoundaryError("installed symlink cannot be attested") from exc
-    if current != resolved:
-        raise DeploymentBoundaryError("symlink resolution differs from attested transit")
-    return resolved
+    raise DeploymentBoundaryError("installed symlink chain exceeds depth limit")
 
 
 def _trusted_link(path: Path, root: Path) -> None:

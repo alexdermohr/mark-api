@@ -180,7 +180,10 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             config.mkdir(parents=True)
             target = lib / "x86_64-linux-gnu/libpython3.12.so.1"
             target.parent.mkdir()
-            target.write_bytes(b"synthetic-trusted-library")
+            target.with_name("libpython3.12.so.1.0").write_bytes(
+                b"synthetic-trusted-library"
+            )
+            target.symlink_to("libpython3.12.so.1.0")
             (config / "libpython3.12.so").symlink_to(
                 "../../x86_64-linux-gnu/libpython3.12.so.1"
             )
@@ -194,6 +197,16 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             writable = lib / "mutable"
             writable.mkdir()
             writable.chmod(0o777)
+            # The *second* protected link must also attest lexical transit.
+            target.unlink()
+            target.symlink_to("../mutable/../x86_64-linux-gnu/libpython3.12.so.1.0")
+            chained_bad = subprocess.run(
+                ["/bin/sh", "-c", command],
+                capture_output=True, text=True, check=False, env=env,
+            )
+            self.assertNotEqual(chained_bad.returncode, 0)
+            target.unlink()
+            target.symlink_to("libpython3.12.so.1.0")
             (config / "unsafe.so").symlink_to(
                 "../../mutable/../x86_64-linux-gnu/libpython3.12.so.1"
             )
@@ -703,13 +716,38 @@ class MarkDeploymentBoundaryTests(unittest.TestCase):
             usr = root.parent.parent / "usr"
             target = usr / "lib/x86_64-linux-gnu/libpython3.12.so.1"
             target.parent.mkdir(parents=True)
-            target.write_bytes(b"synthetic-root-owned-library")
+            target.with_name("libpython3.12.so.1.0").write_bytes(
+                b"synthetic-root-owned-library"
+            )
+            target.symlink_to("libpython3.12.so.1.0")
             config = usr / "lib/python3.12/config-3.12-x86_64-linux-gnu"
             config.mkdir()
             (config / "libpython3.12.so").symlink_to(
                 "../../x86_64-linux-gnu/libpython3.12.so.1"
             )
             boundary.check_installed_code(root)
+
+    def test_preflight_rejects_writable_second_stdlib_link_transit(self) -> None:
+        # A protected first symlink must not license a writable path in
+        # its protected second symlink's ../ traversal.
+        with self._fake_root_install() as (root, site, _probe):
+            usr = root.parent.parent / "usr"
+            lib = usr / "lib"
+            config = lib / "python3.12/config-3.12-x86_64-linux-gnu"
+            config.mkdir()
+            final = lib / "x86_64-linux-gnu/libpython3.12.so.1.0"
+            final.parent.mkdir()
+            final.write_bytes(b"synthetic-protected-library")
+            writable = lib / "mutable"
+            writable.mkdir()
+            writable.chmod(0o777)
+            second = final.with_name("libpython3.12.so.1")
+            second.symlink_to("../mutable/../x86_64-linux-gnu/libpython3.12.so.1.0")
+            (config / "libpython3.12.so").symlink_to(
+                "../../x86_64-linux-gnu/libpython3.12.so.1"
+            )
+            with self.assertRaises(boundary.DeploymentBoundaryError):
+                boundary.check_installed_code(root)
 
     def test_preflight_rejects_stdlib_link_through_writable_intermediary(self) -> None:
         # A read-only link may traverse a writable second symlink before

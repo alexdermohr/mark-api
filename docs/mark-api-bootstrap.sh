@@ -73,44 +73,68 @@ unsafe=$(/usr/bin/find -L "$stdlib" \
 /usr/bin/find -P "$stdlib" -type l -exec /bin/sh -c '
     set -eu
     for link do
-        raw=$(/usr/bin/readlink "$link") || exit 1
-        path=$(/usr/bin/readlink -f "$link") || exit 1
-        [ -n "$path" ] || exit 1
-        # Audit each lexical transit component *before* resolving ../.
-        # Protected Ubuntu ../../ links are valid; writable intermediate
-        # directories and chained symlinks are not.
-        case "$raw" in
-            /*) walk=/ ;;
-            *) walk="${link%/*}" ;;
-        esac
-        old_ifs=$IFS
-        IFS=/
-        set -f
-        for part in $raw; do
-            case "$part" in
-                ""|".") continue ;;
-                "..") walk=${walk%/*}; [ -n "$walk" ] || walk=/ ;;
-                *) case "$walk" in
-                    /) walk="/$part" ;;
-                    *) walk="$walk/$part" ;;
-                   esac ;;
-            esac
-            unsafe=$(/usr/bin/find -P "$walk" -maxdepth 0 \
-                \( ! -uid 0 -o -perm /022 -o \( ! -type d -a ! -type f \) \) \
-                -print -quit) || exit 1
-            [ -z "$unsafe" ] || exit 1
-        done
-        set +f
-        IFS=$old_ifs
-        [ "$walk" = "$path" ] || exit 1
+        resolved=$(/usr/bin/readlink -f "$link") || exit 1
+        [ -n "$resolved" ] || exit 1
+        next=$link
+        depth=0
         while :; do
-            unsafe=$(/usr/bin/find -P "$path" -maxdepth 0 \
-                \( ! -uid 0 -o -perm /022 -o \( ! -type d -a ! -type f \) \) \
-                -print -quit) || exit 1
+            depth=$((depth + 1))
+            [ "$depth" -le 40 ] || exit 1
+            # Check the link inode itself, not only its dereferenced target.
+            unsafe=$(/usr/bin/find -P "$next" -maxdepth 0 \
+                \( ! -uid 0 -o ! -type l \) -print -quit) || exit 1
             [ -z "$unsafe" ] || exit 1
-            [ "$path" = / ] && break
-            path=${path%/*}
-            [ -n "$path" ] || path=/
+            raw=$(/usr/bin/readlink "$next") || exit 1
+            case "$raw" in
+                /*) walk=/ ;;
+                *) walk="${next%/*}" ;;
+            esac
+            old_ifs=$IFS
+            IFS=/
+            set -f
+            set -- $raw
+            [ "$#" -gt 0 ] || exit 1
+            while [ "$#" -gt 0 ]; do
+                part=$1
+                shift
+                case "$part" in
+                    ""|".") continue ;;
+                    "..") walk=${walk%/*}; [ -n "$walk" ] || walk=/ ;;
+                    *) case "$walk" in
+                        /) walk="/$part" ;;
+                        *) walk="$walk/$part" ;;
+                       esac ;;
+                esac
+                # Only a terminal link may extend the attested chain.
+                # A symlink inside the lexical path is always unsafe.
+                if [ -L "$walk" ]; then
+                    [ "$#" -eq 0 ] || exit 1
+                else
+                    unsafe=$(/usr/bin/find -P "$walk" -maxdepth 0 \
+                        \( ! -uid 0 -o -perm /022 -o \( ! -type d -a ! -type f \) \) \
+                        -print -quit) || exit 1
+                    [ -z "$unsafe" ] || exit 1
+                    [ "$#" -eq 0 ] || [ -d "$walk" ] || exit 1
+                fi
+            done
+            set +f
+            IFS=$old_ifs
+            if [ -L "$walk" ]; then
+                next=$walk
+                continue
+            fi
+            [ "$walk" = "$resolved" ] || exit 1
+            path=$walk
+            while :; do
+                unsafe=$(/usr/bin/find -P "$path" -maxdepth 0 \
+                    \( ! -uid 0 -o -perm /022 -o \( ! -type d -a ! -type f \) \) \
+                    -print -quit) || exit 1
+                [ -z "$unsafe" ] || exit 1
+                [ "$path" = / ] && break
+                path=${path%/*}
+                [ -n "$path" ] || path=/
+            done
+            break
         done
     done
 ' _ {} + || fail
