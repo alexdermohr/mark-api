@@ -105,10 +105,48 @@ status=$(attested_git status --porcelain --untracked-files=normal) ||
 resolved=$(attested_git rev-parse --verify "$expected^{commit}") ||
     fail 'unknown release commit'
 [ "$resolved" = "$expected" ] || fail 'invalid release commit'
-# Compose bytes must come from the attested commit, not mutable worktree.
+# Git objects can be mutated independently of their names. Rehash captured
+# commit, tree and blob bytes, storing verified copies in a private Git store
+# before traversing each tree edge or passing Compose to privileged Docker.
+private_git() {
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+        GIT_GRAFT_FILE=/dev/null \
+        /usr/bin/git --git-dir="$attest_dir" --work-tree="$repo" \
+        -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+        -c diff.external= -c core.pager=cat "$@"
+}
+attest_object() {
+    object_type=$1
+    object_id=$2
+    saved_path=$3
+    case "$object_id" in ''|*[!0-9a-f]*) fail 'attested Git object content mismatch' ;; esac
+    [ "${#object_id}" -eq 40 ] || fail 'attested Git object content mismatch'
+    attested_git cat-file "$object_type" "$object_id" > "$saved_path" ||
+        fail 'attested Git object content mismatch'
+    observed=$(private_git hash-object -t "$object_type" --stdin < "$saved_path") ||
+        fail 'attested Git object content mismatch'
+    [ "$observed" = "$object_id" ] || fail 'attested Git object content mismatch'
+    stored=$(private_git hash-object -w -t "$object_type" --stdin < "$saved_path") ||
+        fail 'attested Git object content mismatch'
+    [ "$stored" = "$object_id" ] || fail 'attested Git object content mismatch'
+}
+attest_object commit "$expected" "$attest_dir/commit.raw"
+root_tree=$(/usr/bin/sed -n '1s/^tree \([0-9a-f]\{40\}\)$/\1/p' "$attest_dir/commit.raw")
+[ "${#root_tree}" -eq 40 ] || fail 'attested Git object content mismatch'
+attest_object tree "$root_tree" "$attest_dir/root-tree.raw"
+docs_tree=$(private_git ls-tree "$root_tree" -- docs |
+    /usr/bin/sed -n 's/^040000 tree \([0-9a-f]\{40\}\)[[:space:]]docs$/\1/p') ||
+    fail 'attested Git object content mismatch'
+[ "${#docs_tree}" -eq 40 ] || fail 'attested Git object content mismatch'
+attest_object tree "$docs_tree" "$attest_dir/docs-tree.raw"
+compose_blob=$(private_git ls-tree "$docs_tree" -- mark-api-container.compose.yaml |
+    /usr/bin/sed -n 's/^100644 blob \([0-9a-f]\{40\}\)[[:space:]]mark-api-container\.compose\.yaml$/\1/p') ||
+    fail 'attested Git object content mismatch'
+[ "${#compose_blob}" -eq 40 ] || fail 'attested Git object content mismatch'
 compose="$attest_dir/mark-api-container.compose.yaml"
-attested_git show "$expected:docs/mark-api-container.compose.yaml" > "$compose" ||
-    fail 'attested Compose definition unavailable'
+attest_object blob "$compose_blob" "$compose"
 # Keep this private release file until the Docker Compose command finishes.
 # Fail closed if caller supplies an image ID not present on the *local* daemon.
 docker=/usr/bin/docker

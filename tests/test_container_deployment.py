@@ -14,6 +14,7 @@ import subprocess
 import tarfile
 from tempfile import TemporaryDirectory
 import unittest
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -124,7 +125,11 @@ class ContainerDeploymentTests(unittest.TestCase):
         self.assertIn('rev-parse --verify HEAD', build)
         self.assertIn('[ "$head" = "$expected" ]', build)
         self.assertIn('status --porcelain --untracked-files=normal', build)
-        self.assertIn('attested_git archive "$expected"', build)
+        self.assertNotIn('attested_git archive "$expected"', build)
+        self.assertIn('private_git archive "$expected"', build)
+        self.assertIn('attested_git rev-list --objects --no-walk "$expected"', build)
+        self.assertIn('private_git hash-object -t "$object_type" --stdin', build)
+        self.assertIn('private_git hash-object -w -t "$object_type" --stdin', build)
         self.assertIn('attested_git status --porcelain', build)
         self.assertIn('--git-dir="$temp/git"', build)
         self.assertIn('GIT_ALTERNATE_OBJECT_DIRECTORIES="$common/objects"', build)
@@ -529,12 +534,124 @@ class ContainerDeploymentTests(unittest.TestCase):
                     self.assertFalse(marker.exists(),
                         f"{script.name} executed checkout-local filter.clean")
 
+    def test_build_never_uses_forged_loose_source_blob(self) -> None:
+        with TemporaryDirectory(prefix="mark-forged-build-blob-") as tmp:
+            repo, expected = self._fake_git_repo(Path(tmp))
+            marker = Path(tmp) / "wheel-builder-invoked"
+            wheel = Path(tmp) / "fake-wheel-builder.sh"
+            wheel.write_text("#!/bin/sh\ntouch " + str(marker) + "\nexit 77\n")
+            wheel.chmod(0o700)
+            blob_id = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", expected + ":README.md"],
+                text=True,
+            ).strip()
+            loose = repo / ".git/objects" / blob_id[:2] / blob_id[2:]
+            self.assertTrue(loose.is_file())
+            loose.chmod(0o600)
+            forged = b"forged build source bytes\n"
+            loose.write_bytes(zlib.compress(
+                b"blob " + str(len(forged)).encode("ascii") + b"\0" + forged,
+            ))
+            (repo / "README.md").write_bytes(forged)
+            result = subprocess.run(
+                ["/bin/sh", str(repo / "docs/mark-api-container-build.sh"),
+                 expected],
+                capture_output=True, text=True,
+                env={**os.environ, "MARK_UV": str(wheel)},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(marker.exists(),
+                "wheel builder must not process unverified source bytes")
+
+    def test_build_verified_source_reaches_wheel_builder(self) -> None:
+        with TemporaryDirectory(prefix="mark-build-verified-source-") as tmp:
+            repo, expected = self._fake_git_repo(Path(tmp))
+            marker = Path(tmp) / "wheel-builder-invoked"
+            wheel = Path(tmp) / "fake-wheel-builder.sh"
+            wheel.write_text("#!/bin/sh\ntouch " + str(marker) + "\nexit 77\n")
+            wheel.chmod(0o700)
+            result = subprocess.run(
+                ["/bin/sh", str(repo / "docs/mark-api-container-build.sh"),
+                 expected],
+                capture_output=True, text=True,
+                env={**os.environ, "MARK_UV": str(wheel)},
+            )
+            self.assertEqual(result.returncode, 77, result.stderr)
+            self.assertTrue(marker.exists(),
+                "validated source should be available to wheel builder")
+
+    def test_control_rejects_forged_loose_compose_blob(self) -> None:
+        with TemporaryDirectory(prefix="mark-forged-git-blob-") as tmp:
+            repo, _ = self._fake_git_repo(Path(tmp))
+            compose = repo / "docs/mark-api-container.compose.yaml"
+            compose.write_bytes(b"services:\n  mark-api:\n    image: sha256:trusted\n")
+
+            def git(*args: str) -> str:
+                p = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(p.returncode, 0, p.stderr)
+                return p.stdout.strip()
+
+            git("add", "docs/mark-api-container.compose.yaml")
+            git("commit", "-qm", "trusted compose blob")
+            expected = git("rev-parse", "HEAD")
+            blob_id = git(
+                "rev-parse", expected + ":docs/mark-api-container.compose.yaml",
+            )
+            self.assertEqual(len(blob_id), 40)
+            loose = repo / ".git/objects" / blob_id[:2] / blob_id[2:]
+            self.assertTrue(loose.is_file())
+            loose.chmod(0o600)
+            untrusted = b"services:\n  mark-api:\n    privileged: true\n"
+            loose.write_bytes(zlib.compress(
+                b"blob " + str(len(untrusted)).encode("ascii")
+                + b"\0" + untrusted,
+            ))
+            # This current-Git fixture is a real hash/content mismatch:
+            # cat-file/show will display the forged bytes under the old OID.
+            shown = subprocess.run(
+                ["git", "-C", str(repo), "show",
+                 expected + ":docs/mark-api-container.compose.yaml"],
+                capture_output=True,
+            )
+            # Git versions differ: this host's Git 2.34 rejects the forged
+            # loose object, while the reviewed Git 2.43 can return its bytes.
+            if shown.returncode == 0:
+                self.assertEqual(shown.stdout, untrusted)
+            else:
+                self.assertTrue(shown.stderr)
+
+            result = subprocess.run(
+                ["/bin/sh", str(repo / "docs/mark-api-container-control.sh"),
+                 "verify", "sha256:" + "a" * 64, expected],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "attested Git object content mismatch", result.stderr,
+            )
+
     def test_control_uses_committed_compose_bytes_not_mutable_worktree(self) -> None:
         control = _read("mark-api-container-control.sh")
-        self.assertIn(
+        for statement in (
+            'attest_object commit "$expected"',
+            'attest_object tree "$root_tree"',
+            'attest_object tree "$docs_tree"',
+            'attest_object blob "$compose_blob" "$compose"',
+            'private_git hash-object -t "$object_type" --stdin',
+            'private_git hash-object -w -t "$object_type" --stdin',
+        ):
+            self.assertIn(statement, control)
+        self.assertNotIn(
             'attested_git show "$expected:docs/mark-api-container.compose.yaml"',
             control,
         )
+        self.assertIn('private_git ls-tree "$root_tree" -- docs', control)
+        self.assertIn('private_git ls-tree "$docs_tree" -- mark-api-container.compose.yaml', control)
+        self.assertNotIn('docs_tree=$(attested_git ls-tree', control)
+        self.assertNotIn('compose_blob=$(attested_git ls-tree', control)
         self.assertIn('compose="$attest_dir/mark-api-container.compose.yaml"', control)
         self.assertNotIn('compose="$repo/docs/mark-api-container.compose.yaml"', control)
         self.assertIn("--project-name mark-api", control)

@@ -74,6 +74,49 @@ status=$(attested_git status --porcelain --untracked-files=normal) || exit 1
     printf '%s\n' 'mark-api: source checkout is dirty' >&2
     exit 1
 }
+# The alternate object store is untrusted even when it names a reviewed OID.
+# Capture and independently hash every reachable object of this one commit.
+# The later archives may read only our freshly populated private object store.
+fail() {
+    printf 'mark-api: %s\n' "$1" >&2
+    exit 1
+}
+private_git() {
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+        GIT_GRAFT_FILE=/dev/null \
+        /usr/bin/git --git-dir="$temp/git" --work-tree="$repo" \
+        -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+        -c diff.external= -c core.pager=cat "$@"
+}
+attest_object() {
+    object_type=$1
+    object_id=$2
+    case "$object_id" in ''|*[!0-9a-f]*) fail 'attested Git object content mismatch' ;; esac
+    [ "${#object_id}" -eq 40 ] || fail 'attested Git object content mismatch'
+    attested_git cat-file "$object_type" "$object_id" > "$temp/object.raw" ||
+        fail 'attested Git object content mismatch'
+    observed=$(private_git hash-object -t "$object_type" --stdin < "$temp/object.raw") ||
+        fail 'attested Git object content mismatch'
+    [ "$observed" = "$object_id" ] || fail 'attested Git object content mismatch'
+    stored=$(private_git hash-object -w -t "$object_type" --stdin < "$temp/object.raw") ||
+        fail 'attested Git object content mismatch'
+    [ "$stored" = "$object_id" ] || fail 'attested Git object content mismatch'
+}
+attested_git rev-list --objects --no-walk "$expected" > "$temp/source-objects.list" ||
+    fail 'attested Git object content mismatch'
+while IFS= read -r object_line; do
+    object_id=${object_line%% *}
+    object_type=$(attested_git cat-file -t "$object_id") ||
+        fail 'attested Git object content mismatch'
+    case "$object_type" in commit|tree|blob) ;; *) fail 'attested Git object content mismatch' ;; esac
+    attest_object "$object_type" "$object_id"
+done < "$temp/source-objects.list"
+# Re-traverse the verified copy: omissions in a mutable source object-list
+# must not permit an incomplete release tree.
+private_git rev-list --objects --no-walk "$expected" > /dev/null ||
+    fail 'attested Git object content mismatch'
 # Reject even inactive replacement/graft metadata: no ambiguous revision trust.
 [ -z "$(safe_git -C "$repo" for-each-ref --format='%(refname)' refs/replace)" ] || {
     printf '%s\n' 'mark-api: Git replacement references are not allowed' >&2
@@ -87,20 +130,24 @@ status=$(attested_git status --porcelain --untracked-files=normal) || exit 1
     printf '%s\n' 'mark-api: remote/custom Docker targets require separate attestation' >&2
     exit 1
 }
-attested_git archive "$expected" -- pyproject.toml README.md src |
-    tar -xf - -C "$temp/source"
+private_git archive "$expected" -- pyproject.toml README.md src > "$temp/source.tar" ||
+    fail 'verified source archive unavailable'
+/usr/bin/tar -xf "$temp/source.tar" -C "$temp/source" ||
+    fail 'verified source extraction failed'
 "${MARK_UV:-uv}" build --wheel --offline --out-dir "$temp/context" "$temp/source"
 set -- "$temp/context"/*.whl
 [ "$#" -eq 1 ] && [ -f "$1" ] || {
     printf '%s\n' 'mark-api: expected exactly one verified wheel' >&2
     exit 1
 }
-attested_git archive "$expected" -- \
+private_git archive "$expected" -- \
     docs/mark-api-container.Dockerfile \
     docs/mark-api-container-start.sh \
     docs/mark-api-container-backup.sh \
-    docs/mark-api-bootstrap.sh docs/mark-api-preflight.py |
-    tar -xf - -C "$temp"
+    docs/mark-api-bootstrap.sh docs/mark-api-preflight.py > "$temp/docs.tar" ||
+    fail 'verified Docker files unavailable'
+/usr/bin/tar -xf "$temp/docs.tar" -C "$temp" ||
+    fail 'verified Docker files extraction failed'
 for file in mark-api-container.Dockerfile mark-api-container-start.sh \
             mark-api-container-backup.sh mark-api-bootstrap.sh \
             mark-api-preflight.py; do
