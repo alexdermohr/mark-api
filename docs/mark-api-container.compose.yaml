@@ -1,0 +1,55 @@
+# Explicit operator-only deployment. Volumes and immutable image ID must already
+# exist, be attested, and have a verified exclusive host UID/GID (50042).
+# Do not use 'up' on an existing database before offline ownership reconciliation.
+services:
+  mark-api:
+    image: ${MARK_API_IMAGE:?Exact verified image ID required}
+    profiles: ["live"]
+    user: "50042:50042"
+    network_mode: host  # Required for already-authenticated loopback CDP :9222.
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    restart: "no"
+    stop_grace_period: 30s
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=134217728,mode=1777
+      - /run/mark-api:rw,nosuid,nodev,noexec,size=1048576,uid=50042,gid=50042,mode=0700
+    volumes:
+      - type: volume
+        source: mark_data
+        target: /var/lib/mark-api
+      - type: volume
+        source: mark_backups
+        target: /var/lib/mark-api-backups
+        read_only: true
+  mark-api-backup:
+    image: ${MARK_API_IMAGE:?Exact verified image ID required}
+    profiles: ["backup"]
+    user: "50042:50042"
+    network_mode: none
+    entrypoint: ["/bin/sh", "/etc/mark-api/backup.sh"]
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    restart: "no"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=134217728,mode=1777
+    volumes:
+      - type: volume
+        source: mark_data
+        target: /var/lib/mark-api
+      - type: volume
+        source: mark_backups
+        target: /var/lib/mark-api-backups
+
+# External volumes prevent Compose from silently creating/reowning user data.
+volumes:
+  mark_data:
+    external: true
+    name: mark-api-data-v1
+  mark_backups:
+    external: true
+    name: mark-api-backups-v1

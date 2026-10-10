@@ -403,3 +403,122 @@ nicht, dass früher nie Plattformwrites durchgeführt wurden.
 Die fachliche Wahl der Interessentenmetrik und der Optimierungszielfunktion
 bleibt in Issue #1 offen. Historische Real-Smokes sind kein Beweis
 für den heutigen vollständigen Live-Betrieb.
+
+## Alternative A6-Installation: geprüftes Ubuntu-24.04-Containerimage
+
+Dieser alternative Installationsweg ist für Hosts ohne vertrauenswürdige
+System-Python-3.12-Installation (aktuell Pop!_OS 22.04) vorgesehen und **kein
+automatisches Betriebs-/Merge-Gate**. Die systemd-Vorlagen oben bleiben bestehen.
+Die bereits ausgeführten Wegwerfcontainer haben eine root-eigene Ubuntu-24.04-
+Installation mit dedizierter UID, vollständigem Preflight sowie Backup und Restore
+mit allen drei offenen Recovery-Fences synthetisch nachgewiesen. Ein dauerhafter
+Hostdienst, realer CDP-Zugang und Schutz vor vorbestehenden fremden
+`MAP_SHARED`-Mappings sind dadurch nicht nachgewiesen.
+
+`docs/mark-api-container.Dockerfile`, `mark-api-container-start.sh`,
+`mark-api-container-backup.sh`, `mark-api-container-build.sh` und
+`mark-api-container.compose.yaml` definieren eine opt-in-Produktkomposition:
+
+- Das Image wird nur aus einem *sauberen exakt 40-stellig gebundenen Git-HEAD*
+  erzeugt. Das Buildskript erstellt per `git archive` in einem privaten
+  temporären Kontext ein nicht-editierbares Wheel und überträgt ausschließlich
+  dieses Wheel sowie die geprüften Bootstrap-/Startskripte an den lokalen
+  Docker-Daemon. Das Ubuntu-24.04-Basisimage ist über SHA-256 adressiert.
+  Python 3.12 stammt aus den Ubuntu-Paketen. Paketdateien werden root-eigen
+  installiert; die Containerlaufzeit startet als Nicht-Root-`mark-api`.
+- Die *normalen* Create-/Media-/Update-/Pause-/Activate-/Delete-Funktionen
+  bleiben ohne Write-Opt-in im Produkt-Launcher aktiv. Der Start führt erst
+  den nativen und den Python-Preflight aus und ruft anschließend
+  `mark_api.launcher` ohne `--init-db` auf. Bestätigungen, Bearer,
+  Ownership-, Idempotenz- und Recovery-Fences bleiben erhalten.
+- Das Produktprofil ist ausdrücklich `live`, das Backup `backup`.
+  Ohne diese expliziten Compose-Profile entsteht kein Dienst. Beide verwenden
+  ein nur lesbares Root-Dateisystem, keine Linux-Capabilities, `no-new-privileges`
+  und begrenzte PIDs. Volumes sind `external: true`; Compose erstellt
+  sie nicht stillschweigend und weist bestehenden Daten keinen neuen Owner zu.
+  Backups haben `network_mode: none` und verwenden einen zulässigen einzelnen
+  Instanznamen als create-only-Ziel.
+- Der Launcher benötigt `network_mode: host`, um eine separat autorisierte,
+  bereits angemeldete Browser-CDP-Sitzung auf **127.0.0.1:9222** zu erreichen.
+  Das ist eine bewusste Abschwächung ausschließlich der **Netzwerk-Namespace**-
+  Trennung, nicht der Dateirechte oder Write-Fences. Dashboard/Write-API
+  binden nur Loopback `8875/8876`. Die sensible Dashboard-URL und der
+  prozessgebundene Bearer stehen nur in `/run/mark-api/launcher.log` auf
+  einem privaten temporären `0700`-Dateisystem, nicht im Docker-STDOUT.
+  Andere Host-Loopback-Dienste bleiben durch Host-Networking erreichbar;
+  diese Trust-Boundary vor der Produktivnutzung ausdrücklich prüfen.
+
+**Kritische Host-UID-Grenze:** Der vorhandene Docker-Daemon ist rootful
+und hat kein User-Namespace-Remapping. Container-UIDs entsprechen damit
+numerisch Host-UIDs. Auf dem aktuell geprüften Host ist **UID 999 schon
+für Caddy sowie Redis-/MongoDB-/PostgreSQL-Prozesse in Benutzung**.
+Die synthetische Container-UID 999 darf daher nicht übernommen werden!
+Die alternative Image-/Compose-Konfiguration wählt stattdessen bewusst
+`50042:50042` außerhalb von systemds üblichem DynamicUser-Bereich.
+Das ist **keine automatische UID-Exklusivität**: Vor einer echten
+Produktinstallation muss root diese UID/GID systemweit eindeutig dem
+nicht-interaktiven `mark-api`-Dienst zuweisen/reservieren und überprüfen,
+dass keine fremden Host- oder Containerprozesse dieselbe numerische UID
+besitzen, vorher besessen haben oder schreibbare Mappings der betroffenen
+DB-, WAL- oder SHM-Inodes halten. Die Registrierung, die aktive Prozess-
+/Mapping-Inventur und die Volume-Provisionierung sind separate,
+ausdrücklich nachzuweisende Root-Operationen; nicht durch einen
+passenden `getent`-Eintrag allein erledigt. Insbesondere weder Docker
+`userns-remap` global auf dem gemeinsam genutzten Host aktivieren noch
+bestehende Docker-Volumes blind übernehmen/umberechtigen.
+
+**Image-Bau (kein Host-Deployment):**
+
+~~~bash
+# Im sauberen, unabhängig geprüften PR-Checkout mit exakt aktuellem HEAD:
+HEAD_SHA=$(git rev-parse HEAD)
+MARK_UV=/home/alex/.local/bin/uv sh docs/mark-api-container-build.sh "$HEAD_SHA"
+# Readback des erzeugten Images und des org.opencontainers.image.revision-Labels:
+docker image inspect "mark-api:pr75-${HEAD_SHA%????????????????????????????}"
+~~~
+
+Das 40-stellige Commit-SHA ist vor dem Bau aus GitHub unabhängig zu prüfen.
+Für die Freigabe ist die **vollständige Image-ID**, nicht ein veränderliches
+Tag, zu verwenden. Paketversionen, signierte Ubuntu-Paketherkunft und
+das vollständige Image-/Wheel-/Source-Binding sind am tatsächlich gebauten
+Artefakt erneut zu kontrollieren. Falls der getrennte Docker-Daemon oder
+die Buildabhängigkeiten nicht vertrauenswürdig/verfügbar sind, nicht
+auf einen ungescannten Benutzer-Python-Importpfad ausweichen.
+
+**Vor einem kontrollierten Start müssen zusätzlich** alle folgenden
+Bedingungen nachgewiesen sein: Dedizierte und reservierte UID/GID
+`50042:50042`; keine fremden Prozesse oder offenen beschreibbaren
+Mappings unter dieser Identität; geprüfte neue oder offline sicher
+übertragene Datenbank mit vollständigen Recovery-Tabellen und
+`0600`-Datei/Sidecars in einem privaten `0700`-Volume; ausschließlich
+vertrauenswürdig neu provisioniertes `mark-api-data-v1` und
+`mark-api-backups-v1` mit passenden Rechten, ohne andere Container-Mounts;
+gültige bereits angemeldete und zulässige CDP-Sitzung; freie Ports
+`8875/8876`; kein paralleler Writer und frische Release-/Review-Evidenz.
+**Keine automatische Datenbankinitialisierung oder chown bestehender
+Datenbanken!** Die tatsächliche Datenübernahme braucht ihren eigenen
+Stop-/Hash-/Snapshot-/Mapping-/Recovery-Nachweis.
+
+Erst nach diesen Gates kann der Operator das geprüfte Image mit der
+Compose-Datei als separaten dauerhaft betriebenen Dienst starten, etwa
+indem er dessen unveränderliche Image-ID als `MARK_API_IMAGE` übergibt und
+`docker compose -f docs/mark-api-container.compose.yaml --profile live up`
+ausführt. Die beiden **bereits vorhandenen, verifizierten externen**
+Volumes sind Voraussetzung. Der Backup-Einzelaufruf erfolgt getrennt
+über `--profile backup run --rm --no-deps mark-api-backup EINDEUTIGE_ID`,
+niemals durch einen blinden Retry. Fehlen die Betriebsnachweise, wird kein
+`up` ausgeführt. Ein Image-Bau oder eine grüne `docker compose config`
+sind keine erfolgreiche Host-Installation.
+
+**Angreifermodell und Merge-Gate:** Eine verlässlich exklusive UID mit
+frischen privaten DB-/WAL-/SHM-Inodes verhindert den gewöhnlichen
+unprivilegierten *fremden* Same-UID-Prozesszugriff, sobald die
+tatsächliche Host- und Docker-Konfiguration das belegt. Das schützt
+weder gegen root-/Docker-Gruppen-Kompromittierung noch gegen böswilligen
+Code, der bereits als der vertraute Mark-Dienst ausgeführt wird. Falls
+auch dieser Angreifer abgewehrt werden muss, ist eine unabhängig
+durchgesetzte Storage-Snapshot-/Integrity-Grenze erforderlich.
+Die drei bestehenden `MAP_SHARED`-P2 sind bis zu einer neuen unabhängigen
+Live-Attestation und entsprechendem head-bound High-Critical-/Captain-Gate
+**weiterhin blockierend**. Keine reale Kleinanzeigenmutation zu Testzwecken
+ohne nachgewiesene Kontoberechtigung und zulässigen Integrationsweg.
