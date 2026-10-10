@@ -85,6 +85,7 @@ def _utc_now() -> datetime:
 
 
 _MEDIA_PERSISTENCE_VERIFY_TIMEOUT_SECONDS = 10.0
+_WRITE_HANDLER_DRAIN_SECONDS = 12.0
 
 
 def _pending_dashboard_media_refs(store: SnapshotStore) -> frozenset[str]:
@@ -1178,6 +1179,16 @@ class PrivateWebWriteApiRuntime:
                     "private Web write API runtime cleanup failed"
                 )
 
+            # A stuck accepted HTTP operation may still own the browser and
+            # its SQLite in_progress fence. Do not release owned state while
+            # that handler is active; return within the Docker stop deadline.
+            if not self._server.wait_for_active_handlers(
+                _WRITE_HANDLER_DRAIN_SECONDS
+            ):
+                raise PrivateWebRuntimeSetupError(
+                    "active write handlers remain after shutdown"
+                )
+
             media_unknown: PrivateWebSubmitUnknownError | None = None
             with self._operation_lock:
                 if self._media_runtime is not None:
@@ -1408,11 +1419,11 @@ def compose_private_web_write_api_runtime(
     # store lease across server_close() until owned runtimes are fully settled
     # and cleaned up; SubmitUnknown reconciliation intentionally retains it.
     server.retain_store_lock_until_explicit_release()
-    # The generic Write API keeps daemon request threads for its standalone
-    # use. This composition owns browser runtimes, so close must drain every
-    # accepted handler before those runtimes can be released.
-    server.daemon_threads = False
-    server.block_on_close = True
+    # Keep daemon request threads so server_close cannot hang past Docker's
+    # stop deadline. The owned browser runtimes and exclusive store lease are
+    # released only after the explicit, bounded handler drain in close().
+    server.daemon_threads = True
+    server.block_on_close = False
     try:
         return PrivateWebWriteApiRuntime(
             server=server,

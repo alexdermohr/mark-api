@@ -3764,6 +3764,86 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             )
             self.assertEqual(close_events, ["content"])
 
+    def test_stuck_http_write_fails_bounded_close_without_losing_sqlite_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(
+                OwnerReader(ReadResult.success_empty(())), close_events,
+            )
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=content_runtime,
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.SET_STATE}),
+                    writes_enabled=True,
+                ),
+                core_writes_enabled=True,
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            client_errors: list[BaseException] = []
+            responses: list[tuple[int, dict[str, object]]] = []
+
+            def pause(
+                ad_id: str,
+                *,
+                authorization_by: str | None = None,
+                authorization_reference: str | None = None,
+            ) -> OperationReceipt:
+                entered.set()
+                if not release.wait(timeout=4):
+                    raise AssertionError("test write handler did not release")
+                return self._operation_receipt(
+                    "set_state:paused", ad_id,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+
+            runtime._mark_service.pause = pause
+
+            def request() -> None:
+                try:
+                    responses.append(self._request(
+                        runtime, "POST", f"/api/write/ads/{AD_ID}/pause",
+                        idempotency_key="stalled-pause",
+                    ))
+                except BaseException as exc:
+                    client_errors.append(exc)
+
+            runtime.start()
+            client = threading.Thread(target=request, daemon=True)
+            client.start()
+            try:
+                self.assertTrue(entered.wait(timeout=2))
+                with patch(
+                    "mark_api.private_web_runtime._WRITE_HANDLER_DRAIN_SECONDS",
+                    0.15, create=True,
+                ):
+                    with self.assertRaisesRegex(
+                        PrivateWebRuntimeSetupError, "active write handlers",
+                    ):
+                        runtime.close()
+                self.assertEqual(close_events, [])
+                record = store.write_api_request("stalled-pause")
+                self.assertIsNotNone(record)
+                assert record is not None
+                self.assertEqual(record.state, "in_progress")
+                self.assertIsNotNone(record.execution_started_at)
+                with self.assertRaisesRegex(RuntimeError, "already active"):
+                    acquire_write_api_store_lock(store)
+            finally:
+                release.set()
+                client.join(timeout=3)
+                runtime.close()
+
+            self.assertFalse(client.is_alive())
+            self.assertEqual(client_errors, [])
+            self.assertEqual([s for s, _ in responses], [200])
+            self.assertEqual(close_events, ["content"])
+
     def test_close_preserves_runtimes_if_http_cannot_quiesce(self) -> None:
         class StuckThread:
             def __init__(self) -> None:

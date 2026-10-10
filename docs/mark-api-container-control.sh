@@ -147,24 +147,36 @@ compose_blob=$(private_git ls-tree "$docs_tree" -- mark-api-container.compose.ya
 [ "${#compose_blob}" -eq 40 ] || fail 'attested Git object content mismatch'
 compose="$attest_dir/mark-api-container.compose.yaml"
 attest_object blob "$compose_blob" "$compose"
-# Keep this private release file until the Docker Compose command finishes.
-# Fail closed if caller supplies an image ID not present on the *local* daemon.
-docker=/usr/bin/docker
+# Keep the attested Compose bytes until the Docker command finishes.
+# Use an empty private Docker CLI configuration: caller-selected Docker
+# Compose plugins, contexts, endpoint variables and credential helpers must
+# never execute with the release operator's Docker-daemon authority.
+mkdir -m 0700 "$attest_dir/docker-config" ||
+    fail 'private Docker configuration unavailable'
+docker_cli() {
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        XDG_CONFIG_HOME=/nonexistent \
+        DOCKER_CONFIG="$attest_dir/docker-config" \
+        MARK_API_IMAGE_DIGEST="$digest" \
+        /usr/bin/docker --config "$attest_dir/docker-config" \
+        --host unix:///var/run/docker.sock "$@"
+}
+# Fail closed if caller supplies an image ID not present on the local daemon.
 format_id='{{.Id}}'
 format_rev='{{index .Config.Labels "org.opencontainers.image.revision"}}'
-actual_image=$("$docker" --host unix:///var/run/docker.sock image inspect --format "$format_id" "$image") ||
+actual_image=$(docker_cli image inspect --format "$format_id" "$image") ||
     fail 'immutable image not present locally'
 [ "$actual_image" = "$image" ] || fail 'image identity mismatch'
-actual_rev=$("$docker" --host unix:///var/run/docker.sock image inspect --format "$format_rev" "$image") ||
+actual_rev=$(docker_cli image inspect --format "$format_rev" "$image") ||
     fail 'image revision label missing'
 [ "$actual_rev" = "$expected" ] || fail 'image revision label does not match commit'
-actual_user=$("$docker" --host unix:///var/run/docker.sock image inspect --format '{{.Config.User}}' "$image") ||
+actual_user=$(docker_cli image inspect --format '{{.Config.User}}' "$image") ||
     fail 'image user unavailable'
 [ "$actual_user" = 'mark-api:mark-api' ] || fail 'image is not configured for Mark service user'
 # Compose receives exclusively the checked immutable ID, never a caller's tag.
 MARK_API_IMAGE_DIGEST="$digest"
 export MARK_API_IMAGE_DIGEST
-"$docker" --host unix:///var/run/docker.sock compose -f "$compose" --project-name mark-api --profile live --profile backup config --quiet ||
+docker_cli compose -f "$compose" --project-name mark-api --profile live --profile backup config --quiet ||
     fail 'Compose configuration invalid'
 case "$action" in
     verify)
@@ -178,16 +190,16 @@ case "$action" in
         [ "$passwd_name" = mark-api ] && [ "$group_name" = mark-api ] ||
             fail 'exclusive host service UID/GID 50042 not reserved'
         for name in mark-api-data-v1 mark-api-backups-v1; do
-            found=$("$docker" --host unix:///var/run/docker.sock volume inspect --format '{{.Name}}' "$name") ||
+            found=$(docker_cli volume inspect --format '{{.Name}}' "$name") ||
                 fail 'required pre-attested external volume missing'
             [ "$found" = "$name" ] || fail 'volume identity changed'
         done
         if [ "$action" = live ]; then
-            "$docker" --host unix:///var/run/docker.sock compose -f "$compose" --project-name mark-api --profile live \
+            docker_cli compose -f "$compose" --project-name mark-api --profile live \
                 up --no-deps --no-build --pull never --detach mark-api
             exit 0
         fi
-        "$docker" --host unix:///var/run/docker.sock compose -f "$compose" --project-name mark-api --profile backup \
+        docker_cli compose -f "$compose" --project-name mark-api --profile backup \
             run --rm --no-deps --pull never mark-api-backup "$instance"
         ;;
 esac

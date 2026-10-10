@@ -153,10 +153,20 @@ for file in mark-api-container.Dockerfile mark-api-container-start.sh \
             mark-api-preflight.py; do
     cp -- "$temp/docs/$file" "$temp/context/$file"
 done
+# Image/build plugin lookup must not inherit mutable caller CLI configuration.
+# Only the trusted system Docker CLI plugin locations are usable.
+mkdir -m 0700 "$temp/docker-config" ||
+    fail 'private Docker configuration unavailable'
+docker_cli() {
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        XDG_CONFIG_HOME=/nonexistent DOCKER_CONFIG="$temp/docker-config" \
+        /usr/bin/docker --config "$temp/docker-config" \
+        --host unix:///var/run/docker.sock "$@"
+}
 short=$(printf '%.12s' "$expected")
 tag="mark-api:pr75-$short"
-/usr/bin/docker --host unix:///var/run/docker.sock build --pull=false \
+docker_cli build --pull=false \
     --label "org.opencontainers.image.revision=$expected" \
     --file "$temp/context/mark-api-container.Dockerfile" --tag "$tag" "$temp/context"
-/usr/bin/docker --host unix:///var/run/docker.sock image inspect \
+docker_cli image inspect \
     --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' "$tag"

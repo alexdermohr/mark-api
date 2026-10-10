@@ -32,6 +32,7 @@ from .write_api import WriteApiAccess, WriteCapability
 
 
 _LAUNCHER_SOURCE = "private-web-product-launcher"
+_SHUTDOWN_MEDIA_RECONCILE_SECONDS = 8.0
 
 
 class ProductLauncherError(RuntimeError):
@@ -297,16 +298,19 @@ class ProductLauncherRuntime:
                 else:
                     self._write_closed = True
 
-            if self._inventory_close_failed:
-                cleanup_failed = True
-            elif not self._inventory_closed:
-                try:
-                    self._inventory_runtime.close()
-                except Exception:
-                    self._inventory_close_failed = True
+            # An un-drained Write API may still use its caller-owned inventory
+            # runtime. Preserve it until the write runtime is quiesced.
+            if self._write_closed or media_unknown is not None:
+                if self._inventory_close_failed:
                     cleanup_failed = True
-                else:
-                    self._inventory_closed = True
+                elif not self._inventory_closed:
+                    try:
+                        self._inventory_runtime.close()
+                    except Exception:
+                        self._inventory_close_failed = True
+                        cleanup_failed = True
+                    else:
+                        self._inventory_closed = True
 
             if media_unknown is not None:
                 raise media_unknown
@@ -761,10 +765,37 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 launcher.close()
             except PrivateWebSubmitUnknownError:
-                try:
-                    launcher.reconcile_media_submit()
-                    launcher.close()
-                except Exception:
+                # On SIGTERM, an unavailable CDP peer must not hold PID 1
+                # past Docker's stop deadline. The durable in-progress media
+                # fence forbids blind retry after this process exits.
+                if shutdown_requested:
+                    reconciled: list[bool] = []
+
+                    def _settle_before_stop() -> None:
+                        try:
+                            launcher.reconcile_media_submit()
+                            launcher.close()
+                        except Exception:
+                            return
+                        reconciled.append(True)
+
+                    settle_thread = Thread(
+                        target=_settle_before_stop,
+                        daemon=True,
+                        name="mark-media-stop-reconciliation",
+                    )
+                    settle_thread.start()
+                    settle_thread.join(_SHUTDOWN_MEDIA_RECONCILE_SECONDS)
+                    media_settled = not settle_thread.is_alive() and bool(reconciled)
+                else:
+                    try:
+                        launcher.reconcile_media_submit()
+                        launcher.close()
+                    except Exception:
+                        media_settled = False
+                    else:
+                        media_settled = True
+                if not media_settled:
                     print(
                         "mark-api-launch: media submit reconciliation required",
                         file=sys.stderr,

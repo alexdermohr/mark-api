@@ -6,6 +6,7 @@ import signal
 import sqlite3
 import tempfile
 import threading
+from time import monotonic
 import tomllib
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -1008,6 +1009,29 @@ class ProductLauncherTests(unittest.TestCase):
         with self.assertRaisesRegex(ProductLauncherError, "closed"):
             launcher.serve_forever()
 
+    def test_write_shutdown_pending_preserves_inventory_owned_by_handler(self) -> None:
+        _tmp, db = self.make_db()
+        inventory = InventoryRuntime(ReadResult.success_empty(()))
+        launcher = build_product_launcher(
+            db_path=db,
+            cdp_port=9222,
+            runtime_factory=lambda **kwargs: inventory,
+            dashboard_factory=lambda *args, **kwargs: DashboardServer(),
+            clock=lambda: NOW,
+        )
+        from mark_api.private_web_runtime import PrivateWebRuntimeSetupError
+        self.write_runtime.close_error = PrivateWebRuntimeSetupError(
+            "active write handlers remain"
+        )
+        with self.assertRaisesRegex(ProductLauncherError, "cleanup"):
+            launcher.close()
+        self.assertEqual(inventory.close_calls, 0)
+        self.assertFalse(inventory.closed)
+        self.write_runtime.close_error = None
+        launcher.close()
+        self.assertEqual(inventory.close_calls, 1)
+        self.assertTrue(inventory.closed)
+
     def test_unknown_media_close_can_reconcile_then_finish_shutdown(self) -> None:
         _tmp, db = self.make_db()
         inventory = InventoryRuntime(ReadResult.success_empty(()))
@@ -1288,6 +1312,59 @@ class ProductLauncherTests(unittest.TestCase):
         self.assertEqual(runtime.term_calls, 1)
         self.assertTrue(runtime.closed)
         self.assertIs(signal.getsignal(signal.SIGTERM), original)
+
+    def test_main_sigterm_bounds_hung_media_reconciliation(self) -> None:
+        class Launcher:
+            write_server_address = ("127.0.0.1", 18766)
+            dashboard_url = "http://127.0.0.1/#write_token=synthetic"
+            write_bearer_token = "synthetic-only"
+            startup_inventory_count = 0
+            startup_persisted_count = 0
+
+            def __init__(self) -> None:
+                self.reconciliation_entered = threading.Event()
+                self.release_reconciliation = threading.Event()
+                self.close_calls = 0
+
+            def serve_forever(self) -> None:
+                handler = signal.getsignal(signal.SIGTERM)
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+                raise AssertionError("SIGTERM must interrupt serving")
+
+            def close(self) -> None:
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise PrivateWebSubmitUnknownError("create_media_submit_settle")
+
+            def reconcile_media_submit(self) -> None:
+                self.reconciliation_entered.set()
+                self.release_reconciliation.wait(timeout=3)
+
+        runtime = Launcher()
+        try:
+            with (
+                patch("mark_api.launcher.build_product_launcher", return_value=runtime),
+                patch(
+                    "mark_api.launcher._SHUTDOWN_MEDIA_RECONCILE_SECONDS",
+                    0.15, create=True,
+                ),
+                patch("sys.stdout", io.StringIO()),
+                patch("sys.stderr", io.StringIO()) as stderr,
+            ):
+                started = monotonic()
+                result = main([
+                    "--db", "/tmp/synthetic-mark.sqlite",
+                    "--cdp-port", "9222",
+                ])
+                elapsed = monotonic() - started
+            self.assertTrue(runtime.reconciliation_entered.is_set())
+            self.assertEqual(result, 2)
+            self.assertLess(elapsed, 1.5)
+            self.assertEqual(runtime.close_calls, 1)
+            self.assertIn("media submit reconciliation required", stderr.getvalue())
+        finally:
+            runtime.release_reconciliation.set()
 
     def test_main_sigterm_preserves_ambiguous_media_reconciliation(self) -> None:
         original = signal.getsignal(signal.SIGTERM)

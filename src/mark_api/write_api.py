@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Lock
+from threading import Condition, Lock
 from typing import Callable, ContextManager, Protocol
 from urllib.parse import unquote, urlsplit
 
@@ -1124,6 +1124,7 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
 
     def __init__(self, *args, **kwargs) -> None:
         self._store_lock_guard = Lock()
+        self._handler_drained = Condition(self._store_lock_guard)
         self._active_handler_count = 0
         self._serve_loop_active = False
         self._socket_close_succeeded = False
@@ -1170,8 +1171,9 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
         try:
             super().process_request(request, client_address)
         except BaseException:
-            with self._store_lock_guard:
+            with self._handler_drained:
                 self._active_handler_count -= 1
+                self._handler_drained.notify_all()
             self._release_store_lock_if_quiesced()
             raise
 
@@ -1179,9 +1181,17 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            with self._store_lock_guard:
+            with self._handler_drained:
                 self._active_handler_count -= 1
+                self._handler_drained.notify_all()
             self._release_store_lock_if_quiesced()
+
+    def wait_for_active_handlers(self, timeout_seconds: float) -> bool:
+        with self._handler_drained:
+            return self._handler_drained.wait_for(
+                lambda: self._active_handler_count == 0,
+                timeout=timeout_seconds,
+            )
 
     def server_close(self) -> None:
         super().server_close()

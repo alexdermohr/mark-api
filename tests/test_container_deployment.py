@@ -703,6 +703,73 @@ class ContainerDeploymentTests(unittest.TestCase):
         self.assertIn("volume inspect", guard)
         self.assertIn("org.opencontainers.image.revision", guard)
 
+    def test_control_never_executes_caller_selected_compose_plugin(self) -> None:
+        control = _read("mark-api-container-control.sh")
+        self.assertIn("docker_cli() {", control)
+        self.assertIn('DOCKER_CONFIG="$attest_dir/docker-config"', control)
+        self.assertIn('/usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent', control)
+        self.assertNotIn('"$docker" --host unix:///var/run/docker.sock compose', control)
+        start = control.index("docker_cli() {")
+        end = control.index("\n}", start) + 2
+        wrapper = control[start:end]
+        with TemporaryDirectory(prefix="mark-compose-plugin-p1-") as tmp:
+            root = Path(tmp)
+            private = root / "attested"
+            (private / "docker-config").mkdir(parents=True, mode=0o700)
+            attacker = root / "attacker-config"
+            plugins = attacker / "cli-plugins"
+            plugins.mkdir(parents=True)
+            marker = root / "plugin-executed"
+            malicious = plugins / "docker-compose"
+            malicious.write_text(
+                "#!/bin/sh\n"
+                + "printf exploited > " + str(marker) + "\n"
+                + "exit 77\n", encoding="utf-8",
+            )
+            malicious.chmod(0o755)
+            observed = root / "docker-env"
+            fake_docker = root / "docker-stub"
+            fake_docker.write_text(
+                "#!/bin/sh\n"
+                + "printf '%s\\n' \"$DOCKER_CONFIG\" \"${DOCKER_HOST-unset}\" "
+                + "> " + str(observed) + "\n"
+                + 'if [ -x "$DOCKER_CONFIG/cli-plugins/docker-compose" ]; then\n'
+                + '  exec "$DOCKER_CONFIG/cli-plugins/docker-compose"\n'
+                + "fi\n"
+                + "exit 0\n", encoding="utf-8",
+            )
+            fake_docker.chmod(0o700)
+            script = (
+                "set -eu\n"
+                + "attest_dir='" + str(private) + "'\n"
+                + "digest=" + "a" * 64 + "\n"
+                + wrapper.replace("/usr/bin/docker", str(fake_docker))
+                + "\ndocker_cli compose version\n"
+            )
+            result = subprocess.run(
+                ["/bin/sh", "-c", script],
+                env={
+                    **os.environ,
+                    "DOCKER_CONFIG": str(attacker),
+                    "DOCKER_HOST": "tcp://localhost:1234",
+                },
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(marker.exists())
+            self.assertEqual(
+                observed.read_text(encoding="utf-8").splitlines(),
+                [str(private / "docker-config"), "unset"],
+            )
+
+    def test_build_docker_cli_uses_private_configuration(self) -> None:
+        build = _read("mark-api-container-build.sh")
+        self.assertIn("docker_cli() {", build)
+        self.assertIn('DOCKER_CONFIG="$temp/docker-config"', build)
+        self.assertIn('/usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent', build)
+        self.assertNotIn('/usr/bin/docker --host unix:///var/run/docker.sock build', build)
+        self.assertNotIn('/usr/bin/docker --host unix:///var/run/docker.sock image', build)
+
     def test_guard_rejects_mutable_image_refs_before_docker(self) -> None:
         tool = str(DOCS / "mark-api-container-control.sh")
         sha = "a" * 40
