@@ -1277,6 +1277,83 @@ class SnapshotStore:
             else None
         )
 
+    def create_recovery_pending(
+        self, *, exclude_idempotency_key: str, claim_owner: str
+    ) -> bool:
+        """Fail closed on older executed Writes or unresolved media Creates.
+
+        An ambiguous media receipt can be HTTP-completed while its browser
+        submit remains unsettled. Its durable HTTP response, rather than the
+        process-local media page, must prevent a new key from re-submitting.
+        A previous process's in-progress execution is similarly non-retryable.
+        This check does not resolve an old fence; independent reconciliation
+        and an explicit persisted clearance are required for that.
+        """
+        if not isinstance(exclude_idempotency_key, str) or not exclude_idempotency_key:
+            raise ValueError("excluded idempotency key is required")
+        owner = _validated_write_api_claim_owner(claim_owner)
+        with self._connect() as connection:
+            # Keep accepted but never-started claims recoverable. A started
+            # write with unknown outcome can still have reached the platform.
+            if connection.execute(
+                """
+                SELECT 1 FROM write_api_requests
+                WHERE idempotency_key != ?
+                  AND state = 'in_progress'
+                  AND execution_started_at IS NOT NULL
+                  AND (claim_owner IS NULL OR claim_owner != ?)
+                LIMIT 1
+                """,
+                (exclude_idempotency_key, owner),
+            ).fetchone() is not None:
+                return True
+            if connection.execute(
+                """
+                SELECT 1 FROM create_operation_receipts
+                WHERE operation = 'create' AND outcome = 'ambiguous'
+                  AND writer_invoked = 1 AND media_post_read_status IS NOT NULL
+                LIMIT 1
+                """
+            ).fetchone() is not None:
+                return True
+            rows = connection.execute(
+                """
+                SELECT response_json FROM write_api_requests
+                WHERE idempotency_key != ?
+                  AND state = 'completed'
+                  AND instr(response_json, 'media_persistence_confirmed') > 0
+                """,
+                (exclude_idempotency_key,),
+            )
+            for row in rows:
+                try:
+                    response = json.loads(row["response_json"])
+                    if not isinstance(response, dict):
+                        raise ValueError("invalid response envelope")
+                    if not isinstance(response.get("media_persistence_confirmed"), bool):
+                        raise ValueError("invalid media response")
+                    receipt = response.get("operation_receipt")
+                    if receipt is None:
+                        # An execution error may have followed browser submit.
+                        return True
+                    if not isinstance(receipt, dict):
+                        raise ValueError("invalid media receipt")
+                    outcome = receipt.get("outcome")
+                    invoked = receipt.get("writer_invoked")
+                    if not isinstance(invoked, bool) or not isinstance(outcome, str):
+                        raise ValueError("invalid media receipt outcome")
+                    if invoked and outcome == "ambiguous":
+                        return True
+                    if outcome not in {
+                        "confirmed", "ambiguous", "precondition_failed",
+                    }:
+                        raise ValueError("unknown media outcome")
+                except (TypeError, ValueError) as exc:
+                    raise sqlite3.DatabaseError(
+                        "invalid persisted media recovery evidence"
+                    ) from exc
+        return False
+
     def claim_write_api_request(
         self,
         *,

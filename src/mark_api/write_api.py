@@ -41,6 +41,10 @@ class _RequestBodyTimeoutError(ValueError):
     pass
 
 
+class _CreateRecoveryPendingError(RuntimeError):
+    """A durable unknown Write outcome forbids another Create."""
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -431,6 +435,10 @@ def _handler_factory(
     # media and media-free create cannot share/contaminate the same delta
     # window. Other write routes remain independent.
     create_lock = Lock()
+    # Conservatively close the small window between an ambiguous Create
+    # receipt and its durable HTTP idempotency completion. Every Create,
+    # including media-free, must observe this under create_lock.
+    create_recovery_in_memory = [False]
     # A staging request may buffer up to _MAX_MEDIA_BODY_BYTES. Serialize
     # staging reads so ThreadingHTTPServer cannot multiply that bound by the
     # number of concurrent authenticated clients.
@@ -917,6 +925,14 @@ def _handler_factory(
                     if action in {"create", "create_media"}:
                         assert create_request is not None
                         with create_lock:
+                            if (
+                                create_recovery_in_memory[0]
+                                or store.create_recovery_pending(
+                                    exclude_idempotency_key=idempotency_key,
+                                    claim_owner=claim_owner,
+                                )
+                            ):
+                                raise _CreateRecoveryPendingError()
                             if action == "create":
                                 create_receipt = service.create(
                                     create_request,
@@ -926,12 +942,25 @@ def _handler_factory(
                             else:
                                 assert media_service is not None
                                 assert media_refs is not None
-                                create_receipt = media_service.create_with_media(
-                                    create_request,
-                                    media_refs,
-                                    authorization_by=access.principal,
-                                    authorization_reference=authorization_reference,
-                                )
+                                try:
+                                    create_receipt = media_service.create_with_media(
+                                        create_request,
+                                        media_refs,
+                                        authorization_by=access.principal,
+                                        authorization_reference=authorization_reference,
+                                    )
+                                except BaseException:
+                                    # No conclusive receipt after entry into
+                                    # the media writer: do not admit another
+                                    # key while this runtime remains live.
+                                    create_recovery_in_memory[0] = True
+                                    raise
+                                if (
+                                    isinstance(create_receipt, CreateOperationReceipt)
+                                    and create_receipt.writer_invoked
+                                    and create_receipt.outcome is OperationOutcome.AMBIGUOUS
+                                ):
+                                    create_recovery_in_memory[0] = True
                         if not isinstance(
                             create_receipt,
                             CreateOperationReceipt,
@@ -1045,6 +1074,13 @@ def _handler_factory(
                             "operation_receipt": _receipt_to_dict(receipt),
                             "platform_retry_authorized": False,
                         }
+                except _CreateRecoveryPendingError:
+                    status = 409
+                    response = {
+                        "error": "create_recovery_pending",
+                        "idempotency_key": idempotency_key,
+                        "platform_retry_authorized": False,
+                    }
                 except Exception:
                     status = 500
                     response = {

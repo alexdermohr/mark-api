@@ -1419,6 +1419,12 @@ class WriteApiTests(unittest.TestCase):
             (OperationOutcome.PRECONDITION_FAILED, 409),
         ):
             with self.subTest(outcome=outcome.value):
+                # An earlier ambiguous platform submit intentionally fences
+                # future creates. Exercise independent receipt classifications
+                # on independent synthetic stores.
+                self.store = SnapshotStore(
+                    Path(self.tmp.name) / f"media-outcome-{outcome.value}.sqlite"
+                )
                 media_service = FakeMediaWriteService(outcome=outcome)
                 key = f"media-create-{outcome.value}"
                 with self.server(
@@ -1997,6 +2003,163 @@ class WriteApiTests(unittest.TestCase):
                     )
         self.assertEqual(service.calls, [])
 
+    def test_ambiguous_media_submit_blocks_new_create_keys_after_restart(self) -> None:
+        payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase", "description": "Beschreibung",
+            "price_eur": 12, "media_refs": ["cover_01"],
+        }
+        with self.server(
+            FakeWriteService(),
+            media_service=FakeMediaWriteService(outcome=OperationOutcome.AMBIGUOUS),
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+        ) as server:
+            first_status, _, first_body = self.request(
+                server, "POST", "/api/write/media/ads",
+                payload=payload, idempotency_key="ambiguous-media-before-restart",
+            )
+        self.assertEqual(first_status, 202)
+        self.assertEqual(
+            self.store.write_api_request("ambiguous-media-before-restart").state,
+            "completed",
+        )
+        self.store = SnapshotStore(self.store.path, create_if_missing=False)
+        media = FakeMediaWriteService(
+            media_post_read_status=MediaPostReadStatus.CONFIRMED,
+            media_persistence_confirmed=True,
+        )
+        plain = FakeWriteService()
+        with self.server(
+            plain, media_service=media,
+            capabilities=frozenset({
+                WriteCapability.CREATE, WriteCapability.CREATE_MEDIA,
+            }),
+        ) as server:
+            status, _, body = self.request(
+                server, "POST", "/api/write/media/ads",
+                payload=payload, idempotency_key="different-media-key",
+            )
+            no_media_status, _, no_media_body = self.request(
+                server, "POST", "/api/write/ads",
+                payload={k: v for k, v in payload.items() if k != "media_refs"},
+                idempotency_key="different-plain-key",
+            )
+            replay, headers, repeated = self.request(
+                server, "POST", "/api/write/media/ads",
+                payload=payload, idempotency_key="ambiguous-media-before-restart",
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "create_recovery_pending")
+        self.assertFalse(body["platform_retry_authorized"])
+        self.assertEqual(no_media_status, 409)
+        self.assertEqual(no_media_body["error"], "create_recovery_pending")
+        self.assertEqual(replay, 202)
+        self.assertEqual(headers.get("Idempotency-Replayed"), "true")
+        self.assertEqual(repeated, first_body)
+        self.assertEqual(media.calls, [])
+        self.assertEqual(plain.calls, [])
+
+    def test_executed_in_progress_write_blocks_new_create_after_restart(self) -> None:
+        self.store.claim_write_api_request(
+            idempotency_key="interrupted-execution",
+            request_sha256="a" * 64,
+            requested_at=NOW, claim_owner="previous-runtime",
+        )
+        self.store.begin_write_api_request(
+            idempotency_key="interrupted-execution",
+            request_sha256="a" * 64,
+            claim_owner="previous-runtime",
+            execution_started_at=NOW,
+        )
+        self.store = SnapshotStore(self.store.path, create_if_missing=False)
+        service = FakeWriteService()
+        with self.server(service) as server:
+            status, _, body = self.request(
+                server, "POST", "/api/write/ads",
+                payload={
+                    "category_path": ["Haus & Garten", "Dekoration"],
+                    "title": "Neue Vase", "description": "Beschreibung",
+                    "price_eur": 12,
+                },
+                idempotency_key="fresh-after-interrupt",
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "create_recovery_pending")
+        self.assertEqual(service.calls, [])
+
+
+    def test_unattempted_media_precondition_allows_later_create(self) -> None:
+        payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase", "description": "Beschreibung",
+            "price_eur": 12, "media_refs": ["cover_01"],
+        }
+        with self.server(
+            FakeWriteService(),
+            media_service=FakeMediaWriteService(
+                outcome=OperationOutcome.PRECONDITION_FAILED,
+            ),
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+        ) as server:
+            old_status, _, old_body = self.request(
+                server, "POST", "/api/write/media/ads",
+                payload=payload, idempotency_key="media-not-attempted",
+            )
+        self.assertEqual(old_status, 409)
+        self.assertFalse(old_body["operation_receipt"]["writer_invoked"])
+        self.store = SnapshotStore(self.store.path, create_if_missing=False)
+        fresh = FakeMediaWriteService(
+            media_post_read_status=MediaPostReadStatus.CONFIRMED,
+            media_persistence_confirmed=True,
+        )
+        with self.server(
+            FakeWriteService(), media_service=fresh,
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+        ) as server:
+            status, _, response = self.request(
+                server, "POST", "/api/write/media/ads",
+                payload=payload, idempotency_key="fresh-safe-create",
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(response["media_persistence_confirmed"])
+        self.assertEqual(len(fresh.calls), 1)
+
+    def test_corrupt_persisted_media_response_fails_closed_for_create(self) -> None:
+        payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase", "description": "Beschreibung",
+            "price_eur": 12, "media_refs": ["cover_01"],
+        }
+        with self.server(
+            FakeWriteService(),
+            media_service=FakeMediaWriteService(outcome=OperationOutcome.AMBIGUOUS),
+            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+        ) as server:
+            status, _, _ = self.request(
+                server, "POST", "/api/write/media/ads",
+                payload=payload, idempotency_key="damaged-media-fence",
+            )
+        self.assertEqual(status, 202)
+        import sqlite3
+        with sqlite3.connect(self.store.path) as connection:
+            connection.execute(
+                "UPDATE write_api_requests SET response_json = ? "
+                "WHERE idempotency_key = ?",
+                ('{"media_persistence_confirmed":invalid',
+                 "damaged-media-fence"),
+            )
+        self.store = SnapshotStore(self.store.path, create_if_missing=False)
+        plain = FakeWriteService()
+        with self.server(plain) as server:
+            status, _, response = self.request(
+                server, "POST", "/api/write/ads",
+                payload={k: v for k, v in payload.items() if k != "media_refs"},
+                idempotency_key="new-key-damaged-fence",
+            )
+        self.assertEqual(status, 500)
+        self.assertEqual(response["error"], "write_execution_error")
+        self.assertFalse(response["platform_retry_authorized"])
+        self.assertEqual(plain.calls, [])
 
 if __name__ == "__main__":
     unittest.main()
