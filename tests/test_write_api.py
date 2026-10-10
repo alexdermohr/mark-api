@@ -2161,5 +2161,64 @@ class WriteApiTests(unittest.TestCase):
         self.assertFalse(response["platform_retry_authorized"])
         self.assertEqual(plain.calls, [])
 
+
+    def test_exact_verified_clearance_reopens_current_create_runtime(self) -> None:
+        payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase", "description": "Beschreibung",
+            "price_eur": 12, "media_refs": ["cover_01"],
+        }
+        media = FakeMediaWriteService(outcome=OperationOutcome.AMBIGUOUS)
+        with self.server(
+            FakeWriteService(),
+            media_service=media,
+            capabilities=frozenset({
+                WriteCapability.CREATE, WriteCapability.CREATE_MEDIA,
+            }),
+        ) as server:
+            first_status, _, first_body = self.request(
+                server, "POST", "/api/write/media/ads",
+                payload=payload, idempotency_key="uncertain-original",
+            )
+            self.assertEqual(first_status, 202)
+            old_record = self.store.write_api_request("uncertain-original")
+            assert old_record is not None
+            with self.assertRaises(ValueError):
+                server.clear_verified_create_recovery(
+                    "uncertain-original", old_record.request_sha256,
+                )
+            self.store.record_write_recovery_clearance(
+                idempotency_key="uncertain-original",
+                request_sha256=old_record.request_sha256,
+                verification_kind="operator_verified_postread",
+                evidence_reference="synthetic-trusted-postread:ad-200",
+                observed_at=NOW,
+            )
+            with self.assertRaises(ValueError):
+                server.clear_verified_create_recovery(
+                    "unrelated-operation", old_record.request_sha256,
+                )
+            server.clear_verified_create_recovery(
+                "uncertain-original", old_record.request_sha256,
+            )
+            media.outcome = OperationOutcome.CONFIRMED
+            media.media_post_read_status = MediaPostReadStatus.CONFIRMED
+            media.media_persistence_confirmed = True
+            second_status, _, second_body = self.request(
+                server, "POST", "/api/write/media/ads",
+                payload=payload, idempotency_key="verified-new-write",
+            )
+            repeat_status, repeat_headers, repeated = self.request(
+                server, "POST", "/api/write/media/ads",
+                payload=payload, idempotency_key="uncertain-original",
+            )
+        self.assertEqual(second_status, 200)
+        self.assertTrue(second_body["media_persistence_confirmed"])
+        self.assertEqual(repeat_status, 202)
+        self.assertEqual(repeat_headers.get("Idempotency-Replayed"), "true")
+        self.assertEqual(repeated, first_body)
+        self.assertEqual(len(media.calls), 2)
+        self.assertEqual(self.store.write_api_request("uncertain-original"), old_record)
+
 if __name__ == "__main__":
     unittest.main()

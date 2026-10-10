@@ -1,6 +1,6 @@
 # Mark – aktuelles Betriebs- und Recovery-Runbook
 
-Stand: 09.10.2026. Dieses Runbook beschreibt den installierten technischen
+Stand: 10.10.2026. Dieses Runbook beschreibt den installierten technischen
 Produktpfad. Eine laufende lokale Write-API und ein belegter, zulässiger
 Kleinanzeigen-Live-Write sind unterschiedliche Abnahmegegenstände.
 
@@ -353,6 +353,77 @@ bleiben solange blockierend, bis eine für den realen Produktpfad wirksame
 Vertrauensgrenze nachgewiesen und der konkrete PR-Head unabhängig
 nachgeprüft ist.
 
+## Wiederanlauf nach einem unklaren Write-/Media-Submit
+
+Nach SIGTERM, SIGKILL, Prozessabsturz oder Browser-Timeout bleibt ein
+bereits gestarteter, unklarer Write durch den SQLite-Request **in_progress**
+gesperrt. Bei abgeschlossenem HTTP-202-Receipt eines unklaren Media-Submits
+bleibt nun ebenfalls eine **datenbankweite Create-Recovery-Sperre** bestehen:
+Ein neuer Idempotency-Key darf keine erneute Create-/Media-Create-Eingabe
+auslösen. Bereits gespeicherte Antworten auf den alten Key werden unverändert
+replayed. Andere reguläre Write-Capabilities bleiben technisch default-on,
+soweit ihre eigenen Sicherheitsbedingungen erfüllt sind.
+
+Der an den ursprünglichen Browser-Submit gebundene offene Media-Page-Zustand
+kann während der **gleichen laufenden Sitzung** ausschließlich über
+`reconcile_media_submit()` observation-only geprüft werden. Nach
+positiv abgeschlossenem Page-Readback schreibt Mark für exakt den gebundenen
+Write-API-Idempotency-Key eine zusätzliche SQLite-Clearance mit Fingerprint
+und Verifikationsart. Die ursprüngliche Operation, ihr Receipt und ihre
+HTTP-Replay-Antwort werden **niemals gelöscht oder verändert**. Scheitert
+die Beobachtung oder das Schreiben der Clearance, bleibt die Sperre bestehen.
+
+Für einen bereits beendeten Prozess ist die ursprüngliche Browserseite
+nicht automatisch rekonstruierbar. Ein unabhängiger, autorisierter Operator
+muss dann den tatsächlichen fremden Plattformzustand und die konkrete
+betroffene Operation anhand frischer Account-/Owner-/Target- und bei Bedarf
+Medien-Beobachtungen verifizieren. Ein fehlender lokaler Pending-Eintrag,
+ein historisches Backup oder die Aussage des ursprünglichen Write-Handlers
+genügen nicht. Nur wenn das Ergebnis eindeutig festgestellt ist, darf der
+Operator eine **manuelle**, exakt an den Request-Fingerprint gebundene
+Clearance attestieren. Sind Ausgang oder Accountrechte weiterhin unklar,
+**nicht quittieren und nicht erneut senden**.
+
+Nach unabhängig dokumentierter Einzelfallprüfung und nach geordnetem Stop
+aller Schreibdienste kann der vertrauenswürdige Host-/Dienstoperator die
+gezielte Clearance mit dem installierten Mark-Code erzeugen:
+
+~~~bash
+# Platzhalter vor Ausführung durch exakt geprüfte lokale Werte ersetzen.
+sudo -u mark-api /opt/mark-api/venv/bin/python -I - \
+    /var/lib/mark-api/mark.sqlite \
+    'EXAKTER_IDEMPOTENCY_KEY' 'EXAKTER_REQUEST_SHA256' \
+    'REFERENZ_DER_UNABHAENGIGEN_POSTREADBACK_EVIDENZ' <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+from mark_api.storage import SnapshotStore
+
+db, key, fingerprint, evidence = sys.argv[1:]
+store = SnapshotStore(Path(db), create_if_missing=False)
+record = store.write_api_request(key)
+if record is None or record.request_sha256 != fingerprint:
+    raise SystemExit("recovery operation mismatch")
+store.record_write_recovery_clearance(
+    idempotency_key=key,
+    request_sha256=fingerprint,
+    verification_kind="operator_verified_postread",
+    evidence_reference=evidence,
+    observed_at=datetime.now(timezone.utc),
+)
+print("operation-bound recovery clearance appended")
+PY
+~~~
+
+Dieser Aufruf ist ein **operatorverantwortetes Evidenz-Attest**, keine
+automatische oder kryptografische Bestätigung des externen Plattformzustands.
+Er ist keine öffentlich erreichbare API und darf niemals in eine generische
+Chat-/Dashboard-Write-Freigabeschaltfläche umgewandelt werden. Die
+SQLite-Version-2-Migration erstellt eine eigene append-only-Clearance-Tabelle
+erst nach Prüfung aller bisherigen Write-/Sync-Fences. Das Fehlen dieser
+Tabelle in einem bereits versionierten Version-2-Store blockiert den Start
+fail-closed; sie wird nicht stillschweigend neu angelegt.
+
 ## Restore – ausschließlich in neue Datei
 
 1. Mark, Dashboard, Write-API und andere SQLite-Nutzer stoppen.
@@ -390,7 +461,7 @@ nicht, dass früher nie Plattformwrites durchgeführt wurden.
 
 | Bereich | Tatsächlicher Nachweis |
 | --- | --- |
-| Paketinstallation und sechs bisherige CLI-Einstiege | installierter lokaler Smoke |
+| Paketinstallation und sieben CLI-Einstiege | installierter lokaler Smoke |
 | Default-on Write-Wiring, Auth, Idempotenz und Confirmation | umfangreiche lokale Tests, kein aktueller Live-Write |
 | E-Mail → SQLite → Dashboard/Analytics | installierter lokaler Smoke |
 | Per-Metrik-Provenienz und separate Sync-Erfolge | lokale Tests und PR #73/#74 CI |

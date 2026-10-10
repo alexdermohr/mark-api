@@ -518,6 +518,24 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertTrue(page._closed)
         runtime.close()
 
+    def test_pending_submit_tracks_exact_authorization_reference(self) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events, submit_unknown=True)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+        writer = runtime.bind_create_writer(
+            self.request, self.sources,
+            authorization_reference="write-api:exact-media-idempotency",
+        )
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            writer.create_ad(self.request)
+        self.assertEqual(
+            runtime.pending_authorization_reference,
+            "write-api:exact-media-idempotency",
+        )
+        runtime.reconcile_media_submit()
+        self.assertIsNone(runtime.pending_authorization_reference)
+        runtime.close()
+
     def test_context_manager_preserves_submit_unknown_stage(self) -> None:
         events: list[tuple] = []
         page = MediaCreatePage(events, submit_unknown=True)
@@ -4004,6 +4022,103 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             replacement_lock.close()
 
 
+
+    def test_reconciled_pending_page_persists_exact_clearance(self) -> None:
+        class ObservedPendingPage:
+            def __init__(self) -> None:
+                self.readbacks = 0
+                self.closed = False
+
+            def reconcile_create_media_submit(self) -> None:
+                self.readbacks += 1
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "reconcile.sqlite")
+            store.claim_write_api_request(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+                requested_at=NOW,
+                claim_owner="prior-runtime",
+            )
+            store.begin_write_api_request(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+                execution_started_at=NOW,
+                claim_owner="prior-runtime",
+            )
+            body = json.dumps({
+                "operation_receipt": {
+                    "outcome": "ambiguous", "writer_invoked": True,
+                },
+                "media_persistence_confirmed": False,
+            })
+            store.complete_write_api_request(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+                claim_owner="prior-runtime",
+                response_status=202,
+                response_json=body,
+                completed_at=NOW,
+            )
+            source_path = Path(tmp) / "photo.jpg"
+            source_path.write_bytes(b"synthetic-image")
+            media_runtime = PrivateWebMediaCreateRuntime(
+                page_factory=lambda: (_ for _ in ()).throw(
+                    AssertionError("do not create a new page")
+                ),
+            )
+            pending = ObservedPendingPage()
+            media_runtime._pending_page = pending
+            media_runtime._submit_unknown_fenced = True
+            media_runtime._pending_authorization_reference = (
+                "write-api:bound-media-create"
+            )
+            close_events: list[str] = []
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=self._content_runtime(
+                    OwnerReader(ReadResult.success_empty(())), close_events,
+                ),
+                media_runtime=media_runtime,
+                media_resolver=PrivateWebMediaRefResolver({
+                    "cover": PrivateWebMediaSource(path=str(source_path)),
+                }),
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                ),
+            )
+            old_record = store.write_api_request("bound-media-create")
+            with self.assertRaises(PrivateWebSubmitUnknownError):
+                runtime.close()
+            self.assertTrue(store.create_recovery_pending(
+                exclude_idempotency_key="different-key",
+                claim_owner="new-runtime",
+            ))
+            runtime.reconcile_media_submit()
+            self.assertEqual(pending.readbacks, 1)
+            self.assertTrue(pending.closed)
+            self.assertFalse(SnapshotStore(
+                store.path, create_if_missing=False,
+            ).create_recovery_pending(
+                exclude_idempotency_key="different-key",
+                claim_owner="new-runtime",
+            ))
+            self.assertEqual(store.write_api_request("bound-media-create"), old_record)
+            with sqlite3.connect(store.path) as db:
+                row = db.execute(
+                    "SELECT verification_kind, request_sha256 "
+                    "FROM write_recovery_clearances "
+                    "WHERE idempotency_key = 'bound-media-create'",
+                ).fetchone()
+            self.assertEqual(row, ("media_submit_reconciled", "e" * 64))
+            db.close()
+            runtime.close()
+            self.assertEqual(close_events, ["content"])
 
     def test_normal_create_route_uses_composed_mark_service(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -438,7 +438,7 @@ def _handler_factory(
     # Conservatively close the small window between an ambiguous Create
     # receipt and its durable HTTP idempotency completion. Every Create,
     # including media-free, must observe this under create_lock.
-    create_recovery_in_memory = [False]
+    create_recovery_in_memory: set[str] = set()
     # A staging request may buffer up to _MAX_MEDIA_BODY_BYTES. Serialize
     # staging reads so ThreadingHTTPServer cannot multiply that bound by the
     # number of concurrent authenticated clients.
@@ -447,6 +447,20 @@ def _handler_factory(
     class WriteApiHandler(BaseHTTPRequestHandler):
         server_version = "mark-api-write/0.1"
         sys_version = ""
+
+        @classmethod
+        def clear_verified_create_recovery(
+            cls, idempotency_key: str, request_sha256: str,
+        ) -> None:
+            # Trusted local method, never an HTTP capability. The persisted
+            # original-operation fingerprint is the only release authority.
+            if not store.has_write_recovery_clearance(
+                idempotency_key=idempotency_key,
+                request_sha256=request_sha256,
+            ):
+                raise ValueError("write recovery clearance is not verified")
+            with create_lock:
+                create_recovery_in_memory.discard(idempotency_key)
 
         def log_message(self, format: str, *args: object) -> None:
             return
@@ -926,7 +940,7 @@ def _handler_factory(
                         assert create_request is not None
                         with create_lock:
                             if (
-                                create_recovery_in_memory[0]
+                                create_recovery_in_memory
                                 or store.create_recovery_pending(
                                     exclude_idempotency_key=idempotency_key,
                                     claim_owner=claim_owner,
@@ -953,14 +967,14 @@ def _handler_factory(
                                     # No conclusive receipt after entry into
                                     # the media writer: do not admit another
                                     # key while this runtime remains live.
-                                    create_recovery_in_memory[0] = True
+                                    create_recovery_in_memory.add(idempotency_key)
                                     raise
                                 if (
                                     isinstance(create_receipt, CreateOperationReceipt)
                                     and create_receipt.writer_invoked
                                     and create_receipt.outcome is OperationOutcome.AMBIGUOUS
                                 ):
-                                    create_recovery_in_memory[0] = True
+                                    create_recovery_in_memory.add(idempotency_key)
                         if not isinstance(
                             create_receipt,
                             CreateOperationReceipt,
@@ -1221,6 +1235,13 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
                 self._active_handler_count -= 1
                 self._handler_drained.notify_all()
             self._release_store_lock_if_quiesced()
+
+    def clear_verified_create_recovery(
+        self, idempotency_key: str, request_sha256: str,
+    ) -> None:
+        self.RequestHandlerClass.clear_verified_create_recovery(
+            idempotency_key, request_sha256,
+        )
 
     def wait_for_active_handlers(self, timeout_seconds: float) -> bool:
         with self._handler_drained:

@@ -344,6 +344,7 @@ class PrivateWebMediaCreateRuntime:
     ) -> None:
         self._page_factory = page_factory
         self._pending_page: _CloseablePrivateWebMediaPage | None = None
+        self._pending_authorization_reference: str | None = None
         self._submit_unknown_fenced = False
         self._closed = False
         self._operation_lock = Lock()
@@ -371,15 +372,26 @@ class PrivateWebMediaCreateRuntime:
         with self._operation_lock:
             return self._pending_page is not None
 
+    @property
+    def pending_authorization_reference(self) -> str | None:
+        with self._operation_lock:
+            return (
+                self._pending_authorization_reference
+                if self._pending_page is not None else None
+            )
+
     def _close_after_writer_outcome(
         self,
         page: _CloseablePrivateWebMediaPage,
+        *,
+        authorization_reference: str | None = None,
     ) -> None:
         try:
             page.close()
         except PrivateWebSubmitUnknownError as exc:
             if exc.stage == "create_media_submit_unsettled":
                 self._pending_page = page
+                self._pending_authorization_reference = authorization_reference
                 raise
             # Any other cleanup classification must not replace the already
             # classified writer outcome.
@@ -391,6 +403,8 @@ class PrivateWebMediaCreateRuntime:
         self,
         request: AdCreateRequest,
         sources: tuple[PrivateWebMediaSource, ...],
+        *,
+        authorization_reference: str | None = None,
     ) -> None:
         self._ensure_open()
         self._ensure_create_available()
@@ -411,13 +425,17 @@ class PrivateWebMediaCreateRuntime:
             # and can be closed, such as writer-owned local cleanup failure.
             self._submit_unknown_fenced = True
             try:
-                self._close_after_writer_outcome(page)
+                self._close_after_writer_outcome(
+                    page, authorization_reference=authorization_reference
+                )
             except PrivateWebSubmitUnknownError:
                 pass
             raise
         except Exception:
             try:
-                self._close_after_writer_outcome(page)
+                self._close_after_writer_outcome(
+                    page, authorization_reference=authorization_reference
+                )
             except PrivateWebSubmitUnknownError:
                 pass
             raise
@@ -428,7 +446,9 @@ class PrivateWebMediaCreateRuntime:
             # never replace the original cancellation with cleanup outcome.
             self._submit_unknown_fenced = True
             try:
-                self._close_after_writer_outcome(page)
+                self._close_after_writer_outcome(
+                    page, authorization_reference=authorization_reference
+                )
             except PrivateWebSubmitUnknownError:
                 pass
             raise
@@ -437,7 +457,9 @@ class PrivateWebMediaCreateRuntime:
         # If close nevertheless reports an unsettled submit, preserve the page
         # and surface UNKNOWN rather than dropping its media lifetime.
         try:
-            self._close_after_writer_outcome(page)
+            self._close_after_writer_outcome(
+                page, authorization_reference=authorization_reference
+            )
         except PrivateWebSubmitUnknownError:
             self._submit_unknown_fenced = True
             raise
@@ -446,20 +468,27 @@ class PrivateWebMediaCreateRuntime:
         self,
         request: AdCreateRequest,
         sources: tuple[PrivateWebMediaSource, ...],
+        *,
+        authorization_reference: str | None = None,
     ) -> None:
         with self._operation_lock:
-            self._create_ad_locked(request, sources)
+            self._create_ad_locked(
+                request, sources, authorization_reference=authorization_reference,
+            )
 
     def bind_create_writer(
         self,
         request: AdCreateRequest,
         sources: tuple[PrivateWebMediaSource, ...],
+        *,
+        authorization_reference: str | None = None,
     ) -> AdCreateWriter:
         """Bind one explicit create request and media tuple to a one-shot writer."""
         return _BoundPrivateWebMediaCreateWriter(
             runtime=self,
             request=request,
             sources=sources,
+            authorization_reference=authorization_reference,
         )
 
     def _reconcile_media_submit_locked(self) -> None:
@@ -472,6 +501,7 @@ class PrivateWebMediaCreateRuntime:
 
         page.reconcile_create_media_submit()
         self._pending_page = None
+        self._pending_authorization_reference = None
         self._submit_unknown_fenced = False
         try:
             page.close()
@@ -523,6 +553,7 @@ class _BoundPrivateWebMediaCreateWriter:
         runtime: PrivateWebMediaCreateRuntime,
         request: AdCreateRequest,
         sources: tuple[PrivateWebMediaSource, ...],
+        authorization_reference: str | None = None,
     ) -> None:
         if not isinstance(request, AdCreateRequest):
             raise TypeError("media create writer request must be AdCreateRequest")
@@ -538,6 +569,7 @@ class _BoundPrivateWebMediaCreateWriter:
         self._runtime = runtime
         self._request = request
         self._sources = sources
+        self._authorization_reference = authorization_reference
         self._call_lock = Lock()
         self._used = False
 
@@ -554,7 +586,10 @@ class _BoundPrivateWebMediaCreateWriter:
             # This adapter represents one explicit logical create attempt.
             # Never manufacture retry authority from a later runtime outcome.
             self._used = True
-        self._runtime.create_ad(request, self._sources)
+        self._runtime.create_ad(
+            request, self._sources,
+            authorization_reference=self._authorization_reference,
+        )
 
 
 class PrivateWebMediaCreateService:
@@ -743,6 +778,7 @@ class PrivateWebMediaCreateService:
                 writer = self._runtime.bind_create_writer(
                     request,
                     stable_sources,
+                    authorization_reference=authorization_reference,
                 )
                 receipt = self._writes.create(
                     request=request,
@@ -1053,6 +1089,7 @@ class PrivateWebWriteApiRuntime:
         self,
         *,
         server: LoopbackWriteApiServer,
+        store: SnapshotStore,
         content_runtime: PrivateWebContentRuntime,
         confirmation_runtime: PrivateWebInventoryRuntime | None,
         media_runtime: PrivateWebMediaCreateRuntime | None,
@@ -1062,6 +1099,7 @@ class PrivateWebWriteApiRuntime:
         operation_lock: Lock,
     ) -> None:
         self._server = server
+        self._store = store
         self._content_runtime = content_runtime
         self._confirmation_runtime = confirmation_runtime
         self._media_runtime = media_runtime
@@ -1126,7 +1164,29 @@ class PrivateWebWriteApiRuntime:
                 "private Web media runtime is not configured"
             )
         with self._operation_lock:
+            operation_reference = runtime.pending_authorization_reference
             runtime.reconcile_media_submit()
+            if operation_reference is not None and operation_reference.startswith(
+                "write-api:"
+            ):
+                key = operation_reference[len("write-api:"):]
+                record = self._store.write_api_request(key)
+                if record is None:
+                    raise PrivateWebRuntimeSetupError(
+                        "media reconciliation lacks bound write operation"
+                    )
+                # Browser observation-only reconciliation never re-sends
+                # platform input; preserve the original HTTP response.
+                self._store.record_write_recovery_clearance(
+                    idempotency_key=key,
+                    request_sha256=record.request_sha256,
+                    verification_kind="media_submit_reconciled",
+                    evidence_reference="private-web:observation-only-submit-settlement",
+                    observed_at=_utc_now(),
+                )
+                self._server.clear_verified_create_recovery(
+                    key, record.request_sha256,
+                )
 
     def close(self) -> None:
         with self._close_lock:
@@ -1427,6 +1487,7 @@ def compose_private_web_write_api_runtime(
     try:
         return PrivateWebWriteApiRuntime(
             server=server,
+            store=store,
             content_runtime=content_runtime,
             confirmation_runtime=confirmation_runtime,
             media_runtime=media_runtime,

@@ -169,7 +169,7 @@ class SyncAttemptJournalTests(unittest.TestCase):
         self.assertEqual(reopened.latest_ad_snapshot("123"), self.ad())
         self.assertEqual(reopened.sync_status()["state"], "never_attempted")
         with sqlite3.connect(self.db) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='write_api_requests'"
             ).fetchone())

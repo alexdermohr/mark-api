@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +24,7 @@ from .domain import (
 from .results import ReadResult, ReadStatus
 
 _SYNC_SCHEMA_VERSION = 1
+_STORE_SCHEMA_VERSION = 2
 _SYNC_ERROR_KINDS = frozenset({
     "unauthenticated", "http_error", "transport_error", "parse_error",
     "reader_exception", "runtime_unavailable", "invalid_inventory",
@@ -157,6 +158,13 @@ _REQUIRED_STORE_COLUMNS: dict[str, tuple[str, ...]] = {
         "response_status",
         "response_json",
     ),
+    "write_recovery_clearances": (
+        "idempotency_key",
+        "request_sha256",
+        "observed_at",
+        "verification_kind",
+        "evidence_reference",
+    ),
     "dashboard_pending_writes": (
         "scope",
         "resource_key",
@@ -184,6 +192,7 @@ _LEGACY_ADDABLE_COLUMNS: dict[str, frozenset[str]] = {
 _REQUIRED_SINGLE_COLUMN_UNIQUES: dict[str, tuple[str, ...]] = {
     "inbound_message_events": ("provider_message_id",),
     "write_api_requests": ("idempotency_key",),
+    "write_recovery_clearances": ("idempotency_key",),
     "dashboard_pending_writes": ("scope", "resource_key", "idempotency_key"),
 }
 
@@ -351,11 +360,27 @@ class SnapshotStore:
         if integrity is None or integrity[0] != "ok":
             raise sqlite3.DatabaseError("database integrity check failed")
 
+        marker = connection.execute("PRAGMA user_version").fetchone()
+        version = int(marker[0]) if marker is not None else -1
+        if version not in (0, _SYNC_SCHEMA_VERSION, _STORE_SCHEMA_VERSION):
+            raise sqlite3.DatabaseError("database version is unsupported")
+
         for table, expected in _REQUIRED_STORE_COLUMNS.items():
             table_type = connection.execute(
                 "SELECT type FROM sqlite_master WHERE name = ?", (table,)
             ).fetchone()
-            if table_type is None or table_type["type"] != "table":
+            if table_type is None:
+                # A version-1 store predates only this new append-only table.
+                # Never recreate a missing clearance table in a version-2
+                # database: doing so would erase previously granted fences.
+                if (
+                    allow_additive_migrations
+                    and version < _STORE_SCHEMA_VERSION
+                    and table == "write_recovery_clearances"
+                ):
+                    continue
+                raise sqlite3.DatabaseError("database schema is incomplete")
+            if table_type["type"] != "table":
                 raise sqlite3.DatabaseError("database schema is incomplete")
             columns = {
                 str(row["name"])
@@ -392,10 +417,6 @@ class SnapshotStore:
                 ):
                     raise sqlite3.DatabaseError("database recovery keys are not unique")
 
-        version_row = connection.execute("PRAGMA user_version").fetchone()
-        version = int(version_row[0]) if version_row is not None else -1
-        if version not in (0, _SYNC_SCHEMA_VERSION):
-            raise sqlite3.DatabaseError("database version is unsupported")
         journal_type = connection.execute(
             "SELECT type FROM sqlite_master WHERE name='sync_attempts'"
         ).fetchone()
@@ -602,6 +623,22 @@ class SnapshotStore:
                     )
                 );
 
+                CREATE TABLE IF NOT EXISTS write_recovery_clearances (
+                    idempotency_key TEXT PRIMARY KEY,
+                    request_sha256 TEXT NOT NULL
+                        CHECK(length(request_sha256) = 64),
+                    observed_at TEXT NOT NULL,
+                    verification_kind TEXT NOT NULL CHECK (
+                        verification_kind IN (
+                            'media_submit_reconciled',
+                            'operator_verified_postread'
+                        )
+                    ),
+                    evidence_reference TEXT NOT NULL CHECK (
+                        length(trim(evidence_reference)) BETWEEN 1 AND 256
+                    )
+                );
+
                 CREATE TABLE IF NOT EXISTS dashboard_pending_writes (
                     scope TEXT PRIMARY KEY,
                     resource_key TEXT NOT NULL UNIQUE,
@@ -714,7 +751,7 @@ class SnapshotStore:
 
             # Existing stores pass old Write-recovery validation before
             # migrations. The journal and version marker commit together.
-            connection.execute(f"PRAGMA user_version = {_SYNC_SCHEMA_VERSION}")
+            connection.execute(f"PRAGMA user_version = {_STORE_SCHEMA_VERSION}")
             self._validate_store_schema(connection)
 
     @staticmethod
@@ -1292,16 +1329,20 @@ class SnapshotStore:
         if not isinstance(exclude_idempotency_key, str) or not exclude_idempotency_key:
             raise ValueError("excluded idempotency key is required")
         owner = _validated_write_api_claim_owner(claim_owner)
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             # Keep accepted but never-started claims recoverable. A started
             # write with unknown outcome can still have reached the platform.
             if connection.execute(
                 """
-                SELECT 1 FROM write_api_requests
-                WHERE idempotency_key != ?
-                  AND state = 'in_progress'
-                  AND execution_started_at IS NOT NULL
-                  AND (claim_owner IS NULL OR claim_owner != ?)
+                SELECT 1 FROM write_api_requests AS w
+                LEFT JOIN write_recovery_clearances AS c
+                  ON c.idempotency_key = w.idempotency_key
+                 AND c.request_sha256 = w.request_sha256
+                WHERE w.idempotency_key != ?
+                  AND w.state = 'in_progress'
+                  AND w.execution_started_at IS NOT NULL
+                  AND (w.claim_owner IS NULL OR w.claim_owner != ?)
+                  AND c.idempotency_key IS NULL
                 LIMIT 1
                 """,
                 (exclude_idempotency_key, owner),
@@ -1309,19 +1350,30 @@ class SnapshotStore:
                 return True
             if connection.execute(
                 """
-                SELECT 1 FROM create_operation_receipts
-                WHERE operation = 'create' AND outcome = 'ambiguous'
-                  AND writer_invoked = 1 AND media_post_read_status IS NOT NULL
+                SELECT 1 FROM create_operation_receipts AS r
+                LEFT JOIN write_api_requests AS w
+                  ON r.authorization_reference = ('write-api:' || w.idempotency_key)
+                LEFT JOIN write_recovery_clearances AS c
+                  ON c.idempotency_key = w.idempotency_key
+                 AND c.request_sha256 = w.request_sha256
+                WHERE r.operation = 'create' AND r.outcome = 'ambiguous'
+                  AND r.writer_invoked = 1
+                  AND r.media_post_read_status IS NOT NULL
+                  AND c.idempotency_key IS NULL
                 LIMIT 1
                 """
             ).fetchone() is not None:
                 return True
             rows = connection.execute(
                 """
-                SELECT response_json FROM write_api_requests
-                WHERE idempotency_key != ?
-                  AND state = 'completed'
-                  AND instr(response_json, 'media_persistence_confirmed') > 0
+                SELECT w.response_json FROM write_api_requests AS w
+                LEFT JOIN write_recovery_clearances AS c
+                  ON c.idempotency_key = w.idempotency_key
+                 AND c.request_sha256 = w.request_sha256
+                WHERE w.idempotency_key != ?
+                  AND w.state = 'completed'
+                  AND instr(w.response_json, 'media_persistence_confirmed') > 0
+                  AND c.idempotency_key IS NULL
                 """,
                 (exclude_idempotency_key,),
             )
@@ -1353,6 +1405,121 @@ class SnapshotStore:
                         "invalid persisted media recovery evidence"
                     ) from exc
         return False
+
+    def record_write_recovery_clearance(
+        self, *, idempotency_key: str, request_sha256: str,
+        verification_kind: str, evidence_reference: str, observed_at: datetime,
+    ) -> None:
+        """Append an operation-bound clearance after independent readback.
+
+        This trusted local method does not itself access the external platform.
+        The caller must have independently established the outcome before
+        passing its specific evidence reference. It is never exposed as a
+        Write API route or used to authorize an automatic browser retry.
+        """
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValueError("idempotency key is required")
+        if (
+            not isinstance(request_sha256, str)
+            or len(request_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in request_sha256)
+        ):
+            raise ValueError("exact request fingerprint is required")
+        if verification_kind not in {
+            "media_submit_reconciled", "operator_verified_postread",
+        }:
+            raise ValueError("independent verification kind is required")
+        if (
+            not isinstance(evidence_reference, str)
+            or not 1 <= len(evidence_reference.strip()) <= 256
+            or any(ch in evidence_reference for ch in "\r\n\x00")
+        ):
+            raise ValueError("independent evidence reference is required")
+        timestamp = _sync_time(observed_at)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_store_schema(connection)
+            row = connection.execute(
+                """
+                SELECT request_sha256, state, execution_started_at,
+                       response_json FROM write_api_requests
+                WHERE idempotency_key = ?
+                """, (idempotency_key,),
+            ).fetchone()
+            if row is None or row["request_sha256"] != request_sha256:
+                raise ValueError("write recovery operation binding mismatch")
+            if row["execution_started_at"] is None:
+                raise ValueError("write recovery was never executed")
+            if row["state"] == "completed":
+                try:
+                    response = json.loads(row["response_json"])
+                    if not isinstance(response, dict):
+                        raise ValueError("invalid response")
+                    if not isinstance(response.get("media_persistence_confirmed"), bool):
+                        raise ValueError("not a media response")
+                    receipt = response.get("operation_receipt")
+                    unresolved = (
+                        receipt is None
+                        or (
+                            isinstance(receipt, dict)
+                            and receipt.get("writer_invoked") is True
+                            and receipt.get("outcome") == "ambiguous"
+                        )
+                    )
+                except (TypeError, ValueError):
+                    unresolved = False
+                if not unresolved:
+                    raise ValueError("write recovery has no ambiguous media outcome")
+            elif row["state"] != "in_progress":
+                raise ValueError("write recovery state is invalid")
+
+            existing = connection.execute(
+                "SELECT 1 FROM write_recovery_clearances "
+                "WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("write recovery operation already cleared")
+            connection.execute(
+                """
+                INSERT INTO write_recovery_clearances (
+                    idempotency_key, request_sha256, observed_at,
+                    verification_kind, evidence_reference
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    idempotency_key, request_sha256, timestamp,
+                    verification_kind, evidence_reference.strip(),
+                ),
+            )
+            connection.commit()
+
+    def has_write_recovery_clearance(
+        self, *, idempotency_key: str, request_sha256: str,
+    ) -> bool:
+        """Check an exact persisted operation clearance, never infer one."""
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            return False
+        if (
+            not isinstance(request_sha256, str)
+            or len(request_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in request_sha256)
+        ):
+            return False
+        with closing(self._connect()) as connection:
+            return connection.execute(
+                """
+                SELECT 1 FROM write_recovery_clearances AS c
+                JOIN write_api_requests AS w
+                  ON w.idempotency_key = c.idempotency_key
+                 AND w.request_sha256 = c.request_sha256
+                WHERE c.idempotency_key = ?
+                  AND c.request_sha256 = ?
+                  AND w.execution_started_at IS NOT NULL
+                LIMIT 1
+                """,
+                (idempotency_key, request_sha256),
+            ).fetchone() is not None
 
     def claim_write_api_request(
         self,

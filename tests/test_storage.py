@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Barrier
@@ -1125,6 +1127,135 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(latest.city, "Dresden")
         self.assertEqual(latest.title_type, "question")
         self.assertEqual(len(direct_store.classification_history("42")), 2)
+
+
+    def _seed_ambiguous_media_api_request(self, store: SnapshotStore) -> str:
+        key = "media-unknown-original"
+        store.claim_write_api_request(
+            idempotency_key=key, request_sha256="a" * 64,
+            requested_at=NOW, claim_owner="original-runtime",
+        )
+        store.begin_write_api_request(
+            idempotency_key=key, request_sha256="a" * 64,
+            claim_owner="original-runtime", execution_started_at=NOW,
+        )
+        store.complete_write_api_request(
+            idempotency_key=key, request_sha256="a" * 64,
+            claim_owner="original-runtime", response_status=202,
+            response_json=json.dumps({
+                "media_persistence_confirmed": False,
+                "operation_receipt": {
+                    "outcome": "ambiguous", "writer_invoked": True,
+                },
+            }),
+            completed_at=NOW,
+        )
+        return key
+
+    def test_operation_bound_media_recovery_clearance_is_append_only(self) -> None:
+        store = self.make_store()
+        key = self._seed_ambiguous_media_api_request(store)
+        original = store.write_api_request(key)
+        self.assertTrue(store.create_recovery_pending(
+            exclude_idempotency_key="fresh", claim_owner="second-runtime",
+        ))
+        store.record_write_recovery_clearance(
+            idempotency_key=key,
+            request_sha256="a" * 64,
+            verification_kind="operator_verified_postread",
+            evidence_reference="synthetic-independent-owner-postread:ad-123",
+            observed_at=NOW,
+        )
+        reopened = SnapshotStore(store.path, create_if_missing=False)
+        self.assertFalse(reopened.create_recovery_pending(
+            exclude_idempotency_key="new-create", claim_owner="third-runtime",
+        ))
+        self.assertEqual(reopened.write_api_request(key), original)
+        with closing(sqlite3.connect(store.path)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM write_recovery_clearances",
+            ).fetchone()[0], 1)
+        with self.assertRaisesRegex(ValueError, "already cleared"):
+            reopened.record_write_recovery_clearance(
+                idempotency_key=key, request_sha256="a" * 64,
+                verification_kind="operator_verified_postread",
+                evidence_reference="synthetic-independent-owner-postread:ad-123",
+                observed_at=NOW,
+            )
+
+    def test_media_recovery_clearance_rejects_bad_binding_and_missing_evidence(self) -> None:
+        store = self.make_store()
+        key = self._seed_ambiguous_media_api_request(store)
+        for args in (
+            {"idempotency_key": key, "request_sha256": "b" * 64,
+             "verification_kind": "operator_verified_postread",
+             "evidence_reference": "independent-owner-read", "observed_at": NOW},
+            {"idempotency_key": key, "request_sha256": "a" * 64,
+             "verification_kind": "operator_verified_postread",
+             "evidence_reference": "", "observed_at": NOW},
+            {"idempotency_key": "unrelated", "request_sha256": "a" * 64,
+             "verification_kind": "operator_verified_postread",
+             "evidence_reference": "independent-owner-read", "observed_at": NOW},
+            {"idempotency_key": key, "request_sha256": "a" * 64,
+             "verification_kind": "self_reported",
+             "evidence_reference": "independent-owner-read", "observed_at": NOW},
+        ):
+            with self.subTest(args=args):
+                with self.assertRaises((ValueError, TypeError)):
+                    store.record_write_recovery_clearance(**args)
+        self.assertTrue(store.create_recovery_pending(
+            exclude_idempotency_key="new-create", claim_owner="other-runtime",
+        ))
+
+    def test_clear_executed_stale_in_progress_preserves_original_fence(self) -> None:
+        store = self.make_store()
+        store.claim_write_api_request(
+            idempotency_key="stale-executed",
+            request_sha256="c" * 64,
+            requested_at=NOW, claim_owner="old-runtime",
+        )
+        store.begin_write_api_request(
+            idempotency_key="stale-executed",
+            request_sha256="c" * 64,
+            claim_owner="old-runtime", execution_started_at=NOW,
+        )
+        self.assertTrue(store.create_recovery_pending(
+            exclude_idempotency_key="new-create", claim_owner="new-runtime",
+        ))
+        store.record_write_recovery_clearance(
+            idempotency_key="stale-executed", request_sha256="c" * 64,
+            verification_kind="operator_verified_postread",
+            evidence_reference="owner-plus-target-independent-2026-10-10",
+            observed_at=NOW,
+        )
+        self.assertFalse(SnapshotStore(
+            store.path, create_if_missing=False,
+        ).create_recovery_pending(
+            exclude_idempotency_key="new-create", claim_owner="new-runtime",
+        ))
+        record = store.write_api_request("stale-executed")
+        self.assertEqual(record.state, "in_progress")
+        self.assertIsNotNone(record.execution_started_at)
+
+    def test_additive_clearance_upgrade_requires_intact_old_recovery_schema(self) -> None:
+        store = self.make_store()
+        self._seed_ambiguous_media_api_request(store)
+        with closing(sqlite3.connect(store.path)) as db:
+            db.execute("DROP TABLE write_recovery_clearances")
+            db.execute("PRAGMA user_version = 1")
+            db.commit()
+        upgraded = SnapshotStore(store.path, create_if_missing=False)
+        self.assertTrue(upgraded.is_ready())
+        self.assertTrue(upgraded.create_recovery_pending(
+            exclude_idempotency_key="fresh", claim_owner="new-runtime",
+        ))
+        with closing(sqlite3.connect(store.path)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            db.execute("DROP TABLE write_recovery_clearances")
+            db.commit()
+        self.assertFalse(upgraded.is_ready())
+        with self.assertRaises(sqlite3.DatabaseError):
+            SnapshotStore(store.path, create_if_missing=False)
 
 
 if __name__ == "__main__":
