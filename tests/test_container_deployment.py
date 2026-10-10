@@ -144,6 +144,8 @@ class ContainerDeploymentTests(unittest.TestCase):
             self.assertIn("-c core.hooksPath=/dev/null", script)
             self.assertIn("GIT_ALTERNATE_OBJECT_DIRECTORIES=", script)
             self.assertIn("attested_git status --porcelain", script)
+            self.assertIn('attested_git read-tree "$expected"', script)
+            self.assertNotIn('cp -- "$gitdir/index"', script)
             self.assertNotIn('safe_git -C "$repo" status --porcelain', script)
 
 
@@ -312,6 +314,74 @@ class ContainerDeploymentTests(unittest.TestCase):
                         self.assertNotEqual(completed.returncode, 0)
                         self.assertFalse(marker.exists(),
                             f"{script.name} executed {source} core.fsmonitor")
+
+    def test_release_status_does_not_trust_assume_unchanged_index(self) -> None:
+        with TemporaryDirectory(prefix="mark-git-assume-unchanged-") as tmp:
+            repo, _ = self._fake_git_repo(Path(tmp))
+            compose = repo / "docs/mark-api-container.compose.yaml"
+            compose.write_text("trusted compose\n", encoding="utf-8")
+
+            def git(*args: str) -> str:
+                p = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(p.returncode, 0, p.stderr)
+                return p.stdout.strip()
+
+            git("add", "docs/mark-api-container.compose.yaml")
+            git("commit", "-qm", "trusted compose")
+            expected = git("rev-parse", "HEAD")
+            git("update-index", "--assume-unchanged",
+                "docs/mark-api-container.compose.yaml")
+            compose.write_text(
+                "services:\n  mark-api:\n    image: untrusted-latest\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(git("status", "--porcelain"), "")
+            for name, argv, expected_message in (
+                ("mark-api-container-build.sh", [expected],
+                 "source checkout is dirty"),
+                ("mark-api-container-control.sh",
+                 ["verify", "sha256:" + "a" * 64, expected],
+                 "dirty release checkout"),
+            ):
+                with self.subTest(script=name):
+                    env = {**os.environ, "MARK_UV": "/usr/bin/true"}
+                    p = subprocess.run(
+                        ["/bin/sh", str(repo / "docs" / name), *argv],
+                        capture_output=True, text=True, env=env,
+                    )
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertIn(expected_message, p.stderr)
+
+    def test_release_status_rebuilds_clean_split_index(self) -> None:
+        with TemporaryDirectory(prefix="mark-git-split-index-") as tmp:
+            repo, expected = self._fake_git_repo(Path(tmp))
+            p = subprocess.run(
+                ["git", "-C", str(repo), "update-index", "--split-index"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(p.returncode, 0, p.stderr)
+            # The source checkout is genuinely clean; a copied split index
+            # without sharedindex.<hash> must not reject this release.
+            p = subprocess.run(
+                ["/bin/sh", str(repo / "docs/mark-api-container-build.sh"),
+                 expected],
+                capture_output=True, text=True,
+                env={**os.environ, "MARK_UV": "/usr/bin/true"},
+            )
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("expected exactly one verified wheel", p.stderr)
+            p = subprocess.run(
+                ["/bin/sh", str(repo / "docs/mark-api-container-control.sh"),
+                 "verify", "sha256:" + "a" * 64, expected],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(p.returncode, 0)
+            self.assertNotIn("Git snapshot status unavailable", p.stderr)
+            self.assertNotIn("dirty release checkout", p.stderr)
+            self.assertNotIn("index file open failed", p.stderr)
 
     def test_git_filter_injected_after_preflight_is_inert(self) -> None:
         # A one-time config allowlist is insufficient. Mutate .git/config

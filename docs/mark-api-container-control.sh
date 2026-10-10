@@ -73,13 +73,11 @@ require_inert_git_config || exit 1
 actual=$(safe_git -C "$repo" rev-parse --verify HEAD) || fail 'HEAD unavailable'
 [ "$actual" = "$expected" ] || fail 'HEAD/revision drift'
 # Never execute a worktree status check under mutable .git/config. A private
-# Git metadata snapshot binds HEAD and index to an inert synthetic config.
+# Git metadata snapshot regenerates the index from the immutable commit tree.
 common=$(safe_git -C "$repo" rev-parse --path-format=absolute --git-common-dir) ||
     fail 'Git common directory unavailable'
-gitdir=$(safe_git -C "$repo" rev-parse --absolute-git-dir) ||
-    fail 'Git checkout directory unavailable'
-[ -d "$common/objects" ] && [ -f "$gitdir/index" ] ||
-    fail 'Git objects or index unavailable'
+[ -d "$common/objects" ] ||
+    fail 'Git objects unavailable'
 umask 077
 attest_dir=$(mktemp -d /tmp/mark-api-control.XXXXXXXX) ||
     fail 'Git snapshot staging unavailable'
@@ -87,8 +85,6 @@ trap 'rm -rf -- "$attest_dir"' 0
 trap 'exit 1' 1 2 3 15
 mkdir -m 0700 "$attest_dir/objects" "$attest_dir/refs" ||
     fail 'Git snapshot staging unavailable'
-cp -- "$gitdir/index" "$attest_dir/index" ||
-    fail 'Git index copy unavailable'
 printf '%s\n' "$expected" > "$attest_dir/HEAD"
 printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = true\n' > "$attest_dir/config"
 attested_git() {
@@ -101,6 +97,8 @@ attested_git() {
         -c core.fsmonitor=false -c core.hooksPath=/dev/null \
         -c diff.external= -c core.pager=cat "$@"
 }
+attested_git read-tree "$expected" ||
+    fail 'Git snapshot index unavailable'
 status=$(attested_git status --porcelain --untracked-files=normal) ||
     fail 'Git snapshot status unavailable'
 [ -z "$status" ] || fail 'dirty release checkout'

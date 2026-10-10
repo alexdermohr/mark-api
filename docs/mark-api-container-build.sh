@@ -46,18 +46,16 @@ require_inert_git_config || exit 1
 head=$(safe_git -C "$repo" rev-parse --verify HEAD)
 [ "$head" = "$expected" ] || { printf '%s\n' 'mark-api: HEAD changed' >&2; exit 1; }
 # Pin executable Git configuration by using a private, minimal Git directory.
-# Its HEAD and index are a copy of the attested checkout, but Git never reads
-# the mutable checkout-local config when comparing files or making archives.
+# Its HEAD is the attested commit and its index is regenerated from that
+# commit's tree, never copied from the mutable checkout's index or config.
 common=$(safe_git -C "$repo" rev-parse --path-format=absolute --git-common-dir) || exit 1
-gitdir=$(safe_git -C "$repo" rev-parse --absolute-git-dir) || exit 1
-[ -d "$common/objects" ] && [ -f "$gitdir/index" ] || exit 1
+[ -d "$common/objects" ] || exit 1
 umask 077
 temp=$(mktemp -d /tmp/mark-api-image.XXXXXXXX) || exit 1
 trap 'rm -rf -- "$temp"' 0
 trap 'exit 1' 1 2 3 15
 mkdir -m 0700 "$temp/git" "$temp/git/objects" "$temp/git/refs" \
     "$temp/source" "$temp/context" "$temp/docs"
-cp -- "$gitdir/index" "$temp/git/index"
 printf '%s\n' "$expected" > "$temp/git/HEAD"
 printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = true\n' > "$temp/git/config"
 attested_git() {
@@ -70,6 +68,7 @@ attested_git() {
         -c core.fsmonitor=false -c core.hooksPath=/dev/null \
         -c diff.external= -c core.pager=cat "$@"
 }
+attested_git read-tree "$expected" || exit 1
 status=$(attested_git status --porcelain --untracked-files=normal) || exit 1
 [ -z "$status" ] || {
     printf '%s\n' 'mark-api: source checkout is dirty' >&2
