@@ -518,6 +518,24 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertTrue(page._closed)
         runtime.close()
 
+    def test_pending_submit_tracks_exact_authorization_reference(self) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events, submit_unknown=True)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+        writer = runtime.bind_create_writer(
+            self.request, self.sources,
+            authorization_reference="write-api:exact-media-idempotency",
+        )
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            writer.create_ad(self.request)
+        self.assertEqual(
+            runtime.pending_authorization_reference,
+            "write-api:exact-media-idempotency",
+        )
+        runtime.reconcile_media_submit()
+        self.assertIsNone(runtime.pending_authorization_reference)
+        runtime.close()
+
     def test_context_manager_preserves_submit_unknown_stage(self) -> None:
         events: list[tuple] = []
         page = MediaCreatePage(events, submit_unknown=True)
@@ -3764,6 +3782,86 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             )
             self.assertEqual(close_events, ["content"])
 
+    def test_stuck_http_write_fails_bounded_close_without_losing_sqlite_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(
+                OwnerReader(ReadResult.success_empty(())), close_events,
+            )
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=content_runtime,
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.SET_STATE}),
+                    writes_enabled=True,
+                ),
+                core_writes_enabled=True,
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            client_errors: list[BaseException] = []
+            responses: list[tuple[int, dict[str, object]]] = []
+
+            def pause(
+                ad_id: str,
+                *,
+                authorization_by: str | None = None,
+                authorization_reference: str | None = None,
+            ) -> OperationReceipt:
+                entered.set()
+                if not release.wait(timeout=4):
+                    raise AssertionError("test write handler did not release")
+                return self._operation_receipt(
+                    "set_state:paused", ad_id,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+
+            runtime._mark_service.pause = pause
+
+            def request() -> None:
+                try:
+                    responses.append(self._request(
+                        runtime, "POST", f"/api/write/ads/{AD_ID}/pause",
+                        idempotency_key="stalled-pause",
+                    ))
+                except BaseException as exc:
+                    client_errors.append(exc)
+
+            runtime.start()
+            client = threading.Thread(target=request, daemon=True)
+            client.start()
+            try:
+                self.assertTrue(entered.wait(timeout=2))
+                with patch(
+                    "mark_api.private_web_runtime._WRITE_HANDLER_DRAIN_SECONDS",
+                    0.15, create=True,
+                ):
+                    with self.assertRaisesRegex(
+                        PrivateWebRuntimeSetupError, "active write handlers",
+                    ):
+                        runtime.close()
+                self.assertEqual(close_events, [])
+                record = store.write_api_request("stalled-pause")
+                self.assertIsNotNone(record)
+                assert record is not None
+                self.assertEqual(record.state, "in_progress")
+                self.assertIsNotNone(record.execution_started_at)
+                with self.assertRaisesRegex(RuntimeError, "already active"):
+                    acquire_write_api_store_lock(store)
+            finally:
+                release.set()
+                client.join(timeout=3)
+                runtime.close()
+
+            self.assertFalse(client.is_alive())
+            self.assertEqual(client_errors, [])
+            self.assertEqual([s for s, _ in responses], [200])
+            self.assertEqual(close_events, ["content"])
+
     def test_close_preserves_runtimes_if_http_cannot_quiesce(self) -> None:
         class StuckThread:
             def __init__(self) -> None:
@@ -3924,6 +4022,170 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             replacement_lock.close()
 
 
+
+    def test_reconciled_pending_page_persists_exact_clearance(self) -> None:
+        class ObservedPendingPage:
+            def __init__(self) -> None:
+                self.readbacks = 0
+                self.closed = False
+
+            def reconcile_create_media_submit(self) -> None:
+                self.readbacks += 1
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "reconcile.sqlite")
+            store.claim_write_api_request(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+                requested_at=NOW,
+                claim_owner="prior-runtime",
+            )
+            store.begin_write_api_request(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+                execution_started_at=NOW,
+                claim_owner="prior-runtime",
+            )
+            body = json.dumps({
+                "operation_receipt": {
+                    "outcome": "ambiguous", "writer_invoked": True,
+                },
+                "media_persistence_confirmed": False,
+            })
+            store.complete_write_api_request(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+                claim_owner="prior-runtime",
+                response_status=202,
+                response_json=body,
+                completed_at=NOW,
+            )
+            source_path = Path(tmp) / "photo.jpg"
+            source_path.write_bytes(b"synthetic-image")
+            media_runtime = PrivateWebMediaCreateRuntime(
+                page_factory=lambda: (_ for _ in ()).throw(
+                    AssertionError("do not create a new page")
+                ),
+            )
+            pending = ObservedPendingPage()
+            media_runtime._pending_page = pending
+            media_runtime._submit_unknown_fenced = True
+            media_runtime._pending_authorization_reference = (
+                "write-api:bound-media-create"
+            )
+            close_events: list[str] = []
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=self._content_runtime(
+                    OwnerReader(ReadResult.success_empty(())), close_events,
+                ),
+                media_runtime=media_runtime,
+                media_resolver=PrivateWebMediaRefResolver({
+                    "cover": PrivateWebMediaSource(path=str(source_path)),
+                }),
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                ),
+            )
+            old_record = store.write_api_request("bound-media-create")
+            with self.assertRaises(PrivateWebSubmitUnknownError):
+                runtime.close()
+            self.assertTrue(store.create_recovery_pending(
+                exclude_idempotency_key="different-key",
+                claim_owner="new-runtime",
+            ))
+            # The browser observation succeeds but the SQLite clearance fails.
+            # Retain the page and retry persistence without new browser input.
+            with patch.object(
+                store, "record_write_recovery_clearance",
+                side_effect=sqlite3.OperationalError("temporary clearance I/O"),
+            ):
+                with self.assertRaises(sqlite3.OperationalError):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertEqual(pending.readbacks, 1)
+            self.assertFalse(pending.closed)
+            self.assertTrue(store.create_recovery_pending(
+                exclude_idempotency_key="different-key",
+                claim_owner="new-runtime",
+            ))
+            # Cancellation before a durable SQLite commit must retain the
+            # observed page and may not perform another browser readback.
+            with patch.object(
+                store, "record_write_recovery_clearance",
+                side_effect=KeyboardInterrupt("before SQLite commit"),
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "before SQLite"):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(pending.closed)
+            self.assertEqual(pending.readbacks, 1)
+            # Commit may be durable even if cancellation reaches the caller
+            # before the in-memory runtime can release its page and fence.
+            durable_append = store.record_write_recovery_clearance
+
+            def committed_then_cancel(**kwargs: object) -> None:
+                durable_append(**kwargs)
+                raise KeyboardInterrupt("after durable clearance")
+
+            with patch.object(
+                store, "record_write_recovery_clearance",
+                side_effect=committed_then_cancel,
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "durable clearance"):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(pending.closed)
+            self.assertEqual(pending.readbacks, 1)
+            self.assertTrue(store.has_write_recovery_clearance(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+            ))
+            # Even an additional shutdown attempt must retain the page.
+            with self.assertRaisesRegex(
+                PrivateWebSubmitUnknownError, "media_runtime_close_unsettled",
+            ):
+                runtime.close()
+            # The SQLite commit succeeds, but the following in-memory release
+            # fails. Retain the settled page and reuse the exact old clearance.
+            with patch.object(
+                runtime._server, "clear_verified_create_recovery",
+                side_effect=RuntimeError("synthetic in-memory release error"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "in-memory release"):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(pending.closed)
+            self.assertEqual(pending.readbacks, 1)
+            self.assertTrue(store.has_write_recovery_clearance(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+            ))
+            runtime.reconcile_media_submit()
+            self.assertEqual(pending.readbacks, 1)
+            self.assertTrue(pending.closed)
+            self.assertFalse(SnapshotStore(
+                store.path, create_if_missing=False,
+            ).create_recovery_pending(
+                exclude_idempotency_key="different-key",
+                claim_owner="new-runtime",
+            ))
+            self.assertEqual(store.write_api_request("bound-media-create"), old_record)
+            with sqlite3.connect(store.path) as db:
+                row = db.execute(
+                    "SELECT verification_kind, request_sha256 "
+                    "FROM write_recovery_clearances "
+                    "WHERE idempotency_key = 'bound-media-create'",
+                ).fetchone()
+            self.assertEqual(row, ("media_submit_reconciled", "e" * 64))
+            db.close()
+            runtime.close()
+            self.assertEqual(close_events, ["content"])
 
     def test_normal_create_route_uses_composed_mark_service(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

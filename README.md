@@ -37,6 +37,30 @@ Die additive Tabelle erhält den SQLite-`user_version`-Marker 1 erst nach vollst
 
 Für den angereicherten Besitzerbestand bleibt die allgemeine Anzeige-/Inhaltsquelle zusammengesetzt (beispielsweise management+mobile). Die tatsächliche Zählerquelle wird separat und unverwechselbar in `ad_snapshots.metric_source` gespeichert. Bei bereits vollständigen SQLite-Stores wird diese optionale Spalte erst **nach der Prüfung sämtlicher vorhandener Recovery-Tabellen und Idempotenz-Fences** additiv ergänzt; der Quelltext `source` bleibt stets unverändert, auch bei beliebigen Präfixen oder JSON-ähnlichen Provider-Namen. Fehlende Recovery-Fences und unerkannte historische Tabellenschemata werden weiterhin nicht automatisch repariert. Fehlt bei älteren oder direkt gespeicherten Snapshots `metric_source`, wird in `metric_evidence.source` ausschließlich der unveränderte Quelltext `source` angezeigt. Gerade bei zusammengesetzten Bezeichnungen ist damit **nicht** unabhängig belegt, welcher Teil die Zähler geliefert hat. Weder Pluszeichen noch Präfixe werden als Trennzeichen oder Herkunftsbeweise interpretiert; eine Management-Teilquelle wird nicht geraten.
 
+## Isolierter Produktbetrieb unter eigener Unix-UID
+
+Für den root-verwalteten Linux-Produktbetrieb gibt es
+[`docs/mark-api.service`](docs/mark-api.service),
+[`docs/mark-api-backup@.service`](docs/mark-api-backup@.service),
+[`docs/mark-api-bootstrap.sh`](docs/mark-api-bootstrap.sh),
+[`docs/mark-api-preflight.py`](docs/mark-api-preflight.py) und
+[`docs/mark-api.sysusers.conf`](docs/mark-api.sysusers.conf).
+Sie beschreiben einen nicht interaktiv verwendbaren, dedizierten
+`mark-api`-Unix-Account mit privaten SQLite- und Runtime-Verzeichnissen;
+ein root-verwalteter nativer Shell-Check prüft zuerst die Standardbibliothek
+**des Bootstrap-OS-Pythons selbst**. Erst danach startet der Python-Preflight
+unter `-I -S` und prüft alle First-/Third-Party-Dateien des nicht-editierbaren,
+root-owned Venvs. Der normale Launcher aktiviert weiterhin alle
+vorhandenen produktseitigen Write-Capabilities **default-on**. Ausführbare Installationsanweisungen,
+Sicherheits- und Beweisgrenzen stehen im
+[`docs/operations-runbook.md`](docs/operations-runbook.md).
+Die Repository-Vorlagen wurden nicht als laufender Dienst installiert:
+Insbesondere ist eine echte OS-Identitätstrennung gegen andere
+gleichberechtigte lokale Prozesse erst nach Installation und unabhängiger
+Liveprüfung belegt, nicht durch eine statische Unit-Datei. Die
+Standard-Ports 8765/8766 können auf dem Host belegt sein; die Vorlage
+verwendet daher 8875/8876 (vor Start erneut auf Kollision prüfen).
+
 ## Product Launcher
 
 Der installierte Startpfad für den aktuellen Produktstand ist `mark-api-launch`. Er verwendet einen **bereits laufenden, vom Nutzer bereits authentifizierten** lokalen Chrome-/Chromium-Prozess mit loopback-CDP; der Launcher startet keinen Browser und automatisiert weder Login noch MFA/CAPTCHA.
@@ -78,6 +102,29 @@ Die Product-Launcher-Oberfläche kann damit Create, optionales lokales Media-Sta
 Für jede Plattformaktion erzeugt die Browser-UX genau einen Idempotency-Key. Vor der Weiterleitung an die Write API legt der Dashboard-Proxy den normalisierten Request samt Key atomar als Pending-Record in derselben SQLite-Datei an. Kann dieser Claim nicht sicher persistiert werden, wird der Plattformrequest nicht weitergeleitet. Bei einem Transportfehler oder sonst unbekanntem Proxy-Ausgang erfolgt **kein automatischer Retry**; der ursprüngliche Request bleibt serverseitig an denselben Key gebunden und eine manuelle Wiederholung verwendet exakt denselben Pfad und Payload. Ein zweiter Tab oder ein neuer Key für dieselbe Create-/Anzeigen-Ressource wird durch den persistenten Fence abgewiesen. Nach Tab-Schließen oder Dashboard-Neustart lädt die UI die noch offenen Records über eine authentifizierte Same-Origin-Surface erneut; ein rotierter per-process Dashboard-Token ändert den gespeicherten Plattform-Key nicht. Ein Backend-Response löscht den Pending-Record nicht schon vor der Browserzustellung: erst nachdem der Browser einen gebundenen terminalen Response oder einen sicheren Clientfehler verarbeitet hat, bestätigt er lokal exakt Scope und Idempotency-Key. Gehen Response oder dieser ACK verloren, bleibt der Fence erhalten und derselbe persistierte Request/Key kann sicher erneut gelesen beziehungsweise replayt werden. Media-Staging bleibt ein lokaler, nicht-plattformschreibender Schritt; vor dem Staging wird der ausgewählte Batch gegen Anzahl und Größenlimits geprüft. Scheitert ein späteres Einzel-Staging, werden bereits bekannte opake Refs über die capability-gebundene lokale Discard-Primitive wieder freigegeben. Geht die Antwort eines bereits lokal erfolgreichen Stage verloren und bleibt dessen Ref deshalb unbekannt, läuft der ungenutzte Handle nach 15 Minuten ab und wird vor dem nächsten Stage/Resolve lazy aus dem lokalen Kontingent entfernt. Erst der nachgelagerte Media-Create besitzt den persistenten Plattform-Idempotency-Claim. Persistente Idempotenz, ID-/Ownership-Bindung, Confirmation, TOCTOU-Prüfung, Post-Readback und `platform_retry_authorized=false` bleiben ausschließlich Verantwortung der bestehenden Write API und des darunterliegenden Core. Ein Media-Submit-`UNKNOWN` kann beim Shutdown weiterhin ausschließlich über die bestehende observation-only Reconciliation geklärt werden; ein zweiter Plattform-Submit wird dadurch nicht autorisiert.
 
 CDP, Dashboard und Write API bleiben auf Loopback begrenzt. Ein zusätzlicher Write-Opt-in ist im normalen Produktpfad nicht erforderlich. Schlägt Initial-Read oder expliziter Mail-Import fehl, startet keine HTTP-Surface. Kann die Write API nicht starten, wird das Dashboard nicht konstruiert; scheitert die spätere Dashboard-Konstruktion, wird die bereits gestartete Write-Runtime geschlossen. Der Launcher führt weiterhin **keine periodische Synchronisation** aus; Freshness/Recovery folgen separat.
+
+## Backup und Wiederanlauf des Gesamtprodukts (A6)
+
+Das installierte Tool **mark-api-backup** sichert eine bestehende, vollständig
+validierte SQLite-Produktdatenbank einschließlich WAL, Sync-Journal und
+persistenter Write-Idempotenz-/Dashboard-Pending-Fences. Es erzeugt
+ausschließlich einen neuen, geschützten Backup-Pfad und überschreibt
+keine vorhandenen Daten. Kein Plattformrequest wird ausgelöst.
+
+~~~bash
+mark-api-backup --db /sicherer/pfad/mark.sqlite \
+  --backup /sicherer/backup-ordner/mark-2026-10-09.sqlite
+~~~
+
+Backup-Receipt, aktuelle Start-/Readiness-Prüfungen, sichere Offline-Restores
+**nur auf neue Pfade**, Reconciliation ungeklärter Plattformwrites sowie die
+verifizierten und weiterhin offenen Gesamtprodukt-Gates stehen im
+[Betriebs- und Wiederanlaufhandbuch](docs/operations-runbook.md).
+Eine lokale Backup-/Restore-Abnahme ist keine Berechtigung zur
+Kleinanzeigen-Plattformautomation und kein Ersatz für einen echten,
+autorisierten Create/Update/Delete/Media-End-to-End-Test. Die normale
+Write-Komposition des Product Launchers bleibt default-on; Authentisierung,
+Confirmation, Ownership und No-Blind-Retry bleiben unverändert.
 
 ## Historische SQLite-Datenbanken sicher übernehmen
 

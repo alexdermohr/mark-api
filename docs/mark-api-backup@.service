@@ -1,0 +1,37 @@
+# Install root-owned in /etc/systemd/system/mark-api-backup@.service.
+# Start an explicit, unique instance, e.g. mark-api-backup@20261009T1700.service.
+# A repeated instance cannot overwrite its create-only destination.
+[Unit]
+Description=Create-only Mark SQLite backup (%i)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=mark-api
+Group=mark-api
+WorkingDirectory=/var/lib/mark-api
+ReadWritePaths=/var/lib/mark-api /var/lib/mark-api-backups
+UMask=0077
+# First code: native OS Python trust scan, then /usr/bin/python3 -I -S preflight.
+# Refuse an untrusted bootstrap file before executing it.
+ExecCondition=/usr/bin/find -P / /etc /etc/mark-api /etc/mark-api/bootstrap.sh -maxdepth 0 ( ! -uid 0 -o -perm /022 -o -type l ) -exec /usr/bin/false {} +
+ExecStartPre=/bin/sh /etc/mark-api/bootstrap.sh --db /var/lib/mark-api/mark.sqlite --backup-dir /var/lib/mark-api-backups
+ExecStart=/opt/mark-api/venv/bin/python -I -m mark_api.backup_cli --db /var/lib/mark-api/mark.sqlite --backup /var/lib/mark-api-backups/mark-%i.sqlite
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
