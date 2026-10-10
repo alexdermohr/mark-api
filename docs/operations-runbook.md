@@ -416,14 +416,19 @@ Hostdienst, realer CDP-Zugang und Schutz vor vorbestehenden fremden
 `MAP_SHARED`-Mappings sind dadurch nicht nachgewiesen.
 
 `docs/mark-api-container.Dockerfile`, `mark-api-container-start.sh`,
-`mark-api-container-backup.sh`, `mark-api-container-build.sh` und
-`mark-api-container.compose.yaml` definieren eine opt-in-Produktkomposition:
+`mark-api-container-backup.sh`, `mark-api-container-build.sh`,
+`mark-api-container-control.sh` und `mark-api-container.compose.yaml`
+definieren eine opt-in-Produktkomposition:
 
 - Das Image wird nur aus einem *sauberen exakt 40-stellig gebundenen Git-HEAD*
   erzeugt. Das Buildskript erstellt per `git archive` in einem privaten
   temporären Kontext ein nicht-editierbares Wheel und überträgt ausschließlich
   dieses Wheel sowie die geprüften Bootstrap-/Startskripte an den lokalen
-  Docker-Daemon. Das Ubuntu-24.04-Basisimage ist über SHA-256 adressiert.
+  Docker-Daemon. Das Buildskript deaktiviert Git-Replacement-Objekte,
+  verweigert vorhandene `refs/replace` und Git-Grafts und akzeptiert keine
+  umgeleiteten Git-Objektdatenbanken aus der Shell-Umgebung. Andernfalls
+  könnte die Archivquelle trotz des attestierten Commit-SHA verändert sein.
+  Das Ubuntu-24.04-Basisimage ist über SHA-256 adressiert.
   Python 3.12 stammt aus den Ubuntu-Paketen. Paketdateien werden root-eigen
   installiert; die Containerlaufzeit startet als Nicht-Root-`mark-api`.
 - Die *normalen* Create-/Media-/Update-/Pause-/Activate-/Delete-Funktionen
@@ -473,8 +478,12 @@ bestehende Docker-Volumes blind übernehmen/umberechtigen.
 # Im sauberen, unabhängig geprüften PR-Checkout mit exakt aktuellem HEAD:
 HEAD_SHA=$(git rev-parse HEAD)
 MARK_UV=/home/alex/.local/bin/uv sh docs/mark-api-container-build.sh "$HEAD_SHA"
-# Readback des erzeugten Images und des org.opencontainers.image.revision-Labels:
-docker image inspect "mark-api:pr75-${HEAD_SHA%????????????????????????????}"
+# Das Tag dient nur zur Identifikation der gerade gebauten lokalen Datei.
+# Für jede tatsächliche Container-Aktion gilt anschließend ausschließlich die
+# vollständige unveränderliche Image-ID; das Release-Label wird erneut geprüft.
+IMAGE_ID=$(docker --host unix:///var/run/docker.sock image inspect \
+  --format '{{.Id}}' "mark-api:pr75-${HEAD_SHA%????????????????????????????}")
+sh docs/mark-api-container-control.sh verify "$IMAGE_ID" "$HEAD_SHA"
 ~~~
 
 Das 40-stellige Commit-SHA ist vor dem Bau aus GitHub unabhängig zu prüfen.
@@ -499,16 +508,36 @@ gültige bereits angemeldete und zulässige CDP-Sitzung; freie Ports
 Datenbanken!** Die tatsächliche Datenübernahme braucht ihren eigenen
 Stop-/Hash-/Snapshot-/Mapping-/Recovery-Nachweis.
 
-Erst nach diesen Gates kann der Operator das geprüfte Image mit der
-Compose-Datei als separaten dauerhaft betriebenen Dienst starten, etwa
-indem er dessen unveränderliche Image-ID als `MARK_API_IMAGE` übergibt und
-`docker compose -f docs/mark-api-container.compose.yaml --profile live up`
-ausführt. Die beiden **bereits vorhandenen, verifizierten externen**
-Volumes sind Voraussetzung. Der Backup-Einzelaufruf erfolgt getrennt
-über `--profile backup run --rm --no-deps mark-api-backup EINDEUTIGE_ID`,
-niemals durch einen blinden Retry. Fehlen die Betriebsnachweise, wird kein
-`up` ausgeführt. Ein Image-Bau oder eine grüne `docker compose config`
-sind keine erfolgreiche Host-Installation.
+Erst nach diesen Gates darf der Operator die **einzige unterstützte**
+Image-/Startkontrolle `docs/mark-api-container-control.sh` verwenden:
+
+~~~bash
+# HEAD_SHA und IMAGE_ID müssen aus dem obigen geprüften Build stammen.
+# Prüft exakt 64 hexadezimale Image-ID-Bytes, das tatsächliche lokale
+# Docker-Image, dessen Git-Revisionslabel und den sauberen Quell-HEAD.
+sh docs/mark-api-container-control.sh verify "$IMAGE_ID" "$HEAD_SHA"
+
+# Nur nach zusätzlich vollständig belegter OS-/Storage-/CDP-Freigabe:
+sh docs/mark-api-container-control.sh live "$IMAGE_ID" "$HEAD_SHA"
+
+# Getrennt und nur mit bekannt unbenutzter, eindeutiger Backup-Instanz:
+sh docs/mark-api-container-control.sh backup "$IMAGE_ID" "$HEAD_SHA" EINDEUTIGE_ID
+~~~
+
+Der Guard übergibt der Compose-Konfiguration ausschließlich die vollständig
+geprüfte unveränderliche `sha256:...`-Image-ID und kontrolliert das
+`org.opencontainers.image.revision`-Label **unmittelbar vor dem Aufruf**.
+Mutable Tags wie `latest` oder `mark-api:pr75-...` sowie unvollständige
+Image-IDs werden verweigert. Der Start verlangt außerdem die explizite
+root-verwaltete Registrierung von Host-UID/-GID `50042:50042` als
+`mark-api` und zwei bereits existierende externe Volumes.
+**Direktes `docker compose up/run` mit manuell gesetztem `MARK_API_IMAGE`
+umgeht diesen Guard und ist kein freigegebener Betriebsweg.** Auch der Guard
+beweist keine Mapping-Isolation, Volume-Eigentümerschaft oder Kontoberechtigung;
+diese separaten Gates bleiben Pflicht. Ohne sie wird kein `live` oder
+`backup` ausgeführt. Ein Image-Bau, ein erfolgreicher Guard-`verify` oder
+eine grüne `docker compose config` sind keine erfolgreiche Host-Installation.
+Keine Wiederholung einer unklaren Backup- oder Plattformmutation ohne Readback.
 
 **Angreifermodell und Merge-Gate:** Eine verlässlich exklusive UID mit
 frischen privaten DB-/WAL-/SHM-Inodes verhindert den gewöhnlichen

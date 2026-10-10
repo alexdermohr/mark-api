@@ -7,7 +7,12 @@ live deployment gate, not a result of these static checks.
 from __future__ import annotations
 
 from pathlib import Path
+import io
+import os
+import shutil
 import subprocess
+import tarfile
+from tempfile import TemporaryDirectory
 import unittest
 
 
@@ -25,6 +30,7 @@ class ContainerDeploymentTests(unittest.TestCase):
             "mark-api-container-start.sh",
             "mark-api-container-backup.sh",
             "mark-api-container-build.sh",
+            "mark-api-container-control.sh",
         ):
             with self.subTest(filename=filename):
                 result = subprocess.run(
@@ -92,7 +98,9 @@ class ContainerDeploymentTests(unittest.TestCase):
 
     def test_compose_requires_preexisting_private_volumes_and_does_not_autostart(self) -> None:
         compose = _read("mark-api-container.compose.yaml")
-        self.assertIn("MARK_API_IMAGE:?Exact verified image ID required", compose)
+        self.assertIn("MARK_API_IMAGE_DIGEST:?Verified immutable image digest required", compose)
+        self.assertEqual(compose.count("image: sha256:"), 2)
+        self.assertNotIn("image: ${MARK_API_IMAGE:", compose)
         self.assertEqual(compose.count('user: "50042:50042"'), 2)
         self.assertEqual(compose.count("read_only: true\n    cap_drop:"), 2)
         self.assertEqual(compose.count('cap_drop: ["ALL"]'), 2)
@@ -124,6 +132,164 @@ class ContainerDeploymentTests(unittest.TestCase):
         self.assertNotIn('docker push', build)
         self.assertNotIn('docker run', build)
 
+
+    def _fake_git_repo(self, root: Path) -> tuple[Path, str]:
+        repo = root / "synthetic"
+        repo.mkdir()
+        (repo / "docs").mkdir()
+        (repo / "src/mark_api").mkdir(parents=True)
+        shutil.copyfile(DOCS / "mark-api-container-build.sh", repo / "docs/mark-api-container-build.sh")
+        (repo / "src/mark_api/__init__.py").write_text("# mark\n")
+        (repo / "pyproject.toml").write_text("[project]\nname='synthetic'\nversion='0.0.1'\n")
+        (repo / "README.md").write_text("attested-version\n")
+        def git(*args: str) -> str:
+            p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            return p.stdout.strip()
+        git("init", "-q")
+        git("config", "user.email", "test@example.invalid")
+        git("config", "user.name", "Test")
+        git("add", ".")
+        git("commit", "-qm", "attested")
+        expected = git("rev-parse", "HEAD")
+        return repo, expected
+
+    def test_rejects_replacement_commit_even_when_head_sha_looks_valid(self) -> None:
+        with TemporaryDirectory(prefix="mark-git-replace-") as tmp:
+            repo, expected = self._fake_git_repo(Path(tmp))
+            def git(*args: str) -> str:
+                p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                return p.stdout.strip()
+            (repo / "README.md").write_text("untrusted-replacement\n")
+            git("add", "README.md")
+            git("commit", "-qm", "replacement")
+            replacement = git("rev-parse", "HEAD")
+            git("replace", expected, replacement)
+            # HEAD still reports the original ID; normal Git archive does not.
+            git("checkout", "--detach", "--force", expected)
+            self.assertEqual(git("rev-parse", "HEAD"), expected)
+            archived = subprocess.run(
+                ["git", "-C", str(repo), "archive", expected, "--", "README.md"],
+                capture_output=True, check=True,
+            )
+            with tarfile.open(fileobj=io.BytesIO(archived.stdout)) as archive:
+                self.assertEqual(archive.extractfile("README.md").read(),
+                                 b"untrusted-replacement\n")
+            env = {**os.environ, "MARK_UV": "/usr/bin/false"}
+            env.pop("GIT_NO_REPLACE_OBJECTS", None)
+            p = subprocess.run(
+                ["/bin/sh", str(repo / "docs/mark-api-container-build.sh"), expected],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertNotEqual(p.returncode, 0)
+            build = _read("mark-api-container-build.sh")
+            self.assertIn("export GIT_NO_REPLACE_OBJECTS=1", build)
+            self.assertIn("refs/replace", build)
+            self.assertTrue(
+                "mark-api: source checkout is dirty" in p.stderr
+                or "mark-api: Git replacement references are not allowed" in p.stderr,
+                p.stderr,
+            )
+
+    def test_rejects_unused_replacement_ref_in_clean_repo(self) -> None:
+        with TemporaryDirectory(prefix="mark-git-unused-replace-") as tmp:
+            repo, expected = self._fake_git_repo(Path(tmp))
+            (repo / "README.md").write_text("a second commit\n")
+            for cmd in (
+                ("add", "README.md"), ("commit", "-qm", "unrelated"),
+            ):
+                p = subprocess.run(["git", "-C", str(repo), *cmd],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stderr)
+            alt = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            p = subprocess.run(
+                ["git", "-C", str(repo), "checkout", "--detach", expected],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(p.returncode, 0, p.stderr)
+            p = subprocess.run(
+                ["git", "-C", str(repo), "replace", alt, expected],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(p.returncode, 0, p.stderr)
+            clean = subprocess.check_output(
+                ["git", "-C", str(repo), "status", "--porcelain"], text=True
+            )
+            self.assertEqual(clean, "")
+            result = subprocess.run(
+                ["/bin/sh", str(repo / "docs/mark-api-container-build.sh"), expected],
+                capture_output=True, text=True,
+                env={**os.environ, "MARK_UV": "/usr/bin/false"},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("mark-api: Git replacement references are not allowed",
+                          result.stderr)
+
+    def test_rejects_git_graft_even_if_branch_and_index_look_clean(self) -> None:
+        with TemporaryDirectory(prefix="mark-git-graft-") as tmp:
+            repo, expected = self._fake_git_repo(Path(tmp))
+            graft = repo / ".git/info/grafts"
+            graft.parent.mkdir(parents=True, exist_ok=True)
+            graft.write_text(expected + "\n")
+            p = subprocess.run(
+                ["/bin/sh", str(repo / "docs/mark-api-container-build.sh"), expected],
+                capture_output=True, text=True,
+                env={**os.environ, "MARK_UV": "/usr/bin/false"},
+            )
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("mark-api: Git grafts are not allowed", p.stderr)
+
+    def test_documented_product_run_uses_only_guarded_image_actions(self) -> None:
+        runbook = _read("operations-runbook.md")
+        self.assertIn('sh docs/mark-api-container-control.sh verify', runbook)
+        self.assertIn('sh docs/mark-api-container-control.sh live', runbook)
+        self.assertIn('sh docs/mark-api-container-control.sh backup', runbook)
+        self.assertNotIn(
+            "docker compose -f docs/mark-api-container.compose.yaml --profile live up",
+            runbook,
+        )
+        guard = _read("mark-api-container-control.sh")
+        self.assertIn("getent passwd 50042", guard)
+        self.assertIn("getent group 50042", guard)
+        self.assertIn("volume inspect", guard)
+        self.assertIn("org.opencontainers.image.revision", guard)
+
+    def test_guard_rejects_mutable_image_refs_before_docker(self) -> None:
+        tool = str(DOCS / "mark-api-container-control.sh")
+        sha = "a" * 40
+        invalid_images = (
+            "latest", "mark-api:pr75-21eb0bee", "sha256:latest",
+            "sha256:" + "a" * 63,
+            "sha256:" + "g" * 64,
+            "sha256:" + "a" * 65,
+        )
+        for ref in invalid_images:
+            with self.subTest(image=ref):
+                p = subprocess.run(
+                    ["/bin/sh", tool, "verify", ref, sha],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(p.returncode, 64, p.stderr)
+                self.assertIn("immutable", p.stderr.lower())
+
+    def test_guard_rejects_unbound_commit_and_does_not_start_compose(self) -> None:
+        tool = str(DOCS / "mark-api-container-control.sh")
+        immutable = "sha256:" + "a" * 64
+        for ref in ("21eb0bee", "z" * 40, ""):
+            with self.subTest(commit=ref):
+                p = subprocess.run(
+                    ["/bin/sh", tool, "verify", immutable, ref],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(p.returncode, 64, p.stderr)
+        control = _read("mark-api-container-control.sh")
+        self.assertIn("image inspect", control)
+        self.assertIn("org.opencontainers.image.revision", control)
+        self.assertIn('MARK_API_IMAGE_DIGEST="$digest"', control)
+        self.assertIn("--pull never", control)
 
 if __name__ == "__main__":
     unittest.main()

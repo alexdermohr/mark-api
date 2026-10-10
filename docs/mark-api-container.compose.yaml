@@ -3,7 +3,7 @@
 # Do not use 'up' on an existing database before offline ownership reconciliation.
 services:
   mark-api:
-    image: ${MARK_API_IMAGE:?Exact verified image ID required}
+    image: sha256:${MARK_API_IMAGE_DIGEST:?Verified immutable image digest required}
     profiles: ["live"]
     user: "50042:50042"
     network_mode: host  # Required for already-authenticated loopback CDP :9222.
@@ -25,7 +25,7 @@ services:
         target: /var/lib/mark-api-backups
         read_only: true
   mark-api-backup:
-    image: ${MARK_API_IMAGE:?Exact verified image ID required}
+    image: sha256:${MARK_API_IMAGE_DIGEST:?Verified immutable image digest required}
     profiles: ["backup"]
     user: "50042:50042"
     network_mode: none
