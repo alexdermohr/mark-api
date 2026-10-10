@@ -40,12 +40,41 @@ unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
 unset GIT_ALTERNATE_OBJECT_DIRECTORIES
 export GIT_NO_REPLACE_OBJECTS=1
 export GIT_GRAFT_FILE=/dev/null
+
+# Run every Git check with a minimal fixed environment and override dangerous
+# executable local configuration (notably core.fsmonitor). Caller-provided
+# GIT_CONFIG_COUNT/PARAMETERS, config include paths and Git helpers are inert.
+safe_git() {
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+        GIT_GRAFT_FILE=/dev/null /usr/bin/git \
+        -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+        -c diff.external= -c core.pager=cat "$@"
+}
+
+# Check checkout-local Git configuration *before* any status/archive operation.
+# Untrusted filter drivers, fsmonitor, includes, worktreeConfig and unknown
+# repository options are not permitted in a release-attested checkout.
+require_inert_git_config() {
+    keys=$(safe_git -C "$repo" config --local --list --name-only --includes) || {
+        printf '%s\n' 'mark-api: cannot inspect local Git configuration' >&2
+        return 1
+    }
+    unexpected=$(printf '%s\n' "$keys" |
+        /usr/bin/grep -Ev '^(core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|symlinks)|remote\.[^.]+\.(url|fetch)|branch\..+\.(remote|merge)|user\.(name|email)|init\.defaultbranch|pull\.rebase|push\.default|gc\.auto|safe\.directory)$' || :)
+    if [ -n "$unexpected" ]; then
+        printf '%s\n' 'mark-api: untrusted or unknown local Git configuration' >&2
+        return 1
+    fi
+}
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
-actual=$(git -C "$repo" rev-parse --verify HEAD) || fail 'HEAD unavailable'
+require_inert_git_config || exit 1
+actual=$(safe_git -C "$repo" rev-parse --verify HEAD) || fail 'HEAD unavailable'
 [ "$actual" = "$expected" ] || fail 'HEAD/revision drift'
-[ -z "$(git -C "$repo" status --porcelain --untracked-files=normal)" ] ||
+[ -z "$(safe_git -C "$repo" status --porcelain --untracked-files=normal)" ] ||
     fail 'dirty release checkout'
-resolved=$(git -C "$repo" rev-parse --verify "$expected^{commit}") ||
+resolved=$(safe_git -C "$repo" rev-parse --verify "$expected^{commit}") ||
     fail 'unknown release commit'
 [ "$resolved" = "$expected" ] || fail 'invalid release commit'
 # Fail closed if caller supplies an image ID not present on the *local* daemon.

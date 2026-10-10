@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 import sqlite3
 import tempfile
 import threading
@@ -1187,6 +1188,146 @@ class ProductLauncherTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(launcher.reconcile_calls, 1)
         self.assertEqual(launcher.close_calls, 2)
+
+
+    def test_main_sigterm_during_startup_defers_cleanup(self) -> None:
+        original = signal.getsignal(signal.SIGTERM)
+        stdout = io.StringIO()
+
+        class Launcher:
+            write_server_address = ("127.0.0.1", 18766)
+            dashboard_url = "http://127.0.0.1/#write_token=secret-synthetic"
+            write_bearer_token = "secret-synthetic"
+            startup_inventory_count = 0
+            startup_persisted_count = 0
+
+            def __init__(self) -> None:
+                self.serve_calls = 0
+                self.close_calls = 0
+
+            def serve_forever(self) -> None:
+                self.serve_calls += 1
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        runtime = Launcher()
+
+        def build(**_kwargs: object) -> Launcher:
+            handler = signal.getsignal(signal.SIGTERM)
+            self.assertTrue(callable(handler))
+            handler(signal.SIGTERM, None)
+            # Repeated termination during setup is also deferred.
+            handler(signal.SIGTERM, None)
+            return runtime
+
+        with (
+            patch("mark_api.launcher.build_product_launcher", side_effect=build),
+            patch("sys.stdout", stdout),
+        ):
+            code = main(["--db", "/tmp/synthetic-mark.sqlite", "--cdp-port", "9222"])
+        self.assertEqual(code, 0)
+        self.assertEqual(runtime.serve_calls, 0)
+        self.assertEqual(runtime.close_calls, 1)
+        self.assertNotIn("secret-synthetic", stdout.getvalue())
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
+
+    def test_main_sigterm_startup_error_restores_handler(self) -> None:
+        original = signal.getsignal(signal.SIGTERM)
+
+        def build(**_kwargs: object) -> None:
+            handler = signal.getsignal(signal.SIGTERM)
+            self.assertTrue(callable(handler))
+            handler(signal.SIGTERM, None)
+            raise ProductLauncherError("synthetic startup error")
+
+        with (
+            patch("mark_api.launcher.build_product_launcher", side_effect=build),
+            patch("sys.stderr", io.StringIO()),
+        ):
+            code = main(["--db", "/tmp/synthetic-mark.sqlite", "--cdp-port", "9222"])
+        self.assertEqual(code, 2)
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
+
+    def test_main_sigterm_runs_close_and_restores_signal_handler(self) -> None:
+        original = signal.getsignal(signal.SIGTERM)
+
+        class Launcher:
+            write_server_address = ("127.0.0.1", 18766)
+            dashboard_url = "http://127.0.0.1/#write_token=synthetic-test-only"
+            write_bearer_token = "synthetic-test-only"
+            startup_inventory_count = 0
+            startup_persisted_count = 0
+
+            def __init__(self) -> None:
+                self.closed = False
+                self.term_calls = 0
+
+            def serve_forever(self) -> None:
+                handler = signal.getsignal(signal.SIGTERM)
+                if not callable(handler):
+                    raise AssertionError("SIGTERM handler was not installed")
+                self.term_calls += 1
+                handler(signal.SIGTERM, None)
+                raise AssertionError("SIGTERM did not exit serve_forever")
+
+            def close(self) -> None:
+                # A second SIGTERM during cleanup must not interrupt close.
+                handler = signal.getsignal(signal.SIGTERM)
+                if callable(handler):
+                    handler(signal.SIGTERM, None)
+                self.closed = True
+
+        runtime = Launcher()
+        with (
+            patch("mark_api.launcher.build_product_launcher", return_value=runtime),
+            patch("sys.stdout", io.StringIO()),
+        ):
+            code = main(["--db", "/tmp/synthetic-mark.sqlite", "--cdp-port", "9222"])
+        self.assertEqual(code, 0)
+        self.assertEqual(runtime.term_calls, 1)
+        self.assertTrue(runtime.closed)
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
+
+    def test_main_sigterm_preserves_ambiguous_media_reconciliation(self) -> None:
+        original = signal.getsignal(signal.SIGTERM)
+
+        class Launcher:
+            write_server_address = ("127.0.0.1", 18766)
+            dashboard_url = "http://127.0.0.1/#write_token=synthetic-test-only"
+            write_bearer_token = "synthetic-test-only"
+            startup_inventory_count = 0
+            startup_persisted_count = 0
+
+            def __init__(self) -> None:
+                self.close_calls = 0
+                self.reconcile_calls = 0
+
+            def serve_forever(self) -> None:
+                handler = signal.getsignal(signal.SIGTERM)
+                if not callable(handler):
+                    raise AssertionError("SIGTERM handler was not installed")
+                handler(signal.SIGTERM, None)
+                raise AssertionError("SIGTERM did not exit serve_forever")
+
+            def close(self) -> None:
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise PrivateWebSubmitUnknownError("create_media_submit_settle")
+
+            def reconcile_media_submit(self) -> None:
+                self.reconcile_calls += 1
+
+        runtime = Launcher()
+        with (
+            patch("mark_api.launcher.build_product_launcher", return_value=runtime),
+            patch("sys.stdout", io.StringIO()),
+        ):
+            code = main(["--db", "/tmp/synthetic-mark.sqlite", "--cdp-port", "9222"])
+        self.assertEqual(code, 0)
+        self.assertEqual(runtime.close_calls, 2)
+        self.assertEqual(runtime.reconcile_calls, 1)
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
 
     def test_main_returns_two_for_sanitized_startup_failure(self) -> None:
         stderr = io.StringIO()

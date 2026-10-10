@@ -124,13 +124,20 @@ class ContainerDeploymentTests(unittest.TestCase):
         self.assertIn('rev-parse --verify HEAD', build)
         self.assertIn('[ "$head" = "$expected" ]', build)
         self.assertIn('status --porcelain --untracked-files=normal', build)
-        self.assertIn('git -C "$repo" archive "$expected"', build)
+        self.assertIn('safe_git -C "$repo" archive "$expected"', build)
         self.assertIn('build --wheel --offline', build)
         self.assertIn('org.opencontainers.image.revision=$expected', build)
         self.assertIn('image inspect', build)
         self.assertIn('--host unix:///var/run/docker.sock', build)
         self.assertNotIn('docker push', build)
         self.assertNotIn('docker run', build)
+        for script in (build, _read("mark-api-container-control.sh")):
+            self.assertIn("safe_git() {", script)
+            self.assertIn("/usr/bin/env -i", script)
+            self.assertIn("GIT_CONFIG_NOSYSTEM=1", script)
+            self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", script)
+            self.assertIn("-c core.fsmonitor=false", script)
+            self.assertIn("-c core.hooksPath=/dev/null", script)
 
 
     def _fake_git_repo(self, root: Path) -> tuple[Path, str]:
@@ -139,6 +146,7 @@ class ContainerDeploymentTests(unittest.TestCase):
         (repo / "docs").mkdir()
         (repo / "src/mark_api").mkdir(parents=True)
         shutil.copyfile(DOCS / "mark-api-container-build.sh", repo / "docs/mark-api-container-build.sh")
+        shutil.copyfile(DOCS / "mark-api-container-control.sh", repo / "docs/mark-api-container-control.sh")
         (repo / "src/mark_api/__init__.py").write_text("# mark\n")
         (repo / "pyproject.toml").write_text("[project]\nname='synthetic'\nversion='0.0.1'\n")
         (repo / "README.md").write_text("attested-version\n")
@@ -241,6 +249,121 @@ class ContainerDeploymentTests(unittest.TestCase):
             )
             self.assertNotEqual(p.returncode, 0)
             self.assertIn("mark-api: Git grafts are not allowed", p.stderr)
+
+    def test_untrusted_git_fsmonitor_cannot_execute(self) -> None:
+        # Both environment-injected and checkout-local executable config must
+        # be inert before any git status or revision validation runs.
+        with TemporaryDirectory(prefix="mark-git-fsmonitor-") as tmp:
+            root = Path(tmp)
+            repo, expected = self._fake_git_repo(root)
+            # Force a tracked-content refresh: fsmonitor is not called on a cache hit.
+            (repo / "README.md").write_text("dirty tracked content\\n")
+            marker = root / "fsmonitor-executed"
+            hook = root / "fsmonitor.sh"
+            hook.write_text(
+                "#!/bin/sh\n"
+                + "printf triggered > '" + str(marker) + "'\n"
+                + "printf 'token\\000/\\000'\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o700)
+            paths = (
+                (repo / "docs/mark-api-container-build.sh", [expected]),
+                (repo / "docs/mark-api-container-control.sh",
+                 ["verify", "sha256:" + "a" * 64, expected]),
+            )
+            for script, arguments in paths:
+                for source in ("environment", "checkout-local"):
+                    with self.subTest(script=script.name, source=source):
+                        marker.unlink(missing_ok=True)
+                        env = {**os.environ, "MARK_UV": "/usr/bin/false"}
+                        env.pop("GIT_CONFIG_COUNT", None)
+                        for key in list(env):
+                            if key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+                                env.pop(key)
+                        conf = subprocess.run(
+                            ["git", "-C", str(repo), "config", "--unset-all", "core.fsmonitor"],
+                            capture_output=True, text=True, env=os.environ.copy(),
+                        )
+                        self.assertIn(conf.returncode, (0, 5), conf.stderr)
+                        if source == "environment":
+                            env.update(
+                                GIT_CONFIG_COUNT="1",
+                                GIT_CONFIG_KEY_0="core.fsmonitor",
+                                GIT_CONFIG_VALUE_0=str(hook),
+                            )
+                        else:
+                            conf = subprocess.run(
+                                ["git", "-C", str(repo), "config", "core.fsmonitor", str(hook)],
+                                capture_output=True, text=True, env=os.environ.copy(),
+                            )
+                            self.assertEqual(conf.returncode, 0, conf.stderr)
+                        completed = subprocess.run(
+                            ["/bin/sh", str(script), *arguments],
+                            capture_output=True, text=True, env=env,
+                        )
+                        self.assertNotEqual(completed.returncode, 0)
+                        self.assertFalse(marker.exists(),
+                            f"{script.name} executed {source} core.fsmonitor")
+
+    def test_untrusted_git_clean_filter_cannot_execute(self) -> None:
+        with TemporaryDirectory(prefix="mark-git-clean-filter-") as tmp:
+            root = Path(tmp)
+            repo, _ = self._fake_git_repo(root)
+            (repo / ".gitattributes").write_text(
+                "README.md filter=malicious\n", encoding="utf-8",
+            )
+
+            def git(*args: str) -> str:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result.stdout.strip()
+
+            git("add", ".gitattributes")
+            git("commit", "-qm", "trusted attributes")
+            expected = git("rev-parse", "HEAD")
+            marker = root / "filter-executed"
+            hook = root / "filter.sh"
+            hook.write_text(
+                "#!/bin/sh\n"
+                + "printf executed > '" + str(marker) + "'\n"
+                + "exec /bin/cat\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o700)
+            git("config", "filter.malicious.clean", str(hook))
+            for script, arguments in (
+                (repo / "docs/mark-api-container-build.sh", [expected]),
+                (repo / "docs/mark-api-container-control.sh",
+                 ["verify", "sha256:" + "a" * 64, expected]),
+            ):
+                with self.subTest(script=script.name):
+                    marker.unlink(missing_ok=True)
+                    readme = repo / "README.md"
+                    stamp = readme.stat()
+                    # Force Git to compare a tracked worktree file to its index.
+                    os.utime(readme, (stamp.st_atime, stamp.st_mtime + 90))
+                    # Prove the fixture is executable before testing isolation.
+                    check = subprocess.run(
+                        ["git", "-C", str(repo), "status", "--porcelain"],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(check.returncode, 0, check.stderr)
+                    self.assertTrue(marker.exists(), "clean-filter fixture never executed")
+                    marker.unlink()
+                    stamp = readme.stat()
+                    os.utime(readme, (stamp.st_atime, stamp.st_mtime + 90))
+                    completed = subprocess.run(
+                        ["/bin/sh", str(script), *arguments],
+                        capture_output=True, text=True,
+                        env={**os.environ, "MARK_UV": "/usr/bin/false"},
+                    )
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertFalse(marker.exists(),
+                        f"{script.name} executed checkout-local filter.clean")
 
     def test_documented_product_run_uses_only_guarded_image_actions(self) -> None:
         runbook = _read("operations-runbook.md")

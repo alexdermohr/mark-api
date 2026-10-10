@@ -7,25 +7,54 @@ unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
 unset GIT_ALTERNATE_OBJECT_DIRECTORIES
 export GIT_NO_REPLACE_OBJECTS=1
 export GIT_GRAFT_FILE=/dev/null
+
+# Run every Git check with a minimal fixed environment and override dangerous
+# executable local configuration (notably core.fsmonitor). Caller-provided
+# GIT_CONFIG_COUNT/PARAMETERS, config include paths and Git helpers are inert.
+safe_git() {
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+        GIT_GRAFT_FILE=/dev/null /usr/bin/git \
+        -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+        -c diff.external= -c core.pager=cat "$@"
+}
 [ "$#" -eq 1 ] || { printf '%s\n' 'usage: sh docs/mark-api-container-build.sh EXACT_HEAD_SHA' >&2; exit 64; }
 expected=$1
 case "$expected" in
     *[!0-9a-f]*|'') exit 64 ;;
 esac
 [ "${#expected}" -eq 40 ] || exit 64
+
+# Check checkout-local Git configuration *before* any status/archive operation.
+# Untrusted filter drivers, fsmonitor, includes, worktreeConfig and unknown
+# repository options are not permitted in a release-attested checkout.
+require_inert_git_config() {
+    keys=$(safe_git -C "$repo" config --local --list --name-only --includes) || {
+        printf '%s\n' 'mark-api: cannot inspect local Git configuration' >&2
+        return 1
+    }
+    unexpected=$(printf '%s\n' "$keys" |
+        /usr/bin/grep -Ev '^(core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|symlinks)|remote\.[^.]+\.(url|fetch)|branch\..+\.(remote|merge)|user\.(name|email)|init\.defaultbranch|pull\.rebase|push\.default|gc\.auto|safe\.directory)$' || :)
+    if [ -n "$unexpected" ]; then
+        printf '%s\n' 'mark-api: untrusted or unknown local Git configuration' >&2
+        return 1
+    fi
+}
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
-head=$(git -C "$repo" rev-parse --verify HEAD)
+require_inert_git_config || exit 1
+head=$(safe_git -C "$repo" rev-parse --verify HEAD)
 [ "$head" = "$expected" ] || { printf '%s\n' 'mark-api: HEAD changed' >&2; exit 1; }
-[ -z "$(git -C "$repo" status --porcelain --untracked-files=normal)" ] || {
+[ -z "$(safe_git -C "$repo" status --porcelain --untracked-files=normal)" ] || {
     printf '%s\n' 'mark-api: source checkout is dirty' >&2
     exit 1
 }
 # Reject even inactive replacement/graft metadata: no ambiguous revision trust.
-[ -z "$(git -C "$repo" for-each-ref --format='%(refname)' refs/replace)" ] || {
+[ -z "$(safe_git -C "$repo" for-each-ref --format='%(refname)' refs/replace)" ] || {
     printf '%s\n' 'mark-api: Git replacement references are not allowed' >&2
     exit 1
 }
-common=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
+common=$(safe_git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
 [ ! -e "$common/info/grafts" ] && [ ! -L "$common/info/grafts" ] || {
     printf '%s\n' 'mark-api: Git grafts are not allowed' >&2
     exit 1
@@ -38,7 +67,7 @@ temp=$(mktemp -d "${TMPDIR:-/tmp}/mark-api-image.XXXXXXXX") || exit 1
 trap 'rm -rf -- "$temp"' 0
 trap 'exit 1' 1 2 3 15
 mkdir -m 0700 "$temp/source" "$temp/context" "$temp/docs"
-git -C "$repo" archive "$expected" -- pyproject.toml README.md src |
+safe_git -C "$repo" archive "$expected" -- pyproject.toml README.md src |
     tar -xf - -C "$temp/source"
 "${MARK_UV:-uv}" build --wheel --offline --out-dir "$temp/context" "$temp/source"
 set -- "$temp/context"/*.whl
@@ -46,7 +75,7 @@ set -- "$temp/context"/*.whl
     printf '%s\n' 'mark-api: expected exactly one verified wheel' >&2
     exit 1
 }
-git -C "$repo" archive "$expected" -- \
+safe_git -C "$repo" archive "$expected" -- \
     docs/mark-api-container.Dockerfile \
     docs/mark-api-container-start.sh \
     docs/mark-api-container-backup.sh \
