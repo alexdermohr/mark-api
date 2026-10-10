@@ -26,6 +26,7 @@ import sqlite3
 import stat
 import struct
 import time
+import weakref
 from threading import Event, RLock, Thread
 from typing import Any
 from urllib.parse import quote
@@ -177,24 +178,41 @@ class FenceLedger:
         self.path = path
         self._uid = os.geteuid()
         self._guard = RLock()
-        _private_directory(path.parent, self._uid, mode=0o700)
-        created = False
-        if initialize:
-            try:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY |
-                             os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
-            except FileExistsError:
-                pass
-            else:
-                os.close(fd)
-                created = True
-        checked = _file_identity(path, self._uid)
-        self._db_identity = (checked.st_dev, checked.st_ino)
-        parent_info = path.parent.lstat()
-        self._parent_identity = (parent_info.st_dev, parent_info.st_ino)
+        self._owner_pid = os.getpid()
         self._lock_path = path.with_name(path.name + ".lock")
+        _private_directory(path.parent, self._uid, mode=0o700)
+        # Normal serve never creates a lock file for a missing ledger.
+        if not initialize:
+            _file_identity(path, self._uid)
+        # Acquire exclusive ownership before publishing or inspecting the DB.
         self._lock_fd: int | None = self._acquire_lock()
         try:
+            # A fork child must release its inherited descriptor immediately,
+            # even if it never touches this object or the parent dies. Retain
+            # only a weak reference: at-fork callbacks must not keep old ledgers
+            # alive, or release unrelated future file descriptors.
+            ledger_ref = weakref.ref(self)
+
+            def release_in_forked_child() -> None:
+                ledger = ledger_ref()
+                if ledger is not None:
+                    ledger.close()  # child PID fast path never takes _guard
+
+            os.register_at_fork(after_in_child=release_in_forked_child)
+            created = False
+            if initialize:
+                try:
+                    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY |
+                                 os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+                except FileExistsError:
+                    pass
+                else:
+                    os.close(fd)
+                    created = True
+            checked = _file_identity(path, self._uid)
+            self._db_identity = (checked.st_dev, checked.st_ino)
+            parent_info = path.parent.lstat()
+            self._parent_identity = (parent_info.st_dev, parent_info.st_ino)
             if created:
                 with closing(self._connect()) as conn:
                     conn.executescript("""
@@ -299,6 +317,15 @@ class FenceLedger:
             raise
 
     def close(self) -> None:
+        # After fork, a vanished parent thread may own the inherited RLock.
+        # The child's inherited flock descriptor must be closed without taking
+        # that lock or calling LOCK_UN on the parent's shared file description.
+        if os.getpid() != self._owner_pid:
+            descriptor = getattr(self, "_lock_fd", None)
+            self._lock_fd = None
+            if descriptor is not None:
+                os.close(descriptor)
+            return
         with self._guard:
             descriptor = getattr(self, "_lock_fd", None)
             self._lock_fd = None
@@ -320,9 +347,15 @@ class FenceLedger:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
 
+    def _ensure_owner_pid(self) -> None:
+        # A fork child may inherit _guard while its owning thread is gone.
+        # Check the process identity BEFORE taking that thread lock.
+        if os.getpid() != self._owner_pid:
+            raise FenceWitnessError("witness owner lease inherited by fork")
+
     def _connect(self) -> sqlite3.Connection:
-        if self._lock_fd is None:
-            raise FenceWitnessError("witness owner lease is closed")
+        if self._lock_fd is None or os.getpid() != self._owner_pid:
+            raise FenceWitnessError("witness owner lease is closed or inherited by fork")
         _private_directory(self.path.parent, self._uid, mode=0o700)
         current_lock = os.fstat(self._lock_fd)
         published_lock = self._lock_path.lstat()
@@ -415,6 +448,7 @@ class FenceLedger:
             raise FenceWitnessError("runtime session is not active")
 
     def open_session(self) -> str:
+        self._ensure_owner_pid()
         with self._guard, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -435,6 +469,7 @@ class FenceLedger:
                 raise
 
     def seal_session(self, session: str) -> None:
+        self._ensure_owner_pid()
         with self._guard, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -472,6 +507,7 @@ class FenceLedger:
         """).fetchone() is not None
 
     def fence_pending(self) -> bool:
+        self._ensure_owner_pid()
         with self._guard, closing(self._connect()) as conn:
             return self._is_pending(conn)
 
@@ -482,6 +518,7 @@ class FenceLedger:
         sha = _required_string(sha, _SHA, "request SHA-256")
         if not isinstance(action, str) or action not in _ACTIONS:
             raise FenceWitnessError("write action is not supported")
+        self._ensure_owner_pid()
         with self._guard, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -505,6 +542,7 @@ class FenceLedger:
     ) -> str:
         key = _required_string(key, _KEY, "idempotency key")
         sha = _required_string(sha, _SHA, "request SHA-256")
+        self._ensure_owner_pid()
         with self._guard, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -550,6 +588,7 @@ class FenceLedger:
         key = _required_string(key, _KEY, "idempotency key")
         sha = _required_string(sha, _SHA, "request SHA-256")
         evidence = _evidence(evidence)
+        self._ensure_owner_pid()
         with self._guard, closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -635,7 +674,7 @@ class _WitnessUnixHandler(socketserver.StreamRequestHandler):
             if session is not None:
                 try:
                     server.ledger.seal_session(session)
-                except (FenceWitnessError, sqlite3.Error, OSError):
+                except BaseException:
                     # The caller is no longer authenticated to this session,
                     # and an unavailable journal must fail the entire owner
                     # service rather than silently retain an active session.

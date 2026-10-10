@@ -6,9 +6,11 @@ evidence in its own active session or that the actual host is UID-isolated.
 from __future__ import annotations
 
 from contextlib import closing
+import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import socket
 import sqlite3
 import stat
@@ -18,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from mark_api.fence_witness import (
     FenceLedger,
@@ -41,6 +44,19 @@ _UNKNOWN_MEDIA = {
 }
 
 
+def _bounded_child_exit(pid: int, *, timeout_seconds: float = 1.5) -> int | None:
+    """Never let a fork-regression hang the test suite after a deadlock."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        completed, status = os.waitpid(pid, os.WNOHANG)
+        if completed == pid:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.01)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    return None
+
+
 class FenceWitnessTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="mark-witness-contract-")
@@ -51,6 +67,181 @@ class FenceWitnessTests(unittest.TestCase):
         self.ledger_file = self.data / "witness.sqlite"
         self.owner = FenceLedger(self.ledger_file, initialize=True)
         self.addCleanup(self.owner.close)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_forked_process_does_not_retain_crashed_witness_lease(self) -> None:
+        """A forked child must not pin an orphaned owner's flock indefinitely."""
+        read_fd, write_fd = os.pipe()
+        ready_read, ready_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(write_fd)
+            os.close(ready_read)
+            try:
+                # At-fork callbacks have already run before reaching here.
+                os.write(ready_write, b"R")
+                os.close(ready_write)
+                os.read(read_fd, 1)  # Stay alive until the parent tests the lock.
+            finally:
+                os._exit(0)
+        os.close(read_fd)
+        os.close(ready_write)
+        try:
+            self.assertTrue(select.select([ready_read], [], [], 1.5)[0],
+                            "fork child never reached ready barrier")
+            self.assertEqual(os.read(ready_read, 1), b"R")
+            os.close(ready_read)
+            # Emulate process death by closing, WITHOUT explicitly LOCK_UN.
+            original_fd = self.owner._lock_fd
+            self.owner._lock_fd = None
+            assert original_fd is not None
+            os.close(original_fd)
+            with FenceLedger(self.ledger_file) as replacement:
+                self.assertFalse(replacement.fence_pending())
+        finally:
+            os.write(write_fd, b"X")
+            os.close(write_fd)
+            _bounded_child_exit(pid)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_fork_child_public_read_fails_before_inherited_lock(self) -> None:
+        """A fork child cannot block on an RLock held by a vanished thread."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_parent_lock() -> None:
+            with self.owner._guard:
+                entered.set()
+                release.wait(3)
+
+        holder = threading.Thread(target=hold_parent_lock)
+        holder.start()
+        self.assertTrue(entered.wait(1))
+        pid = os.fork()
+        if pid == 0:
+            try:
+                self.owner.fence_pending()
+            except FenceWitnessError as exc:
+                os._exit(0 if "fork" in str(exc) else 4)
+            except BaseException:
+                os._exit(5)
+            os._exit(6)
+        code = None
+        try:
+            deadline = time.monotonic() + 0.6
+            while time.monotonic() < deadline:
+                complete, status = os.waitpid(pid, os.WNOHANG)
+                if complete == pid:
+                    code = os.waitstatus_to_exitcode(status)
+                    break
+                time.sleep(0.01)
+        finally:
+            if code is None:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+            release.set()
+            holder.join(timeout=3)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(code, 0, "forked public read hung on orphaned RLock")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_fork_child_close_does_not_wait_on_inherited_thread_lock(self) -> None:
+        """Fork child must release its inherited FD without waiting for a dead thread."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_parent_lock() -> None:
+            with self.owner._guard:
+                entered.set()
+                release.wait(3)
+
+        holder = threading.Thread(target=hold_parent_lock)
+        holder.start()
+        self.assertTrue(entered.wait(1))
+        pid = os.fork()
+        if pid == 0:
+            try:
+                self.owner.close()
+            except BaseException:
+                os._exit(4)
+            os._exit(0)
+        exitcode = None
+        try:
+            deadline = time.monotonic() + 0.6
+            while time.monotonic() < deadline:
+                completed, status = os.waitpid(pid, os.WNOHANG)
+                if completed == pid:
+                    exitcode = os.waitstatus_to_exitcode(status)
+                    break
+                time.sleep(0.01)
+        finally:
+            if exitcode is None:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+            release.set()
+            holder.join(timeout=3)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(exitcode, 0, "fork child hung on orphaned RLock")
+        self.assertFalse(self.owner.fence_pending())
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_child_close_cannot_unlock_live_parent_witness(self) -> None:
+        """A forked child must never unlock the parent's shared flock OFD."""
+        session = self.owner.open_session()
+        self.owner.execution_started(
+            session, key="fork-parent-live", sha=_SHA, action="create",
+        )
+        pid = os.fork()
+        if pid == 0:
+            try:
+                try:
+                    self.owner.fence_pending()
+                except FenceWitnessError as exc:
+                    if "inherited by fork" not in str(exc):
+                        os._exit(5)
+                else:
+                    os._exit(6)
+                self.owner.close()  # inherited descriptor, NOT the owner PID
+            except BaseException:
+                os._exit(3)
+            os._exit(0)
+        self.assertEqual(_bounded_child_exit(pid), 0,
+                         "forked child did not exit within the deadline")
+        try:
+            second = FenceLedger(self.ledger_file)
+        except FenceWitnessError as exc:
+            self.assertIn("another witness owner", str(exc))
+        else:
+            second.close()
+            self.fail("fork child released the live parent's ledger lease")
+        self.assertTrue(self.owner.fence_pending())
+
+    def test_real_kernel_lock_denial_does_not_publish_ledger(self) -> None:
+        """Another open file description must hold first-init ownership."""
+        fresh = self.data / "kernel-lock-denied.sqlite"
+        lock_path = fresh.with_name(fresh.name + ".lock")
+        lock_fd = os.open(
+            lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(FenceWitnessError, "another witness owner"):
+                FenceLedger(fresh, initialize=True)
+            self.assertFalse(fresh.exists(), "failed initial owner published a ledger")
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+    def test_denied_first_ledger_lock_creates_no_partial_database(self) -> None:
+        """Initialization must acquire exclusive ownership before O_EXCL."""
+        fresh = self.data / "first-init-blocked.sqlite"
+        with patch.object(
+            FenceLedger, "_acquire_lock",
+            side_effect=FenceWitnessError("injected first-init lease denial"),
+        ):
+            with self.assertRaisesRegex(FenceWitnessError, "lease denial"):
+                FenceLedger(fresh, initialize=True)
+        self.assertFalse(fresh.exists(), "ownerless partial ledger was published")
 
     def test_second_owner_cannot_seal_live_session_or_clear_active_fence(self) -> None:
         """A second witness process must fail before touching active sessions."""
@@ -117,6 +308,7 @@ else:
         with self.assertRaises(FenceWitnessError):
             FenceLedger(absent)
         self.assertFalse(absent.exists())
+        self.assertFalse(absent.with_name(absent.name + ".lock").exists())
         self.assertTrue(self.ledger_file.exists())
         self.owner.close()
         with closing(sqlite3.connect(self.ledger_file)) as db:
@@ -446,6 +638,40 @@ else:
         self.assertFalse(runtime_path.exists())
         self.assertFalse(operator_path.exists())
 
+
+    def test_seal_base_exception_marks_witness_fatal(self) -> None:
+        """A non-sqlite BaseException during sealing must poison serve mode."""
+        runtime_dir = self.root / "fatal-runtime"
+        operator_dir = self.root / "fatal-operator"
+        runtime_dir.mkdir()
+        runtime_dir.chmod(0o2710)
+        operator_dir.mkdir(mode=0o700)
+        server = FenceWitnessServer(
+            ledger=self.owner,
+            runtime_socket=runtime_dir / "witness.sock",
+            operator_socket=operator_dir / "operator.sock",
+            runtime_uid=os.geteuid() + 100000,
+            runtime_gid=os.getegid(),
+            operator_uid=os.geteuid(),
+        )
+        # A temporary same-UID test client, not a production UID exemption.
+        server._runtime.peer_uid = os.geteuid()
+        server.start()
+        try:
+            with patch.object(self.owner, "seal_session", side_effect=SystemExit(57)):
+                client = FenceWitnessClient(
+                    runtime_dir / "witness.sock", expected_owner_uid=os.geteuid(),
+                )
+                client.close()
+                self.assertTrue(
+                    server._runtime._fatal.wait(1.5),
+                    "unsealed session left witness serving after BaseException",
+                )
+                with self.assertRaisesRegex(FenceWitnessError, "one live runtime session"):
+                    self.owner.open_session()
+        finally:
+            with self.assertRaisesRegex(FenceWitnessError, "shutdown could not seal"):
+                server.close()
 
     def test_shutdown_does_not_block_on_continuous_runtime_session(self) -> None:
         """A long-lived client must not hold SIGTERM cleanup indefinitely.
