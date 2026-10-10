@@ -4099,6 +4099,73 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 exclude_idempotency_key="different-key",
                 claim_owner="new-runtime",
             ))
+            # The browser observation succeeds but the SQLite clearance fails.
+            # Retain the page and retry persistence without new browser input.
+            with patch.object(
+                store, "record_write_recovery_clearance",
+                side_effect=sqlite3.OperationalError("temporary clearance I/O"),
+            ):
+                with self.assertRaises(sqlite3.OperationalError):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertEqual(pending.readbacks, 1)
+            self.assertFalse(pending.closed)
+            self.assertTrue(store.create_recovery_pending(
+                exclude_idempotency_key="different-key",
+                claim_owner="new-runtime",
+            ))
+            # Cancellation before a durable SQLite commit must retain the
+            # observed page and may not perform another browser readback.
+            with patch.object(
+                store, "record_write_recovery_clearance",
+                side_effect=KeyboardInterrupt("before SQLite commit"),
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "before SQLite"):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(pending.closed)
+            self.assertEqual(pending.readbacks, 1)
+            # Commit may be durable even if cancellation reaches the caller
+            # before the in-memory runtime can release its page and fence.
+            durable_append = store.record_write_recovery_clearance
+
+            def committed_then_cancel(**kwargs: object) -> None:
+                durable_append(**kwargs)
+                raise KeyboardInterrupt("after durable clearance")
+
+            with patch.object(
+                store, "record_write_recovery_clearance",
+                side_effect=committed_then_cancel,
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "durable clearance"):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(pending.closed)
+            self.assertEqual(pending.readbacks, 1)
+            self.assertTrue(store.has_write_recovery_clearance(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+            ))
+            # Even an additional shutdown attempt must retain the page.
+            with self.assertRaisesRegex(
+                PrivateWebSubmitUnknownError, "media_runtime_close_unsettled",
+            ):
+                runtime.close()
+            # The SQLite commit succeeds, but the following in-memory release
+            # fails. Retain the settled page and reuse the exact old clearance.
+            with patch.object(
+                runtime._server, "clear_verified_create_recovery",
+                side_effect=RuntimeError("synthetic in-memory release error"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "in-memory release"):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(pending.closed)
+            self.assertEqual(pending.readbacks, 1)
+            self.assertTrue(store.has_write_recovery_clearance(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+            ))
             runtime.reconcile_media_submit()
             self.assertEqual(pending.readbacks, 1)
             self.assertTrue(pending.closed)

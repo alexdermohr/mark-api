@@ -345,6 +345,8 @@ class PrivateWebMediaCreateRuntime:
         self._page_factory = page_factory
         self._pending_page: _CloseablePrivateWebMediaPage | None = None
         self._pending_authorization_reference: str | None = None
+        # Positive browser observations remain reusable if SQLite fails.
+        self._pending_observation_confirmed = False
         self._submit_unknown_fenced = False
         self._closed = False
         self._operation_lock = Lock()
@@ -491,7 +493,9 @@ class PrivateWebMediaCreateRuntime:
             authorization_reference=authorization_reference,
         )
 
-    def _reconcile_media_submit_locked(self) -> None:
+    def _reconcile_media_submit_locked(
+        self, *, persist_after_observation: Callable[[], None] | None = None,
+    ) -> None:
         self._ensure_open()
         page = self._pending_page
         if page is None:
@@ -499,9 +503,19 @@ class PrivateWebMediaCreateRuntime:
                 "private Web media submit has no pending reconciliation"
             )
 
-        page.reconcile_create_media_submit()
+        if not self._pending_observation_confirmed:
+            page.reconcile_create_media_submit()
+            self._pending_observation_confirmed = True
+
+        # Do not release the page or operation reference before the observed
+        # settlement is durably bound to its SQLite request. On a failed
+        # commit, retry only persistence, never browser input.
+        if persist_after_observation is not None:
+            persist_after_observation()
+
         self._pending_page = None
         self._pending_authorization_reference = None
+        self._pending_observation_confirmed = False
         self._submit_unknown_fenced = False
         try:
             page.close()
@@ -510,11 +524,15 @@ class PrivateWebMediaCreateRuntime:
             # manufacture platform retry authority.
             pass
 
-    def reconcile_media_submit(self) -> None:
-        """Observe unresolved browser submit state without repeating browser input."""
+    def reconcile_media_submit(
+        self, *, persist_after_observation: Callable[[], None] | None = None,
+    ) -> None:
+        """Observe an existing submit and durably settle it without re-sending."""
 
         with self._operation_lock:
-            self._reconcile_media_submit_locked()
+            self._reconcile_media_submit_locked(
+                persist_after_observation=persist_after_observation,
+            )
 
     def _close_locked(self) -> None:
         if self._closed:
@@ -1165,28 +1183,40 @@ class PrivateWebWriteApiRuntime:
             )
         with self._operation_lock:
             operation_reference = runtime.pending_authorization_reference
-            runtime.reconcile_media_submit()
-            if operation_reference is not None and operation_reference.startswith(
-                "write-api:"
-            ):
+
+            def _persist_verified_settlement() -> None:
+                if operation_reference is None:
+                    return
+                if not operation_reference.startswith("write-api:"):
+                    raise PrivateWebRuntimeSetupError(
+                        "media reconciliation lacks a valid operation reference"
+                    )
                 key = operation_reference[len("write-api:"):]
                 record = self._store.write_api_request(key)
                 if record is None:
                     raise PrivateWebRuntimeSetupError(
                         "media reconciliation lacks bound write operation"
                     )
-                # Browser observation-only reconciliation never re-sends
-                # platform input; preserve the original HTTP response.
-                self._store.record_write_recovery_clearance(
+                # If persistence succeeded but memory release failed, never
+                # overwrite or duplicate the immutable clearance record.
+                if not self._store.has_write_recovery_clearance(
                     idempotency_key=key,
                     request_sha256=record.request_sha256,
-                    verification_kind="media_submit_reconciled",
-                    evidence_reference="private-web:observation-only-submit-settlement",
-                    observed_at=_utc_now(),
-                )
+                ):
+                    self._store.record_write_recovery_clearance(
+                        idempotency_key=key,
+                        request_sha256=record.request_sha256,
+                        verification_kind="media_submit_reconciled",
+                        evidence_reference="private-web:observation-only-submit-settlement",
+                        observed_at=_utc_now(),
+                    )
                 self._server.clear_verified_create_recovery(
                     key, record.request_sha256,
                 )
+
+            runtime.reconcile_media_submit(
+                persist_after_observation=_persist_verified_settlement,
+            )
 
     def close(self) -> None:
         with self._close_lock:

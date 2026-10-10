@@ -371,7 +371,13 @@ positiv abgeschlossenem Page-Readback schreibt Mark für exakt den gebundenen
 Write-API-Idempotency-Key eine zusätzliche SQLite-Clearance mit Fingerprint
 und Verifikationsart. Die ursprüngliche Operation, ihr Receipt und ihre
 HTTP-Replay-Antwort werden **niemals gelöscht oder verändert**. Scheitert
-die Beobachtung oder das Schreiben der Clearance, bleibt die Sperre bestehen.
+die Beobachtung, bleibt die Sperre bestehen. Scheitert lediglich die
+SQLite-Quittierung nach bestätigter Browser-Beobachtung, bleibt die
+operationgebundene Media-Seite im laufenden Prozess erhalten. Ein zweiter
+Reconciliation-Aufruf wiederholt nur den fehlenden Persistenzschritt, nicht
+den externen Submit oder die bereits abgeschlossene Browser-Beobachtung.
+Bei einem Prozessabbruch vor dieser Quittierung bleibt die SQLite-Sperre
+bestehen; dann ist die unabhängige Operatorprüfung erforderlich.
 
 Für einen bereits beendeten Prozess ist die ursprüngliche Browserseite
 nicht automatisch rekonstruierbar. Ein unabhängiger, autorisierter Operator
