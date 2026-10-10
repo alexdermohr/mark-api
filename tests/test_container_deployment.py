@@ -124,7 +124,11 @@ class ContainerDeploymentTests(unittest.TestCase):
         self.assertIn('rev-parse --verify HEAD', build)
         self.assertIn('[ "$head" = "$expected" ]', build)
         self.assertIn('status --porcelain --untracked-files=normal', build)
-        self.assertIn('safe_git -C "$repo" archive "$expected"', build)
+        self.assertIn('attested_git archive "$expected"', build)
+        self.assertIn('attested_git status --porcelain', build)
+        self.assertIn('--git-dir="$temp/git"', build)
+        self.assertIn('GIT_ALTERNATE_OBJECT_DIRECTORIES="$common/objects"', build)
+        self.assertNotIn('safe_git -C "$repo" status --porcelain', build)
         self.assertIn('build --wheel --offline', build)
         self.assertIn('org.opencontainers.image.revision=$expected', build)
         self.assertIn('image inspect', build)
@@ -138,6 +142,9 @@ class ContainerDeploymentTests(unittest.TestCase):
             self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", script)
             self.assertIn("-c core.fsmonitor=false", script)
             self.assertIn("-c core.hooksPath=/dev/null", script)
+            self.assertIn("GIT_ALTERNATE_OBJECT_DIRECTORIES=", script)
+            self.assertIn("attested_git status --porcelain", script)
+            self.assertNotIn('safe_git -C "$repo" status --porcelain', script)
 
 
     def _fake_git_repo(self, root: Path) -> tuple[Path, str]:
@@ -305,6 +312,93 @@ class ContainerDeploymentTests(unittest.TestCase):
                         self.assertNotEqual(completed.returncode, 0)
                         self.assertFalse(marker.exists(),
                             f"{script.name} executed {source} core.fsmonitor")
+
+    def test_git_filter_injected_after_preflight_is_inert(self) -> None:
+        # A one-time config allowlist is insufficient. Mutate .git/config
+        # AFTER that preflight, immediately before the release status check.
+        with TemporaryDirectory(prefix="mark-git-config-race-") as tmp:
+            root = Path(tmp)
+            repo, _ = self._fake_git_repo(root)
+            (repo / ".gitattributes").write_text(
+                "README.md filter=malicious\n", encoding="utf-8",
+            )
+            for command in (("add", ".gitattributes"),
+                            ("commit", "-qm", "trusted attributes")):
+                p = subprocess.run(
+                    ["git", "-C", str(repo), *command],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(p.returncode, 0, p.stderr)
+            expected = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True,
+            ).strip()
+            marker = root / "late-injected-filter-executed"
+            hook = root / "late-filter.sh"
+            hook.write_text(
+                "#!/bin/sh\n"
+                + "printf executed > '" + str(marker) + "'\n"
+                + "exec /bin/cat\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o700)
+
+            for name, anchor in (
+                ("mark-api-container-build.sh",
+                 'head=$(safe_git -C "$repo" rev-parse --verify HEAD)'),
+                ("mark-api-container-control.sh",
+                 'actual=$(safe_git -C "$repo" rev-parse --verify HEAD) || fail \'HEAD unavailable\''),
+            ):
+                with self.subTest(script=name):
+                    marker.unlink(missing_ok=True)
+                    script = repo / "docs" / name
+                    source = (DOCS / name).read_text(encoding="utf-8")
+                    self.assertEqual(source.count(anchor), 1)
+                    # Fixture injection runs after allowlist (if present).
+                    injection = (
+                        '\n/usr/bin/git -C "$repo" config filter.malicious.clean "'
+                        + str(hook) + '"\n'
+                    )
+                    script.write_text(
+                        source.replace(anchor, anchor + injection, 1),
+                        encoding="utf-8",
+                    )
+                    config = subprocess.run(
+                        ["git", "-C", str(repo), "config", "--unset-all",
+                         "filter.malicious.clean"],
+                        capture_output=True, text=True,
+                    )
+                    self.assertIn(config.returncode, (0, 5), config.stderr)
+                    readme = repo / "README.md"
+                    readme.write_text("attested-changes\n", encoding="utf-8")
+                    stamp = readme.stat()
+                    os.utime(readme, (stamp.st_atime, stamp.st_mtime + 90))
+                    p = subprocess.run(
+                        ["/bin/sh", str(script), *(
+                            [expected] if name.endswith("-build.sh") else
+                            ["verify", "sha256:" + "a" * 64, expected]
+                        )],
+                        capture_output=True, text=True,
+                        env={**os.environ, "MARK_UV": "/usr/bin/false"},
+                    )
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertFalse(
+                        marker.exists(),
+                        f"{name} executed a Git filter introduced after preflight",
+                    )
+                    # Prove this is a working executable filter fixture.
+                    marker.unlink(missing_ok=True)
+                    stamp = readme.stat()
+                    os.utime(readme, (stamp.st_atime, stamp.st_mtime + 90))
+                    check = subprocess.run(
+                        ["git", "-C", str(repo), "status", "--porcelain"],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(check.returncode, 0, check.stderr)
+                    self.assertTrue(
+                        marker.exists(),
+                        f"race fixture was not executable: script_stderr={p.stderr!r}; "
+                        f"status={check.stdout!r}",
+                    )
 
     def test_untrusted_git_clean_filter_cannot_execute(self) -> None:
         with TemporaryDirectory(prefix="mark-git-clean-filter-") as tmp:

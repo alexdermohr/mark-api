@@ -45,7 +45,33 @@ repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 require_inert_git_config || exit 1
 head=$(safe_git -C "$repo" rev-parse --verify HEAD)
 [ "$head" = "$expected" ] || { printf '%s\n' 'mark-api: HEAD changed' >&2; exit 1; }
-[ -z "$(safe_git -C "$repo" status --porcelain --untracked-files=normal)" ] || {
+# Pin executable Git configuration by using a private, minimal Git directory.
+# Its HEAD and index are a copy of the attested checkout, but Git never reads
+# the mutable checkout-local config when comparing files or making archives.
+common=$(safe_git -C "$repo" rev-parse --path-format=absolute --git-common-dir) || exit 1
+gitdir=$(safe_git -C "$repo" rev-parse --absolute-git-dir) || exit 1
+[ -d "$common/objects" ] && [ -f "$gitdir/index" ] || exit 1
+umask 077
+temp=$(mktemp -d /tmp/mark-api-image.XXXXXXXX) || exit 1
+trap 'rm -rf -- "$temp"' 0
+trap 'exit 1' 1 2 3 15
+mkdir -m 0700 "$temp/git" "$temp/git/objects" "$temp/git/refs" \
+    "$temp/source" "$temp/context" "$temp/docs"
+cp -- "$gitdir/index" "$temp/git/index"
+printf '%s\n' "$expected" > "$temp/git/HEAD"
+printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = true\n' > "$temp/git/config"
+attested_git() {
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+        GIT_GRAFT_FILE=/dev/null \
+        GIT_ALTERNATE_OBJECT_DIRECTORIES="$common/objects" \
+        /usr/bin/git --git-dir="$temp/git" --work-tree="$repo" \
+        -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+        -c diff.external= -c core.pager=cat "$@"
+}
+status=$(attested_git status --porcelain --untracked-files=normal) || exit 1
+[ -z "$status" ] || {
     printf '%s\n' 'mark-api: source checkout is dirty' >&2
     exit 1
 }
@@ -54,7 +80,6 @@ head=$(safe_git -C "$repo" rev-parse --verify HEAD)
     printf '%s\n' 'mark-api: Git replacement references are not allowed' >&2
     exit 1
 }
-common=$(safe_git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
 [ ! -e "$common/info/grafts" ] && [ ! -L "$common/info/grafts" ] || {
     printf '%s\n' 'mark-api: Git grafts are not allowed' >&2
     exit 1
@@ -63,11 +88,7 @@ common=$(safe_git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
     printf '%s\n' 'mark-api: remote/custom Docker targets require separate attestation' >&2
     exit 1
 }
-temp=$(mktemp -d "${TMPDIR:-/tmp}/mark-api-image.XXXXXXXX") || exit 1
-trap 'rm -rf -- "$temp"' 0
-trap 'exit 1' 1 2 3 15
-mkdir -m 0700 "$temp/source" "$temp/context" "$temp/docs"
-safe_git -C "$repo" archive "$expected" -- pyproject.toml README.md src |
+attested_git archive "$expected" -- pyproject.toml README.md src |
     tar -xf - -C "$temp/source"
 "${MARK_UV:-uv}" build --wheel --offline --out-dir "$temp/context" "$temp/source"
 set -- "$temp/context"/*.whl
@@ -75,7 +96,7 @@ set -- "$temp/context"/*.whl
     printf '%s\n' 'mark-api: expected exactly one verified wheel' >&2
     exit 1
 }
-safe_git -C "$repo" archive "$expected" -- \
+attested_git archive "$expected" -- \
     docs/mark-api-container.Dockerfile \
     docs/mark-api-container-start.sh \
     docs/mark-api-container-backup.sh \

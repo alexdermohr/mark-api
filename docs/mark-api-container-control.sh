@@ -72,11 +72,43 @@ repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 require_inert_git_config || exit 1
 actual=$(safe_git -C "$repo" rev-parse --verify HEAD) || fail 'HEAD unavailable'
 [ "$actual" = "$expected" ] || fail 'HEAD/revision drift'
-[ -z "$(safe_git -C "$repo" status --porcelain --untracked-files=normal)" ] ||
-    fail 'dirty release checkout'
-resolved=$(safe_git -C "$repo" rev-parse --verify "$expected^{commit}") ||
+# Never execute a worktree status check under mutable .git/config. A private
+# Git metadata snapshot binds HEAD and index to an inert synthetic config.
+common=$(safe_git -C "$repo" rev-parse --path-format=absolute --git-common-dir) ||
+    fail 'Git common directory unavailable'
+gitdir=$(safe_git -C "$repo" rev-parse --absolute-git-dir) ||
+    fail 'Git checkout directory unavailable'
+[ -d "$common/objects" ] && [ -f "$gitdir/index" ] ||
+    fail 'Git objects or index unavailable'
+umask 077
+attest_dir=$(mktemp -d /tmp/mark-api-control.XXXXXXXX) ||
+    fail 'Git snapshot staging unavailable'
+trap 'rm -rf -- "$attest_dir"' 0
+trap 'exit 1' 1 2 3 15
+mkdir -m 0700 "$attest_dir/objects" "$attest_dir/refs" ||
+    fail 'Git snapshot staging unavailable'
+cp -- "$gitdir/index" "$attest_dir/index" ||
+    fail 'Git index copy unavailable'
+printf '%s\n' "$expected" > "$attest_dir/HEAD"
+printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = true\n' > "$attest_dir/config"
+attested_git() {
+    /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+        GIT_GRAFT_FILE=/dev/null \
+        GIT_ALTERNATE_OBJECT_DIRECTORIES="$common/objects" \
+        /usr/bin/git --git-dir="$attest_dir" --work-tree="$repo" \
+        -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+        -c diff.external= -c core.pager=cat "$@"
+}
+status=$(attested_git status --porcelain --untracked-files=normal) ||
+    fail 'Git snapshot status unavailable'
+[ -z "$status" ] || fail 'dirty release checkout'
+resolved=$(attested_git rev-parse --verify "$expected^{commit}") ||
     fail 'unknown release commit'
 [ "$resolved" = "$expected" ] || fail 'invalid release commit'
+rm -rf -- "$attest_dir"
+trap - 0
 # Fail closed if caller supplies an image ID not present on the *local* daemon.
 docker=/usr/bin/docker
 format_id='{{.Id}}'
