@@ -1477,5 +1477,191 @@ with closing(sqlite3.connect(db)) as c:
         self.assertTrue(self.backup.exists())
 
 
+    def test_cross_process_predirtied_mmap_reproduces_missing_fence(self) -> None:
+        """Issue #76 P2 exploit reproduction, NOT a protective security gate.
+
+        A distinct Linux process holds a writable MAP_SHARED source mapping
+        before attestation. The parent controls only timing; the subprocess
+        substitutes real stale DB pages during SQLite's actual backup and raw
+        comparison, then restores them without a metadata change. This test
+        MUST fail if setup breaks or the defect is fixed. When an independent
+        storage authority prevents this attack, replace the final vulnerable
+        snapshot assertion with the safety contract (reject or retain all
+        durable recovery fences). A green result currently proves the bug.
+        """
+        if not hasattr(os, "O_TMPFILE") or not sys.platform.startswith("linux"):
+            self.skipTest("requires Linux anonymous backup stage and mmap")
+        try:
+            stage_probe = os.open(
+                self.root, os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600,
+            )
+        except OSError:
+            self.skipTest("backing filesystem does not support O_TMPFILE")
+        else:
+            os.close(stage_probe)
+        with closing(sqlite3.connect(self.source)) as connection:
+            self.assertEqual(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone(),
+                ("wal",),
+            )
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute(
+                "INSERT INTO write_api_requests "
+                "(idempotency_key, request_sha256, state, requested_at) "
+                "VALUES (?, ?, 'in_progress', ?)",
+                ("cross-process-mmap-fence", "a" * 64, NOW.isoformat()),
+            )
+            connection.commit()
+            self.assertEqual(
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0],
+                0,
+            )
+        gc.collect()
+        self.assertFalse(self.source.with_name(self.source.name + "-wal").exists())
+        self.assertFalse(self.source.with_name(self.source.name + "-shm").exists())
+
+        old = self.root / "before-fence.sqlite"
+        SnapshotStore(old)
+        gc.collect()
+        current = self.root / "current-image.bin"
+        current.write_bytes(self.source.read_bytes())
+        self.assertEqual(old.stat().st_size, current.stat().st_size)
+        self.assertNotEqual(old.read_bytes(), current.read_bytes())
+
+        # No unsafe pickle, inherited SQLite handle, platform adapter or
+        # app code in the child; only stdlib mmap and a two-command protocol.
+        child_code = """
+import mmap
+import os
+from pathlib import Path
+import sys
+
+source, previous, current = map(Path, sys.argv[1:])
+stale_bytes = previous.read_bytes()
+current_bytes = current.read_bytes()
+with source.open("r+b", buffering=0) as opened:
+    with mmap.mmap(opened.fileno(), 0, access=mmap.ACCESS_WRITE) as shared:
+        assert len(shared) == len(stale_bytes) == len(current_bytes)
+        for offset in range(0, len(shared), mmap.PAGESIZE):
+            shared[offset] = shared[offset]
+        before = os.fstat(opened.fileno())
+        print("READY", flush=True)
+        for line in sys.stdin:
+            command = line.strip()
+            if command == "EXIT":
+                break
+            if command not in ("SWAP", "RESTORE"):
+                raise ValueError("unexpected child command")
+            shared[:] = stale_bytes if command == "SWAP" else current_bytes
+            after = os.fstat(opened.fileno())
+            if (before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_mtime_ns, after.st_ctime_ns
+            ):
+                print("METADATA_DRIFT", flush=True)
+            else:
+                print("SWAPPED" if command == "SWAP" else "RESTORED", flush=True)
+"""
+        child = subprocess.Popen(
+            [sys.executable, "-B", "-c", child_code,
+             str(self.source), str(old), str(current)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        self.assertIsNotNone(child.stdin)
+        self.assertIsNotNone(child.stdout)
+        self.assertIsNotNone(child.stderr)
+
+        def receive() -> str:
+            assert child.stdout is not None
+            ready, _, _ = select.select([child.stdout], [], [], 5.0)
+            self.assertTrue(ready, "mapped subprocess did not respond")
+            return child.stdout.readline().strip()
+
+        def command(value: str, expected: str) -> None:
+            assert child.stdin is not None
+            child.stdin.write(value + "\n")
+            child.stdin.flush()
+            self.assertEqual(receive(), expected)
+
+        try:
+            self.assertEqual(receive(), "READY")
+            actual_connect = sqlite3.connect
+            actual_open = os.open
+            source_uri = backup_cli._uri(self.source, "ro") + "&immutable=1"
+            swapped = False
+            restored = False
+
+            def mapped_at_connect(database, *args, **kwargs):
+                nonlocal swapped
+                if database == source_uri and not swapped:
+                    command("SWAP", "SWAPPED")
+                    swapped = True
+                return actual_connect(database, *args, **kwargs)
+
+            def restored_before_stage(path, flags, *args, **kwargs):
+                nonlocal restored
+                if (
+                    isinstance(flags, int)
+                    and flags & os.O_TMPFILE == os.O_TMPFILE
+                    and not restored
+                ):
+                    command("RESTORE", "RESTORED")
+                    restored = True
+                return actual_open(path, flags, *args, **kwargs)
+
+            try:
+                with (
+                    patch("mark_api.backup_cli.sqlite3.connect",
+                          side_effect=mapped_at_connect),
+                    patch("mark_api.backup_cli.os.open",
+                          side_effect=restored_before_stage),
+                ):
+                    receipt = backup_store(self.source, backup_db=self.backup)
+            except BackupError as exc:
+                # This is deliberately an exploit *reproducer*. Any rejection
+                # must be investigated and the test turned into a protective
+                # contract, rather than silently counting as a fix.
+                self.fail(f"known MAP_SHARED exploit no longer reproduces: {exc}")
+
+            self.assertTrue(swapped and restored)
+            self.assertTrue(self.backup.is_file())
+            with closing(actual_connect(self.source)) as source_db:
+                source_pending = source_db.execute(
+                    "SELECT COUNT(*) FROM write_api_requests "
+                    "WHERE state='in_progress'"
+                ).fetchone()[0]
+            with closing(actual_connect(self.backup)) as copied_db:
+                copy_pending = copied_db.execute(
+                    "SELECT COUNT(*) FROM write_api_requests "
+                    "WHERE state='in_progress'"
+                ).fetchone()[0]
+            self.assertEqual(source_pending, 1)
+            self.assertEqual(receipt.pending_api_writes, copy_pending)
+            self.assertEqual(
+                copy_pending, 0,
+                "known cross-process mmap exploit no longer reproduces: "
+                "replace this assertion with a fail-closed security contract",
+            )
+        finally:
+            if child.poll() is None:
+                try:
+                    assert child.stdin is not None
+                    child.stdin.write("EXIT\n")
+                    child.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+                try:
+                    child.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=3)
+            assert child.stdin is not None
+            assert child.stdout is not None
+            assert child.stderr is not None
+            child.stdin.close()
+            child.stdout.close()
+            child.stderr.close()
+
+
 if __name__ == "__main__":
     unittest.main()
