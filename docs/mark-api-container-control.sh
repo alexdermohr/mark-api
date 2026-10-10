@@ -105,8 +105,11 @@ status=$(attested_git status --porcelain --untracked-files=normal) ||
 resolved=$(attested_git rev-parse --verify "$expected^{commit}") ||
     fail 'unknown release commit'
 [ "$resolved" = "$expected" ] || fail 'invalid release commit'
-rm -rf -- "$attest_dir"
-trap - 0
+# Compose bytes must come from the attested commit, not mutable worktree.
+compose="$attest_dir/mark-api-container.compose.yaml"
+attested_git show "$expected:docs/mark-api-container.compose.yaml" > "$compose" ||
+    fail 'attested Compose definition unavailable'
+# Keep this private release file until the Docker Compose command finishes.
 # Fail closed if caller supplies an image ID not present on the *local* daemon.
 docker=/usr/bin/docker
 format_id='{{.Id}}'
@@ -123,8 +126,7 @@ actual_user=$("$docker" --host unix:///var/run/docker.sock image inspect --forma
 # Compose receives exclusively the checked immutable ID, never a caller's tag.
 MARK_API_IMAGE_DIGEST="$digest"
 export MARK_API_IMAGE_DIGEST
-compose="$repo/docs/mark-api-container.compose.yaml"
-"$docker" --host unix:///var/run/docker.sock compose -f "$compose" --profile live --profile backup config --quiet ||
+"$docker" --host unix:///var/run/docker.sock compose -f "$compose" --project-name mark-api --profile live --profile backup config --quiet ||
     fail 'Compose configuration invalid'
 case "$action" in
     verify)
@@ -143,10 +145,11 @@ case "$action" in
             [ "$found" = "$name" ] || fail 'volume identity changed'
         done
         if [ "$action" = live ]; then
-            exec "$docker" --host unix:///var/run/docker.sock compose -f "$compose" --profile live \
+            "$docker" --host unix:///var/run/docker.sock compose -f "$compose" --project-name mark-api --profile live \
                 up --no-deps --no-build --pull never --detach mark-api
+            exit 0
         fi
-        exec "$docker" --host unix:///var/run/docker.sock compose -f "$compose" --profile backup \
+        "$docker" --host unix:///var/run/docker.sock compose -f "$compose" --project-name mark-api --profile backup \
             run --rm --no-deps --pull never mark-api-backup "$instance"
         ;;
 esac

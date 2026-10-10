@@ -529,6 +529,48 @@ class ContainerDeploymentTests(unittest.TestCase):
                     self.assertFalse(marker.exists(),
                         f"{script.name} executed checkout-local filter.clean")
 
+    def test_control_uses_committed_compose_bytes_not_mutable_worktree(self) -> None:
+        control = _read("mark-api-container-control.sh")
+        self.assertIn(
+            'attested_git show "$expected:docs/mark-api-container.compose.yaml"',
+            control,
+        )
+        self.assertIn('compose="$attest_dir/mark-api-container.compose.yaml"', control)
+        self.assertNotIn('compose="$repo/docs/mark-api-container.compose.yaml"', control)
+        self.assertIn("--project-name mark-api", control)
+        self.assertNotIn('exec "$docker"', control)
+        self.assertIn(
+            "up --no-deps --no-build --pull never --detach mark-api\n"
+            "            exit 0\n"
+            "        fi",
+            control,
+        )
+
+        with TemporaryDirectory(prefix="mark-compose-after-check-") as tmp:
+            repo, _ = self._fake_git_repo(Path(tmp))
+            compose = repo / "docs/mark-api-container.compose.yaml"
+            trusted = b"services:\n  mark-api:\n    image: sha256:trusted\n"
+            compose.write_bytes(trusted)
+            for args in (("add", "docs/mark-api-container.compose.yaml"),
+                         ("commit", "-qm", "trusted compose")):
+                result = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+            expected = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True,
+            ).strip()
+            compose.write_bytes(b"services:\n  mark-api:\n    privileged: true\n")
+            committed = subprocess.run(
+                ["git", "-C", str(repo), "show",
+                 expected + ":docs/mark-api-container.compose.yaml"],
+                capture_output=True,
+            )
+            self.assertEqual(committed.returncode, 0, committed.stderr)
+            self.assertEqual(committed.stdout, trusted)
+            self.assertNotEqual(compose.read_bytes(), trusted)
+
     def test_documented_product_run_uses_only_guarded_image_actions(self) -> None:
         runbook = _read("operations-runbook.md")
         self.assertIn('sh docs/mark-api-container-control.sh verify', runbook)
