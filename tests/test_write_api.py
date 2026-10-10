@@ -1776,6 +1776,56 @@ class WriteApiTests(unittest.TestCase):
         self.assertFalse(second_body["platform_retry_authorized"])
         self.assertEqual(fresh_service.calls, [])
 
+    def test_same_runtime_failed_create_completion_blocks_different_key(self) -> None:
+        # Completion can fail after the external platform write succeeded.
+        # A different key on the SAME live server must not bypass that fence.
+        payload = {
+            "category_path": ["Haus & Garten", "Dekoration"],
+            "title": "Neue Vase", "description": "Beschreibung",
+            "price_eur": 12,
+        }
+        service = FakeWriteService()
+        completion = self.store.complete_write_api_request
+
+        def fail_first_completion(**kwargs):
+            if kwargs["idempotency_key"] == "same-owner-failed":
+                raise OSError("synthetic completion persistence failure")
+            return completion(**kwargs)
+
+        with patch.object(
+            self.store, "complete_write_api_request",
+            side_effect=fail_first_completion,
+        ):
+            with self.server(
+                service, capabilities=frozenset({WriteCapability.CREATE}),
+            ) as server:
+                first_status, _, first_body = self.request(
+                    server, "POST", "/api/write/ads",
+                    payload=payload, idempotency_key="same-owner-failed",
+                )
+                next_status, _, next_body = self.request(
+                    server, "POST", "/api/write/ads",
+                    payload=payload, idempotency_key="same-owner-new-key",
+                )
+
+        self.assertEqual(first_status, 500)
+        self.assertEqual(first_body["error"], "idempotency_persistence_failed")
+        self.assertFalse(first_body["platform_retry_authorized"])
+        self.assertEqual(next_status, 409)
+        self.assertEqual(next_body["error"], "create_recovery_pending")
+        self.assertFalse(next_body["platform_retry_authorized"])
+        self.assertEqual(len(service.calls), 1)
+        first_record = self.store.write_api_request("same-owner-failed")
+        next_record = self.store.write_api_request("same-owner-new-key")
+        self.assertIsNotNone(first_record)
+        self.assertIsNotNone(next_record)
+        assert first_record is not None and next_record is not None
+        self.assertEqual(first_record.state, "in_progress")
+        self.assertIsNotNone(first_record.execution_started_at)
+        self.assertEqual(next_record.state, "completed")
+        self.assertEqual(next_record.response_status, 409)
+        self.assertEqual(first_record.claim_owner, next_record.claim_owner)
+
     def test_in_progress_claim_blocks_retry_without_service_call(self) -> None:
         payload = {"title": "one"}
         fingerprint = _request_fingerprint(

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Condition, Lock
+from threading import Condition, Lock, RLock
 from typing import Callable, ContextManager, Protocol
 from urllib.parse import unquote, urlsplit
 
@@ -434,7 +434,7 @@ def _handler_factory(
     # Serialize the complete service calls across this threaded server so a
     # media and media-free create cannot share/contaminate the same delta
     # window. Other write routes remain independent.
-    create_lock = Lock()
+    create_lock = RLock()
     # Conservatively close the small window between an ambiguous Create
     # receipt and its durable HTTP idempotency completion. Every Create,
     # including media-free, must observe this under create_lock.
@@ -914,10 +914,12 @@ def _handler_factory(
                 )
                 return
 
+            # Serialize each Create through durable HTTP completion, not
+            # only through browser submission. Acquire the shared runtime
+            # lock first so media reconciliation cannot invert lock order.
             with (
-                execution_lock
-                if execution_lock is not None
-                else nullcontext()
+                execution_lock if execution_lock is not None else nullcontext(),
+                create_lock if action in {"create", "create_media"} else nullcontext(),
             ):
                 try:
                     store.begin_write_api_request(
@@ -1105,23 +1107,23 @@ def _handler_factory(
                     if action == "create_media":
                         response["media_persistence_confirmed"] = False
 
-            response_json = _canonical_json(response)
-            try:
-                store.complete_write_api_request(
-                    idempotency_key=idempotency_key,
-                    request_sha256=fingerprint,
-                    claim_owner=claim_owner,
-                    response_status=status,
-                    response_json=response_json,
-                    completed_at=clock(),
-                )
-            except Exception:
-                self._error(
-                    500,
-                    "idempotency_persistence_failed",
-                    platform_retry_authorized=False,
-                )
-                return
+                response_json = _canonical_json(response)
+                try:
+                    store.complete_write_api_request(
+                        idempotency_key=idempotency_key,
+                        request_sha256=fingerprint,
+                        claim_owner=claim_owner,
+                        response_status=status,
+                        response_json=response_json,
+                        completed_at=clock(),
+                    )
+                except Exception:
+                    self._error(
+                        500,
+                        "idempotency_persistence_failed",
+                        platform_retry_authorized=False,
+                    )
+                    return
 
             self._send_bytes(status, response_json.encode("utf-8"))
 

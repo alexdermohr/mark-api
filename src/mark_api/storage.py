@@ -1322,13 +1322,14 @@ class SnapshotStore:
         An ambiguous media receipt can be HTTP-completed while its browser
         submit remains unsettled. Its durable HTTP response, rather than the
         process-local media page, must prevent a new key from re-submitting.
-        A previous process's in-progress execution is similarly non-retryable.
+        An older in-progress execution is similarly non-retryable even if the
+        current server owns both request claims.
         This check does not resolve an old fence; independent reconciliation
         and an explicit persisted clearance are required for that.
         """
         if not isinstance(exclude_idempotency_key, str) or not exclude_idempotency_key:
             raise ValueError("excluded idempotency key is required")
-        owner = _validated_write_api_claim_owner(claim_owner)
+        _validated_write_api_claim_owner(claim_owner)
         with closing(self._connect()) as connection:
             # Keep accepted but never-started claims recoverable. A started
             # write with unknown outcome can still have reached the platform.
@@ -1341,11 +1342,10 @@ class SnapshotStore:
                 WHERE w.idempotency_key != ?
                   AND w.state = 'in_progress'
                   AND w.execution_started_at IS NOT NULL
-                  AND (w.claim_owner IS NULL OR w.claim_owner != ?)
                   AND c.idempotency_key IS NULL
                 LIMIT 1
                 """,
-                (exclude_idempotency_key, owner),
+                (exclude_idempotency_key,),
             ).fetchone() is not None:
                 return True
             if connection.execute(
