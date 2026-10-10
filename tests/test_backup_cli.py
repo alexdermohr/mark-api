@@ -1477,20 +1477,28 @@ with closing(sqlite3.connect(db)) as c:
         self.assertTrue(self.backup.exists())
 
 
-    @unittest.expectedFailure
-    def test_cross_process_predirtied_mmap_cannot_drop_sqlite_write_fence(self) -> None:
-        """Issue #76 P2, intentionally XFAIL until backup has independent integrity.
+    def test_cross_process_predirtied_mmap_reproduces_missing_fence(self) -> None:
+        """Issue #76 P2 exploit reproduction, NOT a protective security gate.
 
         A distinct Linux process holds a writable MAP_SHARED source mapping
-        before attestation. The parent controls *only timing*, not SQLite's
-        copy or the mapped bytes: the child substitutes a valid older image
-        during SQLite backup and the raw-image check, then restores it before
-        final metadata checks. The security contract is to reject such a
-        snapshot or preserve every durable fence. Remove expectedFailure only
-        after a genuinely independent storage authority closes this attack.
+        before attestation. The parent controls only timing; the subprocess
+        substitutes real stale DB pages during SQLite's actual backup and raw
+        comparison, then restores them without a metadata change. This test
+        MUST fail if setup breaks or the defect is fixed. When an independent
+        storage authority prevents this attack, replace the final vulnerable
+        snapshot assertion with the safety contract (reject or retain all
+        durable recovery fences). A green result currently proves the bug.
         """
         if not hasattr(os, "O_TMPFILE") or not sys.platform.startswith("linux"):
             self.skipTest("requires Linux anonymous backup stage and mmap")
+        try:
+            stage_probe = os.open(
+                self.root, os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600,
+            )
+        except OSError:
+            self.skipTest("backing filesystem does not support O_TMPFILE")
+        else:
+            os.close(stage_probe)
         with closing(sqlite3.connect(self.source)) as connection:
             self.assertEqual(
                 connection.execute("PRAGMA journal_mode=WAL").fetchone(),
@@ -1609,9 +1617,11 @@ with source.open("r+b", buffering=0) as opened:
                           side_effect=restored_before_stage),
                 ):
                     receipt = backup_store(self.source, backup_db=self.backup)
-            except BackupError:
-                # A correctly hardened implementation must fail closed.
-                return
+            except BackupError as exc:
+                # This is deliberately an exploit *reproducer*. Any rejection
+                # must be investigated and the test turned into a protective
+                # contract, rather than silently counting as a fix.
+                self.fail(f"known MAP_SHARED exploit no longer reproduces: {exc}")
 
             self.assertTrue(swapped and restored)
             self.assertTrue(self.backup.is_file())
@@ -1628,8 +1638,9 @@ with source.open("r+b", buffering=0) as opened:
             self.assertEqual(source_pending, 1)
             self.assertEqual(receipt.pending_api_writes, copy_pending)
             self.assertEqual(
-                copy_pending, source_pending,
-                "real cross-process MAP_SHARED omitted a durable recovery fence",
+                copy_pending, 0,
+                "known cross-process mmap exploit no longer reproduces: "
+                "replace this assertion with a fail-closed security contract",
             )
         finally:
             if child.poll() is None:
