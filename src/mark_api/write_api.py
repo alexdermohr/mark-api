@@ -27,6 +27,7 @@ from .domain import (
     OperationOutcome,
     OperationReceipt,
 )
+from .fence_witness import FenceWitnessAlreadyRecorded, FenceWitnessRejected
 from .storage import SnapshotStore
 
 
@@ -43,6 +44,14 @@ class _RequestBodyTimeoutError(ValueError):
 
 class _CreateRecoveryPendingError(RuntimeError):
     """A durable unknown Write outcome forbids another Create."""
+
+
+class _WitnessStartRejectedError(RuntimeError):
+    """Trusted witness explicitly rejected this unused key before any service call."""
+
+
+class _WitnessPriorOperationError(RuntimeError):
+    """Same key may have previously reached the external platform."""
 
 
 def _utc_now() -> datetime:
@@ -418,6 +427,23 @@ def _receipt_status(
     return 202
 
 
+class _WriteFence(Protocol):
+    """Trusted construction supplies a durable cross-UID witness session.
+
+    This optional core integration does not itself establish the required UID,
+    browser-executor or deployment boundary. The product must supply a real
+    FenceWitnessClient, never an in-process local-only substitute.
+    """
+
+    def pending(self) -> bool: ...
+
+    def replay_status(self, *, key: str, sha: str, response_sha: str) -> str: ...
+
+    def started(self, *, key: str, sha: str, action: str) -> None: ...
+
+    def completed(self, *, key: str, sha: str, response: object) -> str: ...
+
+
 def _handler_factory(
     *,
     service: _WriteService,
@@ -429,6 +455,7 @@ def _handler_factory(
     body_read_timeout_seconds: float,
     claim_owner: str,
     execution_lock: ContextManager[object] | None,
+    fence_witness: _WriteFence | None,
 ):
     # Both create routes infer their result from owner-inventory deltas.
     # Serialize the complete service calls across this threaded server so a
@@ -901,6 +928,96 @@ def _handler_factory(
                     and record.response_status is not None
                     and record.response_json is not None
                 ):
+                    # The local SQLite receipt is not authoritative after
+                    # rollback or an uncertain witness completion ACK. Never
+                    # replay local success while independent recovery is pending.
+                    if fence_witness is not None:
+                        try:
+                            if fence_witness.pending():
+                                raise RuntimeError("independent recovery pending")
+                            # Reject noncanonical, swapped or ambiguous local
+                            # receipts. The ledger hashes a canonical ASCII
+                            # representation, not the UTF-8 local DB bytes.
+                            restored = json.loads(
+                                record.response_json,
+                                parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+                            )
+                            if (
+                                not isinstance(restored, dict)
+                                or _canonical_json(restored) != record.response_json
+                            ):
+                                raise ValueError("stored write response is not canonical")
+                            canonical = json.dumps(
+                                restored, sort_keys=True, ensure_ascii=True,
+                                separators=(",", ":"), allow_nan=False,
+                            ).encode("utf-8")
+                            outcome = fence_witness.replay_status(
+                                key=idempotency_key, sha=fingerprint,
+                                response_sha=hashlib.sha256(canonical).hexdigest(),
+                            )
+                            receipt = restored.get("operation_receipt")
+                            status = record.response_status
+                            error = restored.get("error")
+                            exact_error = {
+                                "error": error,
+                                "idempotency_key": idempotency_key,
+                                "platform_retry_authorized": False,
+                            }
+                            if error == "write_execution_error" and action == "create_media":
+                                exact_error["media_persistence_confirmed"] = False
+                            if status == 200:
+                                verified = (
+                                    isinstance(receipt, dict)
+                                    and receipt.get("outcome") == "confirmed"
+                                    and receipt.get("writer_invoked") is True
+                                    and outcome == "confirmed"
+                                )
+                            elif status == 202:
+                                # A media-content confirmation without proven
+                                # media persistence remains an ambiguous 202.
+                                verified = (
+                                    isinstance(receipt, dict)
+                                    and receipt.get("writer_invoked") is True
+                                    and receipt.get("outcome") in {"ambiguous", "confirmed"}
+                                    and outcome == "ambiguous"
+                                )
+                            elif status == 409 and isinstance(receipt, dict):
+                                verified = (
+                                    receipt.get("outcome") == "precondition_failed"
+                                    and receipt.get("writer_invoked") is False
+                                    and outcome == "precondition_failed"
+                                )
+                            elif receipt is not None:
+                                # No 1xx/3xx/error envelope may smuggle an
+                                # unverified claim of external confirmation.
+                                verified = False
+                            elif status == 503 and error == "witness_write_rejected":
+                                verified = (
+                                    outcome == "never_started"
+                                    and restored == exact_error
+                                )
+                            elif status == 409 and error == "create_recovery_pending":
+                                verified = (
+                                    outcome == "never_started"
+                                    and restored == exact_error
+                                )
+                            elif status == 500 and error == "write_execution_error":
+                                verified = (
+                                    outcome in {"ambiguous", "never_started"}
+                                    and restored == exact_error
+                                )
+                            else:
+                                # Even a syntactically valid old error cannot
+                                # replace authoritative evidence for this key.
+                                verified = False
+                            if not verified:
+                                raise RuntimeError("write replay lacks exact witness proof")
+                        except Exception:
+                            self._error(
+                                503, "witness_outcome_uncertain",
+                                platform_retry_authorized=False,
+                            )
+                            return
                     self._send_bytes(
                         record.response_status,
                         record.response_json.encode("utf-8"),
@@ -936,8 +1053,21 @@ def _handler_factory(
                     )
                     return
 
+                witness_started = False
                 try:
                     authorization_reference = f"write-api:{idempotency_key}"
+                    # Non-Create mutations can execute only after the witness
+                    # has durably acknowledged this exact key/fingerprint.
+                    if action not in {"create", "create_media"} and fence_witness is not None:
+                        try:
+                            fence_witness.started(
+                                key=idempotency_key, sha=fingerprint, action=action,
+                            )
+                        except FenceWitnessAlreadyRecorded as exc:
+                            raise _WitnessPriorOperationError() from exc
+                        except FenceWitnessRejected as exc:
+                            raise _WitnessStartRejectedError() from exc
+                        witness_started = True
                     if action in {"create", "create_media"}:
                         assert create_request is not None
                         with create_lock:
@@ -948,7 +1078,31 @@ def _handler_factory(
                                     claim_owner=claim_owner,
                                 )
                             ):
+                                # A rolled-back local store can remember old J
+                                # but forget a newer, already executed K.
+                                # Before calling K 'never executed', ask the
+                                # independent witness about K specifically.
+                                if fence_witness is not None and (
+                                    fence_witness.replay_status(
+                                        key=idempotency_key, sha=fingerprint,
+                                        response_sha="0" * 64,
+                                    ) != "never_started"
+                                ):
+                                    raise _WitnessPriorOperationError()
                                 raise _CreateRecoveryPendingError()
+                            # For Create, check historical local recovery BEFORE
+                            # starting a new independent fence. Then retain the
+                            # same create lock until external submission settles.
+                            if fence_witness is not None:
+                                try:
+                                    fence_witness.started(
+                                        key=idempotency_key, sha=fingerprint, action=action,
+                                    )
+                                except FenceWitnessAlreadyRecorded as exc:
+                                    raise _WitnessPriorOperationError() from exc
+                                except FenceWitnessRejected as exc:
+                                    raise _WitnessStartRejectedError() from exc
+                                witness_started = True
                             if action == "create":
                                 create_receipt = service.create(
                                     create_request,
@@ -1097,6 +1251,23 @@ def _handler_factory(
                         "idempotency_key": idempotency_key,
                         "platform_retry_authorized": False,
                     }
+                except _WitnessPriorOperationError:
+                    # A previous attempt with this key may already have
+                    # mutated the platform. Do not claim it never executed.
+                    status = 503
+                    response = {
+                        "error": "witness_prior_operation_unknown",
+                        "idempotency_key": idempotency_key,
+                        "platform_retry_authorized": False,
+                    }
+                except _WitnessStartRejectedError:
+                    # This unused key was rejected before any service call.
+                    status = 503
+                    response = {
+                        "error": "witness_write_rejected",
+                        "idempotency_key": idempotency_key,
+                        "platform_retry_authorized": False,
+                    }
                 except Exception:
                     status = 500
                     response = {
@@ -1124,6 +1295,36 @@ def _handler_factory(
                         platform_retry_authorized=False,
                     )
                     return
+
+                # The local operation response is immutable before witness
+                # completion can clear its pending fence. A missing ACK is
+                # never promoted to an HTTP success or automatically retried.
+                if witness_started:
+                    assert fence_witness is not None
+                    try:
+                        result = fence_witness.completed(
+                            key=idempotency_key, sha=fingerprint, response=response,
+                        )
+                        if status == 200 and result != "confirmed":
+                            raise RuntimeError("witness did not confirm safe outcome")
+                        if status == 202 and result != "ambiguous":
+                            raise RuntimeError("witness did not record uncertain outcome")
+                        if (
+                            status == 409 and "operation_receipt" in response
+                            and result != "precondition_failed"
+                        ):
+                            raise RuntimeError("witness precondition outcome mismatched")
+                        if status >= 400 and not (
+                            status == 409 and "operation_receipt" in response
+                        ) and result != "ambiguous":
+                            raise RuntimeError("witness did not preserve uncertain failure")
+                    except Exception:
+                        self._error(
+                            503,
+                            "witness_outcome_uncertain",
+                            platform_retry_authorized=False,
+                        )
+                        return
 
             self._send_bytes(status, response_json.encode("utf-8"))
 
@@ -1271,6 +1472,7 @@ def create_write_api_server(
     clock: Callable[[], datetime] = _utc_now,
     body_read_timeout_seconds: float = _BODY_READ_TIMEOUT_SECONDS,
     execution_lock: ContextManager[object] | None = None,
+    fence_witness: _WriteFence | None = None,
     _store_lock: _WriteApiStoreLock | None = None,
 ) -> LoopbackWriteApiServer:
     if host != "127.0.0.1":
@@ -1319,6 +1521,7 @@ def create_write_api_server(
                 body_read_timeout_seconds=float(body_read_timeout_seconds),
                 claim_owner=claim_owner,
                 execution_lock=execution_lock,
+                fence_witness=fence_witness,
             ),
         )
     except Exception:
