@@ -36,6 +36,14 @@ class FenceWitnessError(RuntimeError):
     """Refuse potentially unsafe recovery progress without leaking records."""
 
 
+class FenceWitnessRejected(FenceWitnessError):
+    """No prior start for this key: definitely rejected before append."""
+
+
+class FenceWitnessAlreadyRecorded(FenceWitnessError):
+    """This key has a prior start; its external result must not be guessed."""
+
+
 _VERSION = 1
 _MAX_FRAME = 32 * 1024
 _KEY = re.compile(r"[A-Za-z0-9._:-]{1,160}\Z", re.ASCII)
@@ -523,13 +531,18 @@ class FenceLedger:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 self._require_active(conn, session)
-                if self._is_pending(conn):
-                    raise FenceWitnessError("earlier write requires recovery")
+                # Historical uses of K must be recognized even if this or
+                # another operation is still pending. The current attempted
+                # start did not commit, but K may have executed previously.
                 if conn.execute(
                     "SELECT 1 FROM events WHERE kind='started' AND request_key=?",
                     (key,),
                 ).fetchone():
-                    raise FenceWitnessError("operation already executed or recorded")
+                    raise FenceWitnessAlreadyRecorded(
+                        "operation already executed or recorded"
+                    )
+                if self._is_pending(conn):
+                    raise FenceWitnessRejected("earlier write requires recovery")
                 self._append(conn, session=session, kind="started",
                              key=key, sha=sha, action=action)
                 conn.commit()
@@ -573,6 +586,42 @@ class FenceLedger:
             except BaseException:
                 conn.rollback()
                 raise
+
+    def replay_status(
+        self, *, key: str, sha: str, response_sha: str,
+    ) -> str:
+        """Read exact durable completion; a clearance is never a success proof.
+
+        A local SQLite rollback can restore a misleading 200 or change its
+        response. Match its key, request fingerprint and canonical response
+        fingerprint to the immutable witness completion, not just global
+        pending=False. Never infer success from operator/runtime clearance.
+        """
+        key = _required_string(key, _KEY, "idempotency key")
+        sha = _required_string(sha, _SHA, "request SHA-256")
+        response_sha = _required_string(response_sha, _SHA, "response SHA-256")
+        self._ensure_owner_pid()
+        with self._guard, closing(self._connect()) as conn:
+            start = conn.execute(
+                "SELECT session_id,request_sha256 FROM events "
+                "WHERE kind='started' AND request_key=?", (key,),
+            ).fetchone()
+            if start is None:
+                return "never_started"
+            completed = conn.execute(
+                "SELECT session_id,request_sha256,response_sha256,outcome "
+                "FROM events WHERE kind='completed' AND request_key=?",
+                (key,),
+            ).fetchone()
+            if (
+                completed is None
+                or start[0] != completed[0]
+                or start[1] != sha or completed[1] != sha
+                or completed[2] != response_sha
+                or completed[3] not in (*_SAFE_OUTCOMES, "ambiguous")
+            ):
+                return "unverified"
+            return completed[3]
 
     def runtime_clearance(
         self, session: str, *, key: str, sha: str, evidence: str,
@@ -659,7 +708,17 @@ class _WitnessUnixHandler(socketserver.StreamRequestHandler):
                     raise FenceWitnessError("protocol version mismatch")
                 try:
                     answer = self._dispatch(request, server, session)
+                except FenceWitnessAlreadyRecorded:
+                    # Not a new mutation, but old use of this key may already
+                    # have reached the external provider. Never call it unused.
+                    self._send({"ok": False, "error": "already_recorded"})
+                except FenceWitnessRejected:
+                    # Only explicit checks before appending a start are known
+                    # noncommitting. Keep this connection for reconciliation.
+                    self._send({"ok": False, "error": "rejected"})
                 except (FenceWitnessError, ValueError, sqlite3.Error, OSError):
+                    # A SQLite commit or filesystem error can have an unknown
+                    # outcome. Never identify it as a definite rejection.
                     self._send({"ok": False, "error": "request_denied"})
                 else:
                     self._send({"ok": True, "result": answer})
@@ -720,6 +779,13 @@ class _WitnessUnixHandler(socketserver.StreamRequestHandler):
                 raise FenceWitnessError("runtime session absent")
             if op == "pending" and set(request) == {"version", "op"}:
                 return {"pending": server.ledger.fence_pending()}
+            if op == "replay_status" and set(request) == {
+                "version", "op", "key", "sha", "response_sha",
+            }:
+                return {"outcome": server.ledger.replay_status(
+                    key=request["key"], sha=request["sha"],
+                    response_sha=request["response_sha"],
+                )}
             if op == "started" and set(request) == {
                 "version", "op", "key", "sha", "action",
             }:
@@ -959,11 +1025,23 @@ class FenceWitnessClient:
                     raise FenceWitnessError("witness request exceeds frame bound")
                 self._socket.sendall(encoded)
                 received = self._receive()
+                if received == {"ok": False, "error": "already_recorded"}:
+                    # Existing started(K) is independent evidence that an old
+                    # execution MAY have occurred, despite this failed call.
+                    raise FenceWitnessAlreadyRecorded(
+                        "witness operation already recorded; prior outcome uncertain"
+                    )
+                if received == {"ok": False, "error": "rejected"}:
+                    # Exact authenticated pre-commit rejection for an unused
+                    # key, not a lost ACK to an execution_started commit.
+                    raise FenceWitnessRejected("witness request rejected before commit")
                 if received.get("ok") is not True or not isinstance(
                     received.get("result"), dict
                 ):
                     raise FenceWitnessError("witness request was not acknowledged")
                 return received["result"]
+            except (FenceWitnessAlreadyRecorded, FenceWitnessRejected):
+                raise
             except (OSError, FenceWitnessError, ValueError, TimeoutError) as exc:
                 # A late SQLite commit or lost response is UNKNOWN, not a
                 # reason to send a second execution_started on a fresh socket.
@@ -984,6 +1062,20 @@ class FenceWitnessClient:
             self.close()
             raise FenceWitnessError("witness pending result is invalid")
         return result["pending"]
+
+    def replay_status(self, *, key: str, sha: str, response_sha: str) -> str:
+        result = self._call(
+            "replay_status", key=key, sha=sha, response_sha=response_sha,
+        )
+        value = result.get("outcome")
+        if (
+            set(result) != {"outcome"}
+            or type(value) is not str
+            or value not in (*_SAFE_OUTCOMES, "ambiguous", "unverified", "never_started")
+        ):
+            self.close()
+            raise FenceWitnessError("witness replay status is invalid")
+        return value
 
     def started(self, *, key: str, sha: str, action: str) -> None:
         if self._call("started", key=key, sha=sha, action=action) != {

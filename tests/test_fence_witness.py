@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import closing
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -431,6 +432,61 @@ else:
         )
         self.assertTrue(reopened.fence_pending())
 
+    def test_replay_status_requires_exact_committed_response_not_just_clearance(self) -> None:
+        session = self.owner.open_session()
+        response = {"operation_receipt": {"writer_invoked": True,
+                                           "outcome": "confirmed"}}
+        response_sha = hashlib.sha256(json.dumps(
+            response, sort_keys=True, ensure_ascii=True,
+            separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+        self.assertEqual(
+            self.owner.replay_status(
+                key="never-started", sha=_SHA, response_sha=response_sha,
+            ), "never_started",
+        )
+        self.owner.execution_started(
+            session, key="real-completion", sha=_SHA, action="pause",
+        )
+        self.assertEqual(
+            self.owner.replay_status(
+                key="real-completion", sha=_SHA, response_sha=response_sha,
+            ), "unverified",
+        )
+        self.owner.execution_completed(
+            session, key="real-completion", sha=_SHA, response=response,
+        )
+        self.assertEqual(
+            self.owner.replay_status(
+                key="real-completion", sha=_SHA, response_sha=response_sha,
+            ), "confirmed",
+        )
+        self.assertEqual(
+            self.owner.replay_status(
+                key="real-completion", sha=_SHA, response_sha="b" * 64,
+            ), "unverified",
+        )
+        # Operator clearance without a durable completion must never turn
+        # a historical local 200 into verified external success.
+        self.owner.execution_started(
+            session, key="cleared-no-completion", sha=_SHA, action="pause",
+        )
+        with self.assertRaisesRegex(FenceWitnessError, "already"):
+            self.owner.execution_started(
+                session, key="cleared-no-completion", sha=_SHA, action="pause",
+            )
+        self.owner.seal_session(session)
+        self.owner.operator_clearance(
+            key="cleared-no-completion", sha=_SHA,
+            evidence="operator:synthetic-negative-postread",
+        )
+        self.assertFalse(self.owner.fence_pending())
+        self.assertEqual(
+            self.owner.replay_status(
+                key="cleared-no-completion", sha=_SHA, response_sha=response_sha,
+            ), "unverified",
+        )
+
     def test_same_key_never_reexecutes_after_completed_response_or_lost_local_db(self) -> None:
         session = self.owner.open_session()
         self.owner.execution_started(session, key="confirmed-key", sha=_SHA, action="create")
@@ -672,6 +728,64 @@ else:
         finally:
             with self.assertRaisesRegex(FenceWitnessError, "shutdown could not seal"):
                 server.close()
+
+    def test_known_pending_rejection_keeps_runtime_session_for_reconciliation(self) -> None:
+        """A definite pre-commit refusal must not poison the live socket."""
+        runtime_dir = self.root / "known-rejection-runtime"
+        operator_dir = self.root / "known-rejection-operator"
+        runtime_dir.mkdir(mode=0o700)
+        runtime_dir.chmod(0o2710)
+        operator_dir.mkdir(mode=0o700)
+        server = FenceWitnessServer(
+            ledger=self.owner,
+            runtime_socket=runtime_dir / "runtime.sock",
+            operator_socket=operator_dir / "operator.sock",
+            runtime_uid=os.geteuid() + 100000,
+            runtime_gid=os.getegid(), operator_uid=os.geteuid(),
+        )
+        self.addCleanup(server.close)
+        # This isolated test alone deliberately allows the current UID.
+        server._runtime.peer_uid = os.geteuid()
+        server.start()
+        with FenceWitnessClient(
+            runtime_dir / "runtime.sock", expected_owner_uid=os.geteuid(),
+        ) as client:
+            client.started(key="live-ambiguous", sha=_SHA, action="pause")
+            self.assertEqual(
+                client.completed(
+                    key="live-ambiguous", sha=_SHA, response=_UNKNOWN_MEDIA,
+                ), "ambiguous",
+            )
+            with self.assertRaises(FenceWitnessError):
+                client.started(key="known-refused-key", sha=_SHA, action="create")
+            with self.assertRaisesRegex(FenceWitnessError, "already recorded"):
+                client.started(key="live-ambiguous", sha=_SHA, action="pause")
+            # A truly rejected request was not committed; the same connection
+            # must still permit safe read and exact in-session clearance.
+            self.assertTrue(client.pending())
+            client.runtime_clear(
+                key="live-ambiguous", sha=_SHA,
+                evidence="synthetic:observed-existing-submit",
+            )
+            self.assertFalse(client.pending())
+            serialized = json.dumps(
+                _UNKNOWN_MEDIA, sort_keys=True, ensure_ascii=True,
+                separators=(",", ":"), allow_nan=False,
+            )
+            response_sha = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            self.assertEqual(
+                client.replay_status(
+                    key="live-ambiguous", sha=_SHA, response_sha=response_sha,
+                ), "ambiguous",
+            )
+            self.assertEqual(
+                client.replay_status(
+                    key="known-refused-key", sha=_SHA, response_sha=response_sha,
+                ), "never_started",
+            )
+            client.started(key="new-after-clearance", sha=_SHA, action="pause")
+            self.assertTrue(client.pending())
+        server.close()
 
     def test_shutdown_does_not_block_on_continuous_runtime_session(self) -> None:
         """A long-lived client must not hold SIGTERM cleanup indefinitely.
