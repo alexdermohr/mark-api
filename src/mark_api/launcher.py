@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import secrets
+import signal
 import sys
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ from .write_api import WriteApiAccess, WriteCapability
 
 
 _LAUNCHER_SOURCE = "private-web-product-launcher"
+_SHUTDOWN_MEDIA_RECONCILE_SECONDS = 8.0
 
 
 class ProductLauncherError(RuntimeError):
@@ -296,16 +298,19 @@ class ProductLauncherRuntime:
                 else:
                     self._write_closed = True
 
-            if self._inventory_close_failed:
-                cleanup_failed = True
-            elif not self._inventory_closed:
-                try:
-                    self._inventory_runtime.close()
-                except Exception:
-                    self._inventory_close_failed = True
+            # An un-drained Write API may still use its caller-owned inventory
+            # runtime. Preserve it until the write runtime is quiesced.
+            if self._write_closed or media_unknown is not None:
+                if self._inventory_close_failed:
                     cleanup_failed = True
-                else:
-                    self._inventory_closed = True
+                elif not self._inventory_closed:
+                    try:
+                        self._inventory_runtime.close()
+                    except Exception:
+                        self._inventory_close_failed = True
+                        cleanup_failed = True
+                    else:
+                        self._inventory_closed = True
 
             if media_unknown is not None:
                 raise media_unknown
@@ -678,79 +683,131 @@ def main(argv: list[str] | None = None) -> int:
         objective_metric=args.objective_metric,
     )
 
-    try:
-        launcher = build_product_launcher(
-            db_path=args.db,
-            initialize_db=args.init_db,
-            cdp_port=args.cdp_port,
-            dashboard_port=args.dashboard_port,
-            write_port=args.write_port,
-            timeout_seconds=args.timeout_seconds,
-            analytics_contract=contract,
-            email_paths=tuple(args.email_paths),
-        )
-    except (ProductLauncherError, PrivateWebRuntimeDependencyError) as exc:
-        print(f"mark-api-launch: {exc}", file=sys.stderr)
-        return 2
-    except (TypeError, ValueError):
-        print("mark-api-launch: invalid startup configuration", file=sys.stderr)
-        return 2
+    # SIGTERM during startup is deferred until a runtime exists.
+    # While serving, unwind into the existing close/reconciliation path.
+    # Further SIGTERM signals during cleanup must not interrupt it.
+    shutdown_requested = False
+    serving = False
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
-    write_host, write_port = launcher.write_server_address
-    print(f"Mark dashboard: {launcher.dashboard_url}", flush=True)
-    print(
-        f"Mark write API: http://{write_host}:{write_port}/api/write/",
-        flush=True,
-    )
-    print(
-        f"Mark write bearer token: {launcher.write_bearer_token}",
-        flush=True,
-    )
-    print(
-        "Startup sync: "
-        f"{launcher.startup_inventory_count} current ad(s), "
-        f"{launcher.startup_persisted_count} observation(s) persisted.",
-        flush=True,
-    )
-    if args.email_paths:
-        email_report = launcher.startup_email_import_report
-        print(
-            "Startup reaction import: "
-            f"{email_report.parsed_files} email file(s), "
-            f"{email_report.inserted_events} new event(s), "
-            f"{email_report.duplicate_events} duplicate event(s).",
-            flush=True,
-        )
+    def _on_sigterm(_signum: int, _frame: object) -> None:
+        nonlocal shutdown_requested, serving
+        shutdown_requested = True
+        if serving:
+            serving = False
+            raise KeyboardInterrupt
 
-    exit_code = 0
+    signal.signal(signal.SIGTERM, _on_sigterm)
     try:
-        launcher.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    except Exception:
-        print(
-            "mark-api-launch: dashboard server stopped unexpectedly",
-            file=sys.stderr,
-        )
-        exit_code = 2
-    finally:
+
         try:
-            launcher.close()
-        except PrivateWebSubmitUnknownError:
-            try:
-                launcher.reconcile_media_submit()
-                launcher.close()
-            except Exception:
-                print(
-                    "mark-api-launch: media submit reconciliation required",
-                    file=sys.stderr,
-                )
-                exit_code = 2
-        except ProductLauncherError as exc:
+            launcher = build_product_launcher(
+                db_path=args.db,
+                initialize_db=args.init_db,
+                cdp_port=args.cdp_port,
+                dashboard_port=args.dashboard_port,
+                write_port=args.write_port,
+                timeout_seconds=args.timeout_seconds,
+                analytics_contract=contract,
+                email_paths=tuple(args.email_paths),
+            )
+        except (ProductLauncherError, PrivateWebRuntimeDependencyError) as exc:
             print(f"mark-api-launch: {exc}", file=sys.stderr)
-            exit_code = 2
-    return exit_code
+            return 2
+        except (TypeError, ValueError):
+            print("mark-api-launch: invalid startup configuration", file=sys.stderr)
+            return 2
 
+        if not shutdown_requested:
+            write_host, write_port = launcher.write_server_address
+            print(f"Mark dashboard: {launcher.dashboard_url}", flush=True)
+            print(
+                f"Mark write API: http://{write_host}:{write_port}/api/write/",
+                flush=True,
+            )
+            print(
+                f"Mark write bearer token: {launcher.write_bearer_token}",
+                flush=True,
+            )
+            print(
+                "Startup sync: "
+                f"{launcher.startup_inventory_count} current ad(s), "
+                f"{launcher.startup_persisted_count} observation(s) persisted.",
+                flush=True,
+            )
+            if args.email_paths:
+                email_report = launcher.startup_email_import_report
+                print(
+                    "Startup reaction import: "
+                    f"{email_report.parsed_files} email file(s), "
+                    f"{email_report.inserted_events} new event(s), "
+                    f"{email_report.duplicate_events} duplicate event(s).",
+                    flush=True,
+                )
+
+        exit_code = 0
+        try:
+            if not shutdown_requested:
+                serving = True
+                try:
+                    launcher.serve_forever()
+                finally:
+                    serving = False
+        except KeyboardInterrupt:
+            pass
+        except Exception:
+            print(
+                "mark-api-launch: dashboard server stopped unexpectedly",
+                file=sys.stderr,
+            )
+            exit_code = 2
+        finally:
+            try:
+                launcher.close()
+            except PrivateWebSubmitUnknownError:
+                # On SIGTERM, an unavailable CDP peer must not hold PID 1
+                # past Docker's stop deadline. The durable in-progress media
+                # fence forbids blind retry after this process exits.
+                if shutdown_requested:
+                    reconciled: list[bool] = []
+
+                    def _settle_before_stop() -> None:
+                        try:
+                            launcher.reconcile_media_submit()
+                            launcher.close()
+                        except Exception:
+                            return
+                        reconciled.append(True)
+
+                    settle_thread = Thread(
+                        target=_settle_before_stop,
+                        daemon=True,
+                        name="mark-media-stop-reconciliation",
+                    )
+                    settle_thread.start()
+                    settle_thread.join(_SHUTDOWN_MEDIA_RECONCILE_SECONDS)
+                    media_settled = not settle_thread.is_alive() and bool(reconciled)
+                else:
+                    try:
+                        launcher.reconcile_media_submit()
+                        launcher.close()
+                    except Exception:
+                        media_settled = False
+                    else:
+                        media_settled = True
+                if not media_settled:
+                    print(
+                        "mark-api-launch: media submit reconciliation required",
+                        file=sys.stderr,
+                    )
+                    exit_code = 2
+            except ProductLauncherError as exc:
+                print(f"mark-api-launch: {exc}", file=sys.stderr)
+                exit_code = 2
+        return exit_code
+
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
 if __name__ == "__main__":
     raise SystemExit(main())

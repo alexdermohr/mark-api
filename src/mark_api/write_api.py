@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Lock
+from threading import Condition, Lock, RLock
 from typing import Callable, ContextManager, Protocol
 from urllib.parse import unquote, urlsplit
 
@@ -39,6 +39,10 @@ _MEDIA_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 class _RequestBodyTimeoutError(ValueError):
     pass
+
+
+class _CreateRecoveryPendingError(RuntimeError):
+    """A durable unknown Write outcome forbids another Create."""
 
 
 def _utc_now() -> datetime:
@@ -430,7 +434,11 @@ def _handler_factory(
     # Serialize the complete service calls across this threaded server so a
     # media and media-free create cannot share/contaminate the same delta
     # window. Other write routes remain independent.
-    create_lock = Lock()
+    create_lock = RLock()
+    # Conservatively close the small window between an ambiguous Create
+    # receipt and its durable HTTP idempotency completion. Every Create,
+    # including media-free, must observe this under create_lock.
+    create_recovery_in_memory: set[str] = set()
     # A staging request may buffer up to _MAX_MEDIA_BODY_BYTES. Serialize
     # staging reads so ThreadingHTTPServer cannot multiply that bound by the
     # number of concurrent authenticated clients.
@@ -439,6 +447,20 @@ def _handler_factory(
     class WriteApiHandler(BaseHTTPRequestHandler):
         server_version = "mark-api-write/0.1"
         sys_version = ""
+
+        @classmethod
+        def clear_verified_create_recovery(
+            cls, idempotency_key: str, request_sha256: str,
+        ) -> None:
+            # Trusted local method, never an HTTP capability. The persisted
+            # original-operation fingerprint is the only release authority.
+            if not store.has_write_recovery_clearance(
+                idempotency_key=idempotency_key,
+                request_sha256=request_sha256,
+            ):
+                raise ValueError("write recovery clearance is not verified")
+            with create_lock:
+                create_recovery_in_memory.discard(idempotency_key)
 
         def log_message(self, format: str, *args: object) -> None:
             return
@@ -892,10 +914,12 @@ def _handler_factory(
                 )
                 return
 
+            # Serialize each Create through durable HTTP completion, not
+            # only through browser submission. Acquire the shared runtime
+            # lock first so media reconciliation cannot invert lock order.
             with (
-                execution_lock
-                if execution_lock is not None
-                else nullcontext()
+                execution_lock if execution_lock is not None else nullcontext(),
+                create_lock if action in {"create", "create_media"} else nullcontext(),
             ):
                 try:
                     store.begin_write_api_request(
@@ -917,6 +941,14 @@ def _handler_factory(
                     if action in {"create", "create_media"}:
                         assert create_request is not None
                         with create_lock:
+                            if (
+                                create_recovery_in_memory
+                                or store.create_recovery_pending(
+                                    exclude_idempotency_key=idempotency_key,
+                                    claim_owner=claim_owner,
+                                )
+                            ):
+                                raise _CreateRecoveryPendingError()
                             if action == "create":
                                 create_receipt = service.create(
                                     create_request,
@@ -926,12 +958,25 @@ def _handler_factory(
                             else:
                                 assert media_service is not None
                                 assert media_refs is not None
-                                create_receipt = media_service.create_with_media(
-                                    create_request,
-                                    media_refs,
-                                    authorization_by=access.principal,
-                                    authorization_reference=authorization_reference,
-                                )
+                                try:
+                                    create_receipt = media_service.create_with_media(
+                                        create_request,
+                                        media_refs,
+                                        authorization_by=access.principal,
+                                        authorization_reference=authorization_reference,
+                                    )
+                                except BaseException:
+                                    # No conclusive receipt after entry into
+                                    # the media writer: do not admit another
+                                    # key while this runtime remains live.
+                                    create_recovery_in_memory.add(idempotency_key)
+                                    raise
+                                if (
+                                    isinstance(create_receipt, CreateOperationReceipt)
+                                    and create_receipt.writer_invoked
+                                    and create_receipt.outcome is OperationOutcome.AMBIGUOUS
+                                ):
+                                    create_recovery_in_memory.add(idempotency_key)
                         if not isinstance(
                             create_receipt,
                             CreateOperationReceipt,
@@ -1045,6 +1090,13 @@ def _handler_factory(
                             "operation_receipt": _receipt_to_dict(receipt),
                             "platform_retry_authorized": False,
                         }
+                except _CreateRecoveryPendingError:
+                    status = 409
+                    response = {
+                        "error": "create_recovery_pending",
+                        "idempotency_key": idempotency_key,
+                        "platform_retry_authorized": False,
+                    }
                 except Exception:
                     status = 500
                     response = {
@@ -1055,23 +1107,23 @@ def _handler_factory(
                     if action == "create_media":
                         response["media_persistence_confirmed"] = False
 
-            response_json = _canonical_json(response)
-            try:
-                store.complete_write_api_request(
-                    idempotency_key=idempotency_key,
-                    request_sha256=fingerprint,
-                    claim_owner=claim_owner,
-                    response_status=status,
-                    response_json=response_json,
-                    completed_at=clock(),
-                )
-            except Exception:
-                self._error(
-                    500,
-                    "idempotency_persistence_failed",
-                    platform_retry_authorized=False,
-                )
-                return
+                response_json = _canonical_json(response)
+                try:
+                    store.complete_write_api_request(
+                        idempotency_key=idempotency_key,
+                        request_sha256=fingerprint,
+                        claim_owner=claim_owner,
+                        response_status=status,
+                        response_json=response_json,
+                        completed_at=clock(),
+                    )
+                except Exception:
+                    self._error(
+                        500,
+                        "idempotency_persistence_failed",
+                        platform_retry_authorized=False,
+                    )
+                    return
 
             self._send_bytes(status, response_json.encode("utf-8"))
 
@@ -1124,6 +1176,7 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
 
     def __init__(self, *args, **kwargs) -> None:
         self._store_lock_guard = Lock()
+        self._handler_drained = Condition(self._store_lock_guard)
         self._active_handler_count = 0
         self._serve_loop_active = False
         self._socket_close_succeeded = False
@@ -1170,8 +1223,9 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
         try:
             super().process_request(request, client_address)
         except BaseException:
-            with self._store_lock_guard:
+            with self._handler_drained:
                 self._active_handler_count -= 1
+                self._handler_drained.notify_all()
             self._release_store_lock_if_quiesced()
             raise
 
@@ -1179,9 +1233,24 @@ class LoopbackWriteApiServer(ThreadingHTTPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            with self._store_lock_guard:
+            with self._handler_drained:
                 self._active_handler_count -= 1
+                self._handler_drained.notify_all()
             self._release_store_lock_if_quiesced()
+
+    def clear_verified_create_recovery(
+        self, idempotency_key: str, request_sha256: str,
+    ) -> None:
+        self.RequestHandlerClass.clear_verified_create_recovery(
+            idempotency_key, request_sha256,
+        )
+
+    def wait_for_active_handlers(self, timeout_seconds: float) -> bool:
+        with self._handler_drained:
+            return self._handler_drained.wait_for(
+                lambda: self._active_handler_count == 0,
+                timeout=timeout_seconds,
+            )
 
     def server_close(self) -> None:
         super().server_close()

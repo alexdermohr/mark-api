@@ -34,6 +34,7 @@ ALL_TABLES = frozenset(
         "write_api_requests",
         "create_operation_checkpoints",
         "dashboard_pending_writes",
+        "write_recovery_clearances",
     )
 )
 STAGES = (
@@ -56,7 +57,7 @@ STAGES = (
          "ad_classifications", "inbound_message_events",
          "create_operation_receipts", "write_api_requests")
     ),
-    ALL_TABLES - {"dashboard_pending_writes"},
+    ALL_TABLES - {"dashboard_pending_writes", "write_recovery_clearances"},
 )
 
 
