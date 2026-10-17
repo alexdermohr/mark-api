@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 from urllib.parse import quote
 
 from .domain import (
@@ -950,6 +950,7 @@ class SnapshotStore:
         source: str,
         changes: Mapping[str, str | None],
         observed_at: datetime | None = None,
+        validate_result: Callable[[AdClassification], None] | None = None,
     ) -> AdClassification:
         """Atomically merge one classification for a locally evidenced ad."""
 
@@ -1064,6 +1065,11 @@ class SnapshotStore:
                     "classification update would not change any label"
                 )
 
+            # Callers with bounded IPC must validate the fully merged
+            # representation *inside* this BEGIN IMMEDIATE transaction.
+            # An invalid reply cannot be committed and then made unreadable.
+            if validate_result is not None:
+                validate_result(classification)
             self._insert_classification(connection, classification)
             return classification
 

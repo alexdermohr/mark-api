@@ -51,6 +51,15 @@ _VERSION = 1  # Wire protocol; ledger schema has its own explicit version.
 _LEDGER_SCHEMA_VERSION = 2
 _OPERATOR_PAGE_LIMIT = 16
 _MAX_FRAME = 32 * 1024
+_PEER_CREDENTIALS = struct.Struct("=iII")  # pid_t signed, uid_t/gid_t unsigned
+
+
+def _witness_peer_uid(raw: bytes) -> int:
+    if type(raw) is not bytes or len(raw) != _PEER_CREDENTIALS.size:
+        raise FenceWitnessError("invalid Linux peer credentials")
+    return _PEER_CREDENTIALS.unpack(raw)[1]
+
+
 _KEY = re.compile(r"[A-Za-z0-9._:-]{1,160}\Z", re.ASCII)
 _SHA = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _ACTIONS = frozenset({
@@ -876,7 +885,7 @@ class _WitnessUnixHandler(socketserver.StreamRequestHandler):
             if not hasattr(socket, "SO_PEERCRED"):
                 raise FenceWitnessError("kernel peer credential support is required")
             credentials = self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-            _pid, uid, _gid = struct.unpack("3i", credentials)
+            uid = _witness_peer_uid(credentials)
             if uid != server.peer_uid:
                 raise FenceWitnessError("socket peer is not authorized")
             if server.role == "runtime":
@@ -1188,7 +1197,7 @@ class FenceWitnessClient:
             credentials = peer.getsockopt(
                 socket.SOL_SOCKET, socket.SO_PEERCRED, 12,
             )
-            _pid, actual_uid, _gid = struct.unpack("3i", credentials)
+            actual_uid = _witness_peer_uid(credentials)
             if actual_uid != expected_owner_uid:
                 raise FenceWitnessError("witness peer UID is not trusted")
             stream = peer.makefile("rwb", buffering=0)

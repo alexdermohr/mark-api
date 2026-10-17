@@ -10,6 +10,7 @@ import os
 from contextlib import closing
 from pathlib import Path
 import socket
+import struct
 import tempfile
 import threading
 import unittest
@@ -18,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 from mark_api.dashboard_relay import (
     DashboardRelayError,
+    _peer_uid,
     _relay_streams,
     _chrome_cdp_reachable,
     FrontendDashboardRelay,
@@ -77,6 +79,14 @@ class DashboardRelayTests(unittest.TestCase):
         self.addCleanup(thread.join, 3)
         self.relay = None
         self.front = None
+
+    @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"), "requires SO_PEERCRED")
+    def test_linux_peer_uid_high_bit_is_unsigned(self) -> None:
+        high_uid = 2**31 + 7
+        credentials = struct.pack("=iII", 123, high_uid, 50042)
+        peer = MagicMock()
+        peer.getsockopt.return_value = credentials
+        self.assertEqual(_peer_uid(peer), high_uid)
 
     def make_relay(self, *, peer_uid: int | None = None) -> None:
         self.relay = UnixDashboardRelay(

@@ -1553,6 +1553,51 @@ class StorageOwnerUnitTests(unittest.TestCase):
         self.assertEqual(store.classification_history("123"), (first, second))
         self.assertEqual(client.latest_classification("123"), second)
 
+    def test_classification_merge_rejects_oversized_final_reply_before_commit(self) -> None:
+        """Each request fits, but the merged classification must remain readable."""
+        from mark_api.domain import AdSnapshot
+
+        service = self.make_service()
+        store = SnapshotStore(self.database, create_if_missing=False)
+        store.append_ad_snapshot(AdSnapshot(
+            ad_id="123", observed_at=NOW, source="management",
+        ))
+        service.runtime_uid = os.geteuid()
+        service.start()
+        client = StorageOwnerClient(self.sock, expected_owner_uid=os.geteuid())
+        label = "\U0001F600" * 1024
+        first = client.merge_classification(
+            ad_id="123", source="manual-cli",
+            changes={"image_type": label},
+            observed_at=NOW + timedelta(minutes=1),
+        )
+        second = client.merge_classification(
+            ad_id="123", source="manual-cli",
+            changes={"city": label},
+            observed_at=NOW + timedelta(minutes=2),
+        )
+        self.assertEqual(first.image_type, label)
+        self.assertEqual(second.city, label)
+        self.assertEqual(len(store.classification_history("123")), 2)
+
+        # A known oversized *response* must fail while still uncommitted.
+        with self.assertRaises(StorageOwnerError):
+            client.merge_classification(
+                ad_id="123", source="manual-cli",
+                changes={"text_type": label},
+                observed_at=NOW + timedelta(minutes=3),
+            )
+        self.assertEqual(store.classification_history("123"), (first, second))
+        self.assertEqual(client.latest_classification("123"), second)
+
+        small = client.merge_classification(
+            ad_id="123", source="manual-cli",
+            changes={"text_type": "short"},
+            observed_at=NOW + timedelta(minutes=4),
+        )
+        self.assertEqual(small.text_type, "short")
+        self.assertEqual(client.latest_classification("123"), small)
+
     def test_classification_merge_refuses_unknown_id_fields_and_late_observation(self) -> None:
         from mark_api.domain import AdSnapshot
         service = self.make_service()

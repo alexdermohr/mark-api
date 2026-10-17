@@ -109,6 +109,14 @@ def _reply_frame_fits(result: dict[str, object]) -> bool:
     ) <= _MAX_FRAME + 1
 
 
+def _require_classification_reply_frame(classification: AdClassification) -> None:
+    """Reject a would-be merged classification before its SQLite commit."""
+    if not _reply_frame_fits({
+        "classification": _class_as_json(classification),
+    }):
+        raise StorageOwnerError("merged classification exceeds IPC frame bound")
+
+
 def _record_as_json(record: WriteApiRequestRecord) -> dict[str, object]:
     return {
         "idempotency_key": record.idempotency_key,
@@ -907,6 +915,7 @@ class StorageOwnerServer(
             result = self.store.merge_classification(
                 ad_id=ad_id, source=source,
                 changes=normalized, observed_at=observed_at,
+                validate_result=_require_classification_reply_frame,
             )
             return {"classification": _class_as_json(result)}
         if op == "classification_latest" and set(request) == {

@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import closing
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -15,13 +16,14 @@ import select
 import socket
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from mark_api.fence_witness import (
     FenceLedger,
@@ -69,6 +71,38 @@ class FenceWitnessTests(unittest.TestCase):
         self.ledger_file = self.data / "witness.sqlite"
         self.owner = FenceLedger(self.ledger_file, initialize=True)
         self.addCleanup(self.owner.close)
+
+    @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"), "requires SO_PEERCRED")
+    def test_linux_peer_uid_high_bit_is_unsigned_in_client_and_handler(self) -> None:
+        high_uid = 2**31 + 7
+        credentials = struct.pack("=iII", 123, high_uid, 50042)
+
+        # Client must accept an otherwise valid UNIX peer whose Linux uid_t
+        # occupies the high half of the unsigned 32-bit range.
+        with patch("mark_api.fence_witness.socket.socket") as ctor:
+            sock = ctor.return_value
+            sock.getsockopt.return_value = credentials
+            sock.makefile.return_value = io.BytesIO(
+                b'{"ok":true,"version":1}\n'
+            )
+            client = FenceWitnessClient(
+                self.root / "synthetic.sock", expected_owner_uid=high_uid,
+            )
+            client.close()
+
+        # Witness server must decode the same on-wire credentials. A role
+        # mismatch remains rejected independently of signedness.
+        from mark_api.fence_witness import _WitnessUnixHandler
+        from types import SimpleNamespace
+
+        handler = object.__new__(_WitnessUnixHandler)
+        handler.request = MagicMock()
+        handler.request.getsockopt.return_value = credentials
+        handler.server = SimpleNamespace(peer_uid=high_uid, role="operator")
+        handler._send = MagicMock()
+        handler._next_frame = MagicMock(return_value=None)
+        handler.handle()
+        handler._send.assert_called_once_with({"ok": True, "version": 1})
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_forked_process_does_not_retain_crashed_witness_lease(self) -> None:

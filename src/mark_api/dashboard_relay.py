@@ -43,7 +43,7 @@ def _peer_uid(sock: socket.socket) -> int:
         credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
         if len(credentials) != 12:
             raise DashboardRelayError("incomplete peer credentials")
-        _pid, uid, _gid = struct.unpack("3i", credentials)
+        _pid, uid, _gid = struct.unpack("=iII", credentials)
         return uid
     except OSError as exc:
         raise DashboardRelayError("peer identity unavailable") from exc
