@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -9,7 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Iterable, Iterator, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 from urllib.parse import quote
 
 from .domain import (
@@ -23,8 +24,10 @@ from .domain import (
     ReactionSnapshot,
 )
 from .results import ReadResult, ReadStatus
+from .strict_json import strict_json_object
 
 _SYNC_SCHEMA_VERSION = 1
+_STORE_SCHEMA_VERSION = 2
 # Unverified observations never establish independently confirmed account ownership.
 LOCAL_CATALOG_SOURCE = "user-supplied-local-catalog"
 _AD_HISTORY_PAGE_ROWS = 256  # Close read connection before projection.
@@ -195,6 +198,13 @@ _REQUIRED_STORE_COLUMNS: dict[str, tuple[str, ...]] = {
         "response_status",
         "response_json",
     ),
+    "write_recovery_clearances": (
+        "idempotency_key",
+        "request_sha256",
+        "observed_at",
+        "verification_kind",
+        "evidence_reference",
+    ),
     "dashboard_pending_writes": (
         "scope",
         "resource_key",
@@ -222,6 +232,7 @@ _LEGACY_ADDABLE_COLUMNS: dict[str, frozenset[str]] = {
 _REQUIRED_SINGLE_COLUMN_UNIQUES: dict[str, tuple[str, ...]] = {
     "inbound_message_events": ("provider_message_id",),
     "write_api_requests": ("idempotency_key",),
+    "write_recovery_clearances": ("idempotency_key",),
     "dashboard_pending_writes": ("scope", "resource_key", "idempotency_key"),
 }
 
@@ -283,6 +294,28 @@ def _sync_attempt_from_row(row: sqlite3.Row) -> SyncAttemptRecord:
         started_at=started, completed_at=completed,
         outcome=outcome, error_kind=error_kind, snapshot_count=count,
     )
+
+
+def _unresolved_sync_attempt_summary(
+    connection: sqlite3.Connection,
+) -> tuple[int, SyncAttemptRecord | None]:
+    """Inspect all open generations in one bounded-memory SQL traversal.
+
+    Checking only the oldest outstanding attempt can conceal a malformed
+    middle generation when a later completed attempt is otherwise healthy.
+    SQL cursors stream rows without materializing private journal history.
+    This read-only check neither settles nor grants retry authorization.
+    """
+    count = 0
+    oldest: SyncAttemptRecord | None = None
+    for row in connection.execute(
+        "SELECT * FROM sync_attempts WHERE outcome='in_progress' ORDER BY id ASC"
+    ):
+        record = _sync_attempt_from_row(row)
+        if oldest is None:
+            oldest = record
+        count += 1
+    return count, oldest
 
 
 def _sync_attempt_to_dict(item: SyncAttemptRecord | None) -> dict[str, object] | None:
@@ -359,9 +392,16 @@ class _ClosingSQLiteConnection(sqlite3.Connection):
 class SnapshotStore:
     """Append-only SQLite storage for normalized observations and write receipts."""
 
-    def __init__(self, path: str | Path, *, create_if_missing: bool = True) -> None:
+    def __init__(
+        self, path: str | Path, *, create_if_missing: bool = True,
+        require_existing_schema: bool = False,
+    ) -> None:
         if not isinstance(create_if_missing, bool):
             raise TypeError("create_if_missing must be bool")
+        if not isinstance(require_existing_schema, bool):
+            raise TypeError("require_existing_schema must be bool")
+        if require_existing_schema and create_if_missing:
+            raise ValueError("strict existing storage cannot initialize a database")
         self.path = Path(path)
         # Same construction-time absolute path for URI and inode comparison.
         self._identity_path = self.path.absolute()
@@ -389,10 +429,15 @@ class SnapshotStore:
             # when the caller explicitly passed --init-db.
             with self._connect() as connection:
                 self._validate_store_schema(
-                    connection, allow_additive_migrations=True
+                    connection,
+                    allow_additive_migrations=not require_existing_schema,
                 )
         self._dashboard_pending_write_lock = RLock()
-        self._initialize()
+        # A separately owned, existing-only SQLite store must not run DDL
+        # (including silently recreating missing optional performance indexes).
+        # The default launcher and historical import paths remain unchanged.
+        if not require_existing_schema:
+            self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -516,11 +561,27 @@ class SnapshotStore:
         if integrity is None or integrity[0] != "ok":
             raise sqlite3.DatabaseError("database integrity check failed")
 
+        marker = connection.execute("PRAGMA user_version").fetchone()
+        version = int(marker[0]) if marker is not None else -1
+        if version not in (0, _SYNC_SCHEMA_VERSION, _STORE_SCHEMA_VERSION):
+            raise sqlite3.DatabaseError("database version is unsupported")
+
         for table, expected in _REQUIRED_STORE_COLUMNS.items():
             table_type = connection.execute(
                 "SELECT type FROM sqlite_master WHERE name = ?", (table,)
             ).fetchone()
-            if table_type is None or table_type["type"] != "table":
+            if table_type is None:
+                # A version-1 store predates only this new append-only table.
+                # Never recreate a missing clearance table in a version-2
+                # database: doing so would erase previously granted fences.
+                if (
+                    allow_additive_migrations
+                    and version < _STORE_SCHEMA_VERSION
+                    and table == "write_recovery_clearances"
+                ):
+                    continue
+                raise sqlite3.DatabaseError("database schema is incomplete")
+            if table_type["type"] != "table":
                 raise sqlite3.DatabaseError("database schema is incomplete")
             columns = {
                 str(row["name"])
@@ -564,10 +625,6 @@ class SnapshotStore:
                 ):
                     raise sqlite3.DatabaseError("database recovery keys are not unique")
 
-        version_row = connection.execute("PRAGMA user_version").fetchone()
-        version = int(version_row[0]) if version_row is not None else -1
-        if version not in (0, _SYNC_SCHEMA_VERSION):
-            raise sqlite3.DatabaseError("database version is unsupported")
         journal_type = connection.execute(
             "SELECT type FROM sqlite_master WHERE name='sync_attempts'"
         ).fetchone()
@@ -604,6 +661,9 @@ class SnapshotStore:
                     record = connection.execute(statement).fetchone()
                     if record is not None:
                         _sync_attempt_from_row(record)
+                # A valid oldest open record does not establish that a later
+                # unfinished predecessor is safe. Audit every open generation.
+                _unresolved_sync_attempt_summary(connection)
 
     def is_ready(self) -> bool:
         """Observe complete schema/data without creating or repairing a store."""
@@ -774,6 +834,22 @@ class SnapshotStore:
                     )
                 );
 
+                CREATE TABLE IF NOT EXISTS write_recovery_clearances (
+                    idempotency_key TEXT PRIMARY KEY,
+                    request_sha256 TEXT NOT NULL
+                        CHECK(length(request_sha256) = 64),
+                    observed_at TEXT NOT NULL,
+                    verification_kind TEXT NOT NULL CHECK (
+                        verification_kind IN (
+                            'media_submit_reconciled',
+                            'operator_verified_postread'
+                        )
+                    ),
+                    evidence_reference TEXT NOT NULL CHECK (
+                        length(trim(evidence_reference)) BETWEEN 1 AND 256
+                    )
+                );
+
                 CREATE TABLE IF NOT EXISTS dashboard_pending_writes (
                     scope TEXT PRIMARY KEY,
                     resource_key TEXT NOT NULL UNIQUE,
@@ -888,7 +964,7 @@ class SnapshotStore:
 
             # Existing stores pass old Write-recovery validation before
             # migrations. The journal and version marker commit together.
-            connection.execute(f"PRAGMA user_version = {_SYNC_SCHEMA_VERSION}")
+            connection.execute(f"PRAGMA user_version = {_STORE_SCHEMA_VERSION}")
             self._validate_store_schema(connection)
 
     @staticmethod
@@ -1049,6 +1125,7 @@ class SnapshotStore:
         source: str,
         changes: Mapping[str, str | None],
         observed_at: datetime | None = None,
+        validate_result: Callable[[AdClassification], None] | None = None,
     ) -> AdClassification:
         """Atomically merge one classification for a locally evidenced ad."""
 
@@ -1163,6 +1240,11 @@ class SnapshotStore:
                     "classification update would not change any label"
                 )
 
+            # Callers with bounded IPC must validate the fully merged
+            # representation *inside* this BEGIN IMMEDIATE transaction.
+            # An invalid reply cannot be committed and then made unreadable.
+            if validate_result is not None:
+                validate_result(classification)
             self._insert_classification(connection, classification)
             return classification
 
@@ -1451,6 +1533,481 @@ class SnapshotStore:
             else None
         )
 
+    def create_recovery_pending(
+        self, *, exclude_idempotency_key: str, claim_owner: str
+    ) -> bool:
+        """Fail closed on older executed Writes or unresolved media Creates.
+
+        An ambiguous media receipt can be HTTP-completed while its browser
+        submit remains unsettled. Its durable HTTP response, rather than the
+        process-local media page, must prevent a new key from re-submitting.
+        An older in-progress execution is similarly non-retryable even if the
+        current server owns both request claims.
+        This check does not resolve an old fence; independent reconciliation
+        and an explicit persisted clearance are required for that.
+        """
+        if not isinstance(exclude_idempotency_key, str) or not exclude_idempotency_key:
+            raise ValueError("excluded idempotency key is required")
+        _validated_write_api_claim_owner(claim_owner)
+        with closing(self._connect()) as connection:
+            # Keep accepted but never-started claims recoverable. A started
+            # write with unknown outcome can still have reached the platform.
+            if connection.execute(
+                """
+                SELECT 1 FROM write_api_requests AS w
+                LEFT JOIN write_recovery_clearances AS c
+                  ON c.idempotency_key = w.idempotency_key
+                 AND c.request_sha256 = w.request_sha256
+                WHERE w.idempotency_key != ?
+                  AND w.state = 'in_progress'
+                  AND w.execution_started_at IS NOT NULL
+                  AND c.idempotency_key IS NULL
+                LIMIT 1
+                """,
+                (exclude_idempotency_key,),
+            ).fetchone() is not None:
+                return True
+            # Runtime must enforce the same durable before-media Create fences
+            # the independent offline pair inventory promises to preserve.
+            # A checkpoint is settled only by a final media-confirmed receipt
+            # bound to EVERY immutable source field. In particular, an
+            # independently valid but unrelated final receipt, or a final
+            # timestamp earlier by even one microsecond, cannot release it.
+            # Keep this runtime predicate independent of offline inspector
+            # code; the paired acceptance tests cross-check both contracts.
+            previous_checkpoint_id = None
+            previous_checkpoint_settled = False
+            checkpoint_rows = connection.execute(
+                """
+                SELECT c.id, c.completed_at, r.completed_at,
+                       independent.idempotency_key
+                FROM create_operation_checkpoints AS c
+                LEFT JOIN create_operation_receipts AS r
+                  ON c.operation = r.operation
+                 AND c.created_ad_id = r.created_ad_id
+                 AND c.started_at = r.started_at
+                 AND c.authorization_by IS r.authorization_by
+                 AND c.authorization_reference IS r.authorization_reference
+                 AND c.pre_read_status = r.pre_read_status
+                 AND c.confirmation_pre_read_status = r.confirmation_pre_read_status
+                 AND c.post_read_status IS r.post_read_status
+                 AND c.confirmation_post_read_status IS r.confirmation_post_read_status
+                 AND c.content_post_read_status IS r.content_post_read_status
+                 AND c.writer_error IS r.writer_error
+                 AND c.post_snapshot_json IS r.post_snapshot_json
+                 AND c.confirmation_post_snapshot_json IS r.confirmation_post_snapshot_json
+                 AND c.content_post_snapshot_json IS r.content_post_snapshot_json
+                 AND r.outcome = 'confirmed'
+                 AND r.writer_invoked = 1
+                 AND r.media_persistence_confirmed = 1
+                 AND r.media_post_read_status = 'confirmed'
+                LEFT JOIN write_api_requests AS original_write
+                  ON c.authorization_reference =
+                        ('write-api:' || original_write.idempotency_key)
+                 AND original_write.execution_started_at IS NOT NULL
+                LEFT JOIN write_recovery_clearances AS independent
+                  ON independent.idempotency_key = original_write.idempotency_key
+                 AND independent.request_sha256 = original_write.request_sha256
+                 AND independent.verification_kind = 'operator_verified_postread'
+                ORDER BY c.id, r.id
+                """
+            )
+            for (checkpoint_id, checkpoint_completed, final_completed,
+                 independent_clearance) in checkpoint_rows:
+                if checkpoint_id != previous_checkpoint_id:
+                    if previous_checkpoint_id is not None and not previous_checkpoint_settled:
+                        return True
+                    previous_checkpoint_id = checkpoint_id
+                    # Only a persisted exact operation-bound operator
+                    # clearance can independently reconcile an unfinished
+                    # checkpoint. Executor-only media evidence is never enough.
+                    previous_checkpoint_settled = independent_clearance is not None
+                if final_completed is None:
+                    continue
+                try:
+                    checkpoint_time = datetime.fromisoformat(checkpoint_completed)
+                    final_time = datetime.fromisoformat(final_completed)
+                    if (
+                        checkpoint_time.utcoffset() is not None
+                        and final_time.utcoffset() is not None
+                        and final_time >= checkpoint_time
+                    ):
+                        previous_checkpoint_settled = True
+                except (TypeError, ValueError):
+                    # Invalid historical data cannot prove settlement.
+                    continue
+            if previous_checkpoint_id is not None and not previous_checkpoint_settled:
+                return True
+            if connection.execute(
+                """
+                SELECT 1 FROM create_operation_receipts AS r
+                LEFT JOIN write_api_requests AS w
+                  ON r.authorization_reference = ('write-api:' || w.idempotency_key)
+                LEFT JOIN write_recovery_clearances AS c
+                  ON c.idempotency_key = w.idempotency_key
+                 AND c.request_sha256 = w.request_sha256
+                WHERE r.operation = 'create' AND r.outcome = 'ambiguous'
+                  AND r.writer_invoked = 1
+                  AND r.media_post_read_status IS NOT NULL
+                  AND c.idempotency_key IS NULL
+                LIMIT 1
+                """
+            ).fetchone() is not None:
+                return True
+            rows = connection.execute(
+                """
+                SELECT w.idempotency_key, w.response_status, w.response_json
+                FROM write_api_requests AS w
+                LEFT JOIN write_recovery_clearances AS c
+                  ON c.idempotency_key = w.idempotency_key
+                 AND c.request_sha256 = w.request_sha256
+                WHERE w.idempotency_key != ?
+                  AND w.state = 'completed'
+                  AND c.idempotency_key IS NULL
+                  AND (
+                    (CASE WHEN json_valid(w.response_json) = 0 THEN 1
+                          WHEN json_type(w.response_json) != 'object' THEN 1
+                          ELSE json_type(
+                            w.response_json, '$.media_persistence_confirmed'
+                          ) IS NOT NULL END)
+                    OR (
+                      w.response_status = 202
+                      AND substr(
+                        w.response_json, 1,
+                        length('{"error":"write_outcome_unverified",')
+                      ) = '{"error":"write_outcome_unverified",'
+                    )
+                  )
+                """,
+                (exclude_idempotency_key,),
+            )
+            for row in rows:
+                try:
+                    response = json.loads(row["response_json"])
+                except (TypeError, ValueError):
+                    # Historical corrupt JSON is an unresolved write, not
+                    # permission to re-submit and not an opaque SQLite crash.
+                    return True
+                if not isinstance(response, dict):
+                    # A parseable JSON primitive is not an HTTP response
+                    # envelope and cannot authorize another Create.
+                    return True
+                try:
+                    if (
+                        row["response_status"] == 202
+                        and response.get("error") == "write_outcome_unverified"
+                    ):
+                        if row["response_json"] != self._unverified_write_api_response(
+                            row["idempotency_key"]
+                        ):
+                            raise ValueError("unverified response is not exact")
+                        return True
+                    if not isinstance(response.get("media_persistence_confirmed"), bool):
+                        raise ValueError("invalid media response")
+                    receipt = response.get("operation_receipt")
+                    if receipt is None:
+                        # An execution error may have followed browser submit.
+                        return True
+                    if not isinstance(receipt, dict):
+                        raise ValueError("invalid media receipt")
+                    outcome = receipt.get("outcome")
+                    invoked = receipt.get("writer_invoked")
+                    if not isinstance(invoked, bool) or not isinstance(outcome, str):
+                        raise ValueError("invalid media receipt outcome")
+                    if invoked and outcome == "ambiguous":
+                        return True
+                    if outcome not in {
+                        "confirmed", "ambiguous", "precondition_failed",
+                    }:
+                        raise ValueError("unknown media outcome")
+                except (TypeError, ValueError) as exc:
+                    raise sqlite3.DatabaseError(
+                        "invalid persisted media recovery evidence"
+                    ) from exc
+        return False
+
+    @staticmethod
+    def _original_unsettled_media_checkpoint(
+        connection: sqlite3.Connection, *, idempotency_key: str,
+        operation_receipt: Mapping[str, object],
+    ) -> bool:
+        """Require one original checkpoint, matching final row and full HTTP receipt.
+
+        The HTTP receipt omits snapshots. Their immutable identity must be
+        established by comparing all three persisted SQLite snapshot fields
+        against the sole final Create receipt. No media result reported by the
+        browser/executor supplies independent operator authority.
+        """
+        if type(operation_receipt) is not dict:
+            return False
+        wire = operation_receipt
+        required = {
+            "operation", "created_ad_id", "started_at", "completed_at",
+            "outcome", "pre_read_status", "confirmation_pre_read_status",
+            "post_read_status", "confirmation_post_read_status",
+            "content_post_read_status", "writer_invoked",
+            "authorization_by", "authorization_reference", "writer_error",
+            "media_post_read_status", "media_persistence_confirmed",
+        }
+        if set(wire) != required or (
+            wire["operation"] != "create"
+            or wire["outcome"] != "confirmed"
+            or wire["writer_invoked"] is not True
+            or wire["media_persistence_confirmed"] is not False
+            or type(wire["media_post_read_status"]) is not str
+            or wire["media_post_read_status"] not in {
+                "not_read", "verifier_unavailable", "mismatch", "unknown",
+            }
+            or type(wire["created_ad_id"]) is not str
+            or not wire["created_ad_id"].strip()
+            or wire["authorization_reference"] != "write-api:" + idempotency_key
+            or (wire["authorization_by"] is not None and (
+                type(wire["authorization_by"]) is not str
+                or not wire["authorization_by"].strip()
+            ))
+        ):
+            return False
+
+        checkpoint_fields = (
+            "checkpoint_kind", "operation", "created_ad_id", "started_at",
+            "completed_at", "outcome", "pre_read_status",
+            "confirmation_pre_read_status", "post_read_status",
+            "confirmation_post_read_status", "content_post_read_status",
+            "writer_invoked", "authorization_by", "authorization_reference",
+            "writer_error", "post_snapshot_json",
+            "confirmation_post_snapshot_json", "content_post_snapshot_json",
+        )
+        rows = connection.execute(
+            "SELECT " + ",".join(checkpoint_fields)
+            + " FROM create_operation_checkpoints "
+            "WHERE operation='create' AND authorization_reference=?",
+            ("write-api:" + idempotency_key,),
+        ).fetchall()
+        if len(rows) != 1:
+            return False
+        original = dict(zip(checkpoint_fields, rows[0]))
+        if (
+            original["checkpoint_kind"] != "before_media_post_read"
+            or original["outcome"] != "confirmed"
+            or type(original["writer_invoked"]) is not int
+            or original["writer_invoked"] != 1
+        ):
+            return False
+
+        final_fields = tuple(
+            name for name in checkpoint_fields if name != "checkpoint_kind"
+        ) + ("media_post_read_status", "media_persistence_confirmed")
+        rows = connection.execute(
+            "SELECT " + ",".join(final_fields)
+            + " FROM create_operation_receipts "
+            "WHERE operation='create' AND authorization_reference=?",
+            ("write-api:" + idempotency_key,),
+        ).fetchall()
+        if len(rows) != 1:
+            return False
+        final = dict(zip(final_fields, rows[0]))
+        if (
+            type(final["writer_invoked"]) is not int
+            or final["writer_invoked"] != 1
+            or type(final["media_persistence_confirmed"]) is not int
+            or final["media_persistence_confirmed"] != 0
+        ):
+            return False
+
+        immutable = (
+            "operation", "created_ad_id", "started_at", "outcome",
+            "pre_read_status", "confirmation_pre_read_status",
+            "post_read_status", "confirmation_post_read_status",
+            "content_post_read_status", "authorization_by",
+            "authorization_reference", "writer_error",
+        )
+        if any(
+            original[name] != final[name] or wire[name] != final[name]
+            for name in immutable
+        ):
+            return False
+        if any(
+            original[name] != final[name]
+            for name in (
+                "post_snapshot_json", "confirmation_post_snapshot_json",
+                "content_post_snapshot_json",
+            )
+        ):
+            return False
+        if (
+            wire["completed_at"] != final["completed_at"]
+            or wire["media_post_read_status"] != final["media_post_read_status"]
+        ):
+            return False
+
+        try:
+            def canonical_time(raw: object) -> datetime:
+                if type(raw) is not str or not 1 <= len(raw) <= 80:
+                    raise ValueError("receipt timestamp invalid")
+                value = datetime.fromisoformat(raw)
+                if value.utcoffset() is None or value.isoformat() != raw:
+                    raise ValueError("receipt timestamp not canonical")
+                return value
+
+            started = canonical_time(original["started_at"])
+            checkpoint_done = canonical_time(original["completed_at"])
+            final_done = canonical_time(final["completed_at"])
+            return started <= checkpoint_done <= final_done
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def record_write_recovery_clearance(
+        self, *, idempotency_key: str, request_sha256: str,
+        verification_kind: str, evidence_reference: str, observed_at: datetime,
+    ) -> None:
+        """Append an operation-bound clearance after independent readback.
+
+        This trusted local method does not itself access the external platform.
+        The caller must have independently established the outcome before
+        passing its specific evidence reference. It is never exposed as a
+        Write API route or used to authorize an automatic browser retry.
+        """
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValueError("idempotency key is required")
+        if (
+            not isinstance(request_sha256, str)
+            or len(request_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in request_sha256)
+        ):
+            raise ValueError("exact request fingerprint is required")
+        if verification_kind not in {
+            "media_submit_reconciled", "operator_verified_postread",
+        }:
+            raise ValueError("independent verification kind is required")
+        if (
+            not isinstance(evidence_reference, str)
+            or not 1 <= len(evidence_reference.strip()) <= 256
+            or any(ch in evidence_reference for ch in "\r\n\x00")
+        ):
+            raise ValueError("independent evidence reference is required")
+        timestamp = _sync_time(observed_at)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_store_schema(connection)
+            row = connection.execute(
+                """
+                SELECT request_sha256, state, execution_started_at,
+                       response_status, response_json FROM write_api_requests
+                WHERE idempotency_key = ?
+                """, (idempotency_key,),
+            ).fetchone()
+            if row is None or row["request_sha256"] != request_sha256:
+                raise ValueError("write recovery operation binding mismatch")
+            if row["execution_started_at"] is None:
+                raise ValueError("write recovery was never executed")
+            if (
+                row["state"] == "completed"
+                and row["response_status"] == 202
+                and row["response_json"] == self._unverified_write_api_response(
+                    idempotency_key
+                )
+            ):
+                # The executor cannot use the in-process media observation
+                # path to clear a fixed owner UNKNOWN. Only a separate,
+                # independently authorized operator may later reconcile it.
+                if verification_kind != "operator_verified_postread":
+                    raise ValueError("unknown write requires independent operator")
+            elif row["state"] == "completed":
+                try:
+                    response = json.loads(row["response_json"])
+                    if not isinstance(response, dict):
+                        raise ValueError("invalid response")
+                    if not isinstance(response.get("media_persistence_confirmed"), bool):
+                        raise ValueError("not a media response")
+                    receipt = response.get("operation_receipt")
+                    # A confirmed core Create can have an unconfirmed media
+                    # post-read. The durable before-media checkpoint remains
+                    # a fence until independent operator evidence reconciles
+                    # this exact started, completed Write. Executor-side media
+                    # observations may never issue this kind of clearance.
+                    operator_reconciled_core = (
+                        verification_kind == "operator_verified_postread"
+                        and response["media_persistence_confirmed"] is False
+                        and isinstance(receipt, dict)
+                        and receipt.get("operation") == "create"
+                        and receipt.get("outcome") == "confirmed"
+                        and receipt.get("writer_invoked") is True
+                        and receipt.get("media_post_read_status") in {
+                            "not_read", "verifier_unavailable", "mismatch", "unknown",
+                        }
+                        and type(receipt.get("created_ad_id")) is str
+                        and bool(receipt["created_ad_id"].strip())
+                        and receipt.get("authorization_reference")
+                            == "write-api:" + idempotency_key
+                        and self._original_unsettled_media_checkpoint(
+                            connection, idempotency_key=idempotency_key,
+                            operation_receipt=receipt,
+                        )
+                    )
+                    unresolved = (
+                        receipt is None
+                        or (
+                            isinstance(receipt, dict)
+                            and receipt.get("writer_invoked") is True
+                            and receipt.get("outcome") == "ambiguous"
+                        )
+                        or operator_reconciled_core
+                    )
+                except (TypeError, ValueError):
+                    unresolved = False
+                if not unresolved:
+                    raise ValueError("write recovery has no ambiguous media outcome")
+            elif row["state"] != "in_progress":
+                raise ValueError("write recovery state is invalid")
+
+            existing = connection.execute(
+                "SELECT 1 FROM write_recovery_clearances "
+                "WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("write recovery operation already cleared")
+            connection.execute(
+                """
+                INSERT INTO write_recovery_clearances (
+                    idempotency_key, request_sha256, observed_at,
+                    verification_kind, evidence_reference
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    idempotency_key, request_sha256, timestamp,
+                    verification_kind, evidence_reference.strip(),
+                ),
+            )
+            connection.commit()
+
+    def has_write_recovery_clearance(
+        self, *, idempotency_key: str, request_sha256: str,
+    ) -> bool:
+        """Check an exact persisted operation clearance, never infer one."""
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            return False
+        if (
+            not isinstance(request_sha256, str)
+            or len(request_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in request_sha256)
+        ):
+            return False
+        with closing(self._connect()) as connection:
+            return connection.execute(
+                """
+                SELECT 1 FROM write_recovery_clearances AS c
+                JOIN write_api_requests AS w
+                  ON w.idempotency_key = c.idempotency_key
+                 AND w.request_sha256 = c.request_sha256
+                WHERE c.idempotency_key = ?
+                  AND c.request_sha256 = ?
+                  AND w.execution_started_at IS NOT NULL
+                LIMIT 1
+                """,
+                (idempotency_key, request_sha256),
+            ).fetchone() is not None
+
     def claim_write_api_request(
         self,
         *,
@@ -1582,6 +2139,7 @@ class SnapshotStore:
         request_sha256: str,
         claim_owner: str,
         execution_started_at: datetime,
+        strict_owner_fence: bool = False,
     ) -> WriteApiRequestRecord:
         owner = _validated_write_api_claim_owner(claim_owner)
         if (
@@ -1613,6 +2171,56 @@ class SnapshotStore:
                 raise ValueError("write API request is owned by another runtime")
             if record.execution_started_at is not None:
                 raise ValueError("write API request execution already started")
+
+            # The independent owner must not admit a second externally
+            # effectful Begin while any earlier owner-constructed UNKNOWN is
+            # still unresolved. This test and the Begin update share the same
+            # BEGIN IMMEDIATE transaction, including with concurrent
+            # quarantine and trusted operator-clearance commits.
+            #
+            # Only the canonical owner-fixed error envelope is a candidate:
+            # unrelated valid HTTP 202 receipts (including an idempotency key
+            # named write_outcome_unverified) must never be misclassified.
+            if connection.execute(
+                """
+                SELECT 1 FROM write_api_requests AS prior
+                LEFT JOIN write_recovery_clearances AS cleared
+                  ON cleared.idempotency_key = prior.idempotency_key
+                 AND cleared.request_sha256 = prior.request_sha256
+                WHERE prior.idempotency_key != ?
+                  AND prior.state = 'completed'
+                  AND prior.response_status = 202
+                  AND prior.execution_started_at IS NOT NULL
+                  AND cleared.idempotency_key IS NULL
+                  AND substr(
+                    prior.response_json, 1,
+                    length('{"error":"write_outcome_unverified",')
+                  ) = '{"error":"write_outcome_unverified",'
+                LIMIT 1
+                """, (idempotency_key,),
+            ).fetchone() is not None:
+                raise ValueError("unresolved owner write quarantine blocks Begin")
+
+            # The untrusted browser executor may crash or deliberately omit
+            # quarantine_started after Begin. For the independent owner,
+            # a still-in-progress earlier execution is already UNKNOWN.
+            # Keep this opt-in: legacy SnapshotStore callers currently support
+            # concurrent non-Create actions until the owner cutover is complete.
+            # Both checks and the new Begin remain one IMMEDIATE transaction.
+            if strict_owner_fence and connection.execute(
+                """
+                SELECT 1 FROM write_api_requests AS prior
+                LEFT JOIN write_recovery_clearances AS cleared
+                  ON cleared.idempotency_key = prior.idempotency_key
+                 AND cleared.request_sha256 = prior.request_sha256
+                WHERE prior.idempotency_key != ?
+                  AND prior.state = 'in_progress'
+                  AND prior.execution_started_at IS NOT NULL
+                  AND cleared.idempotency_key IS NULL
+                LIMIT 1
+                """, (idempotency_key,),
+            ).fetchone() is not None:
+                raise ValueError("unresolved started owner write blocks Begin")
 
             updated = connection.execute(
                 """
@@ -1647,6 +2255,130 @@ class SnapshotStore:
             ).fetchone()
             assert row is not None
             return self._write_api_request_record(row)
+
+    def cancel_unstarted_write_api_request(
+        self,
+        *,
+        idempotency_key: str,
+        request_sha256: str,
+        claim_owner: str,
+        cancelled_at: datetime,
+    ) -> WriteApiRequestRecord:
+        """Retire only an exact claim that never crossed the owner Begin gate.
+
+        This is NOT external platform reconciliation, a write success or retry
+        authorization. The owner constructs the entire immutable failure
+        response; neither a browser executor nor an RPC client chooses its
+        status or contents. Historical started operations remain untouched.
+        """
+        if (
+            not isinstance(idempotency_key, str) or not idempotency_key
+            or not isinstance(request_sha256, str)
+            or len(request_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in request_sha256)
+        ):
+            raise ValueError("exact write claim identity required")
+        owner = _validated_write_api_claim_owner(claim_owner)
+        if (
+            not isinstance(cancelled_at, datetime)
+            or cancelled_at.tzinfo is None
+            or cancelled_at.utcoffset() is None
+        ):
+            raise ValueError("cancelled_at must be timezone-aware")
+        response_json = json.dumps(
+            {
+                "error": "write_claim_cancelled_before_begin",
+                "idempotency_key": idempotency_key,
+                "platform_retry_authorized": False,
+            },
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_store_schema(connection)
+            row = connection.execute(
+                """
+                SELECT idempotency_key, request_sha256, state, requested_at,
+                       claim_owner, execution_started_at, completed_at,
+                       response_status, response_json
+                FROM write_api_requests
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("write API claim is absent")
+            record = self._write_api_request_record(row)
+            if (
+                record.request_sha256 != request_sha256
+                or record.claim_owner != owner
+            ):
+                raise ValueError("write API claim binding mismatch")
+            if record.execution_started_at is not None:
+                raise ValueError("begun write cannot be cancelled")
+            if record.state == "completed":
+                if (
+                    record.response_status == 409
+                    and record.response_json == response_json
+                ):
+                    return record
+                raise ValueError("write API claim has another terminal outcome")
+            if record.state != "in_progress":
+                raise ValueError("write API claim state invalid")
+            changed = connection.execute(
+                """
+                UPDATE write_api_requests
+                SET state='completed', completed_at=?,
+                    response_status=409, response_json=?
+                WHERE idempotency_key=? AND request_sha256=?
+                  AND claim_owner=? AND state='in_progress'
+                  AND execution_started_at IS NULL
+                """,
+                (
+                    cancelled_at.isoformat(), response_json, idempotency_key,
+                    request_sha256, owner,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("unstarted claim cancellation lost binding")
+            row = connection.execute(
+                """
+                SELECT idempotency_key, request_sha256, state, requested_at,
+                       claim_owner, execution_started_at, completed_at,
+                       response_status, response_json
+                FROM write_api_requests
+                WHERE idempotency_key=?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            assert row is not None
+            return self._write_api_request_record(row)
+
+    @staticmethod
+    def _unverified_write_api_response(key: str) -> str:
+        return json.dumps({
+            "error": "write_outcome_unverified",
+            "idempotency_key": key,
+            "platform_retry_authorized": False,
+        }, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+    def quarantine_started_write_api_request(
+        self, *, idempotency_key: str, request_sha256: str,
+        claim_owner: str, quarantined_at: datetime,
+    ) -> WriteApiRequestRecord:
+        """Persist owner-constructed UNKNOWN only after a bound Begin.
+
+        No executor-selectable response, success, clearance or retry right.
+        A lost reply requires readback of the original persisted operation.
+        """
+        return self.complete_write_api_request(
+            idempotency_key=idempotency_key,
+            request_sha256=request_sha256,
+            claim_owner=claim_owner,
+            response_status=202,
+            response_json=self._unverified_write_api_response(idempotency_key),
+            completed_at=quarantined_at,
+        )
 
     def complete_write_api_request(
         self,
@@ -1744,30 +2476,95 @@ class SnapshotStore:
             return self._write_api_request_record(row)
 
     @staticmethod
+    def _required_dashboard_pending_key(value: object) -> str:
+        if (
+            type(value) is not str or not 1 <= len(value) <= 128
+            or any(character.isspace() for character in value)
+        ):
+            raise sqlite3.DatabaseError("invalid dashboard pending key")
+        return value
+
+    @classmethod
+    def _assert_native_dashboard_pending_keys(
+        cls, connection: sqlite3.Connection,
+    ) -> None:
+        """Reject hidden native SQLite keys before any keyed read or ACK.
+
+        All three identities have canonical BINARY unique autoindexes. Native
+        NULL/numbers sort below TEXT, BLOB above. Their indexed extrema detect
+        type-class corruption even if WHERE or a page cursor hides the row.
+        The probes and following read/write share the same SQLite snapshot.
+        """
+        if not connection.in_transaction:
+            connection.execute("BEGIN")
+        for position, name in enumerate(
+            ("scope", "resource_key", "idempotency_key"), start=1,
+        ):
+            index = f"sqlite_autoindex_dashboard_pending_writes_{position}"
+            columns = [
+                (row["name"], row["coll"], row["desc"])
+                for row in connection.execute(f"PRAGMA index_xinfo({index})")
+                if row["key"]
+            ]
+            if columns != [(name, "BINARY", 0)]:
+                raise sqlite3.DatabaseError("invalid dashboard pending identity index")
+            for direction in ("ASC", "DESC"):
+                row = connection.execute(
+                    f"SELECT {name} FROM dashboard_pending_writes "
+                    f"INDEXED BY {index} ORDER BY {name} {direction} LIMIT 1"
+                ).fetchone()
+                if row is not None:
+                    cls._required_dashboard_pending_key(row[name])
+
+    @staticmethod
     def _dashboard_pending_write_record(
         row: sqlite3.Row,
     ) -> DashboardPendingWrite:
+        scope = SnapshotStore._required_dashboard_pending_key(row["scope"])
+        resource_key = SnapshotStore._required_dashboard_pending_key(
+            row["resource_key"]
+        )
+        key = SnapshotStore._required_dashboard_pending_key(
+            row["idempotency_key"]
+        )
+        method, path = row["method"], row["path"]
+        payload, ad_id, acknowledged = (
+            row["payload_json"], row["ad_id"], row["acknowledged"],
+        )
+        if type(method) is not str or method not in {"POST", "PATCH", "DELETE"}:
+            raise sqlite3.DatabaseError("invalid stored dashboard pending method")
+        if (
+            type(path) is not str or not 1 <= len(path) <= 512
+            or not path.startswith("/api/write/")
+            or any(character.isspace() for character in path)
+            or "?" in path or "#" in path
+        ):
+            raise sqlite3.DatabaseError("invalid stored dashboard pending path")
+        if payload is not None:
+            if type(payload) is not str or len(payload) > 64 * 1024:
+                raise sqlite3.DatabaseError("invalid stored dashboard pending body")
+            try:
+                strict_json_object(payload.encode("utf-8"))
+            except (UnicodeError, ValueError):
+                raise sqlite3.DatabaseError(
+                    "invalid stored dashboard pending body"
+                ) from None
+        if ad_id is not None and (
+            type(ad_id) is not str or not 1 <= len(ad_id) <= 32
+            or not ad_id.isascii() or not ad_id.isdigit()
+        ):
+            raise sqlite3.DatabaseError("invalid stored dashboard pending ad ID")
+        if type(acknowledged) is not int or acknowledged not in (0, 1):
+            raise sqlite3.DatabaseError("invalid stored dashboard pending ACK")
         return DashboardPendingWrite(
-            scope=str(row["scope"]),
-            resource_key=str(row["resource_key"]),
-            idempotency_key=str(row["idempotency_key"]),
-            method=str(row["method"]),
-            path=str(row["path"]),
-            payload_json=(
-                str(row["payload_json"])
-                if row["payload_json"] is not None
-                else None
-            ),
-            ad_id=(
-                str(row["ad_id"])
-                if row["ad_id"] is not None
-                else None
-            ),
-            acknowledged=bool(row["acknowledged"]),
+            scope=scope, resource_key=resource_key, idempotency_key=key,
+            method=method, path=path, payload_json=payload, ad_id=ad_id,
+            acknowledged=bool(acknowledged),
         )
 
     def dashboard_pending_writes(self) -> tuple[DashboardPendingWrite, ...]:
         with self._connect() as connection:
+            self._assert_native_dashboard_pending_keys(connection)
             rows = connection.execute(
                 """
                 SELECT scope, resource_key, idempotency_key, method, path,
@@ -1779,6 +2576,40 @@ class SnapshotStore:
         return tuple(
             self._dashboard_pending_write_record(row)
             for row in rows
+        )
+
+    def dashboard_pending_writes_page(
+        self, *, after: str = "", limit: int = 16,
+    ) -> tuple[tuple[DashboardPendingWrite, ...], bool]:
+        """Bound pending-write reads without granting recovery-clearance authority.
+
+        This is a read-only advisory view, not a witness or clearance.
+        Concurrent insertions/deletions may affect later pages.
+        """
+        if (
+            type(after) is not str or len(after) > 128
+            or any(character.isspace() for character in after)
+        ):
+            raise ValueError("invalid pending-write cursor")
+        if type(limit) is not int or not 1 <= limit <= 16:
+            raise ValueError("invalid pending-write page capacity")
+        with self._connect() as connection:
+            self._assert_native_dashboard_pending_keys(connection)
+            rows = connection.execute(
+                """
+                SELECT scope, resource_key, idempotency_key, method, path,
+                       payload_json, ad_id, acknowledged
+                FROM dashboard_pending_writes
+                WHERE scope > ?
+                ORDER BY scope
+                LIMIT ?
+                """,
+                (after, limit + 1),
+            ).fetchall()
+        return (
+            tuple(self._dashboard_pending_write_record(row)
+                  for row in rows[:limit]),
+            len(rows) > limit,
         )
 
     def claim_dashboard_pending_write(
@@ -1810,14 +2641,15 @@ class SnapshotStore:
         if not path.startswith("/api/write/") or "?" in path or "#" in path:
             raise ValueError("path is invalid")
         if payload_json is not None:
-            if not isinstance(payload_json, str) or len(payload_json) > 64 * 1024:
+            if type(payload_json) is not str or len(payload_json) > 64 * 1024:
                 raise ValueError("payload_json is invalid")
             try:
-                payload = json.loads(payload_json)
-            except json.JSONDecodeError as exc:
-                raise ValueError("payload_json is invalid") from exc
-            if not isinstance(payload, dict):
-                raise ValueError("payload_json is invalid")
+                # Admit only payloads the recovery reader can independently
+                # decode: duplicate members, nonfinite values, surrogate
+                # codepoints and excess nesting cannot poison a durable fence.
+                strict_json_object(payload_json.encode("utf-8"))
+            except (UnicodeError, ValueError):
+                raise ValueError("payload_json is invalid") from None
         if ad_id is not None and (
             not isinstance(ad_id, str)
             or not ad_id
@@ -1840,6 +2672,7 @@ class SnapshotStore:
         with self.dashboard_pending_write_guard(), self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._validate_store_schema(connection)
+            self._assert_native_dashboard_pending_keys(connection)
             rows = connection.execute(
                 """
                 SELECT scope, resource_key, idempotency_key, method, path,
@@ -1891,9 +2724,11 @@ class SnapshotStore:
             raise ValueError("idempotency_key is invalid")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._assert_native_dashboard_pending_keys(connection)
             row = connection.execute(
                 """
-                SELECT idempotency_key, acknowledged
+                SELECT scope, resource_key, idempotency_key, method, path,
+                       payload_json, ad_id, acknowledged
                 FROM dashboard_pending_writes
                 WHERE scope = ?
                 """,
@@ -1901,11 +2736,12 @@ class SnapshotStore:
             ).fetchone()
             if row is None:
                 return "missing"
-            if str(row["idempotency_key"]) != idempotency_key:
+            record = self._dashboard_pending_write_record(row)
+            if record.idempotency_key != idempotency_key:
                 raise ValueError(
                     "dashboard pending write conflicts with existing recovery state"
                 )
-            if not bool(row["acknowledged"]):
+            if not record.acknowledged:
                 updated = connection.execute(
                     """
                     UPDATE dashboard_pending_writes
@@ -1936,15 +2772,34 @@ class SnapshotStore:
                 )
             return "finalized"
 
-    def begin_sync_attempt(self, *, source: str, started_at: datetime) -> int:
-        """Record intent durably before any owner-inventory network read."""
+    def begin_sync_attempt(
+        self, *, source: str, started_at: datetime,
+        require_no_unresolved: bool = False,
+    ) -> int:
+        """Journal intent; the isolated owner also fences *older* open attempts.
+
+        BEGIN IMMEDIATE makes the unresolved-attempt check and insertion one
+        serialized SQLite transaction across owner generations/processes.
+        Historical local import callers retain their existing journal contract.
+        An open attempt is never silently settled or cleared by a new read.
+        """
         if not isinstance(source, str) or not source.strip():
             raise ValueError("sync source must not be empty")
+        if type(require_no_unresolved) is not bool:
+            raise TypeError("sync recovery fence flag must be bool")
+        started = _sync_time(started_at)
         with self._connect() as connection:
+            if require_no_unresolved:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM sync_attempts "
+                    "WHERE outcome='in_progress' LIMIT 1"
+                ).fetchone() is not None:
+                    raise RuntimeError("unresolved inventory sync requires reconciliation")
             record = connection.execute(
                 "INSERT INTO sync_attempts (source, started_at, outcome) "
                 "VALUES (?, ?, 'in_progress')",
-                (source, _sync_time(started_at)),
+                (source, started),
             )
             if record.lastrowid is None:
                 raise sqlite3.DatabaseError("sync attempt insert failed")
@@ -2033,6 +2888,9 @@ class SnapshotStore:
                 "WHERE outcome IN ('success_empty', 'success_nonempty') "
                 "ORDER BY completed_at DESC, id DESC LIMIT 1"
             ).fetchone()
+            # Do not claim a newer success if any older open recovery
+            # row is malformed, even when the oldest such row is valid.
+            _unresolved_sync_attempt_summary(connection)
         latest_item = _sync_attempt_from_row(latest) if latest is not None else None
         success_item = (
             _sync_attempt_from_row(successful) if successful is not None else None
@@ -2041,6 +2899,21 @@ class SnapshotStore:
             "state": latest_item.outcome if latest_item is not None else "never_attempted",
             "latest_attempt": _sync_attempt_to_dict(latest_item),
             "last_successful_attempt": _sync_attempt_to_dict(success_item),
+        }
+
+    def sync_recovery_status(self) -> dict[str, object]:
+        """Read every unresolved sync generation, not only the latest start.
+
+        A completed newer attempt cannot conceal an older in_progress journal
+        row. Count and oldest record come from one SQLite read transaction.
+        This method never settles, replays, authorizes or clears an attempt.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            count, oldest = _unresolved_sync_attempt_summary(connection)
+        return {
+            "unresolved_count": count,
+            "oldest_unresolved_attempt": _sync_attempt_to_dict(oldest),
         }
 
     def append_inventory_result(
@@ -2173,6 +3046,62 @@ class SnapshotStore:
             )
         except (TypeError, ValueError, OverflowError) as exc:
             raise sqlite3.DatabaseError("invalid ad snapshot data") from exc
+    def ad_history_page(
+        self, ad_id: str, *, after_id: int, watermark: int | None,
+        limit: int = 16,
+    ) -> tuple[int, tuple[tuple[int, AdSnapshot], ...], bool]:
+        """Read one bounded append-only observation page in insertion order.
+
+        The high-water mark is pinned on the first page in the same SQLite
+        read transaction. Later appends cannot change this logical snapshot;
+        the consumer sorts the pinned rows by (actual instant, insertion ID).
+        No caller-supplied SQL, table name or unlimited LIMIT is accepted.
+        """
+        if not isinstance(ad_id, str) or not ad_id.strip():
+            raise ValueError("ad history ID is invalid")
+        if (type(after_id) is not int or not 0 <= after_id <= 2**63 - 1
+                or type(limit) is not int or not 1 <= limit <= 32
+                or (watermark is not None and (
+                    type(watermark) is not int
+                    or not 0 <= watermark <= 2**63 - 1
+                    or watermark < after_id
+                ))):
+            raise ValueError("ad history page cursor is invalid")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            if watermark is None:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS bound "
+                    "FROM ad_snapshots WHERE ad_id = ?", (ad_id,),
+                ).fetchone()
+                assert row is not None
+                watermark = int(row["bound"])
+            rows = conn.execute(
+                """SELECT id, ad_id, observed_at, source, lifecycle_state,
+                          title, description, views, watch_count, reply_count,
+                          metric_source
+                   FROM ad_snapshots
+                   WHERE ad_id = ? AND id > ? AND id <= ?
+                   ORDER BY id ASC LIMIT ?""",
+                (ad_id, after_id, watermark, limit + 1),
+            ).fetchall()
+        more = len(rows) > limit
+        page = tuple(
+            (
+                int(row["id"]),
+                AdSnapshot(
+                    ad_id=row["ad_id"],
+                    observed_at=datetime.fromisoformat(row["observed_at"]),
+                    source=row["source"], metric_source=row["metric_source"],
+                    lifecycle_state=LifecycleState(row["lifecycle_state"]),
+                    title=row["title"], description=row["description"],
+                    views=row["views"], watch_count=row["watch_count"],
+                    reply_count=row["reply_count"],
+                ),
+            )
+            for row in rows[:limit]
+        )
+        return watermark, page, more
 
     def ad_history(self, ad_id: str) -> tuple[AdSnapshot, ...]:
         """Return observations by actual instant, then insertion ID for ties."""
@@ -2427,6 +3356,66 @@ class SnapshotStore:
             raise sqlite3.DatabaseError("invalid observation counter")
         return value
 
+    def reaction_history_page(
+        self, ad_id: str, *, after_id: int, watermark: int | None,
+        limit: int = 16,
+    ) -> tuple[int, tuple[tuple[int, ReactionSnapshot], ...], bool]:
+        """Read one bounded immutable-generation reaction page in insertion order.
+
+        The first page pins MAX(id) inside its read transaction. Later appends
+        cannot enter this generation; no caller-supplied SQL is evaluated.
+        """
+        if not isinstance(ad_id, str) or not ad_id.strip():
+            raise ValueError("reaction history ID is invalid")
+        if (type(after_id) is not int or not 0 <= after_id <= 2**63 - 1
+                or type(limit) is not int or not 1 <= limit <= 32
+                or (watermark is not None and (
+                    type(watermark) is not int
+                    or not 0 <= watermark <= 2**63 - 1
+                    or watermark < after_id
+                ))):
+            raise ValueError("reaction history page cursor is invalid")
+        with closing(self._connect()) as conn:
+            self._assert_native_history_ad_ids(conn, "reaction_snapshots")
+            if watermark is None:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS bound "
+                    "FROM reaction_snapshots WHERE ad_id = ?", (ad_id,),
+                ).fetchone()
+                assert row is not None
+                watermark = int(row["bound"])
+            rows = conn.execute(
+                """SELECT id, ad_id, observed_at, source,
+                          conversation_count, unique_buyer_count,
+                          inbound_message_count
+                   FROM reaction_snapshots
+                   WHERE ad_id = ? AND id > ? AND id <= ?
+                   ORDER BY id ASC LIMIT ?""",
+                (ad_id, after_id, watermark, limit + 1),
+            ).fetchall()
+        more = len(rows) > limit
+        try:
+            page = tuple((
+                self._history_row_id(row["id"]),
+                ReactionSnapshot(
+                    ad_id=self._required_observation_ad_id(row["ad_id"]),
+                    observed_at=self._observed_history_time(row["observed_at"]),
+                    source=self._required_observation_text(row["source"]),
+                    conversation_count=self._history_nonnegative_count(
+                        row["conversation_count"]
+                    ),
+                    unique_buyer_count=self._history_nonnegative_count(
+                        row["unique_buyer_count"]
+                    ),
+                    inbound_message_count=self._history_nonnegative_count(
+                        row["inbound_message_count"]
+                    ),
+                ),
+            ) for row in rows[:limit])
+        except (TypeError, ValueError, OverflowError):
+            raise sqlite3.DatabaseError("invalid reaction history page") from None
+        return watermark, page, more
+
     def reaction_history(self, ad_id: str) -> tuple[ReactionSnapshot, ...]:
         with self._connect() as connection:
             self._assert_native_history_ad_ids(connection, "reaction_snapshots")
@@ -2461,6 +3450,91 @@ class SnapshotStore:
             )
         except (ValueError, TypeError, OverflowError):
             raise sqlite3.DatabaseError("invalid reaction history") from None
+
+    def inbound_message_page(
+        self, ad_id: str, *, after_id: int, watermark: int | None,
+        limit: int = 16,
+    ) -> tuple[int, tuple[tuple[int, InboundMessageEvent], ...], bool]:
+        """Bounded immutable-generation inbox read ordered by insertion id."""
+        if not isinstance(ad_id, str) or not ad_id.strip() or len(ad_id) > 160:
+            raise ValueError("inbound history ID is invalid")
+        if (type(after_id) is not int or not 0 <= after_id <= 2**63 - 1
+                or type(limit) is not int or not 1 <= limit <= 32
+                or (watermark is not None and (
+                    type(watermark) is not int
+                    or not 0 <= watermark <= 2**63 - 1
+                    or watermark < after_id
+                ))):
+            raise ValueError("inbound history page cursor is invalid")
+        with closing(self._connect()) as connection:
+            self._assert_native_history_ad_ids(connection, "inbound_message_events")
+            if watermark is None:
+                row = connection.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS bound "
+                    "FROM inbound_message_events WHERE ad_id = ?", (ad_id,),
+                ).fetchone()
+                assert row is not None
+                watermark = int(row["bound"])
+            rows = connection.execute(
+                """SELECT id, ad_id, conversation_id, provider_message_id,
+                          observed_at, source
+                   FROM inbound_message_events
+                   WHERE ad_id = ? AND id > ? AND id <= ?
+                   ORDER BY id ASC LIMIT ?""",
+                (ad_id, after_id, watermark, limit + 1),
+            ).fetchall()
+        more = len(rows) > limit
+        try:
+            page = tuple((
+                self._history_row_id(row["id"]),
+                InboundMessageEvent(
+                    ad_id=self._required_observation_ad_id(row["ad_id"]),
+                    conversation_id=self._required_observation_text(
+                        row["conversation_id"]
+                    ),
+                    provider_message_id=self._required_observation_text(
+                        row["provider_message_id"]
+                    ),
+                    observed_at=self._observed_history_time(row["observed_at"]),
+                    source=self._required_observation_text(row["source"]),
+                ),
+            ) for row in rows[:limit])
+        except (TypeError, ValueError, OverflowError):
+            raise sqlite3.DatabaseError("invalid inbound history page") from None
+        return watermark, page, more
+
+    def inbound_message_ad_ids_page(
+        self, *, after: str, watermark: int | None,
+        limit: int = 64,
+    ) -> tuple[int, tuple[str, ...], bool]:
+        """List imported email-only and tracked IDs with a pinned generation."""
+        if (type(after) is not str or len(after) > 160
+                or (after and not after.strip())
+                or type(limit) is not int or not 1 <= limit <= 64
+                or (watermark is not None and (
+                    type(watermark) is not int
+                    or not 0 <= watermark <= 2**63 - 1
+                ))):
+            raise ValueError("inbound ad-ID page cursor is invalid")
+        with closing(self._connect()) as connection:
+            self._assert_native_history_ad_ids(connection, "inbound_message_events")
+            if watermark is None:
+                row = connection.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS bound FROM inbound_message_events",
+                ).fetchone()
+                assert row is not None
+                watermark = int(row["bound"])
+            rows = connection.execute(
+                """SELECT DISTINCT ad_id
+                   FROM inbound_message_events
+                   WHERE id <= ? AND ad_id > ?
+                   ORDER BY ad_id ASC LIMIT ?""",
+                (watermark, after, limit + 1),
+            ).fetchall()
+        return watermark, tuple(
+            self._required_observation_ad_id(row["ad_id"])
+            for row in rows[:limit]
+        ), len(rows) > limit
 
     def inbound_message_history(
         self,
@@ -2577,6 +3651,52 @@ class SnapshotStore:
                 for observed_at, _, row in ordered_rows
             )
         except (ValueError, TypeError, OverflowError):
+            raise sqlite3.DatabaseError("invalid classification history") from None
+
+    def latest_classification_bounded(
+        self, ad_id: str, *, max_records: int = 200000,
+    ) -> AdClassification | None:
+        """Select latest real observation instant in bounded constant memory.
+
+        This yields the same (observed_at, insertion-ID) winner as the existing
+        classification_history sort without materializing arbitrary history.
+        """
+        if (type(ad_id) is not str or not ad_id.strip() or len(ad_id) > 160
+                or type(max_records) is not int or not 1 <= max_records <= 200000):
+            raise ValueError("classification lookup bound is invalid")
+        selected: sqlite3.Row | None = None
+        selected_key: tuple[datetime, int] | None = None
+        with closing(self._connect()) as connection:
+            self._assert_native_history_ad_ids(connection, "ad_classifications")
+            cursor = connection.execute(
+                """SELECT id, ad_id, observed_at, source, image_type, city,
+                          text_type, title_type
+                   FROM ad_classifications WHERE ad_id = ?
+                   ORDER BY id ASC""", (ad_id,),
+            )
+            for count, row in enumerate(cursor, start=1):
+                if count > max_records:
+                    raise ValueError("classification history capacity exceeded")
+                try:
+                    when = self._observed_history_time(row["observed_at"])
+                    key = when, self._history_row_id(row["id"])
+                    if selected_key is None or key > selected_key:
+                        selected, selected_key = row, key
+                except (TypeError, ValueError, OverflowError):
+                    raise sqlite3.DatabaseError("invalid classification history") from None
+        if selected is None:
+            return None
+        try:
+            return AdClassification(
+                ad_id=self._required_observation_ad_id(selected["ad_id"]),
+                observed_at=self._observed_history_time(selected["observed_at"]),
+                source=self._required_observation_text(selected["source"]),
+                image_type=self._optional_observation_text(selected["image_type"]),
+                city=self._optional_observation_text(selected["city"]),
+                text_type=self._optional_observation_text(selected["text_type"]),
+                title_type=self._optional_observation_text(selected["title_type"]),
+            )
+        except (TypeError, ValueError, OverflowError):
             raise sqlite3.DatabaseError("invalid classification history") from None
 
     def latest_classification(self, ad_id: str) -> AdClassification | None:

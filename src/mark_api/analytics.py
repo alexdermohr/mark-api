@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from .domain import LifecycleState
 from .query import AdView, MarkQueryService, MetricEvidence, metric_evidence_to_dict
 from .storage import SnapshotStore
+from .storage_owner import StorageOwnerClient
 
 
 ANALYTICS_DIMENSIONS = (
@@ -95,7 +96,7 @@ class AnalyticsService:
 
     def __init__(
         self,
-        store: SnapshotStore,
+        store: SnapshotStore | StorageOwnerClient,
         *,
         contract: AnalyticsContract | None = None,
     ) -> None:

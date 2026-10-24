@@ -33,6 +33,8 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/mark-wheels"
           python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/mark-wheels" .
+          python -m pip download --only-binary=:all: --dest "$RUNNER_TEMP/mark-wheels" \
+            'websocket-client>=1.8,<2' 'Pillow>=10.4,<13'
       - name: Exercise installed distribution and denied platform writes
         shell: bash
         run: |
@@ -66,3 +68,118 @@ jobs:
           grep -Eq '^Ran 1 test in [0-9.]+' "$report"
           grep -Eq '^OK$' "$report"
           grep -Fq '"result": "PASS"' "$report"
+      - name: Installed independent A6 media and non-media UID acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=( "$RUNNER_TEMP"/mark-wheels/kleinanzeiger-*.whl )
+          test "${#wheels[@]}" -eq 1
+          python_bin="$(command -v python)"
+          host_net="$(readlink /proc/self/ns/net)"
+          host_pid="$(readlink /proc/self/ns/pid)"
+          # This directory is newly created on a disposable hosted runner.
+          # No users/accounts, shared Docker daemon or host services are changed.
+          isolated="$(sudo -n mktemp -d /tmp/kleinanzeiger-a6-wheel-XXXXXXXX)"
+          [[ "$isolated" == /tmp/kleinanzeiger-a6-wheel-* ]]
+          trap 'sudo -n rm -rf -- "$isolated"' EXIT
+          sudo -n chmod 0755 "$isolated"
+          sudo -n "$python_bin" -m venv "$isolated/venv"
+          sudo -n "$isolated/venv/bin/python" -m pip install --no-index --no-deps "${wheels[0]}"
+          sudo -n install -o root -g root -m 0444 tests/a6_completion_uid_acceptance.py "$isolated/acceptance.py"
+          report="$RUNNER_TEMP/kleinanzeiger-a6-uid-e2e.log"
+          sudo -n unshare --net --pid --fork --mount-proc -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            exec "$1/venv/bin/python" -I "$1/acceptance.py" --host-net "$2" --host-pid "$3"
+          ' bash "$isolated" "$host_net" "$host_pid" 2>&1 | tee "$report"
+          grep -Fq '"result":"PASS"' "$report"
+          grep -Fq '"scope":"installed-a6-independent-media-nonmedia-uid-composition"' "$report"
+          grep -Fq '"installed_witness_cli":true' "$report"
+          grep -Fq '"protected_actor_inventory_sync":true' "$report"
+          grep -Fq '"protected_media_create":true' "$report"
+          grep -Fq '"protected_media_independent_postread":true' "$report"
+          grep -Fq '"protected_media_unknown_fenced":true' "$report"
+          grep -Fq '"sigkill_media_actor_after_submit":true' "$report"
+          grep -Fq '"sigkill_media_owner_after_submit":true' "$report"
+          grep -Fq '"sigterm_media_owner_inflight_drained":true' "$report"
+          grep -Fq '"media_release_attested":false' "$report"
+          grep -Fq '"host_cutover_attested":false' "$report"
+      - name: Installed native protected fresh start and restart
+        if: matrix.python_version == '3.12'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=( "$RUNNER_TEMP"/mark-wheels/kleinanzeiger-*.whl )
+          test "${#wheels[@]}" -eq 1
+          python_bin="$(command -v python)"
+          host_net="$(readlink /proc/self/ns/net)"
+          host_pid="$(readlink /proc/self/ns/pid)"
+          # Only disposable root-owned state and a test-only loopback CDP peer.
+          # No customer files, real browser, paid provider or live ads touched.
+          isolated="$(sudo -n mktemp -d /tmp/kleinanzeiger-product-XXXXXXXX)"
+          [[ "$isolated" == /tmp/kleinanzeiger-product-* ]]
+          trap 'sudo -n rm -rf -- "$isolated"' EXIT
+          sudo -n chmod 0755 "$isolated"
+          # Setup-python is often runner-owned, correctly rejected by the
+          # installed privileged launcher. Use the root-owned distro
+          # interpreter for the *protected* customer start. Python 3.13
+          # source/installed A6-role acceptance runs in the other matrix job.
+          sudo -n /usr/bin/python3 -m venv "$isolated/venv"
+          sudo -n "$isolated/venv/bin/python" -m pip install \
+            --no-index --no-deps "${wheels[0]}"
+          sudo -n "$isolated/venv/bin/python" -m pip install \
+            --no-index --find-links "$RUNNER_TEMP/mark-wheels" \
+            'websocket-client>=1.8,<2' 'Pillow>=10.4,<13'
+          # The native 6-UID opt-in AI path runs against a dedicated
+          # non-network SDK stub copied ONLY into this disposable test venv.
+          # Neither a provider credential nor the real OpenAI SDK is called.
+          sitepkg="$(sudo -n "$isolated/venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          [[ "$sitepkg" == "$isolated/venv/"*"/site-packages" ]]
+          test ! -e "$sitepkg/openai"
+          sudo -n install -d -o root -g root -m 0755 "$sitepkg/openai"
+          sudo -n install -o root -g root -m 0444 \
+            tests/synthetic_openai_sdk_stub.py "$sitepkg/openai/__init__.py"
+          sudo -n install -o root -g root -m 0444 \
+            tests/protected_product_uid_acceptance.py "$isolated/acceptance.py"
+          report="$RUNNER_TEMP/kleinanzeiger-installed-protected-start.log"
+          sudo -n unshare --net --pid --fork --mount-proc -- bash -c '
+            set -euo pipefail
+            ip link set lo up
+            exec "$1/venv/bin/python" -I "$1/acceptance.py" \
+              --host-net "$2" --host-pid "$3"
+          ' bash "$isolated" "$host_net" "$host_pid" 2>&1 | tee "$report"
+          grep -Fq '"result":"PASS"' "$report"
+          grep -Fq '"scope":"installed-protected-fresh-customer-start"' "$report"
+          grep -Fq '"netless_frontend_owner":true' "$report"
+          grep -Fq '"landlock_ingress":true' "$report"
+          grep -Fq '"restarted_without_db_recreation":true' "$report"
+          grep -Fq '"real_cdp_inventory_sync_attested":true' "$report"
+          grep -Fq '"protected_cdp_synthetic_state_write_attested":true' "$report"
+          grep -Fq '"protected_cdp_synthetic_content_write_attested":true' "$report"
+          grep -Fq '"protected_cdp_synthetic_delete_write_attested":true' "$report"
+          grep -Fq '"protected_cdp_synthetic_create_write_attested":true' "$report"
+          grep -Fq '"protected_synthetic_ai_generation_attested":true' "$report"
+          grep -Fq '"protected_ai_generated_media_stage_attested":true' "$report"
+          grep -Fq '"legacy_cutover_attested":false' "$report"
+      - name: Record the accepted Kleinanzeiger wheel SHA-256
+        if: matrix.python_version == '3.12'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/mark-wheels"
+          shopt -s nullglob
+          wheels=(kleinanzeiger-*.whl)
+          test "${#wheels[@]}" -eq 1
+          sha256sum "${wheels[0]}" > SHA256SUMS.txt
+      - name: Publish the exact installed candidate distribution
+        if: matrix.python_version == '3.12'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kleinanzeiger-tested-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/mark-wheels/kleinanzeiger-*.whl
+            ${{ runner.temp }}/mark-wheels/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import json
 import sqlite3
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
+from .container_draft import container_draft_denied
 from .analytics import ANALYTICS_DIMENSIONS
 from .domain import AdClassification
 from .storage import SnapshotStore
+from .storage_owner import StorageOwnerClient, StorageOwnerError
 
 
 _SOURCE = "manual-cli"
@@ -17,7 +20,7 @@ _CLEAR_CHOICES = tuple(item.replace("_", "-") for item in ANALYTICS_DIMENSIONS)
 
 
 def update_classification(
-    store: SnapshotStore,
+    store: SnapshotStore | StorageOwnerClient,
     *,
     ad_id: str,
     labels: Mapping[str, str] | None = None,
@@ -60,6 +63,10 @@ def update_classification(
 
     changes: dict[str, str | None] = dict(normalized_labels)
     changes.update({dimension: None for dimension in normalized_clears})
+    # The independent owner requires an explicit operation timestamp.
+    # Offline SnapshotStore retains its existing transaction-clock default.
+    if observed_at is None and isinstance(store, StorageOwnerClient):
+        observed_at = datetime.now(timezone.utc)
     return store.merge_classification(
         ad_id=ad_id,
         source=_SOURCE,
@@ -87,11 +94,18 @@ def _parser() -> argparse.ArgumentParser:
             "already evidenced by owner snapshots or imported email events."
         ),
     )
+    backend = parser.add_mutually_exclusive_group(required=True)
+    backend.add_argument(
+        "--db", type=Path,
+        help="Existing local SQLite database (offline/trusted mode).",
+    )
+    backend.add_argument(
+        "--storage-owner-socket", type=Path,
+        help="Private Unix socket of the independent SQLite owner.",
+    )
     parser.add_argument(
-        "--db",
-        type=Path,
-        required=True,
-        help="Path to the local mark-api SQLite database.",
+        "--storage-owner-uid", type=int,
+        help="Expected SQLite-owner UID, required with --storage-owner-socket.",
     )
     parser.add_argument(
         "--ad-id",
@@ -120,6 +134,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if container_draft_denied():
+        print("mark-api: unattested container draft cannot run Python entrypoints",
+              file=sys.stderr)
+        return 2
     parser = _parser()
     args = parser.parse_args(argv)
 
@@ -130,10 +148,25 @@ def main(argv: list[str] | None = None) -> int:
     }
     clears = tuple(item.replace("-", "_") for item in args.clear)
 
-    try:
-        store = SnapshotStore(args.db, create_if_missing=False)
-    except (OSError, sqlite3.Error):
-        parser.error("SQLite database unavailable or not initialized")
+    if args.storage_owner_socket is not None:
+        if args.storage_owner_uid is None:
+            parser.error("--storage-owner-uid is required with --storage-owner-socket")
+        try:
+            store = StorageOwnerClient(
+                args.storage_owner_socket,
+                expected_owner_uid=args.storage_owner_uid,
+            )
+            if not store.ready():
+                raise StorageOwnerError("unready SQLite owner")
+        except (StorageOwnerError, OSError, ValueError):
+            parser.error("storage owner unavailable")
+    else:
+        if args.storage_owner_uid is not None:
+            parser.error("--storage-owner-uid requires --storage-owner-socket")
+        try:
+            store = SnapshotStore(args.db, create_if_missing=False)
+        except (OSError, sqlite3.Error):
+            parser.error("SQLite database unavailable or not initialized")
     try:
         classification = update_classification(
             store,
@@ -141,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
             labels=labels,
             clears=clears,
         )
+    except StorageOwnerError:
+        parser.error("storage owner outcome uncertain; inspect exact labels before retry")
     except ValueError as exc:
         parser.error(str(exc))
 

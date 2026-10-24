@@ -215,6 +215,7 @@ class MarkService:
         source = "mark-service-owner-inventory"
         attempt_id = self._store.begin_sync_attempt(
             source=source, started_at=self._clock(),
+            require_no_unresolved=True,
         )
         try:
             result = self._owner_reader.read_ads()

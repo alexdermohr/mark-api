@@ -26,6 +26,13 @@ _CREDENTIAL_ASSIGNMENT_RE = re.compile(
 _IDENTIFIER_RE = re.compile(rb"^[A-Za-z_][A-Za-z0-9_.]*$")
 _SIMPLE_LITERAL_RE = re.compile(rb"^[A-Za-z0-9._~+/@:!#%&*?=-]+$")
 _PLACEHOLDER_VALUES = {
+    # Exact public synthetic UI tokens introduced by 369c0ae/8bda986.
+    # Real key formats and even nearby variants remain blocked per commit.
+    b"private-generation-token-1234567890",
+    b"synthetic-generation-session-987654321",
+    b"synthetic-http-generation-token-123456",
+    # Exact public fixture in e7be455; not a real provider credential.
+    b"only-synthetic-generation-credential-do-not-use",
     b"none",
     b"null",
     b"true",

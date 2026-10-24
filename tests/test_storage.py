@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 from contextlib import closing
 import tempfile
 import unittest
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Barrier
@@ -191,6 +193,209 @@ class SnapshotStoreTests(unittest.TestCase):
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='write_api_requests'"
             ).fetchone())
+
+    def test_history_pages_exclude_later_append_and_preserve_snapshot_identity(self) -> None:
+        store = self.make_store()
+        ordered_times = (
+            NOW + timedelta(minutes=5), NOW + timedelta(minutes=1),
+            NOW + timedelta(minutes=5), NOW + timedelta(minutes=2),
+        )
+        values = tuple(
+            AdSnapshot(
+                ad_id="same", source="mark:source-v1:literal-{payload}",
+                observed_at=when, lifecycle_state=LifecycleState.ACTIVE,
+                title="Row " + str(index), metric_source="management+stats",
+                views=index,
+            ) for index, when in enumerate(ordered_times)
+        )
+        for value in values:
+            store.append_ad_snapshot(value)
+        watermark, page, more = store.ad_history_page(
+            "same", after_id=0, watermark=None, limit=2,
+        )
+        self.assertTrue(more)
+        self.assertEqual(tuple(row[1] for row in page), values[:2])
+        late = AdSnapshot(ad_id="same", source="late", observed_at=NOW,
+                          lifecycle_state=LifecycleState.ACTIVE)
+        store.append_ad_snapshot(late)
+        next_watermark, second, more = store.ad_history_page(
+            "same", after_id=page[-1][0], watermark=watermark, limit=2,
+        )
+        self.assertEqual(next_watermark, watermark)
+        self.assertFalse(more)
+        self.assertEqual(tuple(row[1] for row in second), values[2:])
+        self.assertEqual(
+            {row[0] for row in (*page, *second)},
+            {1, 2, 3, 4},
+        )
+        self.assertEqual(len(store.ad_history("same")), 5)
+
+    def test_history_page_rejects_invalid_cursors_and_never_creates_data(self) -> None:
+        store = self.make_store()
+        for kwargs in (
+            {"after_id": -1, "watermark": None, "limit": 2},
+            {"after_id": True, "watermark": None, "limit": 2},
+            {"after_id": 0, "watermark": -1, "limit": 2},
+            {"after_id": 0, "watermark": True, "limit": 2},
+            {"after_id": 0, "watermark": None, "limit": 0},
+            {"after_id": 0, "watermark": None, "limit": 33},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                store.ad_history_page("unknown", **kwargs)
+        self.assertEqual(store.tracked_ad_ids(), ())
+
+    def test_latest_classification_bounded_uses_real_instant_and_limit(self) -> None:
+        from mark_api.domain import AdClassification
+        store = self.make_store()
+        newest = AdClassification(
+            ad_id="e", observed_at=NOW + timedelta(hours=1),
+            source="manual", city="Berlin",
+        )
+        older = AdClassification(
+            ad_id="e", observed_at=(NOW + timedelta(minutes=90)).astimezone(
+                timezone(timedelta(hours=2))
+            ) - timedelta(hours=1),
+            source="manual", city="Magdeburg",
+        )
+        store.append_classification(newest)
+        store.append_classification(older)
+        self.assertEqual(store.latest_classification_bounded("e"), newest)
+        self.assertEqual(store.latest_classification_bounded("none"), None)
+        with self.assertRaises(ValueError):
+            store.latest_classification_bounded("e", max_records=1)
+        with self.assertRaises(ValueError):
+            store.latest_classification_bounded("e", max_records=True)
+
+    def test_inbound_message_pages_pin_generation_and_preserve_observed_time(self) -> None:
+        store = self.make_store()
+        events = tuple(InboundMessageEvent(
+            ad_id="email-only",
+            conversation_id=f"conversation-{i % 5}",
+            provider_message_id=f"provider-{i}",
+            observed_at=NOW + timedelta(minutes=20 - i),
+            source="email:imported",
+        ) for i in range(19))
+        self.assertEqual(store.append_inbound_message_events(events), 19)
+        pinned, page, more = store.inbound_message_page(
+            "email-only", after_id=0, watermark=None, limit=5,
+        )
+        collected = list(page)
+        late = InboundMessageEvent(
+            ad_id="email-only", conversation_id="new-buyer",
+            provider_message_id="provider-late",
+            observed_at=NOW - timedelta(hours=1), source="email:late",
+        )
+        store.append_inbound_message_events((late,))
+        while more:
+            watermark, items, more = store.inbound_message_page(
+                "email-only", after_id=collected[-1][0],
+                watermark=pinned, limit=5,
+            )
+            self.assertEqual(watermark, pinned)
+            collected.extend(items)
+        self.assertEqual(tuple(item for _, item in collected), events)
+        self.assertEqual(len({n for n, _ in collected}), 19)
+        self.assertEqual(store.inbound_message_counts("email-only"), (6, 20))
+        self.assertEqual(
+            store.inbound_message_history("email-only")[0], late,
+        )
+
+    def test_inbound_ad_id_pagination_pins_global_generation(self) -> None:
+        store = self.make_store()
+        events = tuple(InboundMessageEvent(
+            ad_id=f"ad-{i:03}", conversation_id="conversation",
+            provider_message_id=f"event-{i}",
+            observed_at=NOW, source="synthetic",
+        ) for i in range(70))
+        store.append_inbound_message_events(events)
+        pinned, page, more = store.inbound_message_ad_ids_page(
+            after="", watermark=None, limit=16,
+        )
+        self.assertTrue(more)
+        collected = list(page)
+        store.append_inbound_message_events((InboundMessageEvent(
+            ad_id="ad-999", conversation_id="conversation",
+            provider_message_id="late-event",
+            observed_at=NOW, source="synthetic",
+        ),))
+        while more:
+            watermark, ids, more = store.inbound_message_ad_ids_page(
+                after=collected[-1], watermark=pinned, limit=16,
+            )
+            self.assertEqual(watermark, pinned)
+            collected.extend(ids)
+        self.assertEqual(tuple(collected), tuple(f"ad-{i:03}" for i in range(70)))
+        self.assertIn("ad-999", store.inbound_message_ad_ids())
+
+    def test_inbound_rpc_store_page_rejects_bad_cursors(self) -> None:
+        store = self.make_store()
+        for kwargs in (
+            {"after_id": True, "watermark": None, "limit": 1},
+            {"after_id": -1, "watermark": None, "limit": 1},
+            {"after_id": 2, "watermark": 1, "limit": 1},
+            {"after_id": 0, "watermark": None, "limit": 0},
+            {"after_id": 0, "watermark": None, "limit": 33},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                store.inbound_message_page("missing", **kwargs)
+        for kwargs in (
+            {"after": True, "watermark": None, "limit": 1},
+            {"after": "", "watermark": True, "limit": 1},
+            {"after": "", "watermark": None, "limit": 0},
+            {"after": "", "watermark": None, "limit": 65},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                store.inbound_message_ad_ids_page(**kwargs)
+
+    def test_reaction_page_pins_generation_and_keeps_distinct_metrics(self) -> None:
+        store = self.make_store()
+        originals = tuple(ReactionSnapshot(
+            ad_id="same", observed_at=NOW + timedelta(minutes=(20 - i)),
+            source='kleinanzeigen:{"provenance":"literal"}',
+            conversation_count=i, unique_buyer_count=i + 1,
+            inbound_message_count=i + 2,
+        ) for i in range(19))
+        for row in originals:
+            store.append_reaction_snapshot(row)
+        watermark, page, more = store.reaction_history_page(
+            "same", after_id=0, watermark=None, limit=4,
+        )
+        self.assertTrue(more)
+        collected = list(page)
+        late = ReactionSnapshot(
+            ad_id="same", observed_at=NOW, source="late",
+            conversation_count=99, unique_buyer_count=98,
+            inbound_message_count=100,
+        )
+        store.append_reaction_snapshot(late)
+        while more:
+            pinned, rows, more = store.reaction_history_page(
+                "same", after_id=collected[-1][0],
+                watermark=watermark, limit=4,
+            )
+            self.assertEqual(pinned, watermark)
+            collected.extend(rows)
+        self.assertEqual([value for _, value in collected], list(originals))
+        self.assertEqual(len({rowid for rowid, _ in collected}), len(originals))
+        self.assertEqual(store.reaction_history("same"), (*originals, late))
+
+    def test_reaction_page_rejects_invalid_cursors_and_unknown_id(self) -> None:
+        store = self.make_store()
+        for kwargs in (
+            {"after_id": True, "watermark": None, "limit": 2},
+            {"after_id": -1, "watermark": None, "limit": 2},
+            {"after_id": 0, "watermark": True, "limit": 2},
+            {"after_id": 5, "watermark": 3, "limit": 2},
+            {"after_id": 0, "watermark": None, "limit": 0},
+            {"after_id": 0, "watermark": None, "limit": 33},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                store.reaction_history_page("unknown", **kwargs)
+        self.assertEqual(
+            store.reaction_history_page(
+                "unknown", after_id=0, watermark=None, limit=4,
+            ), (0, (), False),
+        )
 
     def test_metric_source_column_preserves_raw_source_and_disallows_blank_origin(self) -> None:
         store = self.make_store()
@@ -816,6 +1021,50 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertTrue(created)
         self.assertEqual(events, ["enter", "exit"])
 
+    def test_pending_write_claim_never_persists_unreadable_json(self) -> None:
+        store = self.make_store()
+        malformed = (
+            '{"title":"first","title":"second"}',
+            '{"nested":{"key":1,"key":2}}',
+            '{"price":NaN}',
+            '{"price":Infinity}',
+            '{"price":-Infinity}',
+            '{"price":1e999}',
+            '{"price":-1E999}',
+            '{"nested":{"price":9e999}}',
+        )
+        for payload_json in malformed:
+            with self.subTest(payload_json=payload_json):
+                with self.assertRaisesRegex(ValueError, "payload_json is invalid"):
+                    store.claim_dashboard_pending_write(
+                        scope="create", resource_key="create",
+                        idempotency_key="ui:invalid-json",
+                        method="POST", path="/api/write/ads",
+                        payload_json=payload_json, ad_id=None,
+                    )
+                # Malformed durable JSON would break all owner-paged reads.
+                self.assertEqual(store.dashboard_pending_writes(), ())
+                self.assertTrue(store.is_ready())
+
+        valid = '{"title":"valid","nested":{"key":1}}'
+        self.assertTrue(store.claim_dashboard_pending_write(
+            scope="create", resource_key="create",
+            idempotency_key="ui:valid-json", method="POST",
+            path="/api/write/ads", payload_json=valid, ad_id=None,
+        ))
+        self.assertEqual(
+            store.dashboard_pending_writes()[0].payload_json, valid,
+        )
+        finite = '{"price":1e308}'
+        self.assertTrue(store.claim_dashboard_pending_write(
+            scope="create-finite", resource_key="create-finite",
+            idempotency_key="ui:finite-json", method="POST",
+            path="/api/write/ads", payload_json=finite, ad_id=None,
+        ))
+        self.assertEqual(
+            store.dashboard_pending_writes()[1].payload_json, finite,
+        )
+
     def test_dashboard_pending_write_acknowledgement_is_two_phase(self) -> None:
         store = self.make_store()
         created = store.claim_dashboard_pending_write(
@@ -1068,6 +1317,90 @@ class SnapshotStoreTests(unittest.TestCase):
                 execution_started_at=NOW + timedelta(seconds=2),
             )
 
+    def test_unstarted_claim_cancellation_is_exact_terminal_failure_only(self) -> None:
+        store = self.make_store()
+        key, sha, owner = "ui:unstarted:1", "d" * 64, "runtime:one"
+        store.claim_write_api_request(
+            idempotency_key=key, request_sha256=sha,
+            requested_at=NOW, claim_owner=owner,
+        )
+        for kwargs in (
+            {"request_sha256": "e" * 64},
+            {"claim_owner": "runtime:other"},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                store.cancel_unstarted_write_api_request(
+                    **dict(
+                        idempotency_key=key, request_sha256=sha,
+                        claim_owner=owner, cancelled_at=NOW,
+                    ) | kwargs
+                )
+            self.assertEqual(store.write_api_request(key).state, "in_progress")
+
+        cancelled = store.cancel_unstarted_write_api_request(
+            idempotency_key=key, request_sha256=sha,
+            claim_owner=owner, cancelled_at=NOW + timedelta(minutes=1),
+        )
+        self.assertEqual(cancelled.state, "completed")
+        self.assertIsNone(cancelled.execution_started_at)
+        self.assertEqual(cancelled.completed_at, NOW + timedelta(minutes=1))
+        self.assertEqual(cancelled.response_status, 409)
+        self.assertEqual(json.loads(cancelled.response_json), {
+            "error": "write_claim_cancelled_before_begin",
+            "idempotency_key": key, "platform_retry_authorized": False,
+        })
+        self.assertEqual(
+            store.cancel_unstarted_write_api_request(
+                idempotency_key=key, request_sha256=sha,
+                claim_owner=owner, cancelled_at=NOW + timedelta(days=1),
+            ),
+            cancelled,
+        )
+        with self.assertRaises(ValueError):
+            store.begin_write_api_request(
+                idempotency_key=key, request_sha256=sha,
+                claim_owner=owner, execution_started_at=NOW,
+            )
+        with self.assertRaises(ValueError):
+            store.complete_write_api_request(
+                idempotency_key=key, request_sha256=sha, claim_owner=owner,
+                response_status=200, response_json='{"success":true}',
+                completed_at=NOW,
+            )
+        claimed_again = store.claim_write_api_request(
+            idempotency_key=key, request_sha256=sha,
+            requested_at=NOW + timedelta(days=1),
+            claim_owner="runtime:other", allow_abandoned_takeover=True,
+        )
+        self.assertFalse(claimed_again.created)
+        self.assertEqual(claimed_again.record, cancelled)
+        self.assertFalse(store.has_write_recovery_clearance(
+            idempotency_key=key, request_sha256=sha,
+        ))
+
+    def test_unstarted_cancellation_rejects_executed_or_unknown_claim(self) -> None:
+        store = self.make_store()
+        key, sha, owner = "ui:started:1", "f" * 64, "runtime:one"
+        with self.assertRaises(ValueError):
+            store.cancel_unstarted_write_api_request(
+                idempotency_key=key, request_sha256=sha,
+                claim_owner=owner, cancelled_at=NOW,
+            )
+        store.claim_write_api_request(
+            idempotency_key=key, request_sha256=sha,
+            requested_at=NOW, claim_owner=owner,
+        )
+        started = store.begin_write_api_request(
+            idempotency_key=key, request_sha256=sha,
+            claim_owner=owner, execution_started_at=NOW,
+        )
+        with self.assertRaisesRegex(ValueError, "begun"):
+            store.cancel_unstarted_write_api_request(
+                idempotency_key=key, request_sha256=sha,
+                claim_owner=owner, cancelled_at=NOW + timedelta(seconds=1),
+            )
+        self.assertEqual(store.write_api_request(key), started)
+
     def test_write_api_completion_requires_execution_start(self) -> None:
         store = self.make_store()
         fingerprint = "c" * 64
@@ -1187,6 +1520,194 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(latest.city, "Dresden")
         self.assertEqual(latest.title_type, "question")
         self.assertEqual(len(direct_store.classification_history("42")), 2)
+
+
+    def _seed_ambiguous_media_api_request(self, store: SnapshotStore) -> str:
+        key = "media-unknown-original"
+        store.claim_write_api_request(
+            idempotency_key=key, request_sha256="a" * 64,
+            requested_at=NOW, claim_owner="original-runtime",
+        )
+        store.begin_write_api_request(
+            idempotency_key=key, request_sha256="a" * 64,
+            claim_owner="original-runtime", execution_started_at=NOW,
+        )
+        store.complete_write_api_request(
+            idempotency_key=key, request_sha256="a" * 64,
+            claim_owner="original-runtime", response_status=202,
+            response_json=json.dumps({
+                "media_persistence_confirmed": False,
+                "operation_receipt": {
+                    "outcome": "ambiguous", "writer_invoked": True,
+                },
+            }),
+            completed_at=NOW,
+        )
+        return key
+
+    def test_operation_bound_media_recovery_clearance_is_append_only(self) -> None:
+        store = self.make_store()
+        key = self._seed_ambiguous_media_api_request(store)
+        original = store.write_api_request(key)
+        self.assertTrue(store.create_recovery_pending(
+            exclude_idempotency_key="fresh", claim_owner="second-runtime",
+        ))
+        store.record_write_recovery_clearance(
+            idempotency_key=key,
+            request_sha256="a" * 64,
+            verification_kind="operator_verified_postread",
+            evidence_reference="synthetic-independent-owner-postread:ad-123",
+            observed_at=NOW,
+        )
+        reopened = SnapshotStore(store.path, create_if_missing=False)
+        self.assertFalse(reopened.create_recovery_pending(
+            exclude_idempotency_key="new-create", claim_owner="third-runtime",
+        ))
+        self.assertEqual(reopened.write_api_request(key), original)
+        with closing(sqlite3.connect(store.path)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM write_recovery_clearances",
+            ).fetchone()[0], 1)
+        with self.assertRaisesRegex(ValueError, "already cleared"):
+            reopened.record_write_recovery_clearance(
+                idempotency_key=key, request_sha256="a" * 64,
+                verification_kind="operator_verified_postread",
+                evidence_reference="synthetic-independent-owner-postread:ad-123",
+                observed_at=NOW,
+            )
+
+    def test_media_recovery_clearance_rejects_bad_binding_and_missing_evidence(self) -> None:
+        store = self.make_store()
+        key = self._seed_ambiguous_media_api_request(store)
+        for args in (
+            {"idempotency_key": key, "request_sha256": "b" * 64,
+             "verification_kind": "operator_verified_postread",
+             "evidence_reference": "independent-owner-read", "observed_at": NOW},
+            {"idempotency_key": key, "request_sha256": "a" * 64,
+             "verification_kind": "operator_verified_postread",
+             "evidence_reference": "", "observed_at": NOW},
+            {"idempotency_key": "unrelated", "request_sha256": "a" * 64,
+             "verification_kind": "operator_verified_postread",
+             "evidence_reference": "independent-owner-read", "observed_at": NOW},
+            {"idempotency_key": key, "request_sha256": "a" * 64,
+             "verification_kind": "self_reported",
+             "evidence_reference": "independent-owner-read", "observed_at": NOW},
+        ):
+            with self.subTest(args=args):
+                with self.assertRaises((ValueError, TypeError)):
+                    store.record_write_recovery_clearance(**args)
+        self.assertTrue(store.create_recovery_pending(
+            exclude_idempotency_key="new-create", claim_owner="other-runtime",
+        ))
+
+    def test_clear_executed_stale_in_progress_preserves_original_fence(self) -> None:
+        store = self.make_store()
+        store.claim_write_api_request(
+            idempotency_key="stale-executed",
+            request_sha256="c" * 64,
+            requested_at=NOW, claim_owner="old-runtime",
+        )
+        store.begin_write_api_request(
+            idempotency_key="stale-executed",
+            request_sha256="c" * 64,
+            claim_owner="old-runtime", execution_started_at=NOW,
+        )
+        self.assertTrue(store.create_recovery_pending(
+            exclude_idempotency_key="new-create", claim_owner="new-runtime",
+        ))
+        store.record_write_recovery_clearance(
+            idempotency_key="stale-executed", request_sha256="c" * 64,
+            verification_kind="operator_verified_postread",
+            evidence_reference="owner-plus-target-independent-2026-10-10",
+            observed_at=NOW,
+        )
+        self.assertFalse(SnapshotStore(
+            store.path, create_if_missing=False,
+        ).create_recovery_pending(
+            exclude_idempotency_key="new-create", claim_owner="new-runtime",
+        ))
+        record = store.write_api_request("stale-executed")
+        self.assertEqual(record.state, "in_progress")
+        self.assertIsNotNone(record.execution_started_at)
+
+    def test_additive_clearance_upgrade_requires_intact_old_recovery_schema(self) -> None:
+        store = self.make_store()
+        self._seed_ambiguous_media_api_request(store)
+        with closing(sqlite3.connect(store.path)) as db:
+            db.execute("DROP TABLE write_recovery_clearances")
+            db.execute("PRAGMA user_version = 1")
+            db.commit()
+        upgraded = SnapshotStore(store.path, create_if_missing=False)
+        self.assertTrue(upgraded.is_ready())
+        self.assertTrue(upgraded.create_recovery_pending(
+            exclude_idempotency_key="fresh", claim_owner="new-runtime",
+        ))
+        with closing(sqlite3.connect(store.path)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            db.execute("DROP TABLE write_recovery_clearances")
+            db.commit()
+        self.assertFalse(upgraded.is_ready())
+        with self.assertRaises(sqlite3.DatabaseError):
+            SnapshotStore(store.path, create_if_missing=False)
+
+    def test_exclusive_owner_sync_preserves_prior_unresolved_journal_across_sources(self) -> None:
+        store = self.make_store()
+        old = store.begin_sync_attempt(source="previous-generation", started_at=NOW)
+        recent = store.begin_sync_attempt(
+            source="later-generation", started_at=NOW + timedelta(minutes=1),
+        )
+        store.fail_sync_attempt(
+            recent, source="later-generation",
+            completed_at=NOW + timedelta(minutes=2),
+            error_kind="transport_error",
+        )
+        reopened = SnapshotStore(store.path, create_if_missing=False)
+        with self.assertRaisesRegex(RuntimeError, "unresolved"):
+            reopened.begin_sync_attempt(
+                source="owner-inventory", started_at=NOW + timedelta(minutes=3),
+                require_no_unresolved=True,
+            )
+        with sqlite3.connect(store.path) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM sync_attempts"
+            ).fetchone()[0], 2)
+        with self.assertRaises(TypeError):
+            reopened.begin_sync_attempt(
+                source="owner-inventory", started_at=NOW, require_no_unresolved=1,
+            )
+        store.fail_sync_attempt(
+            old, source="previous-generation",
+            completed_at=NOW + timedelta(minutes=4),
+            error_kind="persistence_error",
+        )
+        resumed = reopened.begin_sync_attempt(
+            source="owner-inventory", started_at=NOW + timedelta(minutes=5),
+            require_no_unresolved=True,
+        )
+        self.assertEqual(resumed, recent + 1)
+
+    def test_exclusive_owner_sync_is_atomic_across_sqlite_connections(self) -> None:
+        store = self.make_store()
+        gate = Barrier(2)
+
+        def begin_one() -> tuple[bool, int | None]:
+            other = SnapshotStore(store.path, create_if_missing=False)
+            gate.wait(timeout=5)
+            try:
+                return True, other.begin_sync_attempt(
+                    source="concurrent-owner", started_at=NOW,
+                    require_no_unresolved=True,
+                )
+            except RuntimeError:
+                return False, None
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            outcomes = list(workers.map(lambda _: begin_one(), range(2)))
+        self.assertEqual(sorted(ok for ok, _ in outcomes), [False, True])
+        with sqlite3.connect(store.path) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM sync_attempts WHERE outcome='in_progress'"
+            ).fetchone()[0], 1)
 
 
 if __name__ == "__main__":

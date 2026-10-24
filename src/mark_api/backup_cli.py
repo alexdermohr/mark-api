@@ -6,6 +6,8 @@ remain pending recovery fences in the backup.
 """
 from __future__ import annotations
 
+from .container_draft import container_draft_denied
+
 import argparse
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import asdict, dataclass
@@ -13,6 +15,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 import sqlite3
 import stat
@@ -773,6 +776,10 @@ def backup_store(source_db: Path, *, backup_db: Path) -> BackupReceipt:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if container_draft_denied():
+        print("mark-api: unattested container draft cannot run Python entrypoints",
+              file=sys.stderr)
+        return 2
     parser = argparse.ArgumentParser(
         description=(
             "Create a verified, non-overwriting SQLite backup of the current Mark "

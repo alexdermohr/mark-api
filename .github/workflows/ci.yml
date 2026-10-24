@@ -88,6 +88,17 @@ jobs:
           offline_bin="$artifact_dir/venv/bin/mark-api-offline"
           "$offline_bin" --help > "$artifact_dir/offline-help.txt"
           grep -q -- "--email" "$artifact_dir/offline-help.txt"
+          # These are real installed role entrypoints. A missing private FD
+          # must deny startup without binding a browser, owner or witness.
+          for role in protected-owner protected-actor protected-witness; do
+            role_bin="$artifact_dir/venv/bin/kleinanzeiger-$role"
+            "$role_bin" --help > /dev/null
+            if "$role_bin" --config-fd=-1 > "$artifact_dir/$role-denial.txt" 2>&1; then
+              echo "Untrusted $role unexpectedly admitted" >&2
+              exit 1
+            fi
+            grep -Fq 'unavailable' "$artifact_dir/$role-denial.txt"
+          done
           missing_db="$artifact_dir/not-initialized.sqlite"
           if "$offline_bin" --db "$missing_db" > "$artifact_dir/offline-denial.txt" 2>&1; then
             echo "offline launcher unexpectedly accepted a missing database" >&2

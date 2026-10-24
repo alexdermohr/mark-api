@@ -56,12 +56,12 @@ class FakeGenerator:
 
 
 @contextlib.contextmanager
-def server_context(access):
+def server_context(access, *, public_origin_port=None):
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "mark.sqlite"
         server = create_server(
             SnapshotStore(db, create_if_missing=True), port=0,
-            generation_access=access,
+            generation_access=access, public_origin_port=public_origin_port,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -148,6 +148,33 @@ class GenerationHttpTests(unittest.TestCase):
                 {**valid, "Host": "attacker.invalid"},
             )[0], 421)
         self.assertEqual(self.generator.text_calls, [])
+
+    def test_protected_public_ingress_generation_origin_matches_validated_host(self):
+        with server_context(self.access, public_origin_port=8875) as (port, _):
+            public = {
+                **headers(port),
+                "Host": "127.0.0.1:8875",
+                "Origin": "http://127.0.0.1:8875",
+            }
+            code, _, data = http_call(
+                port, "POST", "/api/dashboard/generate", body(), public,
+            )
+            self.assertEqual(code, 200, data)
+            self.assertIs(json.loads(data)["published"], False)
+            self.assertEqual(http_call(
+                port, "POST", "/api/dashboard/generate", body(),
+                {**public, "Origin": "http://127.0.0.1:9999"},
+            )[0], 403)
+            self.assertEqual(http_call(
+                port, "POST", "/api/dashboard/generate", body(),
+                {**public, "Host": "127.0.0.1:" + str(port)},
+            )[0], 403)
+            self.assertEqual(http_call(
+                port, "POST", "/api/dashboard/generate", body(),
+                {**public, "Host": "attacker.invalid"},
+            )[0], 421)
+        self.assertEqual(self.generator.text_calls, ["Ein Fahrrad"])
+
 
     def test_non_ascii_token_or_origin_is_rejected_without_provider_call(self):
         # BaseHTTPRequestHandler decodes HTTP header bytes as latin-1.

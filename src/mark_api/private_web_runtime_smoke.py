@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import json
 import tempfile
 import threading
@@ -11,6 +12,7 @@ from typing import Callable, Protocol
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
+from .container_draft import container_draft_denied
 from .dashboard import create_server
 from .domain import AdSnapshot, LifecycleState
 from .private_web_runtime import build_private_web_inventory_runtime
@@ -227,6 +229,7 @@ def run_private_web_runtime_smoke(
                 if not isinstance(summary, dict):
                     raise RuntimeError("dashboard summary is not an object")
                 sync_status = _json_get(opener, base, "/api/sync/status")
+                sync_recovery = _json_get(opener, base, "/api/sync/recovery")
 
                 ads = _json_get(opener, base, "/api/ads")
                 if not isinstance(ads, list):
@@ -330,6 +333,10 @@ def run_private_web_runtime_smoke(
                 "state": "never_attempted",
                 "latest_attempt": None,
                 "last_successful_attempt": None,
+            }
+            expected_sync_recovery = {
+                "unresolved_count": 0,
+                "oldest_unresolved_attempt": None,
             }
             expected_summary = {
                 "tracked_ads": len(snapshots),
@@ -527,10 +534,19 @@ def run_private_web_runtime_smoke(
                     for key in expected_summary
                 }
                 if (
-                    set(summary) != set(expected_summary) | {"sync_status"}
+                    set(summary) != set(expected_summary) | {
+                        "sync_status", "sync_recovery",
+                    }
                     or any(type(value) is not int for value in projected_summary.values())
                     or summary["sync_status"] != expected_sync_status
                     or sync_status != expected_sync_status
+                    or not all(
+                        type(item) is dict
+                        and set(item) == set(expected_sync_recovery)
+                        and type(item["unresolved_count"]) is int
+                        and item == expected_sync_recovery
+                        for item in (summary["sync_recovery"], sync_recovery)
+                    )
                 ):
                     raise TypeError("invalid dashboard summary or sync evidence")
                 tracked_ads = projected_summary["tracked_ads"]
@@ -607,6 +623,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if container_draft_denied():
+        print("mark-api: unattested container draft cannot run Python entrypoints",
+              file=sys.stderr)
+        return 2
     parser = _parser()
     args = parser.parse_args(argv)
     try:

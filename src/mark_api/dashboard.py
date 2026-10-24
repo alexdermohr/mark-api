@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import sys
 import hmac
 import http.client
 import json
@@ -12,12 +13,15 @@ import re
 import secrets
 import sqlite3
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from contextlib import closing
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from threading import Lock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from .container_draft import container_draft_denied
 from .analytics import (
     ANALYTICS_DIMENSIONS,
     ANALYTICS_METRICS,
@@ -36,7 +40,11 @@ from .query import (
     reaction_snapshot_to_dict,
     summary_to_dict,
 )
-from .storage import SnapshotStore
+from .storage import DashboardPendingWrite, SnapshotStore
+from .storage_owner import StorageOwnerClient, StorageOwnerError
+from .strict_json import strict_json_object
+from .write_api import _normalize_create_payload, _request_fingerprint
+
 from .generation import (
     AdvertisementDraft, AdvertisementGenerator, GenerationError,
     _validate_png_payload,
@@ -101,8 +109,29 @@ class DashboardWriteProxy:
     bearer_token: str = field(repr=False)
     ui_token: str = field(repr=False)
     timeout_seconds: float = 90.0
+    backend_principal: str | None = None
+    # Explicit trusted composition opt-in: never enable with an independent
+    # owner or witness. Their completion authority cannot be inferred locally.
+    local_reconciliation_enabled: bool = False
+    # Distinct explicit composition: only an authenticated protected owner
+    # with independently witnessed completion may authorize either UI ACK.
+    owner_reconciliation_enabled: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.local_reconciliation_enabled) is not bool:
+            raise ValueError("local_reconciliation_enabled must be bool")
+        if type(self.owner_reconciliation_enabled) is not bool:
+            raise ValueError("owner_reconciliation_enabled must be bool")
+        if self.local_reconciliation_enabled and self.owner_reconciliation_enabled:
+            raise ValueError("local and owner reconciliation are mutually exclusive")
+        if self.backend_principal is not None and (
+            not isinstance(self.backend_principal, str)
+            or not self.backend_principal.strip()
+            or self.backend_principal != self.backend_principal.strip()
+            or len(self.backend_principal) > 128
+            or "\r" in self.backend_principal or "\n" in self.backend_principal
+        ):
+            raise ValueError("backend_principal is invalid")
         if self.host != "127.0.0.1":
             raise ValueError("dashboard write proxy must target 127.0.0.1")
         if (
@@ -623,6 +652,8 @@ const display = (value) => value === null || value === undefined ? "—" : Strin
 const WRITE_TOKEN_STORAGE_KEY = "mark-dashboard-write-token";
 const GENERATION_TOKEN_STORAGE_KEY = "mark-dashboard-generation-token";
 const pendingWrites = new Map();
+// Only this page session may remember an observed terminal result.
+const pendingAckOnly = new Map();
 let writeUiAvailable = false;
 let writeToken = null;
 let generationToken = null;
@@ -794,24 +825,33 @@ async function refreshPendingWrites() {
     ) {
       throw new Error("pending recovery unavailable");
     }
-    const acknowledgedEntries = [];
+    // A legacy acknowledged tombstone is not independent evidence of an
+    // external outcome. Keep it visible as a blocking recovery intent.
     for (const entry of payload.pending_writes) {
-      if (entry.acknowledged === true) {
-        acknowledgedEntries.push(entry);
-        continue;
-      }
       if (pendingWrites.has(entry.scope)) {
         throw new Error("duplicate pending scope");
       }
+      const prior = pendingAckOnly.get(entry.scope);
+      if (
+        prior !== undefined
+        && prior.key === entry.key
+        && prior.method === entry.method
+        && prior.path === entry.path
+      ) {
+        entry.acknowledgeOnly = true;
+      }
       pendingWrites.set(entry.scope, entry);
     }
-    for (const entry of acknowledgedEntries) {
-      try {
-        await acknowledgePendingWrite(entry);
-      } catch (_error) {
-        // This GET already proved that a previous browser observed the terminal
-        // write result and durably acknowledged it. If tombstone cleanup did not
-        // reach the server, its retained row still blocks a fresh platform key.
+    // A replaced or absent durable key must not inherit old browser
+    // ACK-only evidence. Failed GET leaves this cache intact and fail-closed.
+    for (const [scope, prior] of pendingAckOnly) {
+      const current = pendingWrites.get(scope);
+      if (
+        current === undefined
+        || current.acknowledgeOnly !== true
+        || current.key !== prior.key
+      ) {
+        pendingAckOnly.delete(scope);
       }
     }
   } catch (_error) {
@@ -848,7 +888,7 @@ function renderWriteAvailability() {
   }
   if (ready && pendingWrites.size > 0) {
     setWriteStatus(
-      "Eine frühere Write-Anfrage bleibt mit ihrem ursprünglichen Idempotency-Key gebunden. Eine manuelle Wiederholung sendet exakt denselben Request; es erfolgt kein automatischer Retry.",
+      "Eine frühere Write-Anfrage bleibt mit ihrem ursprünglichen Idempotency-Key gesperrt. Keine erneute Plattformweiterleitung ohne unabhängige Ergebnisprüfung.",
       "warning",
     );
   }
@@ -883,7 +923,7 @@ function ageDescription(observedAt) {
   return "vor " + days + (days === 1 ? " Tag" : " Tagen");
 }
 
-function renderSyncStatus(sync) {
+function renderSyncStatus(sync, recovery) {
   const view = byId("sync-status");
   if (!sync || typeof sync !== "object") {
     view.textContent = "Sync-Status nicht verfügbar; Datenfrische unbekannt.";
@@ -920,7 +960,21 @@ function renderSyncStatus(sync) {
       + ageDescription(successful.completed_at) + "), Quelle: "
       + successful.source + "."
     : " Keine bestätigte Bestandsgrundlage aus diesem Journal.";
-  view.textContent = headline + baseline
+  let recoveryNote = " Offene ältere Sync-Versuche konnten nicht geprüft werden.";
+  if (recovery && typeof recovery === "object") {
+    const open = recovery.unresolved_count;
+    if (Number.isSafeInteger(open) && open === 0) {
+      recoveryNote = " Zum Abfragezeitpunkt keine offenen Sync-Versuche.";
+    } else if (Number.isSafeInteger(open) && open > 0) {
+      const oldest = recovery.oldest_unresolved_attempt;
+      const oldestId = oldest && Number.isSafeInteger(oldest.id)
+        ? " (ältester Versuch #" + oldest.id + ")" : "";
+      recoveryNote = " Achtung: " + open + " noch nicht abgeschlossene Sync-Versuche"
+        + oldestId + "; möglicherweise noch aktiv oder unterbrochen."
+        + " Unbekannte Ergebnisse dürfen nicht automatisch wiederholt werden.";
+    }
+  }
+  view.textContent = headline + baseline + recoveryNote
     + " Das Alter einzelner Zähler ist separat ausgewiesen.";
 }
 
@@ -1425,6 +1479,26 @@ async function runPlatformWrite(
 ) {
   let entry = pendingWrites.get(scope);
   const retryingPending = entry !== undefined;
+  if (retryingPending && entry.acknowledgeOnly === true) {
+    // A terminal result was already observed *in this browser runtime*.
+    // Retry only the local UI ACK, never the prior platform request.
+    try {
+      await acknowledgePendingWrite(entry);
+      pendingWrites.delete(scope);
+      pendingAckOnly.delete(scope);
+      await refreshAfterSettledWrite();
+      setWriteStatus(
+        "Bereits beobachtetes Write-Ergebnis lokal bestätigt. Keine erneute Plattformweiterleitung.",
+        "warning",
+      );
+    } catch (error) {
+      setWriteStatus(
+        `Der lokale Recovery-ACK bleibt offen: ${error.message}. Kein neuer Plattformrequest.`,
+        "warning",
+      );
+    }
+    return null;
+  }
   if (entry === undefined) {
     entry = {
       scope,
@@ -1469,9 +1543,17 @@ async function runPlatformWrite(
             return completedResult;
           }
         }
+        entry.acknowledgeOnly = true;
+        pendingAckOnly.set(scope, {
+          key: entry.key, method: entry.method, path: entry.path,
+        });
         try {
           await acknowledgePendingWrite(entry);
         } catch (error) {
+          // A denied local ACK must keep the original operation fence, but
+          // must not prevent read-only dashboard refresh after the settled
+          // backend response. Refresh neither retries nor clears the write.
+          await refreshAfterSettledWrite();
           setWriteStatus(
             `Write-Ergebnis ist terminal, aber der lokale Recovery-ACK ist fehlgeschlagen: ${error.message}. Derselbe Request/Key bleibt gebunden.`,
             "warning",
@@ -1479,6 +1561,7 @@ async function runPlatformWrite(
           return {response, payload: responsePayload};
         }
         pendingWrites.delete(scope);
+        pendingAckOnly.delete(scope);
       }
       await refreshAfterSettledWrite();
     } else if (responsePayload.error === "dashboard_pending_write_conflict") {
@@ -1490,6 +1573,10 @@ async function runPlatformWrite(
         retryingPending,
       )
     ) {
+      entry.acknowledgeOnly = true;
+      pendingAckOnly.set(scope, {
+        key: entry.key, method: entry.method, path: entry.path,
+      });
       try {
         await acknowledgePendingWrite(entry);
       } catch (error) {
@@ -1500,11 +1587,12 @@ async function runPlatformWrite(
         return {response, payload: responsePayload};
       }
       pendingWrites.delete(scope);
+      pendingAckOnly.delete(scope);
     }
     return {response, payload: responsePayload};
   } catch (error) {
     setWriteStatus(
-      `Transportstatus unbekannt: ${error.message} Derselbe Idempotency-Key bleibt für eine manuelle Wiederholung gebunden; es erfolgt kein automatischer Retry.`,
+      `Transportstatus unbekannt: ${error.message} Derselbe Idempotency-Key bleibt zur unabhängigen Recovery-Prüfung gebunden; eine erneute Plattformweiterleitung ist nicht autorisiert. Kein automatischer Retry.`,
       "warning",
     );
     return null;
@@ -1818,7 +1906,7 @@ async function runAdAction(
   const scope = `ad:${adId}:${action}`;
   if (existing !== null && existing.scope !== scope) {
     setWriteStatus(
-      `Für diese Anzeige ist bereits „${existing.scope}“ mit unbekanntem/ausstehendem Ergebnis gebunden. Zuerst genau diese Anfrage erneut abfragen.`,
+      `Für diese Anzeige ist bereits „${existing.scope}“ mit unbekanntem/ausstehendem Ergebnis gebunden. Zuerst den ursprünglichen Ausgang unabhängig klären.`,
       "warning",
     );
     return;
@@ -2166,7 +2254,7 @@ async function load() {
     renderWriteAvailability();
     renderGenerationAvailability();
     renderAds(ads);
-    renderSyncStatus(summary.sync_status);
+    renderSyncStatus(summary.sync_status, summary.sync_recovery);
     renderAnalyticsContract(contract);
 
     const metricSelect = byId("metric-select");
@@ -2230,6 +2318,7 @@ def _json_bytes(value: object) -> bytes:
         value,
         ensure_ascii=False,
         sort_keys=True,
+        allow_nan=False,
         separators=(",", ":"),
     ).encode("utf-8")
 
@@ -2243,9 +2332,17 @@ def _single_query_value(query_string: str, name: str) -> str | None:
 
 def _dashboard_write_route(path: str, method: str) -> str | None:
     target = urlsplit(path)
-    if target.query:
+    if target.path != path:
         return None
-    parts = [unquote(item) for item in target.path.split("/") if item]
+    # Reject noncanonical write paths before binding any durable intent.
+    # Otherwise a percent-encoded media route can lose its staging references.
+    raw_parts = target.path.split("/")
+    if (
+        raw_parts[0] != ""
+        or any(not part or unquote(part) != part for part in raw_parts[1:])
+    ):
+        return None
+    parts = raw_parts[1:]
     if parts == ["api", "write", "ads"] and method == "POST":
         return "json"
     if parts == ["api", "write", "media", "stage"] and method == "POST":
@@ -2277,7 +2374,7 @@ def _dashboard_pending_identity(
     method: str,
 ) -> tuple[str, str, str | None] | None:
     target = urlsplit(path)
-    if target.query:
+    if target.path != path:
         return None
     parts = [unquote(item) for item in target.path.split("/") if item]
     if parts == ["api", "write", "ads"] and method == "POST":
@@ -2308,40 +2405,285 @@ def _dashboard_pending_identity(
     return None
 
 
+def _local_reconciliation_allowed(
+    store: SnapshotStore | StorageOwnerClient, proxy: DashboardWriteProxy,
+) -> bool:
+    return (
+        type(store) is SnapshotStore
+        and proxy.local_reconciliation_enabled
+        and proxy.backend_principal is not None
+        and not container_draft_denied()
+    )
+
+
+def _local_pending_matches(
+    store: SnapshotStore, *, scope: str, key: str, resource: str | None = None,
+) -> tuple[DashboardPendingWrite, ...]:
+    # Deliberately local SQLite reads, never an owner RPC. Limit collision
+    # reads to two rows; more than one match is always a conflict.
+    with closing(store._connect()) as connection:
+        store._validate_store_schema(connection)
+        rows = connection.execute(
+            "SELECT scope, resource_key, idempotency_key, method, path, "
+            "payload_json, ad_id, acknowledged FROM dashboard_pending_writes "
+            "WHERE scope = ? OR idempotency_key = ? OR resource_key = ? LIMIT 2",
+            (scope, key, resource),
+        ).fetchall()
+    return tuple(store._dashboard_pending_write_record(row) for row in rows)
+
+
+def _local_completed_write_response(
+    store: SnapshotStore, proxy: DashboardWriteProxy, pending: DashboardPendingWrite,
+) -> bytes:
+    """Read only the original confirmed result of an exactly bound local intent.
+
+    Browser JSON is never a completion proof. Both the trusted backend's
+    fingerprint and its persisted operation receipt must support the HTTP row.
+    This function cannot complete requests, clear recovery or contact a backend.
+    """
+    if not _local_reconciliation_allowed(store, proxy):
+        raise ValueError("local reconciliation is not configured")
+    return _stored_completed_write_response(store, proxy.backend_principal, pending)
+
+
+def _stored_completed_write_response(
+    store: SnapshotStore, principal: str, pending: DashboardPendingWrite,
+) -> bytes:
+    """Exact persisted completion check shared by local and protected owners.
+
+    This helper does not establish an independent witness proof. The protected
+    owner adds that proof itself before any remote ACK or replay is permitted.
+    """
+    if type(store) is not SnapshotStore or type(principal) is not str or not principal:
+        raise ValueError("trusted local completion context required")
+    kind = _dashboard_write_route(pending.path, pending.method)
+    if (
+        kind not in {"json", "empty"}
+        or urlsplit(pending.path).path != pending.path
+        or _dashboard_pending_identity(pending.path, pending.method)
+        != (pending.scope, pending.resource_key, pending.ad_id)
+        or _DASHBOARD_IDEMPOTENCY_KEY_RE.fullmatch(pending.idempotency_key) is None
+    ):
+        raise ValueError("pending identity mismatch")
+    payload: dict[str, object] = {}
+    if kind == "json":
+        if pending.payload_json is None or len(pending.payload_json) > _MAX_PROXY_JSON_BODY_BYTES:
+            raise ValueError("missing or oversized pending payload")
+        pending_bytes = pending.payload_json.encode("utf-8")
+        if len(pending_bytes) > _MAX_PROXY_JSON_BODY_BYTES:
+            raise ValueError("oversized pending payload")
+        payload = strict_json_object(pending_bytes)
+        if _json_bytes(payload).decode("utf-8") != pending.payload_json:
+            raise ValueError("noncanonical pending payload")
+        if pending.ad_id is None:
+            _, _, payload = _normalize_create_payload(
+                payload, with_media=pending.scope == "create-media",
+            )
+        elif (
+            not payload or set(payload) - {"title", "description"}
+            or any(not isinstance(value, str) for value in payload.values())
+        ):
+            raise ValueError("invalid content payload")
+    elif pending.payload_json is not None:
+        raise ValueError("unexpected pending payload")
+
+    record = store.write_api_request(pending.idempotency_key)
+    if (
+        record is None or record.idempotency_key != pending.idempotency_key
+        or record.request_sha256 != _request_fingerprint(
+            principal=principal, method=pending.method,
+            path=pending.path, payload=payload,
+        )
+        or record.state != "completed" or record.execution_started_at is None
+        or record.completed_at is None or record.response_status != 200
+        or not record.claim_owner
+        or any(value.utcoffset() is None for value in (
+            record.requested_at, record.execution_started_at, record.completed_at,
+        ))
+        or not record.requested_at <= record.execution_started_at <= record.completed_at
+        or record.response_json is None
+        or len(record.response_json) > _MAX_PROXY_RESPONSE_BYTES
+    ):
+        raise ValueError("no exact completed result")
+    response_bytes = record.response_json.encode("utf-8")
+    if len(response_bytes) > _MAX_PROXY_RESPONSE_BYTES:
+        raise ValueError("oversized completed response")
+    response = strict_json_object(response_bytes)
+    media = pending.scope == "create-media"
+    response_fields = {"idempotency_key", "operation_receipt", "platform_retry_authorized"}
+    if media:
+        response_fields |= {"media_persistence_confirmed", "media_post_read_status"}
+    receipt = response.get("operation_receipt")
+    operation = (
+        "create" if pending.ad_id is None else
+        "update_content" if pending.method == "PATCH" else
+        "delete" if pending.method == "DELETE" else
+        {"pause": "set_state:paused", "activate": "set_state:active"}[
+            pending.path.rsplit("/", 1)[1]
+        ]
+    )
+    if (
+        _json_bytes(response) != response_bytes or set(response) != response_fields
+        or response["idempotency_key"] != pending.idempotency_key
+        or response["platform_retry_authorized"] is not False
+        or not isinstance(receipt, dict)
+        or receipt.get("operation") != operation
+        or receipt.get("outcome") != "confirmed"
+        or receipt.get("writer_invoked") is not True
+        or receipt.get("authorization_by") != principal
+        or receipt.get("authorization_reference") != "write-api:" + pending.idempotency_key
+    ):
+        raise ValueError("invalid completed receipt")
+    if pending.ad_id is None:
+        if not isinstance(receipt.get("created_ad_id"), str) or not _valid_ad_id(receipt["created_ad_id"]):
+            raise ValueError("invalid created target")
+        if any(receipt.get(name) != "success_nonempty" for name in (
+            "post_read_status", "confirmation_post_read_status", "content_post_read_status",
+        )):
+            raise ValueError("incomplete create confirmation")
+    elif receipt.get("ad_id") != pending.ad_id:
+        raise ValueError("receipt target mismatch")
+    if media and (
+        receipt.get("media_persistence_confirmed") is not True
+        or response["media_persistence_confirmed"] is not True
+        or response["media_post_read_status"] != receipt.get("media_post_read_status")
+    ):
+        raise ValueError("unconfirmed media")
+    for name in ("started_at", "completed_at"):
+        raw = receipt.get(name)
+        if not isinstance(raw, str) or len(raw) > 80:
+            raise ValueError("invalid receipt time")
+        timestamp = datetime.fromisoformat(raw)
+        if timestamp.utcoffset() is None or timestamp.isoformat() != raw:
+            raise ValueError("noncanonical receipt time")
+    if datetime.fromisoformat(receipt["started_at"]) > datetime.fromisoformat(receipt["completed_at"]):
+        raise ValueError("invalid receipt chronology")
+
+    # Compare every wire field against the sole persisted operation receipt,
+    # across both tables. A response-only edit or authorization-key collision
+    # must never become an ACK authority. Table names are fixed local constants.
+    with closing(store._connect()) as connection:
+        found = []
+        common = (
+            "operation", "started_at", "completed_at", "outcome", "pre_read_status",
+            "post_read_status", "writer_invoked", "authorization_by",
+            "authorization_reference", "writer_error",
+        )
+        for table in ("operation_receipts", "create_operation_receipts"):
+            columns = common + (
+                ("ad_id",) if table == "operation_receipts" else (
+                    "created_ad_id", "confirmation_pre_read_status",
+                    "confirmation_post_read_status", "content_post_read_status",
+                    "media_post_read_status", "media_persistence_confirmed",
+                )
+            )
+            rows = connection.execute(
+                f"SELECT {','.join(columns)} FROM {table} WHERE authorization_reference = ? LIMIT 2",
+                ("write-api:" + pending.idempotency_key,),
+            ).fetchall()
+            found.extend((table, dict(row)) for row in rows)
+    expected_table = "create_operation_receipts" if pending.ad_id is None else "operation_receipts"
+    if len(found) != 1 or found[0][0] != expected_table:
+        raise ValueError("missing or colliding operation receipt")
+    row = found[0][1]
+    wire = dict(row)
+    wire["writer_invoked"] = wire["writer_invoked"] == 1
+    if pending.ad_id is None:
+        if row["media_post_read_status"] is None:
+            del wire["media_post_read_status"]
+            del wire["media_persistence_confirmed"]
+        else:
+            wire["media_persistence_confirmed"] = row["media_persistence_confirmed"] == 1
+    if _json_bytes(wire) != _json_bytes(receipt):
+        raise ValueError("stored response differs from operation receipt")
+    return response_bytes
+
+
+
+def _owner_reconciliation_allowed(
+    store: SnapshotStore | StorageOwnerClient, proxy: DashboardWriteProxy,
+) -> bool:
+    from .completion_dashboard import CompletionDashboardClient
+    return (
+        type(store) is CompletionDashboardClient
+        and proxy.owner_reconciliation_enabled
+        and not proxy.local_reconciliation_enabled
+        and proxy.backend_principal == store.principal
+        and not container_draft_denied()
+    )
+
+
+def _pending_reconciliation_allowed(
+    store: SnapshotStore | StorageOwnerClient, proxy: DashboardWriteProxy,
+) -> bool:
+    return _local_reconciliation_allowed(store, proxy) or _owner_reconciliation_allowed(store, proxy)
+
+
+def _pending_matches(
+    store: SnapshotStore | StorageOwnerClient, *, scope: str, key: str,
+    resource: str | None = None,
+) -> tuple[DashboardPendingWrite, ...]:
+    if type(store) is SnapshotStore:
+        return _local_pending_matches(store, scope=scope, key=key, resource=resource)
+    from .completion_dashboard import CompletionDashboardClient
+    if type(store) is not CompletionDashboardClient:
+        raise ValueError("independent reconciliation is not configured")
+    # This is a bounded typed read of pending intents, not completion evidence.
+    # The owner rechecks the full identity plus its witness before either ACK.
+    return tuple(row for row in store.dashboard_pending_writes()
+                 if row.scope == scope or row.idempotency_key == key
+                 or row.resource_key == resource)[:2]
+
+
+def _completed_write_response(
+    store: SnapshotStore | StorageOwnerClient, proxy: DashboardWriteProxy,
+    pending: DashboardPendingWrite,
+) -> bytes:
+    if _owner_reconciliation_allowed(store, proxy):
+        return store.confirmed_dashboard_write_response(pending)
+    return _local_completed_write_response(store, proxy, pending)
+
+
 def _handler_factory(
-    store: SnapshotStore,
+    store: SnapshotStore | StorageOwnerClient,
     query: MarkQueryService,
     analytics: AnalyticsService,
     write_proxy: DashboardWriteProxy | None,
     generation_access: DashboardGenerationAccess | None,
+    *,
+    public_origin_port: int | None = None,
 ):
     class DashboardHandler(BaseHTTPRequestHandler):
         server_version = "mark-api-readonly/0.1"
         sys_version = ""
 
         def parse_request(self) -> bool:
-            # A new request must never inherit the preceding request's Host,
-            # including for malformed or legacy two-token request lines.
+            # Reset per-request state before parsing even malformed HTTP/0.9.
             self.headers = None
             if not super().parse_request():
                 return False
-            # Loopback bind alone does not stop DNS-rebound foreign Host
-            # requests. Validate the actual listener authority before any
-            # read route or optional same-origin Write API proxy.
+            # Both native loopback and independently-relayed public origin
+            # must be exact numeric 127.0.0.1 hosts. No DNS rebound or
+            # duplicate Host headers can authorize read or Write proxy routes.
             listener_host, listener_port = self.server.server_address
-            canonical = _dashboard_http_origin(
-                "127.0.0.1", int(listener_port),
-            ).removeprefix("http://")
-            allowed_hosts = {canonical, f"127.0.0.1:{int(listener_port)}"}
-            # Some parser versions may omit self.headers on HTTP/0.9 paths.
-            # No current-request headers means no authority, never an error
-            # or re-use of a prior request's allowlisted Host.
+            allowed_ports = {int(listener_port)}
+            if public_origin_port is not None:
+                allowed_ports.add(public_origin_port)
+            # Both explicit :80 and canonical portless Host spellings
+            # designate the same numeric 127.0.0.1 listener, not DNS aliases.
+            allowed_hosts = {
+                spelling
+                for port in allowed_ports
+                for spelling in (
+                    _dashboard_http_origin("127.0.0.1", port).removeprefix("http://"),
+                    f"127.0.0.1:{port}",
+                )
+            }
             parsed_headers = getattr(self, "headers", None)
             get_all = getattr(parsed_headers, "get_all", None)
-            hosts = get_all("Host") if callable(get_all) else ()
+            hosts = (get_all("Host") if callable(get_all) else None) or []
             if (
                 str(listener_host) != "127.0.0.1"
-                or hosts is None
                 or len(hosts) != 1
                 or hosts[0] not in allowed_hosts
             ):
@@ -2386,9 +2728,16 @@ def _handler_factory(
             self.wfile.write(body)
 
         def _send_json(self, status: int, value: object) -> None:
+            try:
+                encoded = _json_bytes(value)
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                # Never emit JavaScript-invalid NaN/Infinity from metrics
+                # or other service data; invalid data cannot be success.
+                status = 500
+                encoded = b'{"error":"invalid_json_response"}'
             self._send(
                 status,
-                _json_bytes(value),
+                encoded,
                 "application/json; charset=utf-8",
             )
 
@@ -2437,12 +2786,12 @@ def _handler_factory(
                 origins = self.headers.get_all("Origin") or []
                 server_host, server_port = self.server.server_address
                 expected_origin = _dashboard_http_origin(
-                    str(server_host), int(server_port)
+                    str(server_host),
+                    int(server_port) if public_origin_port is None else public_origin_port,
                 )
                 if (
                     len(origins) != 1
-                    or not hmac.compare_digest(origins[0], expected_origin)
-                ):
+                    or not hmac.compare_digest(origins[0], expected_origin)                ):
                     return False
             fetch_sites = self.headers.get_all("Sec-Fetch-Site") or []
             if fetch_sites and (
@@ -2610,6 +2959,20 @@ def _handler_factory(
             headers.update(body_headers)
             headers["Content-Length"] = str(len(body))
 
+            parsed_payload: dict[str, object] | None = None
+            if body_kind in {"json", "local_json"}:
+                try:
+                    parsed_payload = strict_json_object(body)
+                except ValueError as exc:
+                    self._send_json(
+                        400,
+                        {
+                            "error": str(exc),
+                            "platform_retry_authorized": False,
+                        },
+                    )
+                    return
+
             pending_scope: str | None = None
             if platform_write:
                 assert idempotency_key is not None
@@ -2626,39 +2989,70 @@ def _handler_factory(
                 pending_scope, resource_key, pending_ad_id = identity
                 pending_payload_json: str | None = None
                 if body_kind == "json":
+                    assert parsed_payload is not None
                     try:
-                        pending_payload = json.loads(body)
-                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        pending_payload_json = _json_bytes(
+                            parsed_payload
+                        ).decode("utf-8")
+                    except (UnicodeError, ValueError):
+                        # Lone JSON surrogates are not UTF-8. Reject before
+                        # claiming or forwarding instead of dropping the socket.
                         self._send_json(
                             400,
                             {
-                                "error": "invalid_json",
+                                "error": "invalid_unicode_text",
                                 "platform_retry_authorized": False,
                             },
                         )
                         return
-                    if not isinstance(pending_payload, dict):
-                        self._send_json(
-                            400,
-                            {
-                                "error": "json_body_must_be_object",
-                                "platform_retry_authorized": False,
-                            },
-                        )
-                        return
-                    pending_payload_json = _json_bytes(
-                        pending_payload
-                    ).decode("utf-8")
+                replay_body: bytes | None = None
                 try:
-                    store.claim_dashboard_pending_write(
-                        scope=pending_scope,
-                        resource_key=resource_key,
-                        idempotency_key=idempotency_key,
-                        method=method,
-                        path=urlsplit(self.path).path,
-                        payload_json=pending_payload_json,
-                        ad_id=pending_ad_id,
-                    )
+                    if _pending_reconciliation_allowed(store, write_proxy):
+                        expected = DashboardPendingWrite(
+                            scope=pending_scope, resource_key=resource_key,
+                            idempotency_key=idempotency_key, method=method,
+                            path=urlsplit(self.path).path,
+                            payload_json=pending_payload_json, ad_id=pending_ad_id,
+                            acknowledged=False,
+                        )
+                        with store.dashboard_pending_write_guard():
+                            matches = _pending_matches(
+                                store, scope=pending_scope, key=idempotency_key,
+                                resource=resource_key,
+                            )
+                            if matches and (
+                                len(matches) != 1
+                                or replace(matches[0], acknowledged=False) != expected
+                            ):
+                                raise ValueError("pending write identity conflict")
+                            if matches or store.write_api_request(idempotency_key) is not None:
+                                replay_body = _completed_write_response(
+                                    store, write_proxy, matches[0] if matches else expected,
+                                )
+                            else:
+                                # Keep local read/claim and ACK mutually exclusive.
+                                created = store.claim_dashboard_pending_write(
+                                    scope=pending_scope, resource_key=resource_key,
+                                    idempotency_key=idempotency_key, method=method,
+                                    path=expected.path, payload_json=pending_payload_json,
+                                    ad_id=pending_ad_id,
+                                )
+                    else:
+                        created = store.claim_dashboard_pending_write(
+                            scope=pending_scope,
+                            resource_key=resource_key,
+                            idempotency_key=idempotency_key,
+                            method=method,
+                            path=urlsplit(self.path).path,
+                            payload_json=pending_payload_json,
+                            ad_id=pending_ad_id,
+                        )
+                    if replay_body is None and created is not True:
+                        # An exact duplicate is still an unresolved UI fence:
+                        # after a lost backend ACK it may already have written.
+                        # Never forward that intent again without separate,
+                        # read-only independent reconciliation of the outcome.
+                        raise ValueError("existing pending write is unresolved")
                 except ValueError:
                     self._send_json(
                         409,
@@ -2675,6 +3069,12 @@ def _handler_factory(
                             "error": "dashboard_pending_store_error",
                             "platform_retry_authorized": False,
                         },
+                    )
+                    return
+                if replay_body is not None:
+                    self._send(
+                        200, replay_body, "application/json; charset=utf-8",
+                        idempotency_replayed=True,
                     )
                     return
 
@@ -2702,13 +3102,11 @@ def _handler_factory(
                     if not content_type.lower().startswith("application/json"):
                         raise ValueError("write_proxy_response_not_json")
                     try:
-                        response_payload = json.loads(response_body)
-                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        response_payload = strict_json_object(response_body)
+                    except ValueError as exc:
                         raise ValueError(
                             "write_proxy_response_not_json"
                         ) from exc
-                    if not isinstance(response_payload, dict):
-                        raise ValueError("write_proxy_response_not_json")
                     replayed = (
                         response.getheader("Idempotency-Replayed") == "true"
                     )
@@ -2737,7 +3135,7 @@ def _handler_factory(
         def do_GET(self) -> None:
             try:
                 self._handle_GET()
-            except sqlite3.Error:
+            except (sqlite3.Error, StorageOwnerError):
                 # No database error messages, SQL or filesystem paths on HTTP.
                 self._send_json(503, {"error": "database_unavailable"})
 
@@ -2838,9 +3236,13 @@ def _handler_factory(
             if path == "/api/sync/status":
                 self._send_json(200, store.sync_status())
                 return
+            if path == "/api/sync/recovery":
+                self._send_json(200, store.sync_recovery_status())
+                return
             if path == "/api/summary":
                 payload = summary_to_dict(query.summary())
                 payload["sync_status"] = store.sync_status()
+                payload["sync_recovery"] = store.sync_recovery_status()
                 self._send_json(200, payload)
                 return
             if path == "/api/ads":
@@ -3027,20 +3429,34 @@ def _handler_factory(
                 return
             try:
                 body, _ = self._read_proxy_body("local_json")
-                payload = json.loads(body)
+                payload = strict_json_object(body)
                 if (
-                    not isinstance(payload, dict)
-                    or set(payload) != {"scope", "idempotency_key"}
+                    set(payload) != {"scope", "idempotency_key"}
                     or not isinstance(payload["scope"], str)
                     or not isinstance(payload["idempotency_key"], str)
                 ):
                     raise ValueError("invalid_pending_ack")
-                phase = store.acknowledge_dashboard_pending_write(
-                    scope=payload["scope"],
-                    idempotency_key=payload["idempotency_key"],
-                )
-                if phase == "missing":
-                    raise ValueError("dashboard pending write is missing")
+                if not _pending_reconciliation_allowed(store, write_proxy):
+                    self._send_json(409, {
+                        "error": "dashboard_pending_write_reconciliation_required",
+                        "platform_retry_authorized": False,
+                    })
+                    return
+                with store.dashboard_pending_write_guard():
+                    matches = _pending_matches(
+                        store, scope=payload["scope"], key=payload["idempotency_key"],
+                    )
+                    if (
+                        len(matches) != 1 or matches[0].scope != payload["scope"]
+                        or matches[0].idempotency_key != payload["idempotency_key"]
+                    ):
+                        raise ValueError("pending acknowledgement identity conflict")
+                    _completed_write_response(store, write_proxy, matches[0])
+                    phase = store.acknowledge_dashboard_pending_write(
+                        scope=matches[0].scope, idempotency_key=matches[0].idempotency_key,
+                    )
+                    if phase not in {"acknowledged", "finalized"}:
+                        raise ValueError("pending acknowledgement lost record")
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 self._send_json(
                     409,
@@ -3059,13 +3475,7 @@ def _handler_factory(
                     },
                 )
                 return
-            self._send_json(
-                200,
-                {
-                    "acknowledged": True,
-                    "finalized": phase == "finalized",
-                },
-            )
+            self._send_json(200, {"acknowledged": True, "finalized": phase == "finalized"})
 
         def _generation_session_authorized(self) -> bool:
             if generation_access is None:
@@ -3074,8 +3484,11 @@ def _handler_factory(
             tokens = self.headers.get_all("X-Mark-Generation-Token") or []
             origins = self.headers.get_all("Origin") or []
             fetch_sites = self.headers.get_all("Sec-Fetch-Site") or []
-            host, port = self.server.server_address
-            expected_origin = _dashboard_http_origin(str(host), int(port))
+            # parse_request already restricts Host to exact loopback
+            # listener/public-ingress ports. Bind generation consent to the
+            # *browser-facing* Host, not the private frontend netns port.
+            hosts = self.headers.get_all("Host") or []
+            expected_origin = "http://" + hosts[0] if len(hosts) == 1 else ""
             return (
                 len(marker) == 1
                 and marker[0] == "1"
@@ -3187,13 +3600,14 @@ class LoopbackDashboardServer(ThreadingHTTPServer):
 
 
 def create_server(
-    store: SnapshotStore,
+    store: SnapshotStore | StorageOwnerClient,
     *,
     host: str = "127.0.0.1",
     port: int = 8765,
     analytics_contract: AnalyticsContract | None = None,
     write_proxy: DashboardWriteProxy | None = None,
     generation_access: DashboardGenerationAccess | None = None,
+    public_origin_port: int | None = None,
 ) -> LoopbackDashboardServer:
     if host != "127.0.0.1":
         raise ValueError("dashboard must bind to 127.0.0.1")
@@ -3203,26 +3617,53 @@ def create_server(
         or not 0 <= port <= 65535
     ):
         raise ValueError("port must be an integer between 0 and 65535")
+    if public_origin_port is not None and (
+        type(public_origin_port) is not int
+        or not 1 <= public_origin_port <= 65535
+    ):
+        raise ValueError("public_origin_port must be an integer between 1 and 65535")
 
     if generation_access is not None and not isinstance(generation_access, DashboardGenerationAccess):
         raise TypeError("generation_access must be DashboardGenerationAccess or None")
+    if write_proxy is not None and (
+        isinstance(store, StorageOwnerClient) or write_proxy.owner_reconciliation_enabled
+    ):
+        # The old client remains read/claim only. A dedicated owner composition
+        # checks its persisted receipt AND independent witness for each ACK.
+        if not _owner_reconciliation_allowed(store, write_proxy):
+            raise ValueError("independent storage dashboard Writes are not yet attested")
+        store.verify_completion_profile()
     query = MarkQueryService(store)
     analytics = AnalyticsService(store, contract=analytics_contract)
     return LoopbackDashboardServer(
         (host, port),
-        _handler_factory(store, query, analytics, write_proxy, generation_access),
+        _handler_factory(
+            store, query, analytics, write_proxy, generation_access,
+            public_origin_port=public_origin_port,
+        ),
     )
 
 
 def main(argv: list[str] | None = None) -> int:
+    if container_draft_denied():
+        print("mark-api: unattested container draft cannot run Python entrypoints",
+              file=sys.stderr)
+        return 2
     parser = argparse.ArgumentParser(
         description="Serve the local read-only dashboard with optional explicit draft generation.",
     )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--db", type=Path,
+        help="Trusted offline SQLite database (never mount in untrusted runtime).",
+    )
+    source.add_argument(
+        "--owner-socket", type=Path,
+        help="Read-only analytics over the independent SQLite-owner Unix socket.",
+    )
     parser.add_argument(
-        "--db",
-        type=Path,
-        required=True,
-        help="Path to the mark-api SQLite database.",
+        "--owner-uid", type=int,
+        help="Required exact SO_PEERCRED UID for --owner-socket (no DB fallback).",
     )
     parser.add_argument(
         "--port",
@@ -3271,10 +3712,26 @@ def main(argv: list[str] | None = None) -> int:
         if not callable(_GenerationSdkClient):
             parser.error("--enable-generation requires a functional OpenAI SDK")
 
-    try:
-        store = SnapshotStore(args.db, create_if_missing=args.init_db)
-    except (OSError, sqlite3.Error):
-        parser.error("SQLite database unavailable or not initialized")
+    if args.owner_socket is not None:
+        if args.init_db:
+            parser.error("--init-db is forbidden with --owner-socket")
+        if args.owner_uid is None:
+            parser.error("--owner-uid is required for --owner-socket")
+        try:
+            store = StorageOwnerClient(
+                args.owner_socket, expected_owner_uid=args.owner_uid,
+            )
+            if not store.is_ready():
+                parser.error("independent SQLite owner unavailable")
+        except (StorageOwnerError, OSError):
+            parser.error("independent SQLite owner unavailable")
+    else:
+        if args.owner_uid is not None:
+            parser.error("--owner-uid requires --owner-socket")
+        try:
+            store = SnapshotStore(args.db, create_if_missing=args.init_db)
+        except (OSError, sqlite3.Error):
+            parser.error("SQLite database unavailable or not initialized")
     contract = AnalyticsContract(
         reaction_metric=args.reaction_metric,
         objective_metric=args.objective_metric,

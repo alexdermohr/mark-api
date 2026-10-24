@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import closing
 import tempfile
+from time import monotonic
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -62,6 +64,10 @@ from mark_api.private_web_media import (
     PrivateWebMediaSource,
 )
 from mark_api.results import ReadResult, ReadStatus
+from mark_api.fence_witness import (
+    FenceLedger, FenceWitnessClient, FenceWitnessError,
+    FenceWitnessRejected, FenceWitnessServer,
+)
 from mark_api.storage import SnapshotStore
 from mark_api.write_api import (
     WriteApiAccess,
@@ -517,6 +523,24 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         runtime.reconcile_media_submit()
         self.assertFalse(page._unsettled)
         self.assertTrue(page._closed)
+        runtime.close()
+
+    def test_pending_submit_tracks_exact_authorization_reference(self) -> None:
+        events: list[tuple] = []
+        page = MediaCreatePage(events, submit_unknown=True)
+        runtime = PrivateWebMediaCreateRuntime(page_factory=lambda: page)
+        writer = runtime.bind_create_writer(
+            self.request, self.sources,
+            authorization_reference="write-api:exact-media-idempotency",
+        )
+        with self.assertRaises(PrivateWebSubmitUnknownError):
+            writer.create_ad(self.request)
+        self.assertEqual(
+            runtime.pending_authorization_reference,
+            "write-api:exact-media-idempotency",
+        )
+        runtime.reconcile_media_submit()
+        self.assertIsNone(runtime.pending_authorization_reference)
         runtime.close()
 
     def test_context_manager_preserves_submit_unknown_stage(self) -> None:
@@ -1041,6 +1065,15 @@ class PrivateWebMediaCreateRuntimeTests(unittest.TestCase):
         self.assertEqual(
             persisted_completed_at,
             ((NOW + timedelta(seconds=3)).isoformat(),),
+        )
+        # This actual media service uses its legitimate None/None default
+        # authorization. Matching durable checkpoint + confirmed final
+        # receipt must retire the fence; the next Create is not blocked.
+        self.assertFalse(
+            SnapshotStore(db_path, create_if_missing=False).create_recovery_pending(
+                exclude_idempotency_key="new-after-confirmed-media",
+                claim_owner="separate-media-test",
+            )
         )
         runtime.close()
 
@@ -2740,6 +2773,100 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
 
             self.assertEqual(close_events, ["content"])
 
+    def test_composition_requires_witness_start_before_browser_write(self) -> None:
+        class RefusingWitness:
+            starts: list[tuple[str, str, str]] = []
+
+            def started(self, *, key: str, sha: str, action: str) -> None:
+                self.starts.append((key, sha, action))
+                raise FenceWitnessRejected("synthetic independent pending fence")
+
+            def completed(self, *, key: str, sha: str, response: object) -> str:
+                raise AssertionError("a denied start cannot complete")
+
+            def pending(self) -> bool:
+                return False
+
+            def replay_status(self, *, key: str, sha: str, response_sha: str) -> str:
+                return "never_started"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            reader = OwnerReader(ReadResult.success_nonempty((owner_snapshot(),)))
+            close_events: list[str] = []
+            witness = RefusingWitness()
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=self._content_runtime(reader, close_events),
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test", bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.SET_STATE}),
+                    writes_enabled=True,
+                ),
+                core_writes_enabled=True,
+                fence_witness=witness,
+            )
+            try:
+                status, body = self._request(
+                    runtime, "POST", f"/api/write/ads/{AD_ID}/pause",
+                    idempotency_key="witness-privateweb-denied",
+                )
+                self.assertEqual(status, 503, body)
+                self.assertEqual(body["error"], "witness_write_rejected")
+                self.assertFalse(body["platform_retry_authorized"])
+                self.assertEqual(reader.calls, 0)
+                self.assertEqual(len(witness.starts), 1)
+                self.assertEqual(witness.starts[0][2], "pause")
+            finally:
+                runtime.close()
+            self.assertEqual(close_events, ["content"])
+
+    def test_builder_preserves_witness_without_enabling_new_write_flags(self) -> None:
+        class RefusingWitness:
+            def started(self, *, key: str, sha: str, action: str) -> None:
+                raise FenceWitnessRejected("synthetic independent pending fence")
+
+            def completed(self, *, key: str, sha: str, response: object) -> str:
+                raise AssertionError("unstarted witness must not complete")
+
+            def pending(self) -> bool:
+                return False
+
+            def replay_status(self, *, key: str, sha: str, response_sha: str) -> str:
+                return "never_started"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            reader = OwnerReader(ReadResult.success_nonempty((owner_snapshot(),)))
+            close_events: list[str] = []
+            content = self._content_runtime(reader, close_events)
+            with patch(
+                "mark_api.private_web_runtime.build_private_web_content_runtime",
+                return_value=content,
+            ):
+                runtime = build_private_web_write_api_runtime(
+                    cdp_port=19610,
+                    store=store,
+                    access=WriteApiAccess(
+                        principal="runtime-test", bearer_token=self.TOKEN,
+                        capabilities=frozenset({WriteCapability.SET_STATE}),
+                        writes_enabled=True,
+                    ),
+                    core_writes_enabled=True,
+                    fence_witness=RefusingWitness(),
+                )
+            try:
+                status, body = self._request(
+                    runtime, "POST", f"/api/write/ads/{AD_ID}/pause",
+                    idempotency_key="witness-builder-denied",
+                )
+                self.assertEqual(status, 503, body)
+                self.assertEqual(body["error"], "witness_write_rejected")
+                self.assertEqual(reader.calls, 0)
+            finally:
+                runtime.close()
+            self.assertEqual(close_events, ["content"])
+
     def test_api_gate_can_stay_closed_while_core_gate_is_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SnapshotStore(Path(tmp) / "runtime.sqlite")
@@ -3708,6 +3835,218 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             )
             self.assertEqual(close_events, ["content"])
 
+    def test_stuck_http_write_fails_bounded_close_without_losing_sqlite_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            close_events: list[str] = []
+            content_runtime = self._content_runtime(
+                OwnerReader(ReadResult.success_empty(())), close_events,
+            )
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=content_runtime,
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.SET_STATE}),
+                    writes_enabled=True,
+                ),
+                core_writes_enabled=True,
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            client_errors: list[BaseException] = []
+            responses: list[tuple[int, dict[str, object]]] = []
+
+            def pause(
+                ad_id: str,
+                *,
+                authorization_by: str | None = None,
+                authorization_reference: str | None = None,
+            ) -> OperationReceipt:
+                entered.set()
+                if not release.wait(timeout=4):
+                    raise AssertionError("test write handler did not release")
+                return self._operation_receipt(
+                    "set_state:paused", ad_id,
+                    authorization_by=authorization_by,
+                    authorization_reference=authorization_reference,
+                )
+
+            runtime._mark_service.pause = pause
+
+            def request() -> None:
+                try:
+                    responses.append(self._request(
+                        runtime, "POST", f"/api/write/ads/{AD_ID}/pause",
+                        idempotency_key="stalled-pause",
+                    ))
+                except BaseException as exc:
+                    client_errors.append(exc)
+
+            runtime.start()
+            client = threading.Thread(target=request, daemon=True)
+            client.start()
+            try:
+                self.assertTrue(entered.wait(timeout=2))
+                with patch(
+                    "mark_api.private_web_runtime._WRITE_HANDLER_DRAIN_SECONDS",
+                    0.15, create=True,
+                ):
+                    with self.assertRaisesRegex(
+                        PrivateWebRuntimeSetupError, "active write handlers",
+                    ):
+                        runtime.close()
+                self.assertEqual(close_events, [])
+                record = store.write_api_request("stalled-pause")
+                self.assertIsNotNone(record)
+                assert record is not None
+                self.assertEqual(record.state, "in_progress")
+                self.assertIsNotNone(record.execution_started_at)
+                with self.assertRaisesRegex(RuntimeError, "already active"):
+                    acquire_write_api_store_lock(store)
+            finally:
+                release.set()
+                client.join(timeout=3)
+                runtime.close()
+
+            self.assertFalse(client.is_alive())
+            self.assertEqual(client_errors, [])
+            self.assertEqual([s for s, _ in responses], [200])
+            self.assertEqual(close_events, ["content"])
+
+    def test_shutdown_operation_lock_is_bounded_and_retains_store_lease(self) -> None:
+        # A concurrent non-HTTP reconciliation can retain this lock after
+        # active HTTP handlers drain. Shutdown cannot wait forever for it.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            close_events: list[str] = []
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=self._content_runtime(
+                    OwnerReader(ReadResult.success_empty(())), close_events,
+                ),
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset(),
+                ),
+            )
+            close_errors: list[BaseException] = []
+
+            def close_worker() -> None:
+                try:
+                    runtime.close()
+                except BaseException as exc:
+                    close_errors.append(exc)
+
+            runtime._operation_lock.acquire()
+            worker = threading.Thread(target=close_worker, daemon=True)
+            try:
+                with patch(
+                    "mark_api.private_web_runtime._WRITE_OPERATION_DRAIN_SECONDS",
+                    0.1, create=True,
+                ):
+                    worker.start()
+                    worker.join(timeout=0.6)
+                self.assertFalse(
+                    worker.is_alive(),
+                    "shutdown blocked on a non-HTTP write operation",
+                )
+                self.assertEqual(len(close_errors), 1)
+                self.assertIsInstance(
+                    close_errors[0], PrivateWebRuntimeSetupError,
+                )
+                self.assertIn("active write operation", str(close_errors[0]))
+                self.assertEqual(close_events, [])
+                with self.assertRaisesRegex(RuntimeError, "already active"):
+                    acquire_write_api_store_lock(store)
+            finally:
+                runtime._operation_lock.release()
+                if worker.ident is not None:
+                    worker.join(timeout=2)
+                runtime.close()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(close_events, ["content"])
+
+    def test_http_server_shutdown_timeout_preserves_store_fence_until_retry(self) -> None:
+        # HTTPServer.shutdown() itself can block independently of the
+        # already bounded serve thread join and active-handler drain.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            close_events: list[str] = []
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=self._content_runtime(
+                    OwnerReader(ReadResult.success_empty(())), close_events,
+                ),
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset(),
+                ),
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            errors: list[BaseException] = []
+            shutdown_invocations: list[str] = []
+            original_shutdown = runtime._server.shutdown
+
+            def blocked_shutdown() -> None:
+                shutdown_invocations.append("shutdown")
+                entered.set()
+                if not release.wait(timeout=3):
+                    raise AssertionError("test shutdown was not released")
+                original_shutdown()
+
+            def close_worker() -> None:
+                try:
+                    runtime.close()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            runtime.start()
+            closer = threading.Thread(target=close_worker, daemon=True)
+            try:
+                with (
+                    patch.object(runtime._server, "shutdown", side_effect=blocked_shutdown),
+                    patch(
+                        "mark_api.private_web_runtime._WRITE_SERVER_SHUTDOWN_SECONDS",
+                        0.1, create=True,
+                    ),
+                ):
+                    closer.start()
+                    self.assertTrue(entered.wait(timeout=1))
+                    closer.join(timeout=0.6)
+                    self.assertFalse(
+                        closer.is_alive(),
+                        "HTTP server shutdown is not bounded",
+                    )
+                    self.assertEqual(len(errors), 1)
+                    self.assertIsInstance(errors[0], PrivateWebRuntimeSetupError)
+                    self.assertIn("server shutdown timeout", str(errors[0]))
+                    # Retried close must not launch another shutdown worker.
+                    with self.assertRaisesRegex(
+                        PrivateWebRuntimeSetupError, "server shutdown timeout",
+                    ):
+                        runtime.close()
+                    self.assertEqual(shutdown_invocations, ["shutdown"])
+                    self.assertEqual(close_events, [])
+                    with self.assertRaisesRegex(RuntimeError, "already active"):
+                        acquire_write_api_store_lock(store)
+                    with self.assertRaisesRegex(
+                        PrivateWebRuntimeSetupError, "shutdown is pending",
+                    ):
+                        runtime.start()
+            finally:
+                release.set()
+                if closer.ident is not None:
+                    closer.join(timeout=3)
+                runtime.close()
+
+            self.assertFalse(closer.is_alive())
+            self.assertEqual(close_events, ["content"])
+
     def test_close_preserves_runtimes_if_http_cannot_quiesce(self) -> None:
         class StuckThread:
             def __init__(self) -> None:
@@ -3759,6 +4098,127 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
                 runtime._server_thread = None
                 runtime.close()
             self.assertEqual(close_events, ["content"])
+
+
+
+    def test_close_total_deadline_does_not_wait_unbounded_for_state_lock(self) -> None:
+        """A blocked lifecycle lock must not consume the whole stop deadline."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            close_events: list[str] = []
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=self._content_runtime(
+                    OwnerReader(ReadResult.success_empty(())), close_events,
+                ),
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset(),
+                ),
+            )
+            errors: list[BaseException] = []
+
+            def close_thread() -> None:
+                try:
+                    runtime.close()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            runtime._state_lock.acquire()
+            caller = threading.Thread(target=close_thread, daemon=True)
+            try:
+                with patch(
+                    "mark_api.private_web_runtime._WRITE_CLOSE_TOTAL_SECONDS",
+                    0.10, create=True,
+                ):
+                    begin = monotonic()
+                    caller.start()
+                    caller.join(timeout=0.65)
+                    self.assertFalse(
+                        caller.is_alive(),
+                        "close() blocked forever before starting its shutdown worker",
+                    )
+                    self.assertLess(monotonic() - begin, 0.65)
+                    self.assertEqual(len(errors), 1)
+                    self.assertIsInstance(errors[0], PrivateWebRuntimeSetupError)
+                    self.assertIn("shutdown deadline", str(errors[0]))
+                    self.assertTrue(runtime._stopping)
+                    with self.assertRaisesRegex(RuntimeError, "already active"):
+                        acquire_write_api_store_lock(store)
+            finally:
+                runtime._state_lock.release()
+                if caller.ident is not None:
+                    caller.join(timeout=2)
+                worker = getattr(runtime, "_close_worker", None)
+                if worker is not None:
+                    worker.join(timeout=2)
+                runtime.close()
+            self.assertEqual(close_events, ["content"])
+            lock = acquire_write_api_store_lock(store)
+            lock.close()
+
+    def test_close_total_deadline_retains_store_during_hung_browser_cleanup(self) -> None:
+        """A stalled browser cleanup cannot outlive the caller's stop deadline."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "runtime.sqlite")
+            entered = threading.Event()
+            release = threading.Event()
+            events: list[str] = []
+
+            def slow_cleanup() -> None:
+                events.append("entered")
+                entered.set()
+                release.wait(timeout=2)
+                events.append("completed")
+
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=PrivateWebContentRuntime(
+                    owner_reader=OwnerReader(ReadResult.success_empty(())),
+                    page_factory=lambda: (_ for _ in ()).throw(
+                        AssertionError("browser page must remain lazy")
+                    ),
+                    close_runtime=slow_cleanup,
+                ),
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset(),
+                ),
+            )
+            try:
+                with patch(
+                    "mark_api.private_web_runtime._WRITE_CLOSE_TOTAL_SECONDS",
+                    0.10, create=True,
+                ):
+                    begin = monotonic()
+                    with self.assertRaisesRegex(
+                        PrivateWebRuntimeSetupError, "shutdown deadline",
+                    ):
+                        runtime.close()
+                    self.assertLess(monotonic() - begin, 0.75)
+                    self.assertTrue(entered.is_set())
+                    self.assertFalse(runtime._closed)
+                    # A retry must observe the SAME cleanup worker, not launch
+                    # a second browser close against one live SQLite lease.
+                    with self.assertRaisesRegex(
+                        PrivateWebRuntimeSetupError, "shutdown deadline",
+                    ):
+                        runtime.close()
+                    self.assertEqual(events, ["entered"])
+                    with self.assertRaisesRegex(RuntimeError, "already active"):
+                        acquire_write_api_store_lock(store)
+            finally:
+                release.set()
+                worker = getattr(runtime, "_close_worker", None)
+                if worker is not None:
+                    worker.join(timeout=2)
+                runtime.close()
+            self.assertEqual(events, ["entered", "completed"])
+            self.assertTrue(runtime._closed)
+            lock = acquire_write_api_store_lock(store)
+            lock.close()
 
     def test_runtime_cleanup_failure_stays_fail_closed_across_repeated_close(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3868,6 +4328,468 @@ class PrivateWebWriteApiRuntimeCompositionTests(unittest.TestCase):
             replacement_lock.close()
 
 
+
+    def test_media_reconciliation_requires_operator_witness_before_local_clearance(self) -> None:
+        """Executor observations never authorize durable local media recovery."""
+        class ObservedPage:
+            def __init__(self) -> None:
+                self.readbacks = 0
+                self.closed = False
+
+            def reconcile_create_media_submit(self) -> None:
+                self.readbacks += 1
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "witness-media.sqlite")
+            key, sha = "witness-media-ambiguous", "a" * 64
+            store.claim_write_api_request(
+                idempotency_key=key, request_sha256=sha,
+                requested_at=NOW, claim_owner="same-runtime",
+            )
+            store.begin_write_api_request(
+                idempotency_key=key, request_sha256=sha,
+                execution_started_at=NOW, claim_owner="same-runtime",
+            )
+            store.complete_write_api_request(
+                idempotency_key=key, request_sha256=sha,
+                response_status=202,
+                response_json=json.dumps({
+                    "operation_receipt": {"outcome": "ambiguous", "writer_invoked": True},
+                    "media_persistence_confirmed": False,
+                }),
+                completed_at=NOW, claim_owner="same-runtime",
+            )
+            original = store.write_api_request(key)
+            page = ObservedPage()
+
+            class ClearanceWitness:
+                def __init__(self) -> None:
+                    self.cleared_keys: set[tuple[str, str]] = set()
+                    self.poisoned = False
+                    self.reconnects = 0
+                    self.handoffs = 0
+                    self.reads = 0
+
+                def close(self) -> None:
+                    self.handoffs += 1
+                    self.poisoned = True
+
+                def clearance_recorded(self, *, key: str, sha: str) -> bool:
+                    self.reads += 1
+                    if self.poisoned:
+                        raise FenceWitnessError("witness connection is closed")
+                    return (key, sha) in self.cleared_keys
+
+                def resume_from_verified_clearance(self, *, key: str, sha: str) -> bool:
+                    if not self.poisoned or (key, sha) not in self.cleared_keys:
+                        raise FenceWitnessError("operator clearance not verified")
+                    self.reconnects += 1
+                    self.poisoned = False
+                    return True
+
+                def runtime_clear(self, *, key: str, sha: str, evidence: str) -> None:
+                    raise AssertionError(
+                        "compromisable executor must never issue witness clearance"
+                    )
+
+            witness = ClearanceWitness()
+            media = PrivateWebMediaCreateRuntime(
+                page_factory=lambda: (_ for _ in ()).throw(
+                    AssertionError("must not submit media a second time")
+                ),
+            )
+            media._pending_page = page
+            media._submit_unknown_fenced = True
+            media._pending_authorization_reference = "write-api:" + key
+            source_path = Path(tmp) / "photo.jpg"
+            source_path.write_bytes(b"synthetic")
+            events: list[str] = []
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=self._content_runtime(
+                    OwnerReader(ReadResult.success_empty(())), events,
+                ),
+                media_runtime=media,
+                media_resolver=PrivateWebMediaRefResolver({
+                    "cover": PrivateWebMediaSource(path=str(source_path)),
+                }),
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test", bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                ),
+                fence_witness=witness,
+            )
+            # The executor can claim successful media observations, but until
+            # the original operation has a trusted operator clearance the
+            # page/fence and local persisted recovery state MUST remain open.
+            with self.assertRaisesRegex(
+                PrivateWebRuntimeSetupError, "independent operator",
+            ):
+                runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(page.closed)
+            self.assertEqual(page.readbacks, 1)
+            self.assertFalse(store.has_write_recovery_clearance(
+                idempotency_key=key, request_sha256=sha,
+            ))
+            self.assertTrue(witness.poisoned)
+            self.assertEqual(witness.handoffs, 1)
+            witness.cleared_keys.add((key, "f" * 64))
+            with self.assertRaisesRegex(
+                FenceWitnessError, "operator clearance not verified",
+            ):
+                runtime.reconcile_media_submit()
+            self.assertFalse(store.has_write_recovery_clearance(
+                idempotency_key=key, request_sha256=sha,
+            ))
+            self.assertEqual(page.readbacks, 1)
+
+            # Simulate the separate privileged operator's durable clearance of
+            # the exact original key/SHA. Losing the local SQLite append must
+            # still preserve browser lifetime and allow persistence-only retry.
+            witness.cleared_keys.add((key, sha))
+            with patch.object(
+                store, "record_write_recovery_clearance",
+                side_effect=sqlite3.OperationalError("local clearance unavailable"),
+            ):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "unavailable"):
+                    runtime.reconcile_media_submit()
+            self.assertFalse(store.has_write_recovery_clearance(
+                idempotency_key=key, request_sha256=sha,
+            ))
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(page.closed)
+            self.assertEqual(page.readbacks, 1)
+
+            # Recover from a lost witness-read response solely by authentic
+            # independent operator-clearance readback. No browser re-submit.
+            witness.poisoned = True
+            runtime.reconcile_media_submit()
+            self.assertTrue(page.closed)
+            self.assertFalse(runtime.media_reconciliation_required)
+            self.assertEqual(page.readbacks, 1)
+            self.assertEqual(witness.reconnects, 2)
+            self.assertTrue(store.has_write_recovery_clearance(
+                idempotency_key=key, request_sha256=sha,
+            ))
+            self.assertEqual(store.write_api_request(key), original)
+            with sqlite3.connect(store.path) as db:
+                row = db.execute(
+                    "SELECT verification_kind,request_sha256 "
+                    "FROM write_recovery_clearances WHERE idempotency_key=?",
+                    (key,),
+                ).fetchone()
+            self.assertEqual(row, ("operator_verified_postread", sha))
+            runtime.close()
+            self.assertEqual(events, ["content"])
+
+    def test_real_witness_media_operator_handoff_seals_original_session(self) -> None:
+        """Real AF_UNIX ledger: an active session cannot receive operator clear."""
+        class PendingPage:
+            def __init__(self) -> None:
+                self.readbacks = 0
+                self.closed = False
+
+            def reconcile_create_media_submit(self) -> None:
+                self.readbacks += 1
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_dir, operator_dir = root / "runtime", root / "operator"
+            runtime_dir.mkdir(mode=0o700)
+            runtime_dir.chmod(0o2710)
+            operator_dir.mkdir(mode=0o700)
+            runtime_socket, operator_socket = (
+                runtime_dir / "runtime.sock", operator_dir / "operator.sock",
+            )
+            key, sha = "real-witness-media-ambiguity", "e" * 64
+
+            with FenceLedger(root / "witness.sqlite", initialize=True) as ledger:
+                server = FenceWitnessServer(
+                    ledger=ledger, runtime_socket=runtime_socket,
+                    operator_socket=operator_socket,
+                    runtime_uid=os.geteuid() + 10000,
+                    runtime_gid=os.getegid(), operator_uid=os.geteuid(),
+                )
+                # Only a same-UID functional simulation. True distinct UID
+                # SO_PEERCRED denial is tested in the isolated Docker suite.
+                server._runtime.peer_uid = os.geteuid()
+                server.start()
+                witness = FenceWitnessClient(
+                    runtime_socket, expected_owner_uid=os.geteuid(),
+                )
+                try:
+                    witness.started(key=key, sha=sha, action="create_media")
+                    self.assertEqual(
+                        witness.completed(key=key, sha=sha, response={
+                            "operation_receipt": {
+                                "writer_invoked": True, "outcome": "ambiguous",
+                            },
+                        }), "ambiguous",
+                    )
+                    with FenceWitnessClient(
+                        operator_socket, expected_owner_uid=os.geteuid(),
+                    ) as operator:
+                        with self.assertRaises(FenceWitnessError):
+                            operator.operator_clear(
+                                key=key, sha=sha, evidence="operator:verified-media",
+                            )
+
+                    store = SnapshotStore(root / "media.sqlite")
+                    store.claim_write_api_request(
+                        idempotency_key=key, request_sha256=sha,
+                        requested_at=NOW, claim_owner="runtime-one",
+                    )
+                    store.begin_write_api_request(
+                        idempotency_key=key, request_sha256=sha,
+                        execution_started_at=NOW, claim_owner="runtime-one",
+                    )
+                    store.complete_write_api_request(
+                        idempotency_key=key, request_sha256=sha,
+                        response_status=202,
+                        response_json=json.dumps({
+                            "operation_receipt": {
+                                "outcome": "ambiguous", "writer_invoked": True,
+                            }, "media_persistence_confirmed": False,
+                        }),
+                        completed_at=NOW, claim_owner="runtime-one",
+                    )
+                    page = PendingPage()
+                    media = PrivateWebMediaCreateRuntime(
+                        page_factory=lambda: (_ for _ in ()).throw(
+                            AssertionError("never resubmit the original media create")
+                        ),
+                    )
+                    media._pending_page = page
+                    media._submit_unknown_fenced = True
+                    media._pending_authorization_reference = "write-api:" + key
+                    photo = root / "photo.jpg"
+                    photo.write_bytes(b"synthetic-media-only")
+                    runtime = compose_private_web_write_api_runtime(
+                        content_runtime=self._content_runtime(
+                            OwnerReader(ReadResult.success_empty(())), [],
+                        ),
+                        media_runtime=media,
+                        media_resolver=PrivateWebMediaRefResolver({
+                            "cover": PrivateWebMediaSource(path=str(photo)),
+                        }),
+                        store=store,
+                        access=WriteApiAccess(
+                            principal="runtime-test", bearer_token=self.TOKEN,
+                            capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                        ),
+                        fence_witness=witness,
+                    )
+                    sealed = threading.Event()
+                    seal = ledger.seal_session
+
+                    def seal_and_signal(session: str) -> None:
+                        seal(session)
+                        sealed.set()
+
+                    with patch.object(
+                        ledger, "seal_session", side_effect=seal_and_signal,
+                    ):
+                        with self.assertRaisesRegex(
+                            PrivateWebRuntimeSetupError, "independent operator",
+                        ):
+                            runtime.reconcile_media_submit()
+                        self.assertTrue(sealed.wait(3), "session handoff never sealed")
+
+                    self.assertTrue(runtime.media_reconciliation_required)
+                    self.assertFalse(page.closed)
+                    self.assertEqual(page.readbacks, 1)
+                    self.assertFalse(store.has_write_recovery_clearance(
+                        idempotency_key=key, request_sha256=sha,
+                    ))
+                    with FenceWitnessClient(
+                        operator_socket, expected_owner_uid=os.geteuid(),
+                    ) as operator:
+                        operator.operator_clear(
+                            key=key, sha=sha, evidence="operator:verified-media",
+                        )
+                    self.assertTrue(ledger.clearance_recorded(key=key, sha=sha))
+                    runtime.reconcile_media_submit()
+                    self.assertEqual(page.readbacks, 1)
+                    self.assertTrue(page.closed)
+                    self.assertFalse(runtime.media_reconciliation_required)
+                    self.assertTrue(store.has_write_recovery_clearance(
+                        idempotency_key=key, request_sha256=sha,
+                    ))
+                    runtime.close()
+                finally:
+                    witness.close()
+                    server.close()
+
+    def test_reconciled_pending_page_persists_exact_clearance(self) -> None:
+        class ObservedPendingPage:
+            def __init__(self) -> None:
+                self.readbacks = 0
+                self.closed = False
+
+            def reconcile_create_media_submit(self) -> None:
+                self.readbacks += 1
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SnapshotStore(Path(tmp) / "reconcile.sqlite")
+            store.claim_write_api_request(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+                requested_at=NOW,
+                claim_owner="prior-runtime",
+            )
+            store.begin_write_api_request(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+                execution_started_at=NOW,
+                claim_owner="prior-runtime",
+            )
+            body = json.dumps({
+                "operation_receipt": {
+                    "outcome": "ambiguous", "writer_invoked": True,
+                },
+                "media_persistence_confirmed": False,
+            })
+            store.complete_write_api_request(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+                claim_owner="prior-runtime",
+                response_status=202,
+                response_json=body,
+                completed_at=NOW,
+            )
+            source_path = Path(tmp) / "photo.jpg"
+            source_path.write_bytes(b"synthetic-image")
+            media_runtime = PrivateWebMediaCreateRuntime(
+                page_factory=lambda: (_ for _ in ()).throw(
+                    AssertionError("do not create a new page")
+                ),
+            )
+            pending = ObservedPendingPage()
+            media_runtime._pending_page = pending
+            media_runtime._submit_unknown_fenced = True
+            media_runtime._pending_authorization_reference = (
+                "write-api:bound-media-create"
+            )
+            close_events: list[str] = []
+            runtime = compose_private_web_write_api_runtime(
+                content_runtime=self._content_runtime(
+                    OwnerReader(ReadResult.success_empty(())), close_events,
+                ),
+                media_runtime=media_runtime,
+                media_resolver=PrivateWebMediaRefResolver({
+                    "cover": PrivateWebMediaSource(path=str(source_path)),
+                }),
+                store=store,
+                access=WriteApiAccess(
+                    principal="runtime-test",
+                    bearer_token=self.TOKEN,
+                    capabilities=frozenset({WriteCapability.CREATE_MEDIA}),
+                ),
+            )
+            old_record = store.write_api_request("bound-media-create")
+            with self.assertRaises(PrivateWebSubmitUnknownError):
+                runtime.close()
+            self.assertTrue(store.create_recovery_pending(
+                exclude_idempotency_key="different-key",
+                claim_owner="new-runtime",
+            ))
+            # The browser observation succeeds but the SQLite clearance fails.
+            # Retain the page and retry persistence without new browser input.
+            with patch.object(
+                store, "record_write_recovery_clearance",
+                side_effect=sqlite3.OperationalError("temporary clearance I/O"),
+            ):
+                with self.assertRaises(sqlite3.OperationalError):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertEqual(pending.readbacks, 1)
+            self.assertFalse(pending.closed)
+            self.assertTrue(store.create_recovery_pending(
+                exclude_idempotency_key="different-key",
+                claim_owner="new-runtime",
+            ))
+            # Cancellation before a durable SQLite commit must retain the
+            # observed page and may not perform another browser readback.
+            with patch.object(
+                store, "record_write_recovery_clearance",
+                side_effect=KeyboardInterrupt("before SQLite commit"),
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "before SQLite"):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(pending.closed)
+            self.assertEqual(pending.readbacks, 1)
+            # Commit may be durable even if cancellation reaches the caller
+            # before the in-memory runtime can release its page and fence.
+            durable_append = store.record_write_recovery_clearance
+
+            def committed_then_cancel(**kwargs: object) -> None:
+                durable_append(**kwargs)
+                raise KeyboardInterrupt("after durable clearance")
+
+            with patch.object(
+                store, "record_write_recovery_clearance",
+                side_effect=committed_then_cancel,
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "durable clearance"):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(pending.closed)
+            self.assertEqual(pending.readbacks, 1)
+            self.assertTrue(store.has_write_recovery_clearance(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+            ))
+            # Even an additional shutdown attempt must retain the page.
+            with self.assertRaisesRegex(
+                PrivateWebSubmitUnknownError, "media_runtime_close_unsettled",
+            ):
+                runtime.close()
+            # The SQLite commit succeeds, but the following in-memory release
+            # fails. Retain the settled page and reuse the exact old clearance.
+            with patch.object(
+                runtime._server, "clear_verified_create_recovery",
+                side_effect=RuntimeError("synthetic in-memory release error"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "in-memory release"):
+                    runtime.reconcile_media_submit()
+            self.assertTrue(runtime.media_reconciliation_required)
+            self.assertFalse(pending.closed)
+            self.assertEqual(pending.readbacks, 1)
+            self.assertTrue(store.has_write_recovery_clearance(
+                idempotency_key="bound-media-create",
+                request_sha256="e" * 64,
+            ))
+            runtime.reconcile_media_submit()
+            self.assertEqual(pending.readbacks, 1)
+            self.assertTrue(pending.closed)
+            self.assertFalse(SnapshotStore(
+                store.path, create_if_missing=False,
+            ).create_recovery_pending(
+                exclude_idempotency_key="different-key",
+                claim_owner="new-runtime",
+            ))
+            self.assertEqual(store.write_api_request("bound-media-create"), old_record)
+            with sqlite3.connect(store.path) as db:
+                row = db.execute(
+                    "SELECT verification_kind, request_sha256 "
+                    "FROM write_recovery_clearances "
+                    "WHERE idempotency_key = 'bound-media-create'",
+                ).fetchone()
+            self.assertEqual(row, ("media_submit_reconciled", "e" * 64))
+            db.close()
+            runtime.close()
+            self.assertEqual(close_events, ["content"])
 
     def test_normal_create_route_uses_composed_mark_service(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from time import monotonic
+from contextlib import contextmanager
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from .application import MarkService
 from .adapters import _legacy_admission
+from .fence_witness import FenceWitnessError
 from .adapters.management import (
     DEFAULT_SOURCE as MANAGEMENT_SOURCE,
     MANAGEMENT_URL,
@@ -79,6 +82,7 @@ from .write_api import (
     WriteApiAccess,
     WriteCapability,
     _WriteApiStoreLock,
+    _WriteFence,
     acquire_write_api_store_lock,
     create_write_api_server,
 )
@@ -89,6 +93,10 @@ def _utc_now() -> datetime:
 
 
 _MEDIA_PERSISTENCE_VERIFY_TIMEOUT_SECONDS = 10.0
+_WRITE_HANDLER_DRAIN_SECONDS = 12.0
+_WRITE_SERVER_SHUTDOWN_SECONDS = 2.0
+_WRITE_OPERATION_DRAIN_SECONDS = 2.0
+_WRITE_CLOSE_TOTAL_SECONDS = 8.0
 
 
 def _pending_dashboard_media_refs(store: SnapshotStore) -> frozenset[str]:
@@ -128,6 +136,19 @@ class PrivateWebRuntimeClosedError(WriteNotAttemptedError):
 
 class PrivateWebRuntimeSetupError(WriteNotAttemptedError):
     """Per-call private-Web page setup failed before any platform write."""
+
+
+@contextmanager
+def _bounded_write_shutdown_lock(lock):
+    """Never hold service shutdown on an operation lock indefinitely."""
+    if not lock.acquire(timeout=_WRITE_OPERATION_DRAIN_SECONDS):
+        raise PrivateWebRuntimeSetupError(
+            "active write operation prevents safe shutdown; retain recovery fences"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 class _RejectManagementRedirectHandler(HTTPRedirectHandler):
@@ -353,6 +374,9 @@ class PrivateWebMediaCreateRuntime:
     ) -> None:
         self._page_factory = page_factory
         self._pending_page: _CloseablePrivateWebMediaPage | None = None
+        self._pending_authorization_reference: str | None = None
+        # Positive browser observations remain reusable if SQLite fails.
+        self._pending_observation_confirmed = False
         self._submit_unknown_fenced = False
         self._closed = False
         self._operation_lock = Lock()
@@ -380,15 +404,26 @@ class PrivateWebMediaCreateRuntime:
         with self._operation_lock:
             return self._pending_page is not None
 
+    @property
+    def pending_authorization_reference(self) -> str | None:
+        with self._operation_lock:
+            return (
+                self._pending_authorization_reference
+                if self._pending_page is not None else None
+            )
+
     def _close_after_writer_outcome(
         self,
         page: _CloseablePrivateWebMediaPage,
+        *,
+        authorization_reference: str | None = None,
     ) -> None:
         try:
             page.close()
         except PrivateWebSubmitUnknownError as exc:
             if exc.stage == "create_media_submit_unsettled":
                 self._pending_page = page
+                self._pending_authorization_reference = authorization_reference
                 raise
             # Any other cleanup classification must not replace the already
             # classified writer outcome.
@@ -400,6 +435,8 @@ class PrivateWebMediaCreateRuntime:
         self,
         request: AdCreateRequest,
         sources: tuple[PrivateWebMediaSource, ...],
+        *,
+        authorization_reference: str | None = None,
     ) -> None:
         self._ensure_open()
         self._ensure_create_available()
@@ -420,13 +457,17 @@ class PrivateWebMediaCreateRuntime:
             # and can be closed, such as writer-owned local cleanup failure.
             self._submit_unknown_fenced = True
             try:
-                self._close_after_writer_outcome(page)
+                self._close_after_writer_outcome(
+                    page, authorization_reference=authorization_reference
+                )
             except PrivateWebSubmitUnknownError:
                 pass
             raise
         except Exception:
             try:
-                self._close_after_writer_outcome(page)
+                self._close_after_writer_outcome(
+                    page, authorization_reference=authorization_reference
+                )
             except PrivateWebSubmitUnknownError:
                 pass
             raise
@@ -437,7 +478,9 @@ class PrivateWebMediaCreateRuntime:
             # never replace the original cancellation with cleanup outcome.
             self._submit_unknown_fenced = True
             try:
-                self._close_after_writer_outcome(page)
+                self._close_after_writer_outcome(
+                    page, authorization_reference=authorization_reference
+                )
             except PrivateWebSubmitUnknownError:
                 pass
             raise
@@ -446,7 +489,9 @@ class PrivateWebMediaCreateRuntime:
         # If close nevertheless reports an unsettled submit, preserve the page
         # and surface UNKNOWN rather than dropping its media lifetime.
         try:
-            self._close_after_writer_outcome(page)
+            self._close_after_writer_outcome(
+                page, authorization_reference=authorization_reference
+            )
         except PrivateWebSubmitUnknownError:
             self._submit_unknown_fenced = True
             raise
@@ -455,23 +500,32 @@ class PrivateWebMediaCreateRuntime:
         self,
         request: AdCreateRequest,
         sources: tuple[PrivateWebMediaSource, ...],
+        *,
+        authorization_reference: str | None = None,
     ) -> None:
         with self._operation_lock:
-            self._create_ad_locked(request, sources)
+            self._create_ad_locked(
+                request, sources, authorization_reference=authorization_reference,
+            )
 
     def bind_create_writer(
         self,
         request: AdCreateRequest,
         sources: tuple[PrivateWebMediaSource, ...],
+        *,
+        authorization_reference: str | None = None,
     ) -> AdCreateWriter:
         """Bind one explicit create request and media tuple to a one-shot writer."""
         return _BoundPrivateWebMediaCreateWriter(
             runtime=self,
             request=request,
             sources=sources,
+            authorization_reference=authorization_reference,
         )
 
-    def _reconcile_media_submit_locked(self) -> None:
+    def _reconcile_media_submit_locked(
+        self, *, persist_after_observation: Callable[[], None] | None = None,
+    ) -> None:
         self._ensure_open()
         page = self._pending_page
         if page is None:
@@ -479,8 +533,19 @@ class PrivateWebMediaCreateRuntime:
                 "private Web media submit has no pending reconciliation"
             )
 
-        page.reconcile_create_media_submit()
+        if not self._pending_observation_confirmed:
+            page.reconcile_create_media_submit()
+            self._pending_observation_confirmed = True
+
+        # Do not release the page or operation reference before the observed
+        # settlement is durably bound to its SQLite request. On a failed
+        # commit, retry only persistence, never browser input.
+        if persist_after_observation is not None:
+            persist_after_observation()
+
         self._pending_page = None
+        self._pending_authorization_reference = None
+        self._pending_observation_confirmed = False
         self._submit_unknown_fenced = False
         try:
             page.close()
@@ -489,11 +554,15 @@ class PrivateWebMediaCreateRuntime:
             # manufacture platform retry authority.
             pass
 
-    def reconcile_media_submit(self) -> None:
-        """Observe unresolved browser submit state without repeating browser input."""
+    def reconcile_media_submit(
+        self, *, persist_after_observation: Callable[[], None] | None = None,
+    ) -> None:
+        """Observe an existing submit and durably settle it without re-sending."""
 
         with self._operation_lock:
-            self._reconcile_media_submit_locked()
+            self._reconcile_media_submit_locked(
+                persist_after_observation=persist_after_observation,
+            )
 
     def _close_locked(self) -> None:
         if self._closed:
@@ -532,6 +601,7 @@ class _BoundPrivateWebMediaCreateWriter:
         runtime: PrivateWebMediaCreateRuntime,
         request: AdCreateRequest,
         sources: tuple[PrivateWebMediaSource, ...],
+        authorization_reference: str | None = None,
     ) -> None:
         if not isinstance(request, AdCreateRequest):
             raise TypeError("media create writer request must be AdCreateRequest")
@@ -547,6 +617,7 @@ class _BoundPrivateWebMediaCreateWriter:
         self._runtime = runtime
         self._request = request
         self._sources = sources
+        self._authorization_reference = authorization_reference
         self._call_lock = Lock()
         self._used = False
 
@@ -563,7 +634,10 @@ class _BoundPrivateWebMediaCreateWriter:
             # This adapter represents one explicit logical create attempt.
             # Never manufacture retry authority from a later runtime outcome.
             self._used = True
-        self._runtime.create_ad(request, self._sources)
+        self._runtime.create_ad(
+            request, self._sources,
+            authorization_reference=self._authorization_reference,
+        )
 
 
 class PrivateWebMediaCreateService:
@@ -752,6 +826,7 @@ class PrivateWebMediaCreateService:
                 writer = self._runtime.bind_create_writer(
                     request,
                     stable_sources,
+                    authorization_reference=authorization_reference,
                 )
                 receipt = self._writes.create(
                     request=request,
@@ -1073,6 +1148,7 @@ class PrivateWebWriteApiRuntime:
         self,
         *,
         server: LoopbackWriteApiServer,
+        store: SnapshotStore,
         content_runtime: PrivateWebContentRuntime,
         confirmation_runtime: PrivateWebInventoryRuntime | None,
         media_runtime: PrivateWebMediaCreateRuntime | None,
@@ -1080,8 +1156,10 @@ class PrivateWebWriteApiRuntime:
         media_service: PrivateWebMediaCreateService | None,
         media_handle_store: PrivateWebMediaHandleStore | None,
         operation_lock: Lock,
+        fence_witness: _WriteFence | None = None,
     ) -> None:
         self._server = server
+        self._store = store
         self._content_runtime = content_runtime
         self._confirmation_runtime = confirmation_runtime
         self._media_runtime = media_runtime
@@ -1089,10 +1167,18 @@ class PrivateWebWriteApiRuntime:
         self._media_service = media_service
         self._media_handle_store = media_handle_store
         self._operation_lock = operation_lock
+        # Borrowed connection: the outer launcher/owner closes it only after
+        # all handler and reconciliation operations have fully drained.
+        self._fence_witness = fence_witness
         self._state_lock = Lock()
         self._close_lock = Lock()
+        self._close_worker_guard = Lock()
+        self._close_worker: Thread | None = None
+        self._close_worker_result: dict[str, BaseException] | None = None
         self._server_thread: Thread | None = None
         self._server_shutdown = False
+        self._server_shutdown_worker: Thread | None = None
+        self._server_shutdown_error: BaseException | None = None
         self._server_closed = False
         self._stopping = False
         self._closed = False
@@ -1146,9 +1232,166 @@ class PrivateWebWriteApiRuntime:
                 "private Web media runtime is not configured"
             )
         with self._operation_lock:
-            runtime.reconcile_media_submit()
+            operation_reference = runtime.pending_authorization_reference
+
+            def _persist_verified_settlement() -> None:
+                if operation_reference is None:
+                    if self._fence_witness is not None:
+                        raise PrivateWebRuntimeSetupError(
+                            "witness media recovery lacks original operation binding"
+                        )
+                    return
+                if not operation_reference.startswith("write-api:"):
+                    raise PrivateWebRuntimeSetupError(
+                        "media reconciliation lacks a valid operation reference"
+                    )
+                key = operation_reference[len("write-api:"):]
+                record = self._store.write_api_request(key)
+                if record is None:
+                    raise PrivateWebRuntimeSetupError(
+                        "media reconciliation lacks bound write operation"
+                    )
+                # The browser/runtime UID may forge any in-process media
+                # observation, including a claimed successful post-read.
+                # The independent witness must already contain an OPERATOR
+                # clearance bound to this original key and fingerprint before
+                # UID50044 may request any local recovery mutation.
+                if self._fence_witness is not None:
+                    try:
+                        independently_cleared = self._fence_witness.clearance_recorded(
+                            key=key, sha=record.request_sha256,
+                        )
+                    except FenceWitnessError:
+                        # Only after a lost/uncertain read on the old socket:
+                        # reconnect through SO_PEERCRED and VERIFY the exact
+                        # existing operator receipt. No second platform write
+                        # and no runtime_clear RPC may ever be sent here.
+                        independently_cleared = (
+                            self._fence_witness.resume_from_verified_clearance(
+                                key=key, sha=record.request_sha256,
+                            )
+                        )
+                    if independently_cleared is not True:
+                        # Operator clearance requires the original started
+                        # session to be SEALED. Dropping our borrowed client
+                        # socket closes only this runtime's write authority;
+                        # the independent server seals on EOF. Keep the media
+                        # page, local DB and pending request untouched. An
+                        # operator can then inspect and clear that exact key.
+                        # A later call may *only* reopen through the verified
+                        # operator-clearance readback path above.
+                        try:
+                            self._fence_witness.close()
+                        except Exception as exc:
+                            raise PrivateWebRuntimeSetupError(
+                                "witness operator handoff could not seal session"
+                            ) from exc
+                        raise PrivateWebRuntimeSetupError(
+                            "independent operator witness clearance required "
+                            "before local media recovery"
+                        )
+
+                # Once the operator-bound witness fact is durably verified,
+                # local persistence may fail/ACK may be lost. Re-check the
+                # immutable local record on later calls; never duplicate it.
+                if not self._store.has_write_recovery_clearance(
+                    idempotency_key=key,
+                    request_sha256=record.request_sha256,
+                ):
+                    self._store.record_write_recovery_clearance(
+                        idempotency_key=key,
+                        request_sha256=record.request_sha256,
+                        verification_kind=(
+                            "operator_verified_postread"
+                            if self._fence_witness is not None
+                            else "media_submit_reconciled"
+                        ),
+                        evidence_reference=(
+                            "witness:operation-bound-operator-clearance"
+                            if self._fence_witness is not None
+                            else "private-web:observation-only-submit-settlement"
+                        ),
+                        observed_at=_utc_now(),
+                    )
+                self._server.clear_verified_create_recovery(
+                    key, record.request_sha256,
+                )
+
+            runtime.reconcile_media_submit(
+                persist_after_observation=_persist_verified_settlement,
+            )
 
     def close(self) -> None:
+        """Bound the *entire* shutdown, including browser and witness cleanup.
+
+        A single daemon worker retains ownership of all runtimes and the SQLite
+        store lease while any close phase remains unsettled. Subsequent calls
+        observe that same worker instead of launching overlapping cleanup.
+        """
+        deadline = monotonic() + _WRITE_CLOSE_TOTAL_SECONDS
+        if not self._close_worker_guard.acquire(timeout=_WRITE_CLOSE_TOTAL_SECONDS):
+            raise PrivateWebRuntimeSetupError(
+                "private Web write API shutdown deadline exceeded; "
+                "retain recovery fences"
+            )
+        try:
+            if self._closed:
+                return
+            if (
+                self._server_thread is not None
+                and current_thread() is self._server_thread
+            ):
+                raise PrivateWebRuntimeSetupError(
+                    "private Web write API runtime cannot close from its server thread"
+                )
+            if current_thread() is self._close_worker:
+                raise PrivateWebRuntimeSetupError(
+                    "private Web write API shutdown worker cannot close itself"
+                )
+            # Keep start() fail-closed even when another thread owns the
+            # lifecycle state lock: only the shutdown worker may wait for it.
+            self._stopping = True
+
+            worker = self._close_worker
+            outcome = self._close_worker_result
+            if worker is None or not worker.is_alive():
+                outcome = {}
+
+                def finish_shutdown() -> None:
+                    try:
+                        self._close_impl()
+                    except BaseException as exc:
+                        outcome["error"] = exc
+
+                worker = Thread(
+                    target=finish_shutdown,
+                    daemon=True,
+                    name="mark-private-web-total-stop",
+                )
+                self._close_worker = worker
+                self._close_worker_result = outcome
+                try:
+                    worker.start()
+                except RuntimeError as exc:
+                    self._close_worker = None
+                    raise PrivateWebRuntimeSetupError(
+                        "private Web write API shutdown worker unavailable; "
+                        "retain recovery fences"
+                    ) from exc
+
+        finally:
+            self._close_worker_guard.release()
+
+        worker.join(timeout=max(0.0, deadline - monotonic()))
+        if worker.is_alive():
+            raise PrivateWebRuntimeSetupError(
+                "private Web write API shutdown deadline exceeded; "
+                "retain recovery fences"
+            )
+        if outcome is not None and "error" in outcome:
+            raise outcome["error"]
+
+    def _close_impl(self) -> None:
         with self._close_lock:
             with self._state_lock:
                 if self._closed:
@@ -1165,18 +1408,41 @@ class PrivateWebWriteApiRuntime:
             if not self._server_shutdown:
                 if thread is None:
                     self._server_shutdown = True
-                elif thread.is_alive():
-                    try:
-                        self._server.shutdown()
-                    except Exception:
-                        cleanup_failed = True
-                    thread.join(timeout=2.0)
+                else:
+                    # HTTPServer.shutdown() itself waits without a deadline.
+                    # Run it once outside the caller thread and preserve the
+                    # exact worker across failed/retried shutdown attempts.
+                    # Never close the store or browser while it is still alive.
+                    worker = self._server_shutdown_worker
+                    if worker is None and thread.is_alive():
+                        def stop_http_server() -> None:
+                            try:
+                                self._server.shutdown()
+                            except BaseException as exc:
+                                self._server_shutdown_error = exc
+
+                        worker = Thread(
+                            target=stop_http_server,
+                            daemon=True,
+                            name="mark-write-http-stop",
+                        )
+                        worker.start()
+                        self._server_shutdown_worker = worker
+                    if worker is not None:
+                        worker.join(timeout=_WRITE_SERVER_SHUTDOWN_SECONDS)
+                        if worker.is_alive():
+                            raise PrivateWebRuntimeSetupError(
+                                "private Web write API server shutdown timeout; "
+                                "retain recovery fences"
+                            )
+                        if self._server_shutdown_error is not None:
+                            cleanup_failed = True
+                    if thread.is_alive():
+                        thread.join(timeout=2.0)
                     if thread.is_alive():
                         cleanup_failed = True
                     else:
                         self._server_shutdown = True
-                else:
-                    self._server_shutdown = True
 
             if not self._server_shutdown:
                 raise PrivateWebRuntimeSetupError(
@@ -1199,8 +1465,18 @@ class PrivateWebWriteApiRuntime:
                     "private Web write API runtime cleanup failed"
                 )
 
+            # A stuck accepted HTTP operation may still own the browser and
+            # its SQLite in_progress fence. Do not release owned state while
+            # that handler is active; return within the Docker stop deadline.
+            if not self._server.wait_for_active_handlers(
+                _WRITE_HANDLER_DRAIN_SECONDS
+            ):
+                raise PrivateWebRuntimeSetupError(
+                    "active write handlers remain after shutdown"
+                )
+
             media_unknown: PrivateWebSubmitUnknownError | None = None
-            with self._operation_lock:
+            with _bounded_write_shutdown_lock(self._operation_lock):
                 if self._media_runtime is not None:
                     try:
                         self._media_runtime.close()
@@ -1323,6 +1599,7 @@ def compose_private_web_write_api_runtime(
     port: int = 0,
     clock: Callable[[], datetime] | None = None,
     _store_lock: _WriteApiStoreLock | None = None,
+    fence_witness: _WriteFence | None = None,
 ) -> PrivateWebWriteApiRuntime:
     """Compose already-built PrivateWeb runtimes behind one loopback Write API.
 
@@ -1424,19 +1701,21 @@ def compose_private_web_write_api_runtime(
         clock=runtime_clock,
         execution_lock=operation_lock,
         _store_lock=_store_lock,
+        fence_witness=fence_witness,
     )
     # This composition owns state beyond the HTTP server. Keep the exclusive
     # store lease across server_close() until owned runtimes are fully settled
     # and cleaned up; SubmitUnknown reconciliation intentionally retains it.
     server.retain_store_lock_until_explicit_release()
-    # The generic Write API keeps daemon request threads for its standalone
-    # use. This composition owns browser runtimes, so close must drain every
-    # accepted handler before those runtimes can be released.
-    server.daemon_threads = False
-    server.block_on_close = True
+    # Keep daemon request threads so server_close cannot hang past Docker's
+    # stop deadline. The owned browser runtimes and exclusive store lease are
+    # released only after the explicit, bounded handler drain in close().
+    server.daemon_threads = True
+    server.block_on_close = False
     try:
         return PrivateWebWriteApiRuntime(
             server=server,
+            store=store,
             content_runtime=content_runtime,
             confirmation_runtime=confirmation_runtime,
             media_runtime=media_runtime,
@@ -1444,6 +1723,7 @@ def compose_private_web_write_api_runtime(
             media_service=media_service,
             media_handle_store=media_handle_store,
             operation_lock=operation_lock,
+            fence_witness=fence_witness,
         )
     except Exception:
         try:
@@ -1471,6 +1751,7 @@ def build_private_web_write_api_runtime(
     port: int = 0,
     timeout_seconds: float = 5.0,
     clock: Callable[[], datetime] | None = None,
+    fence_witness: _WriteFence | None = None,
 ) -> PrivateWebWriteApiRuntime:
     """Build a loopback-only PrivateWeb write runtime for an existing CDP worker.
 
@@ -1591,6 +1872,7 @@ def build_private_web_write_api_runtime(
             port=port,
             clock=clock,
             _store_lock=store_lock,
+            fence_witness=fence_witness,
         )
         store_lock = None
         return runtime

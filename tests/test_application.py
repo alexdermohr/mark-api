@@ -376,6 +376,43 @@ class MarkServiceTests(unittest.TestCase):
         )
         return service, store, state_writer, content_writer
 
+    def test_refresh_inventory_blocks_older_open_generation_before_reader(self) -> None:
+        store = self.make_store()
+        older = store.begin_sync_attempt(
+            source="previous-owner", started_at=NOW - timedelta(minutes=3),
+        )
+        newer = store.begin_sync_attempt(
+            source="recent-owner", started_at=NOW - timedelta(minutes=2),
+        )
+        store.append_inventory_result(
+            ReadResult.success_empty(()), observed_at=NOW - timedelta(minutes=1),
+            source="recent-owner", attempt_id=newer,
+            completed_at=NOW - timedelta(minutes=1),
+        )
+        reader = SequenceAdsReader(ReadResult.success_empty(()))
+        service, _, writer, content = self.service(
+            owner_reader=reader, management_reader=SequenceAdsReader(),
+            store=store, writes_enabled=True,
+        )
+        self.assertEqual(store.sync_status()["state"], "success_empty")
+        with self.assertRaisesRegex(RuntimeError, "unresolved"):
+            service.refresh_inventory()
+        self.assertEqual(reader.calls, 0)
+        self.assertEqual(store.sync_recovery_status()["unresolved_count"], 1)
+        self.assertEqual(store.latest_sync_attempt().id, newer)
+        self.assertEqual(writer.state_calls, [])
+        self.assertEqual(writer.delete_calls, [])
+        self.assertEqual(content.calls, [])
+        # This explicit settlement is trusted test-store authority; the
+        # executor/reader has no RPC to forge it in the deployed topology.
+        store.fail_sync_attempt(
+            older, source="previous-owner", completed_at=NOW,
+            error_kind="persistence_error",
+        )
+        self.assertEqual(service.refresh_inventory().status, ReadStatus.SUCCESS_EMPTY)
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(store.sync_recovery_status()["unresolved_count"], 0)
+
     def test_refresh_inventory_marks_historical_id_absent_on_successful_empty(self) -> None:
         store = self.make_store()
         store.append_ad_snapshot(

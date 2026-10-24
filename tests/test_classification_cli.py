@@ -290,6 +290,62 @@ class ClassificationCliTests(unittest.TestCase):
         self.assertIsNone(payload["text_type"])
         self.assertEqual(payload["title_type"], "question")
 
+    def test_cli_writes_classification_through_attested_owner_socket(self) -> None:
+        import os
+        from mark_api.storage_owner import StorageOwnerServer
+        tmp, store = self.make_store()
+        self.track(store, "42")
+        rpc_dir = Path(tmp.name) / "rpc"
+        rpc_dir.mkdir(mode=0o700)
+        rpc_dir.chmod(0o2710)
+        socket_path = rpc_dir / "owner.sock"
+        owner = StorageOwnerServer(
+            database=store.path, socket_path=socket_path,
+            runtime_uid=os.geteuid() + 10001, runtime_gid=os.getegid(),
+        )
+        self.addCleanup(owner.stop)
+        owner.runtime_uid = os.geteuid()  # Framing only: real UID proof separate.
+        owner.start()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main([
+                "--storage-owner-socket", str(socket_path),
+                "--storage-owner-uid", str(os.geteuid()),
+                "--ad-id", "42", "--city", "Dresden",
+            ])
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())["city"], "Dresden")
+        self.assertEqual(store.latest_classification("42").city, "Dresden")
+        self.assertEqual(store.tracked_ad_ids(), ("42",))
+
+    def test_cli_refuses_wrong_attested_owner_uid(self) -> None:
+        import os
+        from mark_api.storage_owner import StorageOwnerServer
+        tmp, store = self.make_store()
+        self.track(store)
+        rpc_dir = Path(tmp.name) / "rpc"
+        rpc_dir.mkdir(mode=0o700)
+        rpc_dir.chmod(0o2710)
+        socket_path = rpc_dir / "owner.sock"
+        owner = StorageOwnerServer(
+            database=store.path, socket_path=socket_path,
+            runtime_uid=os.geteuid() + 10001, runtime_gid=os.getegid(),
+        )
+        self.addCleanup(owner.stop)
+        owner.runtime_uid = os.geteuid()
+        owner.start()
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+            main([
+                "--storage-owner-socket", str(socket_path),
+                "--storage-owner-uid", str(os.geteuid() + 123),
+                "--ad-id", "1", "--city", "Berlin",
+            ])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("storage owner unavailable", stderr.getvalue())
+        self.assertIsNone(store.latest_classification("1"))
+
+
 
 if __name__ == "__main__":
     unittest.main()

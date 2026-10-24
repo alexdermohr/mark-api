@@ -859,6 +859,8 @@ class InstalledOfflineWheelAcceptance(unittest.TestCase):
                     store, port=0, write_proxy=DashboardWriteProxy(
                         host="127.0.0.1", port=backend.server_port,
                         bearer_token=backend_token, ui_token=ui_token,
+                        backend_principal=access.principal,
+                        local_reconciliation_enabled=True,
                     ),
                 )
                 threads = []
@@ -923,6 +925,32 @@ class InstalledOfflineWheelAcceptance(unittest.TestCase):
                     )
                     assert status == 200 and replay == paused
                     assert headers["Idempotency-Replayed"] == "true"
+                    # Exact persisted replay above must not contact the backend.
+                    # The installed UI then ACKs both local intents in two
+                    # different, tightly bound persisted phases.
+                    for key, scope in (
+                        ("wheel-create", "create"),
+                        ("wheel-pause", "ad:315:pause"),
+                    ):
+                        for finalized in (False, True):
+                            ack_request = Request(
+                                base + "/api/dashboard/pending-writes/ack",
+                                data=json.dumps({
+                                    "scope": scope, "idempotency_key": key,
+                                }).encode("utf-8"),
+                                method="POST",
+                                headers={
+                                    "Origin": base, "Content-Type": "application/json",
+                                    "X-Mark-Dashboard-Write": "1",
+                                    "X-Mark-Dashboard-Token": ui_token,
+                                },
+                            )
+                            with opener.open(ack_request, timeout=3) as ack:
+                                assert ack.status == 200
+                                assert json.loads(ack.read()) == {
+                                    "acknowledged": True, "finalized": finalized,
+                                }
+                    assert store.dashboard_pending_writes() == ()
                     assert platform.effects == ["create", "set_state"]
                     assert len(store.ad_history("315")) == 2
                 finally:
@@ -937,6 +965,7 @@ class InstalledOfflineWheelAcceptance(unittest.TestCase):
                     "persisted_dashboard_projection": True,
                     "same_origin_ui_token_enforced": True,
                     "write_idempotency_replay": True,
+                    "installed_local_two_phase_ack": True,
                     "synthetic_platform_only": True,
                 }, sort_keys=True))
             """)
@@ -952,6 +981,7 @@ class InstalledOfflineWheelAcceptance(unittest.TestCase):
                 "persisted_dashboard_projection": True,
                 "same_origin_ui_token_enforced": True,
                 "write_idempotency_replay": True,
+                "installed_local_two_phase_ack": True,
                 "synthetic_platform_only": True,
             })
 
@@ -969,6 +999,93 @@ class InstalledOfflineWheelAcceptance(unittest.TestCase):
                 crud_result.stderr, r"Ran [1-9][0-9]* tests? in [0-9.]+s",
             )
             self.assertIn("OK", crud_result.stderr)
+
+            # Exercise the installed media path, not checkout imports:
+            # actual loopback dashboard/upload proxy, private 0600 handle,
+            # confirmed vs UNKNOWN media proof, persisted Write API receipt,
+            # same-key restart replay and two-phase local ACK. The only
+            # platform actor is the deterministic in-memory synthetic double.
+            media_result = _command(
+                str(python), "-I", "-m", "unittest", "discover",
+                "-s", str(Path(__file__).resolve().parent),
+                "-p", "test_dashboard_media_full_lifecycle_e2e.py", "-v",
+                cwd=root, env=env, timeout=95,
+            )
+            self.assertEqual(media_result.returncode, 0, media_result.stderr[-2500:])
+            self.assertRegex(media_result.stderr, r"Ran 3 tests? in [0-9.]+s")
+            self.assertIn("OK", media_result.stderr)
+
+            # Exercise the installed, not checkout-imported, fixed Owner
+            # paginated history decoders against invalid timestamps, BLOB
+            # source fields and hidden native BLOB ad IDs. This is not
+            # hostile-UID, FD or MAP_SHARED host-cutover acceptance.
+            owner_history = _command(
+                str(python), "-I", "-m", "unittest", "discover",
+                "-s", str(Path(__file__).resolve().parent),
+                "-p", "test_storage_owner_paged_history_corruption.py", "-v",
+                cwd=root, env=env, timeout=95,
+            )
+            self.assertEqual(owner_history.returncode, 0, owner_history.stderr[-2500:])
+            self.assertRegex(owner_history.stderr, r"Ran 4 tests? in [0-9.]+s")
+            # Local userns tests may map the runner to UID 0; the
+            # storage-owner socket must then skip rather than weaken its
+            # non-root UID requirement. Official CI drops capabilities and
+            # executes this test under the actual unprivileged runner UID.
+            if os.geteuid() == 0:
+                self.assertIn("OK (skipped=1)", owner_history.stderr)
+            else:
+                self.assertIn("\nOK\n", owner_history.stderr)
+                self.assertNotIn("skipped=", owner_history.stderr)
+
+            # A corrupted native pending-fence identity or ACK bit can
+            # silently hide an unresolved dashboard Write. Exercise the
+            # installed store directly and the owner AF_UNIX framing where a
+            # real non-root UID is available. These are not hostile UID tests.
+            pending_native = _command(
+                str(python), "-I", "-m", "unittest", "discover",
+                "-s", str(Path(__file__).resolve().parent),
+                "-p", "test_dashboard_pending_native_corruption.py", "-v",
+                cwd=root, env=env, timeout=95,
+            )
+            self.assertEqual(
+                pending_native.returncode, 0, pending_native.stderr[-2500:],
+            )
+            self.assertRegex(
+                pending_native.stderr, r"Ran 7 tests? in [0-9.]+s",
+            )
+            if os.geteuid() == 0:
+                self.assertIn("OK (skipped=1)", pending_native.stderr)
+            else:
+                self.assertIn("\nOK\n", pending_native.stderr)
+                self.assertNotIn("skipped=", pending_native.stderr)
+
+            # UTF-8 JSON contains only Unicode scalar values. Escaped
+            # unpaired surrogates must not cross the installed Write-intent
+            # boundary or become durable, including nested member names.
+            scalar = _command(
+                str(python), "-I", "-m", "unittest", "discover",
+                "-s", str(Path(__file__).resolve().parent),
+                "-p", "test_strict_json_unicode_scalars.py", "-v",
+                cwd=root, env=env, timeout=60,
+            )
+            self.assertEqual(scalar.returncode, 0, scalar.stderr[-2000:])
+            self.assertRegex(scalar.stderr, r"Ran 3 tests? in [0-9.]+s")
+            self.assertIn("\nOK\n", scalar.stderr)
+
+            # Inspect real Linux writable MAP_SHARED and old FD references
+            # against pinned synthetic main/WAL/SHM inodes. The independent
+            # installed detector remains negative-only: it cannot attest a
+            # frozen process universe or host cutover without operator proof.
+            host_refs = _command(
+                str(python), "-I", "-m", "unittest", "discover",
+                "-s", str(Path(__file__).resolve().parent),
+                "-p", "test_a6_host_preflight.py", "-v",
+                cwd=root, env=env, timeout=95,
+            )
+            self.assertEqual(host_refs.returncode, 0, host_refs.stderr[-2800:])
+            self.assertRegex(host_refs.stderr, r"Ran 15 tests? in [0-9.]+s")
+            self.assertIn("\nOK\n", host_refs.stderr)
+            self.assertNotIn("skipped=", host_refs.stderr)
 
             # This is a create-only, same-user *offline* backup, NOT hostile
             # service-UID A6 recovery. Test installed CLI, receipt and manual
@@ -1029,6 +1146,11 @@ class InstalledOfflineWheelAcceptance(unittest.TestCase):
             "provider_consent_default_deny": True,
             "installed_synthetic_text_and_image_drafts": True,
             "installed_synthetic_dashboard_write_end_to_end": True,
+            "installed_synthetic_media_write_end_to_end": True,
+            "installed_owner_paged_history_fail_closed": True,
+            "installed_dashboard_pending_corruption_fail_closed": True,
+            "installed_unicode_scalar_json_rejection": True,
+            "installed_a6_old_fd_mmap_negative_scan": True,
             "installed_synthetic_full_crud_restart_e2e": True,
             "image_draft_private_and_create_only": True,
             "backup_scope": "create-only-offline-not-a6",

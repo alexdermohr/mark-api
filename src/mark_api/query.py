@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import dataclass, field
 from typing import Mapping
 from datetime import datetime
 
 from .domain import AdSnapshot, LifecycleState, ReactionSnapshot
 from .storage import LOCAL_CATALOG_SOURCE, SnapshotStore
+from .storage import SnapshotStore
+from .storage_owner import StorageOwnerClient
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,14 +94,23 @@ def _last_metric_with_evidence(
 class MarkQueryService:
     """Read-only projections over the append-only SQLite history."""
 
-    def __init__(self, store: SnapshotStore) -> None:
+    def __init__(self, store: SnapshotStore | StorageOwnerClient) -> None:
         self._store = store
 
     def latest_ads(self) -> tuple[AdView, ...]:
         rows: list[AdView] = []
-        # Close each paginated SQLite iterator even when projection rejects
-        # a corrupted native value; manual catalog never grants owner status.
-        with closing(self._store.ad_histories()) as histories:
+        # The independent UID broker exposes only typed paginated IPC
+        # history reads, never raw SQL or a direct SQLite connection.
+        # Direct SnapshotStore keeps its close-on-error paginated iterator.
+        if isinstance(self._store, StorageOwnerClient):
+            rows_by_id = (
+                (ad_id, self._store.ad_history(ad_id))
+                for ad_id in self._store.tracked_ad_ids()
+            )
+            history_source = nullcontext(rows_by_id)
+        else:
+            history_source = closing(self._store.ad_histories())
+        with history_source as histories:
             for ad_id, history in histories:
                 if not history:
                     continue
@@ -170,7 +181,10 @@ class MarkQueryService:
         history = self._store.inbound_message_history(ad_id)
         if not history:
             return None
-        conversations, messages = self._store.inbound_message_counts(ad_id)
+        # Use the same pinned event generation for counts and provenance.
+        # A concurrent import after the history read must not inflate totals.
+        conversations = len({event.conversation_id for event in history})
+        messages = len(history)
         return EmailReactionView(
             ad_id=ad_id,
             conversation_count=conversations,

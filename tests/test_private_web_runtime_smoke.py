@@ -238,6 +238,54 @@ class PrivateWebRuntimeSmokeTests(unittest.TestCase):
                         )
                 self.assertEqual(runtime.close_calls, 1)
 
+    def test_smoke_rejects_forged_recovery_status_or_summary(self) -> None:
+        original_json_get = runtime_smoke._json_get
+        forged_cases = (
+            ("/api/summary", {
+                "unresolved_count": True, "oldest_unresolved_attempt": None,
+            }),
+            ("/api/summary", {
+                "unresolved_count": 1, "oldest_unresolved_attempt": None,
+            }),
+            ("/api/sync/recovery", {
+                "unresolved_count": False, "oldest_unresolved_attempt": None,
+            }),
+            ("/api/sync/recovery", {
+                "unresolved_count": 0,
+                "oldest_unresolved_attempt": {"outcome": "in_progress"},
+            }),
+            ("/api/sync/recovery", {
+                "unresolved_count": 0,
+                "oldest_unresolved_attempt": None, "cleared": True,
+            }),
+        )
+        for target_path, forged in forged_cases:
+            with self.subTest(target_path=target_path, forged=forged):
+                runtime = FakeInventoryRuntime(
+                    ReadResult.success_nonempty((snapshot("1234567890"),))
+                )
+
+                def corrupt_recovery(opener, base: str, path: str):
+                    payload = original_json_get(opener, base, path)
+                    if path != target_path:
+                        return payload
+                    if path == "/api/summary":
+                        assert isinstance(payload, dict)
+                        return {**payload, "sync_recovery": forged}
+                    return forged
+
+                with patch(
+                    "mark_api.private_web_runtime_smoke._json_get",
+                    side_effect=corrupt_recovery,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "dashboard inventory projections are malformed",
+                    ):
+                        run_private_web_runtime_smoke(
+                            19610, runtime_factory=lambda **_kwargs: runtime,
+                        )
+                self.assertEqual(runtime.close_calls, 1)
+
     def test_smoke_exercises_all_http_write_methods(self) -> None:
         runtime = FakeInventoryRuntime(
             ReadResult.success_nonempty((snapshot("1234567890"),))

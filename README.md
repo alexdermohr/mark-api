@@ -24,6 +24,77 @@ kleinanzeiger --db /pfad/kleinanzeiger.sqlite --cdp-port 9222
 
 Der Starter zeigt die lokale Dashboard-URL mit einem sitzungsgebundenen Zugriffstoken an. Der Start aktiviert standardmäßig die **vollständige Anzeigenverwaltung einschließlich Write und Media**. Wer ausnahmsweise nur lesen möchte, verwendet `--read-only`.
 
+Der normale `kleinanzeiger`-Starter nutzt zur Kompatibilität SQLite unter
+der aufrufenden lokalen UID. Für den streng getrennten, durch unabhängige
+Owner-/Actor-/Witness-Rollen abgesicherten Kundenstart steht zusätzlich der
+vollständig installierte und synthetisch abgenommene **geschützte
+Produktlauncher** bereit.
+
+### Geschützter Kundenstart (A6)
+
+Auf einem dafür vorbereiteten Linux-Host mit Landlock ABI 4 oder neuer,
+funktionsfähigen Netzwerk-/PID-Namespaces, freier Rollentrennung der UIDs
+50042–50047 und einem **root-eigenen, nicht beschreibbaren installierten Wheel**
+als Root in einer kontrollierten Shell starten. Der CDP-Port muss auf
+`127.0.0.1` erreichbar sein und einem bereits angemeldeten Kundenbrowser
+gehören.
+
+```bash
+# Nur für eine wirklich neue, noch nicht vorhandene Zustandswurzel:
+kleinanzeiger-protected --state-root /var/lib/kleinanzeiger --init-new --cdp-port 9222
+
+# Jeder reguläre Neustart ohne --init-new:
+kleinanzeiger-protected --state-root /var/lib/kleinanzeiger --cdp-port 9222
+```
+
+Der geschützte Starter stellt das volle lokale Dashboard über
+`http://127.0.0.1:8875` bereit und gibt eine private Sitzungstoken-URL aus.
+Die geschützte Anzeigenverwaltung einschließlich Create/Publish, Content,
+Pause/Activate und Delete wurde unter realen getrennten UIDs über den
+produktiven CDP-Adapter gegen zustandsbehaftete, synthetische Browsergegenstellen
+aus einem frischen Wheel getestet. Medienvorbereitung und ein getrennt
+getesteter Media-Create-Pfad sind vorhanden. Ein unbekanntes Write-Ergebnis
+löst **keinen** zweiten Plattform-Submit aus.
+
+Für die ausdrücklich optionale Text- und Bildgenerierung die Zusatzabhängigkeit
+`kleinanzeiger[generation]` installieren, den eigenen API-Schlüssel nur im
+vertrauenswürdigen Root-Startkontext setzen und zusätzlich starten:
+
+```bash
+export OPENAI_API_KEY=...  # nicht in Git, Screenshots oder Logdateien ablegen
+kleinanzeiger-protected --state-root /var/lib/kleinanzeiger --cdp-port 9222 --enable-generation
+```
+
+Die KI arbeitet in einer sechsten separaten Nicht-Owner-UID mit auf HTTPS-Port
+443 begrenztem TCP-Egress und peer-authentifiziertem Unix-Socket. Das Dashboard
+und der SQLite-Owner bleiben ohne externen Netzwerkzugang. Jeder KI-Aufruf
+braucht eine neue, sichtbare Kostenbestätigung; Entwürfe werden nie automatisch
+veröffentlicht. Der installierte KI-Pfad ist nur mit **synthetischem, niemals
+kostenpflichtigem Provider** abgenommen; der konkrete externe API-Schlüssel
+und Kundenaccount werden hier nicht zum Test eingesetzt. Kein paralleler
+Kleinanzeiger-Prozess darf denselben CDP-Target-Claim verwenden.
+
+**Liefergrenze:** Der native geschützte Start und die synthetische, installierte
+Kundenkette sind belegbar. Bestehende Legacy-Datenbanken werden durch
+`--init-new` nicht übernommen. Ein Host-Cutover mit alten
+FD-/MAP_SHARED-/WAL-/SHM-Rechten und die unabhängige Sicherheitsfreigabe sind
+weiterhin gesondert nachzuweisen. Ein externer Plattformfreigabeprozess ist
+nicht Teil der technischen Implementierung.
+
+**Geschütztes A6-Frontend (separater installierter Einstieg):** Das Wheel
+stellt zusätzlich `kleinanzeiger-protected-frontend --config-fd FD` bereit.
+Diesen Prozess startet ausschließlich ein vertrauenswürdiger Supervisor mit
+einer eng begrenzten JSON-Konfiguration über einen privaten geerbten
+Dateideskriptor; sie enthält den UID-geprüften Storage-Owner-Socket, den
+bestehenden Owner-Write-API-Port, die Principal-Identität und die beiden
+Sitzungstokens. Der Prozess liest **keine** SQLite-Datei und nimmt keine
+Browseraktion selbst vor; vorhandene unabhängig attestierte Actor-, Witness-
+und Owner-Prozesse sind zwingende Voraussetzung. Der eingebaute Selbsttest
+verweigert fehlende/falsche Gegenstellen. Die installierte synthetische
+Mehr-UID-Abnahme benutzt dieselbe produktive Frontend-Komposition. **Dieser
+zusätzliche Einstieg ist kein eigenständiger Host-Bootstrap und gibt weder
+den Draft-Container-Cutover noch einen Host-Restore frei.**
+
 Unter `Anzeigen verwalten` kann der Anwender eine Anzeige mit Kategorie, Titel, Beschreibung, Festpreis und Bildern erstellen oder eine bestehende eigene Anzeige ändern, pausieren, aktivieren und löschen. Externe Aktionen benötigen eine ausdrückliche Benutzerentscheidung; Idempotenz, Write-Bestätigung und unklare Ausgänge bleiben konservativ behandelt. Bei einem unbekannten Ausgang ist zunächst die vorhandene Reconciliation zu verwenden – **kein blinder erneuter Publish oder Delete**.
 
 ## Text- und Bildentwürfe im selben Dashboard
@@ -51,6 +122,8 @@ kleinanzeiger-sync --db /pfad/kleinanzeiger.sqlite --cdp-port 9222 --interval-se
 ## Backup, Daten und zusätzliche Werkzeuge
 
 `kleinanzeiger-backup --help` zeigt die vorhandenen Backup-/Restore-Kommandos und deren Sicherheitsvoraussetzungen. Bestehende Sicherheitsidentitäten, offene Write-Anfragen und Recovery-Fences dürfen beim Sichern, Wiederherstellen und nach Neustarts nicht verlorengehen. Restore nie unkontrolliert über eine aktive Sitzung ausführen.
+
+Für die noch nicht freigegebene A6-Hostumstellung gibt es eine **rein negative Linux-Kernel-Diagnose**: `python -m mark_api.a6_host_preflight --db /absoluter/pfad/kleinanzeiger.sqlite`. Sie prüft angeheftete Identitäten von SQLite-Hauptdatei, WAL und SHM gegen alte schreibbare Deskriptoren, gelöschte/umbenannte Inodes und schreibbare `MAP_SHARED`-Zuordnungen laufender Prozesse. Fehlt eine geschützte Datei oder ist ein Prozess nicht überprüfbar, wird konservativ abgewiesen. Das Programm endet **immer mit Code 2 und erteilt ausdrücklich keine Freigabe**: Ein endlicher Scan kann weder die vollständige PID-/Mount-Namespace-Sicht noch den Entzug historischer Schreibrechte, eine gesicherte Backup-Quelle oder echte A6-Quieszenz beweisen.
 
 Zusätzliche CLI-Kommandos: `kleinanzeiger-dashboard` für ein eigenständiges Dashboard, `kleinanzeiger-offline` für ausschließlich lokal importierte EML-/JSON-Daten ohne Plattformkontakt, `kleinanzeiger-import-mail`, `kleinanzeiger-classify`, `kleinanzeiger-generate` und `kleinanzeiger-local-smoke`. Der Offline-Modus ist ein **zusätzliches Werkzeug und kein Ersatz** für die vollständige Anzeigenverwaltung.
 

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -16,6 +16,11 @@ generation = ["openai>=2.11,<3"]
 [project.scripts]
 kleinanzeiger = "mark_api.launcher:main"
 kleinanzeiger-dashboard = "mark_api.dashboard:main"
+kleinanzeiger-protected-frontend = "mark_api.protected_frontend:main"
+kleinanzeiger-protected-owner = "mark_api.protected_owner:main"
+kleinanzeiger-protected-actor = "mark_api.protected_actor:main"
+kleinanzeiger-protected-witness = "mark_api.protected_witness:main"
+kleinanzeiger-protected = "mark_api.protected_product:main"
 kleinanzeiger-offline = "mark_api.offline_launcher:main"
 kleinanzeiger-generate = "mark_api.generation_cli:main"
 kleinanzeiger-backup = "mark_api.backup_cli:main"
@@ -30,10 +35,13 @@ mark-api-classify = "mark_api.classification_cli:main"
 mark-api-import-mail = "mark_api.email_import_cli:main"
 mark-api-local-smoke = "mark_api.local_smoke:main"
 mark-api-launch = "mark_api.launcher:main"
+mark-api-inventory-sync = "mark_api.owner_inventory_cli:main"
 mark-api-migrate-legacy = "mark_api.legacy_migration:main"
 mark-api-generate = "mark_api.generation_cli:main"
 mark-api-backup = "mark_api.backup_cli:main"
 mark-api-sync = "mark_api.periodic_sync:main"
+mark-api-pair-restore-check = "mark_api.paired_restore_preflight:main"
+kleinanzeiger-pair-restore-check = "mark_api.paired_restore_preflight:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

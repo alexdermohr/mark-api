@@ -1,0 +1,54 @@
+# Install root-owned in /etc/systemd/system/mark-api.service.
+# Do not enable until an authenticated loopback CDP endpoint and an existing
+# verified database have been set up. Never run with --init-db.
+[Unit]
+Description=Mark Kleinanzeigen retired legacy runtime (NOT SQLite storage owner)
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=mark-api
+Group=mark-api
+WorkingDirectory=/var/lib/mark-api
+ReadWritePaths=/var/lib/mark-api
+RuntimeDirectory=mark-api
+RuntimeDirectoryMode=0700
+UMask=0077
+# First code: native OS Python trust scan, then /usr/bin/python3 -I -S preflight.
+# Refuse an untrusted bootstrap file before executing it.
+# This legacy unit must not run even a trusted bootstrap before migration.
+# Replacement: independently attested UID50046 SQLite owner, UID50044 browser executor, UID50043 witness.
+ExecCondition=/usr/bin/false
+ExecStartPre=/bin/sh /etc/mark-api/bootstrap.sh --db /var/lib/mark-api/mark.sqlite --backup-dir /var/lib/mark-api-backups
+# LEGACY SECURITY RETIREMENT: an unwitnessed 50042 runtime could use host CDP
+# directly, outside the separated 50044 owner + 50043 witness boundary.
+# Do not re-enable until root-owned independently attested replacement exists.
+ExecStart=/usr/bin/false
+Restart=no
+RestartSec=10s
+
+# mark-api-launch prints its process-scoped bearer and dashboard-fragment URL.
+# Keep STDOUT out of journald and inaccessible to non-service UIDs.
+StandardOutput=truncate:/run/mark-api/launcher.log
+StandardError=journal
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

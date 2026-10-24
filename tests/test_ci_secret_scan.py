@@ -119,6 +119,46 @@ class CiSecretScanTests(unittest.TestCase):
         self.assertEqual(commit_count, 1)
         self.assertEqual(findings, ())
 
+    def test_known_public_ui_test_tokens_are_only_exactly_exempted(self) -> None:
+        # Two historically committed harmless literals are not credentials.
+        # One-character variants and real provider token formats still fail.
+        for fixture in (
+            "private-generation-token-1234567890",
+            "synthetic-generation-session-987654321",
+            "synthetic-http-generation-token-123456",
+        ):
+            with self.subTest(fixture=fixture):
+                assignment = ('token = "' + fixture + '"').encode()
+                self.assertIsNone(ci_secret_scan._credential_assignment_rule(assignment))
+                changed = ('token = "' + fixture + 'X"').encode()
+                self.assertEqual(
+                    ci_secret_scan._credential_assignment_rule(changed),
+                    "token_assignment",
+                )
+        self.assertEqual(
+            ci_secret_scan._line_rules(
+                b'token = "ghp_' + b'A' * 24 + b'"'
+            ), ("github_token",),
+        )
+
+
+    def test_known_synthetic_generation_credential_is_only_exactly_exempted(self) -> None:
+        # This exact public disposable unit-test fixture was introduced in
+        # e7be455; the scanner still blocks one-character variants.
+        credential = "only-synthetic-generation-credential-do-not-use"
+        assignment = ('secret = "' + credential + '"').encode()
+        self.assertIsNone(ci_secret_scan._credential_assignment_rule(assignment))
+        changed = ('secret = "' + credential + 'X"').encode()
+        self.assertEqual(
+            ci_secret_scan._credential_assignment_rule(changed),
+            "secret_assignment",
+        )
+        self.assertEqual(
+            ci_secret_scan._line_rules(
+                b'secret = "sk-' + b'A' * 24 + b'"'
+            ), ("openai_key",),
+        )
+
     def test_specific_token_pattern_still_blocks(self) -> None:
         repo = self.make_repo()
         self.commit_file(repo, "sample.txt", "safe\n", "base")

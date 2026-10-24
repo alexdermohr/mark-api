@@ -7,6 +7,8 @@ validation/copy steps have succeeded. Normal product startup remains strict.
 
 from __future__ import annotations
 
+from .container_draft import container_draft_denied
+
 import argparse
 from contextlib import closing, contextmanager
 import hashlib
@@ -432,6 +434,10 @@ def migrate_legacy_store(
 
 
 def main(argv: list[str] | None = None) -> int:
+    if container_draft_denied():
+        print("mark-api: unattested container draft cannot run Python entrypoints",
+              file=sys.stderr)
+        return 2
     parser = argparse.ArgumentParser(
         description=(
             "Offline, backup-backed import of historical Mark SQLite stores. "

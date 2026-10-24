@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+from http.client import HTTPConnection
 import sqlite3
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from mark_api.classification_cli import main as classification_main
 from mark_api.dashboard import (
     DashboardWriteProxy,
     _dashboard_http_origin,
+    _json_bytes,
     create_server,
     main as dashboard_main,
 )
@@ -41,7 +43,9 @@ from mark_api.query import (
     email_reaction_view_to_dict,
     summary_to_dict,
 )
+from mark_api.results import ReadResult
 from mark_api.storage import SnapshotStore
+from mark_api.strict_json import strict_json_object
 
 
 T0 = datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc)
@@ -78,6 +82,7 @@ class RecordingWriteBackend:
     def __init__(self) -> None:
         self.requests: list[dict[str, object]] = []
         self.closed = False
+        self.response_body: bytes | None = None
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -119,7 +124,11 @@ class RecordingWriteBackend:
                         "operation_receipt": {"outcome": "confirmed"},
                         "platform_retry_authorized": False,
                     }
-                encoded = json.dumps(payload).encode("utf-8")
+                encoded = (
+                    owner.response_body
+                    if owner.response_body is not None
+                    else json.dumps(payload).encode("utf-8")
+                )
                 self.send_response(200)
                 self.send_header(
                     "Content-Type",
@@ -267,6 +276,108 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
             _dashboard_http_origin("127.0.0.1", 8765),
             "http://127.0.0.1:8765",
         )
+
+    def test_explicit_frontend_origin_uses_public_port_not_owner_listener(self) -> None:
+        """A mediated browser Origin must be the frontend's 8875, not the owner's port."""
+        backend_host, backend_port = self.backend.server_address
+        public_port = 8875
+        proxied = create_server(
+            self.store,
+            port=0,
+            public_origin_port=public_port,
+            write_proxy=DashboardWriteProxy(
+                host=backend_host,
+                port=backend_port,
+                bearer_token=self.BACKEND_TOKEN,
+                ui_token=self.UI_TOKEN,
+            ),
+        )
+        thread = threading.Thread(target=proxied.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(proxied.server_close)
+        self.addCleanup(proxied.shutdown)
+        host, private_port = proxied.server_address
+        url = f"http://{host}:{private_port}/api/write/ads/2"
+        public_origin = f"http://127.0.0.1:{public_port}"
+
+        valid = Request(
+            url, data=b'{"title":"Neu"}', method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:public-origin-8875",
+                origin=public_origin,
+            ),
+        )
+        with urlopen(valid, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+        self.assertEqual(len(self.backend.requests), 1)
+        self.assertEqual(
+            self.backend.requests[0]["idempotency_key"], "ui:public-origin-8875",
+        )
+
+        for other_origin in (f"http://127.0.0.1:{private_port}", public_origin + "/"):
+            invalid = Request(
+                url, data=b'{"title":"Neu"}', method="PATCH",
+                headers=self.write_headers(
+                    content_type="application/json",
+                    idempotency_key="ui:forbidden-owner-origin",
+                    origin=other_origin,
+                ),
+            )
+            with self.subTest(origin=other_origin):
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(invalid, timeout=2)
+                self.assertEqual(denied.exception.code, 403)
+        self.assertEqual(len(self.backend.requests), 1)
+
+    def test_forwarded_public_host_is_allowed_without_dns_aliases(self) -> None:
+        public_port = 8875
+        proxied = create_server(self.store, port=0, public_origin_port=public_port)
+        thread = threading.Thread(target=proxied.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(proxied.server_close)
+        self.addCleanup(proxied.shutdown)
+        host, private_port = proxied.server_address
+        for forwarded_host, expected_status in (
+            (f"127.0.0.1:{public_port}", 200),
+            (f"127.0.0.1:{private_port}", 200),
+            (f"attacker.example:{public_port}", 421),
+            (f"localhost:{public_port}", 421),
+        ):
+            with self.subTest(host=forwarded_host):
+                connection = HTTPConnection(host, private_port, timeout=2)
+                try:
+                    connection.putrequest("GET", "/readyz", skip_host=True)
+                    connection.putheader("Host", forwarded_host)
+                    connection.endheaders()
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, expected_status)
+                    response.read()
+                finally:
+                    connection.close()
+
+    def test_proxy_rejects_foreign_host_before_write_forward(self) -> None:
+        host, port = self.server.server_address
+        payload = b'{"title":"New"}'
+        connection = HTTPConnection(host, port, timeout=2)
+        try:
+            connection.putrequest("PATCH", "/api/write/ads/2", skip_host=True)
+            connection.putheader("Host", "attacker.example")
+            for header, value in self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:foreign-host-denied",
+            ).items():
+                connection.putheader(header, value)
+            connection.putheader("Content-Length", str(len(payload)))
+            connection.endheaders(payload)
+            response = connection.getresponse()
+            self.assertEqual(response.status, 421)
+            response.read()
+        finally:
+            connection.close()
+        self.assertEqual(self.backend.requests, [])
 
     def test_proxy_requires_dashboard_secret_and_same_origin(self) -> None:
         body = b'{"title":"Neu"}'
@@ -460,6 +571,227 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
             "ui:db-missing-no-write",
         )
 
+    def test_strict_json_allows_brackets_in_strings_but_never_nonfinite_output(self) -> None:
+        self.assertEqual(
+            strict_json_object(b'{"text":"[{}] NaN Infinity","number":1.25}'),
+            {"text": "[{}] NaN Infinity", "number": 1.25},
+        )
+        self.assertEqual(
+            strict_json_object(b'{"max":1.7976931348623157e308}')["max"],
+            1.7976931348623157e308,
+        )
+        for number in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(number=str(number)):
+                with self.assertRaises(ValueError):
+                    _json_bytes({"unsafe": number})
+
+    def test_utf8_decoder_scans_the_same_text_it_parses(self) -> None:
+        payload = {"description": 'Escaped " followed by ' + "[" * 70}
+        raw = json.dumps(payload).encode("utf-8")
+        self.assertEqual(strict_json_object(raw), payload)
+        self.assertEqual(
+            strict_json_object(b'{"value":[1, {"quoted":"\\"[][]"}]}'),
+            {"value": [1, {"quoted": '"[][]'}]},
+        )
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be", "utf-32"):
+            with self.subTest(encoding=encoding):
+                with self.assertRaisesRegex(ValueError, "invalid_json"):
+                    strict_json_object(json.dumps(payload).encode(encoding))
+        ambiguous = (
+            b'{"description":"Escaped \\" before ", "depth":'
+            + b"[" * 80 + b"0" + b"]" * 80 + b"}"
+        )
+        with self.assertRaisesRegex(ValueError, "invalid_json"):
+            strict_json_object(ambiguous)
+
+    def test_proxy_rejects_ambiguous_nonfinite_and_deep_raw_json_before_claim(self) -> None:
+        invalid = (
+            b'{"title":"original","title":"replaced"}',
+            br'{"title":"original","\u0074itle":"replaced"}',
+            b'{"title":"ok","nested":{"x":1,"x":2}}',
+            b'{"media_refs":[{"x":1,"x":2}]}',
+            b'{"price_eur":NaN}',
+            b'{"price_eur":Infinity}',
+            b'{"price_eur":-Infinity}',
+            b'{"price_eur":1e999}',
+            b'{"price_eur":-1E999}',
+            b'{"nested":{"value":1e999}}',
+            b'{"depth":' + (b"[" * 65) + b"0" + (b"]" * 65) + b"}",
+            '{"title":"test"}'.encode("utf-16"),
+            '{"title":"test"}'.encode("utf-16-le"),
+            '{"title":"test"}'.encode("utf-32"),
+            '{"title":"test"}'.encode("utf-32-be"),
+        )
+        routes = (
+            ("POST", "/api/write/ads", True),
+            ("PATCH", "/api/write/ads/2", True),
+            ("POST", "/api/write/media/ads", True),
+            ("POST", "/api/write/media/discard", False),
+        )
+        for index, raw in enumerate(invalid):
+            for method, route, platform_write in routes:
+                with self.subTest(raw=raw[:60], method=method, route=route):
+                    request = Request(
+                        self.base + route,
+                        data=raw,
+                        method=method,
+                        headers=self.write_headers(
+                            content_type="application/json",
+                            idempotency_key=(
+                                f"ui:invalid-wire-{index}" if platform_write else None
+                            ),
+                        ),
+                    )
+                    with self.assertRaises(HTTPError) as caught:
+                        urlopen(request, timeout=2)
+                    self.assertEqual(caught.exception.code, 400)
+                    response = json.loads(caught.exception.read())
+                    self.assertEqual(response["error"], "invalid_json")
+                    self.assertIs(response["platform_retry_authorized"], False)
+                    self.assertEqual(self.store.dashboard_pending_writes(), ())
+                    self.assertEqual(self.backend.requests, [])
+
+    def test_proxy_rejects_lone_surrogate_before_pending_claim(self) -> None:
+        # JSON permits the raw escape but a lone surrogate is not UTF-8.
+        # Reject it before an idempotency claim or backend side effect.
+        body = br'{"title":"\ud800"}'
+        routes = (
+            ("POST", "/api/write/ads"),
+            ("PATCH", "/api/write/ads/2"),
+            ("POST", "/api/write/media/ads"),
+        )
+        for index, (method, route) in enumerate(routes):
+            with self.subTest(method=method, route=route):
+                request = Request(
+                    self.base + route,
+                    data=body,
+                    method=method,
+                    headers=self.write_headers(
+                        content_type="application/json",
+                        idempotency_key=f"ui:invalid-surrogate-{index}",
+                    ),
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                self.assertEqual(caught.exception.code, 400)
+                self.assertEqual(json.loads(caught.exception.read()), {
+                    "error": "invalid_unicode_text",
+                    "platform_retry_authorized": False,
+                })
+                self.assertEqual(self.store.dashboard_pending_writes(), ())
+                self.assertEqual(self.backend.requests, [])
+
+    def test_proxy_rejects_noncanonical_write_route_aliases(self) -> None:
+        # Percent-encoded or split path aliases must never lose staged media
+        # during pending-write recovery by persisting a different raw path.
+        cases = (
+            ("POST", "/api/write/media/%61ds"),
+            ("POST", "/api/write/media/ads/"),
+            ("POST", "/api/write//media/ads"),
+            ("PATCH", "/api/write/ads/%32"),
+        )
+        for index, (method, route) in enumerate(cases):
+            with self.subTest(method=method, route=route):
+                request = Request(
+                    self.base + route,
+                    data=b'{"title":"reject alias"}',
+                    method=method,
+                    headers=self.write_headers(
+                        content_type="application/json",
+                        idempotency_key=f"ui:noncanonical-route-{index}",
+                    ),
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                self.assertEqual(caught.exception.code, 404)
+                self.assertEqual(self.store.dashboard_pending_writes(), ())
+                self.assertEqual(self.backend.requests, [])
+
+    def test_proxy_valid_finite_json_keeps_wire_and_claim_identity(self) -> None:
+        raw = b'{"title":"NaN is text","description":"[{}]","price_eur":1.25}'
+        request = Request(
+            self.base + "/api/write/ads/2",
+            data=raw,
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:finite-exact-wire",
+            ),
+        )
+        with urlopen(request, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+        self.assertEqual(len(self.backend.requests), 1)
+        self.assertEqual(self.backend.requests[0]["body"], raw)
+        pending = self.store.dashboard_pending_writes()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(json.loads(pending[0].payload_json), json.loads(raw))
+
+    def test_proxy_malformed_backend_json_keeps_unknown_pending_write(self) -> None:
+        invalid = (
+            b'{"outcome":"confirmed","outcome":"other"}',
+            b'{"outcome":NaN}',
+            b'{"outcome":1e999}',
+            '{"outcome":"confirmed"}'.encode("utf-16"),
+            b'{"value":' + (b"[" * 65) + b"0" + (b"]" * 65) + b"}",
+        )
+        for index, raw in enumerate(invalid):
+            with self.subTest(raw=raw[:60]):
+                self.backend.response_body = raw
+                request = Request(
+                    self.base + f"/api/write/ads/{100 + index}",
+                    data=b'{"title":"test"}',
+                    method="PATCH",
+                    headers=self.write_headers(
+                        content_type="application/json",
+                        idempotency_key=f"ui:bad-backend-{index}",
+                    ),
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                self.assertEqual(caught.exception.code, 502)
+                response = json.loads(caught.exception.read())
+                self.assertEqual(response["error"], "write_proxy_transport_unknown")
+                self.assertIs(response["platform_retry_authorized"], False)
+                self.assertEqual(len(self.backend.requests), index + 1)
+                pending = self.store.dashboard_pending_writes()
+                self.assertEqual(len(pending), index + 1)
+                self.assertFalse(any(record.acknowledged for record in pending))
+
+    def test_pending_ack_rejects_duplicate_and_nonfinite_wire_json(self) -> None:
+        self.store.claim_dashboard_pending_write(
+            scope="ad:2:update",
+            resource_key="ad:2",
+            idempotency_key="ui:protected-ack",
+            method="PATCH",
+            path="/api/write/ads/2",
+            payload_json='{"title":"test"}',
+            ad_id="2",
+        )
+        before = self.store.dashboard_pending_writes()
+        invalid = (
+            b'{"scope":"ad:2:update","scope":"other","idempotency_key":"ui:protected-ack"}',
+            b'{"scope":"ad:2:update","idempotency_key":"ui:protected-ack","x":NaN}',
+            b'{"scope":"ad:2:update","idempotency_key":"ui:protected-ack","x":1e999}',
+            '{"scope":"ad:2:update","idempotency_key":"ui:protected-ack"}'.encode("utf-16"),
+        )
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                request = Request(
+                    self.base + "/api/dashboard/pending-writes/ack",
+                    data=raw,
+                    method="POST",
+                    headers=self.write_headers(content_type="application/json"),
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                self.assertEqual(caught.exception.code, 409)
+                self.assertIs(
+                    json.loads(caught.exception.read())["platform_retry_authorized"],
+                    False,
+                )
+                self.assertEqual(self.store.dashboard_pending_writes(), before)
+                self.assertEqual(self.backend.requests, [])
+
     def test_proxy_forwards_exact_write_contract_and_hides_ui_secret(self) -> None:
         payload = {"title": "Neu", "description": "Beschreibung"}
         request = Request(
@@ -522,21 +854,35 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
             method="POST",
             headers=self.write_headers(content_type="application/json"),
         )
-        with urlopen(ack, timeout=2) as response:
+        for _ in range(2):
+            with self.assertRaises(HTTPError) as ack_error:
+                urlopen(ack, timeout=2)
+            self.assertEqual(ack_error.exception.code, 409)
             self.assertEqual(
-                json.loads(response.read()),
-                {"acknowledged": True, "finalized": False},
+                json.loads(ack_error.exception.read()),
+                {
+                    "error": "dashboard_pending_write_reconciliation_required",
+                    "platform_retry_authorized": False,
+                },
             )
-        pending_after_ack = self.store.dashboard_pending_writes()
-        self.assertEqual(len(pending_after_ack), 1)
-        self.assertTrue(pending_after_ack[0].acknowledged)
+            self.assertEqual(self.store.dashboard_pending_writes(), pending)
 
-        with urlopen(ack, timeout=2) as response:
-            self.assertEqual(
-                json.loads(response.read()),
-                {"acknowledged": True, "finalized": True},
-            )
-        self.assertEqual(self.store.dashboard_pending_writes(), ())
+        # A forged browser-only ACK must not permit a new mutation key
+        # against the same resource, even after observing HTTP 200.
+        another = Request(
+            self.base + "/api/write/ads/2",
+            data=json.dumps(payload).encode("utf-8"),
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:test-forward-2",
+            ),
+        )
+        with self.assertRaises(HTTPError) as denied:
+            urlopen(another, timeout=2)
+        self.assertEqual(denied.exception.code, 409)
+        self.assertEqual(len(self.backend.requests), 1)
+        self.assertEqual(self.store.dashboard_pending_writes(), pending)
 
     def test_proxy_media_stage_keeps_bytes_local_and_uses_no_idempotency_key(self) -> None:
         media = b"\x89PNG\r\n\x1a\nlocal-test"
@@ -629,6 +975,34 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
             f"Bearer {self.BACKEND_TOKEN}",
         )
 
+    def test_proxy_does_not_forward_identical_unacknowledged_key_twice(self) -> None:
+        request = Request(
+            self.base + "/api/write/ads/789",
+            data=b'{"title":"Neu"}',
+            method="PATCH",
+            headers=self.write_headers(
+                content_type="application/json",
+                idempotency_key="ui:same-key-no-blind-retry",
+            ),
+        )
+        with urlopen(request, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+        self.assertEqual(len(self.backend.requests), 1)
+        before = self.store.dashboard_pending_writes()
+        self.assertEqual(len(before), 1)
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(request, timeout=2)
+        self.assertEqual(raised.exception.code, 409)
+        self.assertEqual(
+            json.loads(raised.exception.read()),
+            {
+                "error": "dashboard_pending_write_conflict",
+                "platform_retry_authorized": False,
+            },
+        )
+        self.assertEqual(self.backend.requests.__len__(), 1)
+        self.assertEqual(self.store.dashboard_pending_writes(), before)
+
     def test_proxy_persists_unknown_request_and_recovers_exactly_after_restart(self) -> None:
         self.backend.close()
         request = Request(
@@ -715,7 +1089,6 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
         self.addCleanup(replacement_server.shutdown)
         host, port = replacement_server.server_address
         replacement_base = f"http://{host}:{port}"
-
         pending_request = Request(
             replacement_base + "/api/dashboard/pending-writes",
             headers={
@@ -754,50 +1127,20 @@ class DashboardWriteProxyHttpTests(unittest.TestCase):
                 "Idempotency-Key": "ui:test-transport-unknown",
             },
         )
-        with urlopen(retry, timeout=2) as response:
-            replay_payload = json.loads(response.read())
+        with self.assertRaises(HTTPError) as retry_error:
+            urlopen(retry, timeout=2)
+        self.assertEqual(retry_error.exception.code, 409)
         self.assertEqual(
-            replay_payload["idempotency_key"],
-            "ui:test-transport-unknown",
-        )
-        self.assertEqual(len(replacement_backend.requests), 1)
-        self.assertEqual(
-            replacement_backend.requests[0]["idempotency_key"],
-            "ui:test-transport-unknown",
-        )
-        self.assertEqual(len(self.store.dashboard_pending_writes()), 1)
-
-        ack = Request(
-            replacement_base + "/api/dashboard/pending-writes/ack",
-            data=json.dumps(
-                {
-                    "scope": "ad:2:update",
-                    "idempotency_key": "ui:test-transport-unknown",
-                }
-            ).encode("utf-8"),
-            method="POST",
-            headers={
-                "Origin": replacement_base,
-                "X-Mark-Dashboard-Write": "1",
-                "X-Mark-Dashboard-Token": replacement_token,
-                "Content-Type": "application/json",
+            json.loads(retry_error.exception.read()),
+            {
+                "error": "dashboard_pending_write_conflict",
+                "platform_retry_authorized": False,
             },
         )
-        with urlopen(ack, timeout=2) as response:
-            self.assertEqual(
-                json.loads(response.read()),
-                {"acknowledged": True, "finalized": False},
-            )
-        pending_after_ack = self.store.dashboard_pending_writes()
-        self.assertEqual(len(pending_after_ack), 1)
-        self.assertTrue(pending_after_ack[0].acknowledged)
-
-        with urlopen(ack, timeout=2) as response:
-            self.assertEqual(
-                json.loads(response.read()),
-                {"acknowledged": True, "finalized": True},
-            )
-        self.assertEqual(self.store.dashboard_pending_writes(), ())
+        # This is a re-sent *identical* idempotency key after a transport
+        # unknown; accepting it would rely on unproven backend storage state.
+        self.assertEqual(replacement_backend.requests, [])
+        self.assertEqual(self.store.dashboard_pending_writes(), pending)
 
 
 class SeededStoreMixin:
@@ -1429,6 +1772,31 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
                 response.read(),
             )
 
+    def test_read_routes_deny_dns_rebinding_and_duplicate_host(self) -> None:
+        host, port = self.server.server_address
+        forbidden = (
+            ("foreign", ("attacker.example",)),
+            ("foreign-port", (f"attacker.example:{port}",)),
+            ("localhost-alias", (f"localhost:{port}",)),
+            ("wrong-port", ("127.0.0.1:1",)),
+            ("missing", ()),
+            ("duplicate", (f"127.0.0.1:{port}", "attacker.example")),
+        )
+        for label, hosts in forbidden:
+            with self.subTest(label=label):
+                connection = HTTPConnection(host, port, timeout=2)
+                try:
+                    connection.putrequest("GET", "/api/summary", skip_host=True)
+                    for value in hosts:
+                        connection.putheader("Host", value)
+                    connection.endheaders()
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 421)
+                    self.assertNotIn(b"tracked_ads", response.read())
+                finally:
+                    connection.close()
+        self.assertEqual(self.get("/api/summary")[0], 200)
+
     def test_standalone_dashboard_rejects_mistyped_database_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "typo" / "mark.sqlite"
@@ -1498,6 +1866,30 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertEqual(failed["latest_attempt"]["error_kind"], "transport_error")
         self.assertIsNone(failed["last_successful_attempt"])
 
+    def test_sync_recovery_endpoint_and_summary_show_old_unknown_after_success(self) -> None:
+        self.assertEqual(json.loads(self.get("/api/sync/recovery")[2]), {
+            "unresolved_count": 0, "oldest_unresolved_attempt": None,
+        })
+        older = self.store.begin_sync_attempt(source="older-owner", started_at=T0)
+        newer = self.store.begin_sync_attempt(source="newer-owner", started_at=T1)
+        self.store.append_inventory_result(
+            ReadResult.success_empty(()), source="newer-owner", observed_at=T1,
+            attempt_id=newer, completed_at=T1,
+        )
+        _, _, latest_body = self.get("/api/sync/status")
+        self.assertEqual(json.loads(latest_body)["state"], "success_empty")
+        _, _, recovery_body = self.get("/api/sync/recovery")
+        recovery = json.loads(recovery_body)
+        self.assertEqual(recovery["unresolved_count"], 1)
+        self.assertEqual(recovery["oldest_unresolved_attempt"]["id"], older)
+        _, _, summary_body = self.get("/api/summary")
+        summary = json.loads(summary_body)
+        self.assertEqual(summary["sync_recovery"], recovery)
+        self.assertEqual(summary["sync_status"]["state"], "success_empty")
+        _, _, script = self.get("/dashboard.js")
+        self.assertIn("noch nicht abgeschlossene Sync-Versuche", script.decode("utf-8"))
+        self.assertIn("summary.sync_recovery", script.decode("utf-8"))
+
     def test_readyz_detects_existing_recovery_table_missing_required_columns(self) -> None:
         self.assertEqual(json.loads(self.get("/readyz")[2]), {"status": "ready"})
         with closing(sqlite3.connect(self.store.path)) as connection, connection:
@@ -1531,6 +1923,7 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
             "/readyz",
             "/api/summary",
             "/api/sync/status",
+            "/api/sync/recovery",
             "/api/ads",
             "/api/analytics/groups?dimension=city&metric=views",
             "/api/ads/1/history",
@@ -1566,6 +1959,63 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         shutil.copyfile(backup, self.store.path)
         self.assertEqual(json.loads(self.get("/readyz")[2]), {"status": "ready"})
         self.assertEqual(json.loads(self.get("/api/summary")[2]), expected)
+
+    def test_middle_unfinished_sync_corruption_fails_dashboard_recovery(self) -> None:
+        first = self.store.begin_sync_attempt(source="first-owner", started_at=T0)
+        hidden = self.store.begin_sync_attempt(source="hidden-owner", started_at=T0)
+        self.store.begin_sync_attempt(source="third-owner", started_at=T0)
+        latest = self.store.begin_sync_attempt(source="newer-owner", started_at=T1)
+        self.store.append_inventory_result(
+            ReadResult.success_empty(()), source="newer-owner",
+            observed_at=T1, attempt_id=latest, completed_at=T1,
+        )
+        self.assertEqual(self.get("/api/sync/recovery")[0], 200)
+        self.assertEqual(
+            json.loads(self.get("/api/sync/recovery")[2])["unresolved_count"], 3,
+        )
+        with sqlite3.connect(self.store.path) as connection:
+            connection.execute(
+                "UPDATE sync_attempts SET started_at=? WHERE id=?",
+                ("private-middle-corrupt-timestamp", hidden),
+            )
+        self.assertEqual(json.loads(self.get("/healthz")[2]), {"status": "ok"})
+        for route in (
+            "/readyz", "/api/sync/status", "/api/sync/recovery", "/api/summary",
+        ):
+            with self.subTest(route=route), self.assertRaises(HTTPError) as caught:
+                urlopen(self.base + route, timeout=2)
+            response = caught.exception
+            self.assertEqual(response.code, 503)
+            body = response.read().decode("utf-8")
+            self.assertNotIn("private-middle-corrupt-timestamp", body)
+            self.assertNotIn(str(self.store.path), body)
+        self.assertEqual(first + 1, hidden)
+
+    def test_hidden_old_open_sync_corruption_fails_http_readiness(self) -> None:
+        old = self.store.begin_sync_attempt(source="previous-owner", started_at=T0)
+        newer = self.store.begin_sync_attempt(source="newer-owner", started_at=T1)
+        self.store.append_inventory_result(
+            ReadResult.success_empty(()), source="newer-owner",
+            observed_at=T1, attempt_id=newer, completed_at=T1,
+        )
+        self.assertEqual(json.loads(self.get("/api/sync/status")[2])["state"],
+                         "success_empty")
+        with sqlite3.connect(self.store.path) as connection:
+            connection.execute(
+                "UPDATE sync_attempts SET started_at=? WHERE id=?",
+                ("private-invalid-old-owner-timestamp", old),
+            )
+        self.assertEqual(json.loads(self.get("/healthz")[2]), {"status": "ok"})
+        for endpoint in (
+            "/readyz", "/api/sync/status", "/api/sync/recovery", "/api/summary",
+        ):
+            with self.subTest(endpoint=endpoint), self.assertRaises(HTTPError) as caught:
+                urlopen(self.base + endpoint, timeout=2)
+            response = caught.exception
+            self.assertEqual(response.code, 503)
+            data = response.read().decode("utf-8")
+            self.assertNotIn("private-invalid-old-owner-timestamp", data)
+            self.assertNotIn(str(self.store.path), data)
 
     def test_corrupted_sync_journal_returns_sanitized_unavailable_http(self) -> None:
         attempt = self.store.begin_sync_attempt(source="owner", started_at=T1)
@@ -2092,6 +2542,61 @@ class DashboardHttpTests(SeededStoreMixin, unittest.TestCase):
         self.assertIn("grid-column: 2;", css)
         self.assertIn("overflow-wrap: anywhere;", css)
 
+    def test_sync_recovery_js_distinguishes_running_from_abandoned(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        definitions, marker, _ = js_body.decode("utf-8").partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const status = {textContent: ""};
+globalThis.document = {
+  getElementById(id) {
+    assert.equal(id, "sync-status");
+    return status;
+  },
+};
+const now = "2026-10-12T12:00:00+00:00";
+const active = {
+  state: "in_progress",
+  latest_attempt: {id: 4, source: "owner", started_at: now},
+  last_successful_attempt: null,
+};
+renderSyncStatus(active, {
+  unresolved_count: 1, oldest_unresolved_attempt: {id: 4},
+});
+assert.match(status.textContent, /möglicherweise noch aktiv oder unterbrochen/);
+assert.doesNotMatch(status.textContent, /dauerhaft offen/);
+const recentSuccess = {
+  state: "success_empty",
+  latest_attempt: {id: 5, source: "owner", started_at: now,
+                   completed_at: now, snapshot_count: 0},
+  last_successful_attempt: {id: 5, source: "owner", completed_at: now},
+};
+renderSyncStatus(recentSuccess, {
+  unresolved_count: 1, oldest_unresolved_attempt: {id: 4},
+});
+assert.match(status.textContent, /noch nicht abgeschlossene Sync-Versuche/);
+assert.match(status.textContent, /ältester Versuch #4/);
+renderSyncStatus(recentSuccess, {
+  unresolved_count: 0, oldest_unresolved_attempt: null,
+});
+assert.match(status.textContent, /Zum Abfragezeitpunkt keine offenen Sync-Versuche/);
+renderSyncStatus(recentSuccess, {
+  unresolved_count: true, oldest_unresolved_attempt: null,
+});
+assert.match(status.textContent, /konnten nicht geprüft werden/);
+"""
+        completed = subprocess.run(
+            ["node"], input=harness, text=True,
+            capture_output=True, check=False,
+        )
+        self.assertEqual(
+            completed.returncode, 0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
     def test_bar_chart_runtime_filters_values_and_preserves_semantics(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
@@ -2398,7 +2903,6 @@ const visibleRanking = () => el("ranking-body").children[0]?.children[2]?.textCo
   assert.equal(visibleRanking(), "0");
   assert.equal(el("groups-body").children[0].children[2].textContent, "0");
   assert.equal(el("analytics-status").textContent, "");
-
   // Choosing no metric invalidates the previous result but issues no request.
   const count = requests.length;
   el("metric-select").value = "";
@@ -2552,7 +3056,7 @@ globalThis.fetch = async (path, options) => {
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
-    def test_write_runtime_finalizes_observed_ack_tombstone_without_platform_retry(self) -> None:
+    def test_write_runtime_retains_legacy_ack_tombstone_without_platform_retry(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
         definitions, marker, _ = javascript.partition(
@@ -2590,30 +3094,18 @@ globalThis.fetch = async (path, options) => {
       },
     };
   }
-  if (path === "/api/dashboard/pending-writes/ack") {
-    assert.deepEqual(
-      JSON.parse(options.body),
-      {scope: tombstone.scope, idempotency_key: tombstone.key},
-    );
-    return {
-      status: 200,
-      ok: true,
-      async text() {
-        return JSON.stringify({acknowledged: true, finalized: true});
-      },
-    };
-  }
   throw new Error("unexpected platform request: " + path);
 };
 
 (async () => {
   await refreshPendingWrites();
   assert.equal(pendingRecoveryBlocked, false);
-  assert.equal(pendingWrites.size, 0);
+  assert.equal(pendingWrites.size, 1);
+  assert.equal(pendingWrites.get("create").acknowledged, true);
   assert.equal(writeUiReady(), true);
   assert.deepEqual(
     calls.map((item) => item.path),
-    ["/api/dashboard/pending-writes", "/api/dashboard/pending-writes/ack"],
+    ["/api/dashboard/pending-writes"],
   );
 })().catch((error) => {
   console.error(error);
@@ -3409,9 +3901,9 @@ globalThis.fetch = async (path, options) => {
 
   ackFails = false;
   await submitCreate({preventDefault() {}});
-  assert.equal(createCalls, 2);
+  assert.equal(createCalls, 1, "ACK-only recovery must not create again");
   assert.equal(ackCalls, 2);
-  assert.equal(keys[1], pendingKey);
+  assert.deepEqual(keys, [pendingKey]);
   assert.equal(pendingWrites.has("create"), false);
   assert.equal(fields.get("create-category").value, "");
   assert.equal(fields.get("create-title").value, "");
@@ -3746,6 +4238,194 @@ globalThis.fetch = async (path, options) => {
         self.assertEqual(
             completed.returncode,
             0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+    def test_write_runtime_refreshes_views_but_keeps_fences_on_denied_ack(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        definitions, marker, _ = js_body.decode("utf-8").partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const status = {textContent: "", className: ""};
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return status;
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() { return []; },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+let readOnlyRefreshes = 0;
+load = async () => { readOnlyRefreshes += 1; };
+const requests = [];
+globalThis.fetch = async (path, options) => {
+  requests.push(path);
+  if (path === "/api/dashboard/pending-writes/ack") {
+    return {status: 409, ok: false, async text() {
+      return JSON.stringify({
+        error: "dashboard_pending_write_reconciliation_required",
+        platform_retry_authorized: false,
+      });
+    }};
+  }
+  assert.match(path, /^\/api\/write\/ads\/(123|124)\/pause$/);
+  const confirmed = path.includes("/123/");
+  return {status: confirmed ? 200 : 202, ok: true, async text() {
+    return JSON.stringify({
+      idempotency_key: options.headers["Idempotency-Key"],
+      operation_receipt: {
+        outcome: confirmed ? "confirmed" : "ambiguous",
+        writer_invoked: true,
+      },
+      platform_retry_authorized: false,
+    });
+  }};
+};
+(async () => {
+  for (const [id, expected] of [["123", 200], ["124", 202]]) {
+    const scope = `ad:${id}:pause`;
+    const result = await runPlatformWrite(
+      scope, "POST", `/api/write/ads/${id}/pause`, null, {adId: id},
+    );
+    assert.equal(result.response.status, expected);
+    assert.equal(pendingWrites.get(scope).acknowledgeOnly, true);
+    assert.equal(readOnlyRefreshes, id === "123" ? 1 : 2);
+    assert.match(status.textContent, /Recovery-ACK ist fehlgeschlagen/);
+  }
+  const beforeRetry = requests.filter(p => p.startsWith("/api/write/"));
+  assert.deepEqual(beforeRetry, [
+    "/api/write/ads/123/pause", "/api/write/ads/124/pause",
+  ]);
+  await runPlatformWrite(
+    "ad:123:pause", "POST", "/api/write/ads/123/pause", null, {adId: "123"},
+  );
+  assert.deepEqual(
+    requests.filter(p => p.startsWith("/api/write/")), beforeRetry,
+    "ACK-only retries must never forward to the backend",
+  );
+  assert.equal(readOnlyRefreshes, 2);
+  assert.equal(pendingWrites.size, 2, "both original recovery fences remain");
+})().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"], input=harness, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(
+            completed.returncode, 0,
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
+        )
+
+    def test_write_runtime_retry_after_terminal_ack_failure_is_ack_only(self) -> None:
+        _, _, js_body = self.get("/dashboard.js")
+        definitions, marker, _ = js_body.decode("utf-8").partition(
+            'byId("reload").addEventListener',
+        )
+        self.assertTrue(marker)
+        harness = definitions + r"""
+const assert = require("node:assert/strict");
+const writeStatus = {textContent: "", className: ""};
+globalThis.document = {
+  getElementById(id) {
+    if (id === "write-status") return writeStatus;
+    throw new Error("unexpected element: " + id);
+  },
+  querySelectorAll() { return []; },
+};
+writeUiAvailable = true;
+writeToken = "dashboard-write-token-00000001";
+let refreshes = 0;
+load = async () => { refreshes += 1; };
+const calls = [];
+let acknowledgements = 0;
+let failRead = true;
+globalThis.fetch = async (path, options) => {
+  calls.push({path, options});
+  if (path === "/api/dashboard/pending-writes") {
+    if (failRead) throw new Error("pending list transport lost");
+    const original = pendingAckOnly.get("ad:123:update");
+    return {status: 200, ok: true, async text() {
+      return JSON.stringify({pending_writes: [{
+        scope: "ad:123:update", key: original.key,
+        method: original.method, path: original.path,
+        payload: {title: "once"}, adId: "123", acknowledged: false,
+      }]});
+    }};
+  }
+  if (path === "/api/dashboard/pending-writes/ack") {
+    acknowledgements += 1;
+    if (acknowledgements === 1) throw new Error("ACK transport lost");
+    return {status: 200, ok: true, async text() {
+      return JSON.stringify({acknowledged: true, finalized: false});
+    }};
+  }
+  assert.equal(path, "/api/write/ads/123");
+  const pending = pendingWrites.get("ad:123:update");
+  return {status: 200, ok: true, async text() {
+    return JSON.stringify({
+      idempotency_key: pending.key,
+      operation_receipt: {outcome: "confirmed"},
+      platform_retry_authorized: false,
+    });
+  }};
+};
+(async () => {
+  const scope = "ad:123:update";
+  const payload = {title: "once"};
+  const result = await runPlatformWrite(
+    scope, "PATCH", "/api/write/ads/123", payload, {adId: "123"},
+  );
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(
+    calls.map((item) => item.path),
+    ["/api/write/ads/123", "/api/dashboard/pending-writes/ack"],
+  );
+  const pending = pendingWrites.get(scope);
+  assert.ok(pending);
+  assert.equal(pending.acknowledgeOnly, true);
+  assert.equal(refreshes, 1);
+  await refreshPendingWrites();
+  assert.equal(pendingRecoveryBlocked, true);
+  assert.equal(pendingWrites.size, 0);
+  failRead = false;
+  await refreshPendingWrites();
+  assert.equal(pendingRecoveryBlocked, false);
+  assert.equal(pendingWrites.get(scope).acknowledgeOnly, true);
+  const afterAck = await runPlatformWrite(
+    scope, "PATCH", "/api/write/ads/999", {title: "must not send"}, {adId: "999"},
+  );
+  assert.equal(afterAck, null);
+  assert.deepEqual(
+    calls.map((item) => item.path),
+    [
+      "/api/write/ads/123",
+      "/api/dashboard/pending-writes/ack",
+      "/api/dashboard/pending-writes",
+      "/api/dashboard/pending-writes",
+      "/api/dashboard/pending-writes/ack",
+    ],
+  );
+  assert.deepEqual(JSON.parse(calls[4].options.body), {
+    scope, idempotency_key: pending.key,
+  });
+  assert.equal(pendingWrites.has(scope), false);
+  assert.equal(refreshes, 2);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"""
+        completed = subprocess.run(
+            ["node"], input=harness, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(
+            completed.returncode, 0,
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
 
@@ -4263,7 +4943,6 @@ globalThis.fetch = async (path, options) => {
             0,
             msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
         )
-
     def test_write_runtime_discards_media_when_cross_tab_create_loses_claim(self) -> None:
         _, _, js_body = self.get("/dashboard.js")
         javascript = js_body.decode("utf-8")
@@ -4397,8 +5076,7 @@ globalThis.fetch = async (path, options) => {
         self.assertEqual(
             completed.returncode,
             0,
-            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",
-        )
+            msg=f"node stderr:\n{completed.stderr}\nnode stdout:\n{completed.stdout}",        )
 
     def test_write_runtime_omits_unknown_unchanged_content_fields(self) -> None:
         _, _, js_body = self.get("/dashboard.js")

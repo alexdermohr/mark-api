@@ -323,6 +323,56 @@ class KleinanzeigenEmailImportTests(unittest.TestCase):
         )
         self.assertEqual(len(store.inbound_message_history("1234567890")), 2)
 
+    def test_cli_uses_private_sqlite_owner_socket_without_database_argument(self) -> None:
+        import os
+        from mark_api.storage_owner import StorageOwnerServer
+        tmp, store = self.make_store()
+        rpc_dir = Path(tmp.name) / "rpc"
+        rpc_dir.mkdir(mode=0o700)
+        rpc_dir.chmod(0o2710)
+        socket_path = rpc_dir / "owner.sock"
+        owner = StorageOwnerServer(
+            database=store.path, socket_path=socket_path,
+            runtime_uid=os.geteuid() + 10001, runtime_gid=os.getegid(),
+        )
+        self.addCleanup(owner.stop)
+        owner.runtime_uid = os.geteuid()  # Same-UID test only, no OS isolation claim.
+        owner.start()
+        email_file = Path(tmp.name) / "owner-notification.eml"
+        email_file.write_bytes(notification())
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main([
+                "--storage-owner-socket", str(socket_path),
+                "--storage-owner-uid", str(os.geteuid()),
+                str(email_file),
+            ])
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())["inserted_events"], 1)
+        self.assertEqual(store.inbound_message_counts("1234567890"), (1, 1))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(main([
+                "--storage-owner-socket", str(socket_path),
+                "--storage-owner-uid", str(os.geteuid()),
+                str(email_file),
+            ]), 0)
+        self.assertEqual(store.inbound_message_counts("1234567890"), (1, 1))
+
+    def test_cli_rejects_owner_socket_with_init_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mail = Path(tmp) / "message.eml"
+            mail.write_bytes(notification())
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+                main([
+                    "--storage-owner-socket", str(Path(tmp) / "owner.sock"),
+                    "--storage-owner-uid", "50046", "--init-db",
+                    str(mail),
+                ])
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("cannot initialize", stderr.getvalue())
+
+
 
 if __name__ == "__main__":
     unittest.main()

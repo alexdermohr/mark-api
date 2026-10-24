@@ -28,6 +28,7 @@ class SyntheticPlatform:
     def __init__(self):
         self.ads = {"314": AdSnapshot(ad_id="314", observed_at=NOW, source="synthetic-owner", lifecycle_state=LifecycleState.ACTIVE, title="Original")}
         self.effects = []
+        self.backend_requests = []
     def read_ads(self):
         values = tuple(self.ads.values())
         return ReadResult.success_nonempty(values) if values else ReadResult.success_empty(())
@@ -71,8 +72,16 @@ def servers(platform, store):
     access = WriteApiAccess(principal="synthetic-lifecycle-only", bearer_token=BACKEND_TOKEN,
          capabilities=frozenset(WriteCapability) - {WriteCapability.CREATE_MEDIA}, writes_enabled=True)
     backend = create_write_api_server(service_for(platform, store), store, access, port=0)
+    dispatch_write = backend.RequestHandlerClass._dispatch_write
+
+    def counted_dispatch(handler, method):
+        platform.backend_requests.append((method, handler.path))
+        return dispatch_write(handler, method)
+
+    backend.RequestHandlerClass._dispatch_write = counted_dispatch
     dashboard = create_server(store, port=0, write_proxy=DashboardWriteProxy(
-        host="127.0.0.1", port=backend.server_port, bearer_token=BACKEND_TOKEN, ui_token=UI_TOKEN))
+        host="127.0.0.1", port=backend.server_port, bearer_token=BACKEND_TOKEN, ui_token=UI_TOKEN,
+        backend_principal=access.principal, local_reconciliation_enabled=True))
     threads = []
     try:
         for server in (backend,dashboard):
@@ -137,6 +146,7 @@ class DashboardFullLifecycleE2ETests(unittest.TestCase):
                     self.assertEqual((status2,body2),(status,body))
                     self.assertEqual(headers2.get("Idempotency-Replayed"),"true")
                     self.assertEqual(len(platform.effects),before+1)
+                    self.assertEqual(len(platform.backend_requests), before + 1)
                     scope = "create" if effect == "create" else "ad:315:" + (
                         "update" if effect == "update_content" else
                         ("pause" if effect == "set_state:paused" else
@@ -165,6 +175,7 @@ class DashboardFullLifecycleE2ETests(unittest.TestCase):
                 self.assertEqual(status,200,body)
                 self.assertEqual(headers.get("Idempotency-Replayed"),"true")
                 self.assertEqual(len(platform.effects),5)
+                self.assertEqual(len(platform.backend_requests), 5)
 
 
     def test_restart_fences_unacknowledged_write_without_external_retry(self):
@@ -227,6 +238,7 @@ class DashboardFullLifecycleE2ETests(unittest.TestCase):
                 self.assertEqual(status, 200, edit)
                 self.assertEqual(edit["operation_receipt"]["outcome"], "confirmed")
                 self.assertEqual(platform.effects, ["create", "update_content"])
+                self.assertEqual(len(platform.backend_requests), 2)
 
 
 if __name__ == "__main__":

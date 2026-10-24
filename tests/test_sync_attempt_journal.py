@@ -49,6 +49,44 @@ class SyncAttemptJournalTests(unittest.TestCase):
         self.assertIsNone(reopened.last_successful_sync_attempt())
         self.assertIsNone(reopened.latest_sync_attempt().completed_at)
 
+    def test_older_open_sync_survives_newer_success_and_stays_visible(self) -> None:
+        self.assertEqual(self.store.sync_recovery_status(), {
+            "unresolved_count": 0, "oldest_unresolved_attempt": None,
+        })
+        old = self.store.begin_sync_attempt(
+            source="older-owner", started_at=NOW,
+        )
+        newer = self.store.begin_sync_attempt(
+            source="newer-owner", started_at=NOW + timedelta(seconds=1),
+        )
+        self.store.append_inventory_result(
+            ReadResult.success_empty(()), observed_at=NOW + timedelta(seconds=2),
+            source="newer-owner", attempt_id=newer,
+            completed_at=NOW + timedelta(seconds=2),
+        )
+        reopened = SnapshotStore(self.db, create_if_missing=False)
+        self.assertEqual(reopened.sync_status()["state"], "success_empty")
+        status = reopened.sync_recovery_status()
+        self.assertEqual(status["unresolved_count"], 1)
+        self.assertEqual(status["oldest_unresolved_attempt"]["id"], old)
+        self.assertEqual(status["oldest_unresolved_attempt"]["source"], "older-owner")
+        self.assertEqual(status["oldest_unresolved_attempt"]["outcome"], "in_progress")
+        self.assertIsNone(status["oldest_unresolved_attempt"]["completed_at"])
+        # A successful newer read is never a clearance for the older attempt.
+        with self.assertRaisesRegex(RuntimeError, "unresolved"):
+            reopened.begin_sync_attempt(
+                source="third-owner", started_at=NOW + timedelta(seconds=3),
+                require_no_unresolved=True,
+            )
+        self.store.fail_sync_attempt(
+            old, source="older-owner",
+            completed_at=NOW + timedelta(seconds=4),
+            error_kind="persistence_error",
+        )
+        self.assertEqual(reopened.sync_recovery_status(), {
+            "unresolved_count": 0, "oldest_unresolved_attempt": None,
+        })
+
     def test_success_nonempty_is_atomic_with_inventory_and_preserves_zero(self) -> None:
         started = self.store.begin_sync_attempt(source="owner+provider", started_at=NOW)
         self.store.append_inventory_result(
@@ -160,6 +198,78 @@ class SyncAttemptJournalTests(unittest.TestCase):
         with self.assertRaises(sqlite3.DatabaseError):
             SnapshotStore(self.db, create_if_missing=False)
 
+    def test_corrupt_middle_open_sync_cannot_hide_behind_oldest_and_success(self) -> None:
+        oldest = self.store.begin_sync_attempt(source="old-owner", started_at=NOW)
+        hidden = self.store.begin_sync_attempt(
+            source="middle-owner", started_at=NOW + timedelta(seconds=1),
+        )
+        newest_open = self.store.begin_sync_attempt(
+            source="new-owner", started_at=NOW + timedelta(seconds=2),
+        )
+        terminal = self.store.begin_sync_attempt(
+            source="finished-owner", started_at=NOW + timedelta(seconds=3),
+        )
+        self.store.append_inventory_result(
+            ReadResult.success_empty(()), source="finished-owner",
+            observed_at=NOW + timedelta(seconds=4),
+            attempt_id=terminal, completed_at=NOW + timedelta(seconds=4),
+        )
+        self.assertEqual(self.store.sync_status()["state"], "success_empty")
+        summary = self.store.sync_recovery_status()
+        self.assertEqual(summary["unresolved_count"], 3)
+        self.assertEqual(summary["oldest_unresolved_attempt"]["id"], oldest)
+        self.assertTrue(self.store.is_ready())
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                "UPDATE sync_attempts SET started_at=? WHERE id=?",
+                ("private-middle-owner-timestamp-corrupt", hidden),
+            )
+        self.assertEqual(self.store.latest_sync_attempt().id, terminal)
+        self.assertEqual(self.store.last_successful_sync_attempt().id, terminal)
+        self.assertEqual(self.store.latest_sync_attempt().outcome, "success_empty")
+        for projection in (self.store.sync_status, self.store.sync_recovery_status):
+            with self.subTest(projection=projection), self.assertRaises(
+                sqlite3.DatabaseError,
+            ):
+                projection()
+        self.assertFalse(self.store.is_ready())
+        with self.assertRaises(sqlite3.DatabaseError):
+            SnapshotStore(self.db, create_if_missing=False)
+        # None of the three pending attempts may be silently resolved.
+        with sqlite3.connect(self.db) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT id FROM sync_attempts WHERE outcome='in_progress' "
+                    "ORDER BY id"
+                ).fetchall(),
+                [(oldest,), (hidden,), (newest_open,)],
+            )
+
+    def test_corrupt_older_open_sync_cannot_hide_behind_new_success(self) -> None:
+        older = self.store.begin_sync_attempt(source="stale-owner", started_at=NOW)
+        newer = self.store.begin_sync_attempt(
+            source="latest-owner", started_at=NOW + timedelta(seconds=1),
+        )
+        self.store.append_inventory_result(
+            ReadResult.success_empty(()), source="latest-owner",
+            observed_at=NOW + timedelta(seconds=2), attempt_id=newer,
+            completed_at=NOW + timedelta(seconds=2),
+        )
+        self.assertTrue(self.store.is_ready())
+        self.assertEqual(self.store.sync_status()["state"], "success_empty")
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                "UPDATE sync_attempts SET started_at=? WHERE id=?",
+                ("corrupt-oldest-owner-time", older),
+            )
+        self.assertFalse(self.store.is_ready())
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.store.sync_status()
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.store.sync_recovery_status()
+        with self.assertRaises(sqlite3.DatabaseError):
+            SnapshotStore(self.db, create_if_missing=False)
+
     def test_additive_upgrade_after_existing_recovery_tables_validated(self) -> None:
         self.store.append_ad_snapshot(self.ad())
         with closing(sqlite3.connect(self.db)) as connection, connection:
@@ -170,9 +280,14 @@ class SyncAttemptJournalTests(unittest.TestCase):
         self.assertEqual(reopened.latest_ad_snapshot("123"), self.ad())
         self.assertEqual(reopened.sync_status()["state"], "never_attempted")
         with closing(sqlite3.connect(self.db)) as connection, connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+            # A6's complete store is schema-v2, including the additive sync
+            # journal. Upgrading an unversioned store must preserve recovery.
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='write_api_requests'"
+            ).fetchone())
+            self.assertIsNotNone(connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='write_recovery_clearances'"
             ).fetchone())
 
     def test_lost_versioned_journal_is_not_silently_regenerated(self) -> None:
